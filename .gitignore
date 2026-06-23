@@ -20,3 +20,6 @@ packaging/aur/pkg/
 packaging/aur/src/
 packaging/aur/*.pkg.tar.*
 packaging/aur/*.tar.gz
+
+# Claude Code - config local da sessao
+.claude/settings.local.json
