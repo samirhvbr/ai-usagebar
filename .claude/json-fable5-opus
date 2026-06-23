@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "_comment_perfil": "PERFIL FABLE-5 — Claude Fable 5 no model e nos subagentes; fallback Opus. Janela 1M nativa (Fable 5 roda 1M na API Anthropic). Effort 'max' via env CLAUDE_CODE_EFFORT_LEVEL. Thinking sempre adaptativo no Fable 5. CREDITOS: incluso no Max ate ~22/jun/2026; depois ~2x o Opus. Requer Claude Code v2.1.170+.",
+  "model": "fable",
+  "fallbackModel": [
+    "opus"
+  ],
+  "env": {
+    "CLAUDE_CODE_SUBAGENT_MODEL": "fable",
+    "ANTHROPIC_DEFAULT_FABLE_MODEL": "claude-fable-5",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-opus-4-8",
+    "CLAUDE_CODE_EFFORT_LEVEL": "max"
+  },
+  "permissions": {
+    "_comment": "Permissoes do projeto - Rust (Cargo + Make)",
+    "defaultMode": "plan",
+    "allow": [
+      "Read",
+      "Edit",
+      "Write",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git show:*)",
+      "Bash(git branch:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(cargo build:*)",
+      "Bash(cargo check:*)",
+      "Bash(cargo test:*)",
+      "Bash(cargo clippy:*)",
+      "Bash(cargo fmt:*)",
+      "Bash(cargo run:*)",
+      "Bash(cargo doc:*)",
+      "Bash(make:*)"
+    ],
+    "deny": [
+      "Read(./.env)",
+      "Read(./.env.*)",
+      "Read(**/*.pem)",
+      "Bash(rm -rf:*)",
+      "Bash(rm -rf /:*)",
+      "Bash(git push --force:*)",
+      "Bash(git push -f:*)",
+      "Bash(git reset --hard:*)",
+      "Bash(git clean -fd:*)",
+      "Bash(curl * | sh:*)",
+      "Bash(curl * | bash:*)",
+      "Bash(wget * | sh:*)"
+    ],
+    "ask": [
+      "Bash(sudo:*)",
+      "Bash(cargo add:*)",
+      "Bash(cargo remove:*)",
+      "Bash(cargo update:*)",
+      "Bash(cargo install:*)",
+      "Bash(cargo publish:*)"
+    ]
+  }
+}
