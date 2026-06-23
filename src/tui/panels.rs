@@ -82,6 +82,7 @@ pub fn sections_for(tab: &TabState, now: DateTime<Utc>, pace_tolerance: u32) -> 
                 VendorSnapshot::Zai(s) => zai_sections(s, now),
                 VendorSnapshot::Openrouter(s) => openrouter_sections(s),
                 VendorSnapshot::Deepseek(s) => deepseek_sections(s),
+                VendorSnapshot::Shvia(s) => shvia_sections(s, now),
             };
             // Inject the (already-absolute) fetched-at instant into the title
             // row, right-aligned. Pre-snapshotted in app::refresh_one so it
@@ -191,6 +192,85 @@ fn zai_sections(s: &crate::usage::ZaiSnapshot, now: DateTime<Utc>) -> Vec<Sectio
         });
     }
     v
+}
+
+fn shvia_sections(s: &crate::usage::ShviaSnapshot, now: DateTime<Utc>) -> Vec<Section> {
+    let mut v = vec![Section::Title {
+        left: s.plan.clone(),
+        right: None,
+    }];
+    if let Some(w) = &s.today {
+        push_shvia_window(&mut v, "Today", w, now);
+    }
+    if let Some(w) = &s.week {
+        push_shvia_window(&mut v, "Week", w, now);
+    }
+    if let Some(w) = &s.month {
+        push_shvia_window(&mut v, "Month", w, now);
+    }
+    if s.today.is_none() && s.week.is_none() && s.month.is_none() {
+        v.push(Section::Spacer);
+        v.push(Section::Text {
+            label: "".into(),
+            value: "  no usage windows reported".into(),
+        });
+    }
+    v
+}
+
+/// Render one ShvIA window. Limited windows become a gauge `Metric`;
+/// unlimited windows (`limit == -1`) become a `Block` showing the raw used
+/// count, since there is no ratio to gauge.
+fn push_shvia_window(
+    sections: &mut Vec<Section>,
+    label: &str,
+    w: &crate::usage::ShviaWindow,
+    now: DateTime<Utc>,
+) {
+    let reset_text = countdown::format(w.resets_at, now);
+    sections.push(Section::Spacer);
+    if w.is_unlimited() {
+        sections.push(Section::Block {
+            label: label.into(),
+            body: vec![format!(
+                "{} used · unlimited · resets in {}",
+                shvia_count(w.used),
+                reset_text
+            )],
+        });
+    } else {
+        let pct = w.utilization_pct().clamp(0, 100) as u16;
+        let remaining = w
+            .remaining
+            .map(|r| format!(" · {} left", shvia_count(r)))
+            .unwrap_or_default();
+        sections.push(Section::Metric {
+            label: label.into(),
+            pct,
+            severity: severity_for(pct as i32),
+            value_label: format!("{pct}%"),
+            footnote: format!(
+                "{} / {}{} · resets in {}",
+                shvia_count(w.used),
+                shvia_count(w.limit),
+                remaining,
+                reset_text
+            ),
+        });
+    }
+}
+
+/// Compact integer formatter for token counts in the TUI panel (mirrors the
+/// Waybar renderer's `format_count`).
+fn shvia_count(n: i64) -> String {
+    let abs = n.unsigned_abs();
+    if abs >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if abs >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
 }
 
 fn openrouter_sections(s: &crate::usage::OpenRouterSnapshot) -> Vec<Section> {

@@ -15,6 +15,7 @@ use crate::deepseek;
 use crate::error::{AppError, Result};
 use crate::openai;
 use crate::openrouter;
+use crate::shvia;
 use crate::theme::Theme;
 use crate::vendor::{HTTP_CLIENT_TIMEOUT, RenderOpts, VendorOutcome};
 use crate::waybar::WaybarOutput;
@@ -108,6 +109,7 @@ async fn build_output(cli: &Cli) -> Result<WaybarOutput> {
         Vendor::Openai => openai_output(cli, &config).await,
         Vendor::Zai => zai_output(cli, &config).await,
         Vendor::Deepseek => deepseek_output(cli, &config).await,
+        Vendor::Shvia => shvia_output(cli, &config).await,
     }
 }
 
@@ -168,6 +170,46 @@ async fn zai_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
     let vendor_outcome: VendorOutcome = outcome.into();
     let opts = RenderOpts::from_cli(cli);
     Ok(zai::vendor::render(
+        &vendor_outcome,
+        &snap,
+        &theme,
+        &opts,
+        chrono::Utc::now(),
+    ))
+}
+
+async fn shvia_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
+    let api_key = crate::config::resolve_api_key(
+        "Shvia",
+        &config.shvia.api_key_env,
+        config.shvia.api_key.as_deref(),
+    )?;
+    let client = http_client()?;
+    let cache = vendor_cache(cli, "shvia")?;
+    let endpoints = match config.shvia.base_url.as_deref() {
+        Some(base) if !base.is_empty() => shvia::fetch::Endpoints::from_base_url(base),
+        _ => shvia::fetch::Endpoints::default(),
+    };
+    let outcome = match shvia::fetch_snapshot(
+        &client,
+        &api_key,
+        &cache,
+        &endpoints,
+        DEFAULT_TTL,
+        config.shvia.plan.as_deref(),
+    )
+    .await
+    {
+        Ok(o) => o,
+        Err(e) if e.is_transient() => return Ok(WaybarOutput::loading(cli.icon.as_deref())),
+        Err(e) => return Err(e),
+    };
+
+    let theme = theme_from_cli(cli);
+    let snap = outcome.snapshot.clone();
+    let vendor_outcome: VendorOutcome = outcome.into();
+    let opts = RenderOpts::from_cli(cli);
+    Ok(shvia::vendor::render(
         &vendor_outcome,
         &snap,
         &theme,

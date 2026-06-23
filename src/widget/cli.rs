@@ -115,6 +115,7 @@ pub enum Vendor {
     Zai,
     Openrouter,
     Deepseek,
+    Shvia,
 }
 
 impl Vendor {
@@ -125,6 +126,7 @@ impl Vendor {
             Vendor::Zai => crate::vendor::VendorId::Zai,
             Vendor::Openrouter => crate::vendor::VendorId::Openrouter,
             Vendor::Deepseek => crate::vendor::VendorId::Deepseek,
+            Vendor::Shvia => crate::vendor::VendorId::Shvia,
         }
     }
 }
@@ -185,6 +187,7 @@ fn id_to_vendor(id: crate::vendor::VendorId) -> Vendor {
         crate::vendor::VendorId::Zai => Vendor::Zai,
         crate::vendor::VendorId::Openrouter => Vendor::Openrouter,
         crate::vendor::VendorId::Deepseek => Vendor::Deepseek,
+        crate::vendor::VendorId::Shvia => Vendor::Shvia,
     }
 }
 

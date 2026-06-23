@@ -20,6 +20,7 @@ pub mod openai;
 pub mod openrouter;
 pub mod pacing;
 pub mod pango;
+pub mod shvia;
 pub mod theme;
 pub mod tooltip;
 pub mod tui;

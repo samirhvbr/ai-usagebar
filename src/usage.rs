@@ -114,6 +114,7 @@ pub enum VendorSnapshot {
     Zai(ZaiSnapshot),
     Openrouter(OpenRouterSnapshot),
     Deepseek(DeepseekSnapshot),
+    Shvia(ShviaSnapshot),
 }
 
 /// OpenAI Codex OAuth — mirrors Anthropic's two-window + extras pattern.
@@ -160,6 +161,56 @@ pub struct ZaiSnapshot {
     pub session: Option<UsageWindow>,
     pub weekly: Option<UsageWindow>,
     pub mcp: Option<UsageWindow>,
+}
+
+/// ShvIA — a self-hosted OpenAI-compatible gateway exposing three rolling
+/// usage windows (today / week / month) via `/api/v1/usage`. Each window
+/// reports a raw `used` count plus an optional `limit` (where `-1` means
+/// unlimited) and an optional pre-computed `remaining`.
+///
+/// Unlike [`ZaiSnapshot`] (which only carries a `% used` per window), ShvIA
+/// reports the raw token counts, so a [`ShviaWindow`] keeps them — that lets
+/// the renderer show the used count verbatim when a window is unlimited and a
+/// percentage when it isn't.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShviaSnapshot {
+    /// Plan / gateway label shown in the tooltip header.
+    pub plan: String,
+    pub today: Option<ShviaWindow>,
+    pub week: Option<ShviaWindow>,
+    pub month: Option<ShviaWindow>,
+}
+
+/// A single ShvIA usage window. `limit == -1` (or `limit <= 0`) is treated as
+/// "unlimited" — [`ShviaWindow::is_unlimited`] returns `true` and
+/// [`ShviaWindow::utilization_pct`] returns `0`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShviaWindow {
+    pub used: i64,
+    /// `-1` means unlimited.
+    pub limit: i64,
+    /// Pre-computed remaining from the API; `None` when unlimited / unreported.
+    pub remaining: Option<i64>,
+    pub resets_at: Option<DateTime<Utc>>,
+}
+
+impl ShviaWindow {
+    /// `true` when the window has no enforced ceiling (`limit == -1`, or any
+    /// non-positive limit).
+    pub fn is_unlimited(&self) -> bool {
+        self.limit <= 0
+    }
+
+    /// Integer percent of the limit consumed (0..=100). Returns 0 for
+    /// unlimited windows (there is no meaningful ratio).
+    pub fn utilization_pct(&self) -> i32 {
+        if self.is_unlimited() {
+            return 0;
+        }
+        (((self.used as f64) / (self.limit as f64)) * 100.0)
+            .round()
+            .clamp(0.0, 100.0) as i32
+    }
 }
 
 /// OpenRouter — credit balance + lifetime/daily/weekly/monthly usage from
@@ -314,5 +365,37 @@ mod tests {
         // session = 100, weekly = 50, extra = 100% → max should be 100.
         let s = snap(100, 50, None, Some((10000, 10000)));
         assert_eq!(anthropic_severity(&s), PaceSeverity::Critical);
+    }
+
+    #[test]
+    fn shvia_window_utilization_rounds_and_clamps() {
+        let limited = ShviaWindow {
+            used: 427,
+            limit: 1000,
+            remaining: Some(573),
+            resets_at: None,
+        };
+        assert!(!limited.is_unlimited());
+        assert_eq!(limited.utilization_pct(), 43); // 42.7 rounds to 43
+
+        let over = ShviaWindow {
+            used: 1500,
+            limit: 1000,
+            remaining: Some(0),
+            resets_at: None,
+        };
+        assert_eq!(over.utilization_pct(), 100); // clamps
+    }
+
+    #[test]
+    fn shvia_window_unlimited_has_zero_pct() {
+        let unlimited = ShviaWindow {
+            used: 12_345,
+            limit: -1,
+            remaining: None,
+            resets_at: None,
+        };
+        assert!(unlimited.is_unlimited());
+        assert_eq!(unlimited.utilization_pct(), 0);
     }
 }

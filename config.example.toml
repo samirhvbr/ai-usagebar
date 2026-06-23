@@ -8,7 +8,7 @@
 [ui]
 # Which vendor the widget shows when `--vendor` is omitted, AND which tab
 # is selected when the TUI opens. Comment out to default to Anthropic.
-# Valid: anthropic | openai | zai | openrouter | deepseek
+# Valid: anthropic | openai | zai | openrouter | deepseek | shvia
 # primary = "anthropic"
 
 [anthropic]
@@ -44,3 +44,15 @@ api_key_env = "OPENROUTER_API_KEY"
 enabled = false
 api_key_env = "DEEPSEEK_API_KEY"  # checked first; if set + non-empty, used
 # api_key = "sk-..."              # fallback; chmod 600 the file if you use it
+
+[shvia]
+# Self-hosted OpenAI-compatible gateway. Token usage is read from
+# {base_url}/api/v1/usage with `Authorization: Bearer <key>`.
+enabled = true
+# Credential resolution order: env var → inline api_key → error.
+api_key_env = "SHVIA_API_KEY"     # checked first; if set + non-empty, used
+# api_key = "..."                 # fallback; chmod 600 the file if you use it
+# Gateway base URL (no trailing path). Defaults to the value below.
+# base_url = "https://ia.blue3.com.br"
+# Display-only label shown in the tooltip header (defaults to "ShvIA").
+# plan = "ShvIA"
