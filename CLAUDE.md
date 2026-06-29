@@ -3,6 +3,16 @@
 Notes for Claude Code (and humans) about working in this repo. Keep tight:
 these are invariants we keep almost-forgetting, not a project tour.
 
+## 🔄 Before you start: `git pull`
+
+**ALWAYS** check for remote updates before writing or changing anything in this repo:
+
+```bash
+git pull          # already allow-listed
+```
+
+Working on a stale base causes conflicts. Pull first, every time. To inspect only: `git fetch && git status`.
+
 ## Release checklist — must do all of these
 
 When cutting a new version (patch, minor, or major):
