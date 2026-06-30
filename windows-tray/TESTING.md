@@ -54,10 +54,19 @@ You should see the bars / plan summary.
 
 ## 4. Build & run the tray
 
+For testing, run **framework-dependent** (uses the .NET 8 runtime you just
+installed — no extra downloads):
+
 ```powershell
 cd windows-tray
-dotnet run -c Release
+dotnet run
 ```
+
+> Don't use `-c Release` for `run`. The Release config is set up for a
+> **self-contained** publish (RID `win-x64`), so `run -c Release` tries to
+> restore the win-x64 runtime packs and can fail with `NU1100: unable to
+> resolve Microsoft.*.Runtime.win-x64 (= 8.0.x)`. Plain `dotnet run` avoids
+> that; `-c Release` is only for the portable bundle (step 5).
 
 A colored dot appears in the system tray (color follows usage severity):
 
@@ -88,6 +97,7 @@ windows-tray\bin\Release\net8.0-windows\win-x64\publish\
 |---|---|
 | `cargo` not found | install Rustup (step 1), open a new shell |
 | `dotnet` not found | install .NET 8 SDK (step 1), open a new shell |
+| `NU1100` resolving `*.Runtime.win-x64` | you used `-c Release` (self-contained) to *run*; use plain `dotnet run` to test |
 | Tray dot is grey / no data | run `claude` (or `codex login`) once; test with `ai-usagebar.exe --pretty` |
 | Wrong/old backend used | set `BackendPath` in `%APPDATA%\ai-usagebar-tray\settings.json` |
 
