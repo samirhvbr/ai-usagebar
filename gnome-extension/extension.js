@@ -1,11 +1,11 @@
 // AI Usage Bar — GNOME Shell indicator that renders ai-usagebar's
-// 5-hour (session) and weekly bars in the top panel, next to the
-// clock/network, with the full bordered tooltip in a dropdown.
+// 5-hour (session), weekly, and (optionally) extra-usage bars in the top
+// panel next to the clock/network, with a native, aligned dropdown.
 //
 // It shells out to the `ai-usagebar` binary (always exits 0, emits Waybar
-// JSON `{text, tooltip, class}`) and draws the bars natively. Colors mirror
-// the binary's default One Dark theme + severity_for() thresholds, so the
-// panel looks identical to the Waybar widget.
+// JSON `{text, tooltip, class}`) and draws everything with native St
+// widgets. Bar colors and thresholds default to the binary's One Dark
+// theme but are user-configurable.
 
 import GObject from 'gi://GObject';
 import St from 'gi://St';
@@ -20,26 +20,24 @@ import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 
 const ROLE = 'ai-usagebar';
 
-// One Dark palette — matches ai-usagebar's default theme (src/theme.rs).
-const C = {
-    green: '#98c379',
-    yellow: '#e5c07b',
-    orange: '#d19a66',
-    red: '#e06c75',
-    empty: '#3e4451',
-    fg: '#abb2bf',
-    dim: '#5c6370',
-};
+// Fixed accent colors (tags / dim text). Bar colors are user-configurable.
+const DIM = '#5c6370';
+const FG = '#abb2bf';
+const RED = '#e06c75';
 
-// severity_for(pct) from src/pango.rs: >=90 red, >=75 orange, >=50 yellow, else green.
-function colorForPct(pct) {
+// All ten fields we pull from the binary, joined by ';;'.
+const FORMAT = '{plan};;{session_pct};;{session_reset};;{weekly_pct};;{weekly_reset};;' +
+    '{sonnet_pct};;{sonnet_reset};;{extra_pct};;{extra_spent};;{extra_limit}';
+
+// severity_for(pct) from src/pango.rs: >=90 critical, >=75 high, >=50 mid, else low.
+function colorForPct(pct, colors) {
     if (pct >= 90)
-        return C.red;
+        return colors.critical;
     if (pct >= 75)
-        return C.orange;
+        return colors.high;
     if (pct >= 50)
-        return C.yellow;
-    return C.green;
+        return colors.mid;
+    return colors.low;
 }
 
 function esc(s) {
@@ -50,12 +48,11 @@ function esc(s) {
 }
 
 // Two-segment block bar as Pango markup, `width` cells wide.
-function barMarkup(pct, width) {
+function barMarkup(pct, width, colors) {
     const p = Math.max(0, Math.min(100, Math.round(pct)));
     const filled = Math.round((p * width) / 100);
-    const empty = width - filled;
-    return `<span foreground="${colorForPct(p)}">${'█'.repeat(filled)}</span>` +
-        `<span foreground="${C.empty}">${'░'.repeat(empty)}</span>`;
+    return `<span foreground="${colorForPct(p, colors)}">${'█'.repeat(filled)}</span>` +
+        `<span foreground="${colors.empty}">${'░'.repeat(width - filled)}</span>`;
 }
 
 function resolveBinary(settings) {
@@ -78,10 +75,11 @@ class AiUsageBarIndicator extends PanelMenu.Button {
 
         this._settings = settings;
         this._openPrefs = openPrefs;
-        this._last = null;          // {sess, week} cache for redraws
+        this._data = null;          // parsed snapshot for redraws
         this._busy = false;
         this._timer = 0;
         this._cancellable = new Gio.Cancellable();
+        this._rows = {};
 
         // Panel: one markup label holds tags + percentages + bars.
         this._label = new St.Label({
@@ -91,12 +89,44 @@ class AiUsageBarIndicator extends PanelMenu.Button {
         });
         this.add_child(this._label);
 
-        // Dropdown: the binary's full bordered tooltip (monospace) + actions.
-        this._tipItem = new PopupMenu.PopupBaseMenuItem({reactive: false, can_focus: false});
-        this._tipLabel = new St.Label({style_class: 'aiub-tip'});
-        this._tipLabel.clutter_text.line_wrap = false;
-        this._tipItem.add_child(this._tipLabel);
-        this.menu.addMenuItem(this._tipItem);
+        this._buildMenu();
+
+        // Re-render cached data when any display setting changes (no refetch).
+        const viewKeys = [
+            'bar-width', 'show-percent', 'show-bars', 'show-session',
+            'show-weekly', 'show-extra', 'color-low', 'color-mid',
+            'color-high', 'color-critical', 'color-empty',
+        ];
+        this._viewIds = viewKeys.map(k =>
+            this._settings.connect(`changed::${k}`, () => this._render()));
+
+        this._intervalId = this._settings.connect('changed::refresh-interval',
+            () => this._restartTimer());
+        this._sourceIds = [
+            this._settings.connect('changed::vendor', () => this._refresh()),
+            this._settings.connect('changed::binary-path', () => this._refresh()),
+        ];
+
+        this.menu.connect('open-state-changed', (_m, open) => {
+            if (open)
+                this._refresh();
+        });
+
+        this._refresh();
+        this._restartTimer();
+    }
+
+    _buildMenu() {
+        // Header (plan name).
+        const header = new PopupMenu.PopupBaseMenuItem({reactive: false, can_focus: false});
+        this._planLabel = new St.Label({text: 'AI Usage', x_expand: true, style_class: 'aiub-header'});
+        header.add_child(this._planLabel);
+        this.menu.addMenuItem(header);
+
+        this._addRow('session', 'Session');
+        this._addRow('weekly', 'Weekly');
+        this._addRow('sonnet', 'Sonnet only');
+        this._addRow('extra', 'Extra usage');
 
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
 
@@ -111,32 +141,44 @@ class AiUsageBarIndicator extends PanelMenu.Button {
         const prefsItem = new PopupMenu.PopupMenuItem('Configurações');
         prefsItem.connect('activate', () => this._openPrefs());
         this.menu.addMenuItem(prefsItem);
+    }
 
-        // Re-render cached data when display settings change.
-        this._redrawIds = [
-            'changed::bar-width',
-            'changed::show-percent',
-            'changed::show-session',
-            'changed::show-weekly',
-        ].map(sig => this._settings.connect(sig, () => this._redraw()));
-
-        // Re-arm the timer when the interval changes; refetch when the
-        // source (vendor / binary) changes.
-        this._intervalId = this._settings.connect('changed::refresh-interval',
-            () => this._restartTimer());
-        this._sourceIds = [
-            this._settings.connect('changed::vendor', () => this._refresh()),
-            this._settings.connect('changed::binary-path', () => this._refresh()),
-        ];
-
-        // Refresh on click-to-open, so the dropdown is never stale.
-        this.menu.connect('open-state-changed', (_m, open) => {
-            if (open)
-                this._refresh();
+    // A native, font-independent row: [name ........ value] / bar / reset.
+    _addRow(key, name) {
+        const item = new PopupMenu.PopupBaseMenuItem({reactive: false, can_focus: false});
+        const vbox = new St.BoxLayout({
+            orientation: Clutter.Orientation.VERTICAL,
+            x_expand: true,
+            style_class: 'aiub-row',
         });
 
-        this._refresh();
-        this._restartTimer();
+        const head = new St.BoxLayout({x_expand: true});
+        const nameL = new St.Label({text: name, x_expand: true, style_class: 'aiub-row-name'});
+        const valL = new St.Label({style_class: 'aiub-row-val'});
+        head.add_child(nameL);
+        head.add_child(valL);
+
+        const barL = new St.Label({style_class: 'aiub-row-bar'});
+        const resetL = new St.Label({style_class: 'aiub-row-reset'});
+
+        vbox.add_child(head);
+        vbox.add_child(barL);
+        vbox.add_child(resetL);
+        item.add_child(vbox);
+        this.menu.addMenuItem(item);
+
+        this._rows[key] = {item, valL, barL, resetL};
+    }
+
+    _colors() {
+        const g = k => this._settings.get_string(k);
+        return {
+            low: g('color-low'),
+            mid: g('color-mid'),
+            high: g('color-high'),
+            critical: g('color-critical'),
+            empty: g('color-empty'),
+        };
     }
 
     _restartTimer() {
@@ -158,7 +200,7 @@ class AiUsageBarIndicator extends PanelMenu.Button {
 
         const bin = resolveBinary(this._settings);
         const vendor = this._settings.get_string('vendor') || 'anthropic';
-        const argv = [bin, '--vendor', vendor, '--format', '{session_pct};;{weekly_pct}'];
+        const argv = [bin, '--vendor', vendor, '--format', FORMAT];
 
         let proc;
         try {
@@ -198,57 +240,97 @@ class AiUsageBarIndicator extends PanelMenu.Button {
             this._setError('saída inválida', stdout);
             return;
         }
-        const text = (data.text ?? '').toString();
-        const tip = (data.tooltip ?? '').toString();
-        const m = text.match(/(\d+);;(\d+)/);
-        if (m) {
-            this._last = {sess: parseInt(m[1], 10), week: parseInt(m[2], 10)};
-            this._redraw();
-        } else {
-            // Loading… / ⚠ — show the binary's own text, stripped of markup.
-            this._last = null;
-            this._label.clutter_text.set_markup(
-                `<span foreground="${C.fg}">${esc(text.replace(/<[^>]+>/g, ''))}</span>`);
+        const raw = (data.text ?? '').toString().replace(/<[^>]*>/g, '');
+        const f = raw.split(';;');
+        if (f.length < 10) {
+            // Loading… / ⚠ — show the binary's own text.
+            this._data = null;
+            this._label.clutter_text.set_markup(`<span foreground="${FG}">${esc(raw) || '…'}</span>`);
+            return;
         }
-        this._setTip(tip);
+        const num = s => {
+            const n = parseInt(s, 10);
+            return Number.isFinite(n) ? n : null;
+        };
+        this._data = {
+            plan: f[0].trim(),
+            session: {pct: num(f[1]) ?? 0, reset: f[2].trim()},
+            weekly: {pct: num(f[3]) ?? 0, reset: f[4].trim()},
+            sonnet: {pct: num(f[5]), reset: f[6].trim()},
+            extra: {pct: num(f[7]) ?? 0, spent: f[8].trim(), limit: f[9].trim()},
+        };
+        this._render();
     }
 
-    _redraw() {
-        if (!this._last)
+    // Redraw both the panel and the dropdown from cached data + settings.
+    _render() {
+        const d = this._data;
+        if (!d)
             return;
-        const {sess, week} = this._last;
+        const colors = this._colors();
+        this._renderPanel(d, colors);
+        this._renderDropdown(d, colors);
+    }
+
+    _renderPanel(d, colors) {
         const w = Math.max(4, Math.min(20, this._settings.get_int('bar-width')));
         const showPct = this._settings.get_boolean('show-percent');
+        const showBars = this._settings.get_boolean('show-bars');
+
+        const seg = (tag, pct, valueText) => {
+            const toks = [`<span foreground="${DIM}">${tag}</span>`];
+            if (showPct)
+                toks.push(`<span foreground="${colorForPct(pct, colors)}">${esc(valueText)}</span>`);
+            if (showBars)
+                toks.push(barMarkup(pct, w, colors));
+            if (!showPct && !showBars) // never render an empty segment
+                toks.push(`<span foreground="${colorForPct(pct, colors)}">${esc(valueText)}</span>`);
+            return toks.join(' ');
+        };
+
         const parts = [];
-        if (this._settings.get_boolean('show-session')) {
-            let s = `<span foreground="${C.dim}">5h </span>`;
-            if (showPct)
-                s += `<span foreground="${colorForPct(sess)}">${sess}% </span>`;
-            parts.push(s + barMarkup(sess, w));
-        }
-        if (this._settings.get_boolean('show-weekly')) {
-            let s = `<span foreground="${C.dim}">7d </span>`;
-            if (showPct)
-                s += `<span foreground="${colorForPct(week)}">${week}% </span>`;
-            parts.push(s + barMarkup(week, w));
-        }
-        const gap = `<span foreground="${C.dim}">   </span>`;
+        if (this._settings.get_boolean('show-session'))
+            parts.push(seg('5h', d.session.pct, `${d.session.pct}%`));
+        if (this._settings.get_boolean('show-weekly'))
+            parts.push(seg('7d', d.weekly.pct, `${d.weekly.pct}%`));
+        if (this._settings.get_boolean('show-extra') && d.extra.spent)
+            parts.push(seg('ex', d.extra.pct, d.extra.spent));
+
+        const gap = `<span foreground="${DIM}">   </span>`;
         this._label.clutter_text.set_markup(parts.join(gap) || ' ');
     }
 
-    _setTip(tipMarkup) {
-        const ok = tipMarkup && tipMarkup.trim();
-        if (ok)
-            this._tipLabel.clutter_text.set_markup(tipMarkup);
-        this._tipItem.visible = !!ok;
+    _renderDropdown(d, colors) {
+        this._planLabel.text = d.plan || 'AI Usage';
+
+        const upd = (key, pct, valueText, reset, visible) => {
+            const r = this._rows[key];
+            r.item.visible = visible;
+            if (!visible)
+                return;
+            r.valL.text = valueText;
+            r.barL.clutter_text.set_markup(barMarkup(pct ?? 0, 18, colors));
+            if (reset) {
+                r.resetL.text = `↺ resets in ${reset}`;
+                r.resetL.visible = true;
+            } else {
+                r.resetL.visible = false;
+            }
+        };
+
+        upd('session', d.session.pct, `${d.session.pct}%`, d.session.reset, true);
+        upd('weekly', d.weekly.pct, `${d.weekly.pct}%`, d.weekly.reset, true);
+        upd('sonnet', d.sonnet.pct, `${d.sonnet.pct ?? 0}%`, d.sonnet.reset, d.sonnet.pct != null);
+        upd('extra', d.extra.pct, `${d.extra.spent} / ${d.extra.limit}`, null, !!d.extra.spent);
     }
 
     _setError(short, detail) {
-        this._last = null;
-        this._label.clutter_text.set_markup(`<span foreground="${C.red}">⚠ ai</span>`);
-        const msg = detail ? `${short}\n\n${esc(detail).slice(0, 400)}` : short;
-        this._tipLabel.clutter_text.set_markup(`<span foreground="${C.fg}">${esc(msg)}</span>`);
-        this._tipItem.visible = true;
+        this._data = null;
+        this._label.clutter_text.set_markup(`<span foreground="${RED}">⚠ ai</span>`);
+        const msg = detail ? `${short}\n${esc(detail).slice(0, 300)}` : short;
+        this._planLabel.clutter_text.set_markup(`<span foreground="${FG}">${esc(msg)}</span>`);
+        for (const r of Object.values(this._rows))
+            r.item.visible = false;
     }
 
     _openTui() {
@@ -263,8 +345,7 @@ class AiUsageBarIndicator extends PanelMenu.Button {
             if (!GLib.find_program_in_path(argv[0]))
                 continue;
             try {
-                GLib.spawn_async(null, argv, null,
-                    GLib.SpawnFlags.SEARCH_PATH | GLib.SpawnFlags.DO_NOT_REAP_CHILD, null);
+                Gio.Subprocess.new(argv, Gio.SubprocessFlags.NONE);
                 return;
             } catch (e) {
                 // try the next terminal
@@ -279,13 +360,13 @@ class AiUsageBarIndicator extends PanelMenu.Button {
             this._timer = 0;
         }
         this._cancellable.cancel();
-        for (const id of this._redrawIds ?? [])
+        for (const id of this._viewIds ?? [])
             this._settings.disconnect(id);
         for (const id of this._sourceIds ?? [])
             this._settings.disconnect(id);
         if (this._intervalId)
             this._settings.disconnect(this._intervalId);
-        this._redrawIds = this._sourceIds = null;
+        this._viewIds = this._sourceIds = null;
         this._intervalId = 0;
         super.destroy();
     }
@@ -302,7 +383,6 @@ export default class AiUsageBarExtension extends Extension {
     }
 
     _place() {
-        // Defensive: free the role if a previous indicator is still registered.
         const existing = Main.panel.statusArea[ROLE];
         if (existing) {
             existing.destroy();

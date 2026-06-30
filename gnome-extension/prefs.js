@@ -2,9 +2,10 @@
 
 import Adw from 'gi://Adw';
 import Gtk from 'gi://Gtk';
+import Gdk from 'gi://Gdk';
 import Gio from 'gi://Gio';
 
-import {ExtensionPreferences, gettext as _} from 'resource:///org/gnome/Shell/Extensions/js/extensions/prefs/prefs.js';
+import {ExtensionPreferences, gettext as _} from 'resource:///org/gnome/Shell/Extensions/js/extensions/prefs.js';
 
 // Bind an Adw.ComboRow (index-based) to a string GSetting via a value table.
 function bindCombo(settings, key, comboRow, values) {
@@ -20,6 +21,39 @@ function bindCombo(settings, key, comboRow, values) {
     });
     const id = settings.connect(`changed::${key}`, sync);
     comboRow.connect('destroy', () => settings.disconnect(id));
+}
+
+function rgbaToHex(rgba) {
+    const h = v => Math.round(Math.max(0, Math.min(1, v)) * 255).toString(16).padStart(2, '0');
+    return `#${h(rgba.red)}${h(rgba.green)}${h(rgba.blue)}`;
+}
+
+// A row with a GTK color picker bound to a hex-string GSetting.
+function colorRow(settings, key, title) {
+    const row = new Adw.ActionRow({title});
+    const btn = new Gtk.ColorDialogButton({
+        dialog: new Gtk.ColorDialog({with_alpha: false}),
+        valign: Gtk.Align.CENTER,
+    });
+    let updating = false;
+    const load = () => {
+        const rgba = new Gdk.RGBA();
+        if (rgba.parse(settings.get_string(key))) {
+            updating = true;
+            btn.set_rgba(rgba);
+            updating = false;
+        }
+    };
+    load();
+    btn.connect('notify::rgba', () => {
+        if (!updating)
+            settings.set_string(key, rgbaToHex(btn.get_rgba()));
+    });
+    const id = settings.connect(`changed::${key}`, load);
+    row.connect('destroy', () => settings.disconnect(id));
+    row.add_suffix(btn);
+    row.activatable_widget = btn;
+    return row;
 }
 
 export default class AiUsageBarPrefs extends ExtensionPreferences {
@@ -40,9 +74,23 @@ export default class AiUsageBarPrefs extends ExtensionPreferences {
         settings.bind('show-weekly', showWeekly, 'active', Gio.SettingsBindFlags.DEFAULT);
         display.add(showWeekly);
 
-        const showPercent = new Adw.SwitchRow({title: _('Mostrar porcentagem')});
+        const showExtra = new Adw.SwitchRow({
+            title: _('Mostrar barra de uso extra (3ª)'),
+            subtitle: _('o custo extra ($) como terceira barra'),
+        });
+        settings.bind('show-extra', showExtra, 'active', Gio.SettingsBindFlags.DEFAULT);
+        display.add(showExtra);
+
+        const showPercent = new Adw.SwitchRow({title: _('Mostrar porcentagem/valor')});
         settings.bind('show-percent', showPercent, 'active', Gio.SettingsBindFlags.DEFAULT);
         display.add(showPercent);
+
+        const showBars = new Adw.SwitchRow({
+            title: _('Mostrar barras'),
+            subtitle: _('desligado = só os números, sem as barras'),
+        });
+        settings.bind('show-bars', showBars, 'active', Gio.SettingsBindFlags.DEFAULT);
+        display.add(showBars);
 
         const barWidth = new Adw.SpinRow({
             title: _('Largura de cada barra (células)'),
@@ -51,7 +99,19 @@ export default class AiUsageBarPrefs extends ExtensionPreferences {
         settings.bind('bar-width', barWidth, 'value', Gio.SettingsBindFlags.DEFAULT);
         display.add(barWidth);
 
-        // ── Data ─────────────────────────────────────────────────────────
+        // ── Cores ────────────────────────────────────────────────────────
+        const colors = new Adw.PreferencesGroup({
+            title: _('Cores'),
+            description: _('Cor da barra por faixa de uso (One Dark por padrão).'),
+        });
+        page.add(colors);
+        colors.add(colorRow(settings, 'color-low', _('Baixo (<50%)')));
+        colors.add(colorRow(settings, 'color-mid', _('Médio (50–74%)')));
+        colors.add(colorRow(settings, 'color-high', _('Alto (75–89%)')));
+        colors.add(colorRow(settings, 'color-critical', _('Crítico (≥90%)')));
+        colors.add(colorRow(settings, 'color-empty', _('Vazio (fundo da barra)')));
+
+        // ── Dados ────────────────────────────────────────────────────────
         const data = new Adw.PreferencesGroup({title: _('Dados')});
         page.add(data);
 

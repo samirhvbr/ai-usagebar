@@ -56,5 +56,40 @@
       <summary>Position index within the chosen panel area</summary>
     </key>
 
+    <key name="show-extra" type="b">
+      <default>false</default>
+      <summary>Show the extra-usage (cost) bar as a third bar</summary>
+    </key>
+
+    <key name="show-bars" type="b">
+      <default>true</default>
+      <summary>Draw the bars; when off, show only the percentages</summary>
+    </key>
+
+    <key name="color-low" type="s">
+      <default>'#98c379'</default>
+      <summary>Bar color for &lt;50% usage</summary>
+    </key>
+
+    <key name="color-mid" type="s">
+      <default>'#e5c07b'</default>
+      <summary>Bar color for 50-74% usage</summary>
+    </key>
+
+    <key name="color-high" type="s">
+      <default>'#d19a66'</default>
+      <summary>Bar color for 75-89% usage</summary>
+    </key>
+
+    <key name="color-critical" type="s">
+      <default>'#e06c75'</default>
+      <summary>Bar color for 90%+ usage</summary>
+    </key>
+
+    <key name="color-empty" type="s">
+      <default>'#3e4451'</default>
+      <summary>Color of the empty part of the bar</summary>
+    </key>
+
   </schema>
 </schemalist>
