@@ -2,6 +2,8 @@
 
 Waybar widget and tabbed TUI for AI plan usage across **Anthropic Claude**, **OpenAI Codex/ChatGPT**, **Z.AI (GLM)**, **OpenRouter**, and **DeepSeek**.
 
+> 🖥️ **Native desktop UIs (GNOME · macOS · Windows):** see **[DESKTOP.md](DESKTOP.md)** for how to run the panel/menu-bar/tray apps from a clone. (Windows tray by [EaeDave](https://github.com/EaeDave/ai-usagebar).)
+
 This started as a Rust port of [`claudebar`](https://github.com/mryll/claudebar) and stays drop-in compatible with it. It keeps the minimalist Pango-bordered tooltip, Omarchy theme auto-detection, and flock-protected OAuth refresh, then adds three more vendors and a proper testable codebase instead of one long shell script.
 
 ![Waybar widget showing `cld 29% · 1h 12m` in the top-right, with the hover tooltip showing Claude Max 20x session/weekly/sonnet/extra-usage progress bars](screenshot.png)
