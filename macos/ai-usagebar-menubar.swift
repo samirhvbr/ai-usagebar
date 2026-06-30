@@ -170,6 +170,180 @@ struct HexColorPicker: View {
     }
 }
 
+// ─── Vendor login / config (mirrors the GNOME "Vendors" tab) ──────────────
+struct VendorAuth {
+    let id, name, kind, cli, login, pkg, env: String
+}
+
+let VENDOR_AUTH: [VendorAuth] = [
+    VendorAuth(id: "anthropic", name: "Anthropic (Claude)", kind: "oauth", cli: "claude", login: "claude", pkg: "@anthropic-ai/claude-code", env: ""),
+    VendorAuth(id: "openai", name: "OpenAI (Codex)", kind: "oauth", cli: "codex", login: "codex login", pkg: "@openai/codex", env: ""),
+    VendorAuth(id: "zai", name: "Z.AI (GLM)", kind: "apikey", cli: "", login: "", pkg: "", env: "ZAI_API_KEY"),
+    VendorAuth(id: "openrouter", name: "OpenRouter", kind: "apikey", cli: "", login: "", pkg: "", env: "OPENROUTER_API_KEY"),
+    VendorAuth(id: "deepseek", name: "DeepSeek", kind: "apikey", cli: "", login: "", pkg: "", env: "DEEPSEEK_API_KEY"),
+]
+
+func configHasApiKeyTOML(_ section: String) -> Bool {
+    let path = "\(NSHomeDirectory())/.config/ai-usagebar/config.toml"
+    guard let text = try? String(contentsOfFile: path, encoding: .utf8) else { return false }
+    var inSection = false
+    for raw in text.split(separator: "\n", omittingEmptySubsequences: false) {
+        let line = String(raw).trimmingCharacters(in: .whitespaces)
+        if line.hasPrefix("[") {
+            inSection = (line == "[\(section)]")
+        } else if inSection && !line.hasPrefix("#") &&
+                  line.range(of: "^api_key\\s*=\\s*[\"']\\S", options: .regularExpression) != nil {
+            return true
+        }
+    }
+    return false
+}
+
+func keychainHasClaude() -> Bool {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+    p.arguments = ["find-generic-password", "-s", "Claude Code-credentials"]
+    p.standardOutput = FileHandle.nullDevice
+    p.standardError = FileHandle.nullDevice
+    do { try p.run(); p.waitUntilExit(); return p.terminationStatus == 0 } catch { return false }
+}
+
+func vendorConfigured(_ v: VendorAuth) -> Bool {
+    let home = NSHomeDirectory()
+    let fm = FileManager.default
+    if v.id == "anthropic" {
+        return fm.fileExists(atPath: "\(home)/.claude/.credentials.json") || keychainHasClaude()
+    }
+    if v.id == "openai" {
+        return fm.fileExists(atPath: "\(home)/.codex/auth.json")
+    }
+    if let e = ProcessInfo.processInfo.environment[v.env], !e.isEmpty { return true }
+    return configHasApiKeyTOML(v.id)
+}
+
+func cliInstalled(_ cli: String) -> Bool {
+    let home = NSHomeDirectory()
+    let fm = FileManager.default
+    for dir in ["\(home)/.local/bin", "/opt/homebrew/bin", "/usr/local/bin", "\(home)/.cargo/bin"]
+    where fm.isExecutableFile(atPath: "\(dir)/\(cli)") {
+        return true
+    }
+    // Fall back to a login shell (covers nvm etc.).
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/bin/bash")
+    p.arguments = ["-lc", "command -v \(cli)"]
+    let pipe = Pipe()
+    p.standardOutput = pipe
+    p.standardError = FileHandle.nullDevice
+    do {
+        try p.run()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        return !(String(data: data, encoding: .utf8) ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    } catch { return false }
+}
+
+// Write a script to a temp file and run it in Terminal.app (no AppleScript quoting hell).
+func runInTerminal(_ script: String) {
+    let tmp = NSTemporaryDirectory() + "ai-usagebar-vendor.sh"
+    try? script.write(toFile: tmp, atomically: true, encoding: .utf8)
+    try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: tmp)
+    let osa = "tell application \"Terminal\" to do script \"bash '\(tmp)'; rm -f '\(tmp)'\"\n" +
+        "tell application \"Terminal\" to activate"
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+    p.arguments = ["-e", osa]
+    try? p.run()
+}
+
+func oauthScript(_ v: VendorAuth) -> String {
+    return """
+    export PATH="$HOME/.local/bin:$PATH"
+    if command -v \(v.cli) >/dev/null 2>&1; then
+      \(v.login)
+    else
+      echo "\(v.cli) nao encontrado. Instalo em ~/.local sem sudo. Pacote: \(v.pkg)"
+      read -p "Instalar agora? [y/N] " a
+      if [ "$a" = y ] || [ "$a" = Y ]; then npm i -g --prefix "$HOME/.local" \(v.pkg) && hash -r && \(v.login); fi
+    fi
+    echo
+    read -p "Enter para fechar..."
+    """
+}
+
+func openTuiInTerminal() {
+    let cargo = "\(NSHomeDirectory())/.cargo/bin/ai-usagebar-tui"
+    let tui = FileManager.default.isExecutableFile(atPath: cargo) ? cargo : "ai-usagebar-tui"
+    runInTerminal("\"\(tui)\"\necho\nread -p \"Enter para fechar...\"")
+}
+
+struct VendorsSection: View {
+    @State private var configured: [String: Bool] = [:]
+    @State private var cliPresent: [String: Bool] = [:]
+    @State private var checking = false
+
+    var body: some View {
+        Section("Vendors") {
+            ForEach(VENDOR_AUTH, id: \.id) { v in
+                HStack(alignment: .firstTextBaseline) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(v.name)
+                        Text(statusText(v)).font(.caption).foregroundColor(.secondary)
+                    }
+                    Spacer()
+                    Button(buttonLabel(v)) { action(v) }
+                }
+            }
+            if checking {
+                Text("verificando…").font(.caption).foregroundColor(.secondary)
+            }
+        }
+        .onAppear(perform: refresh)
+    }
+
+    private func refresh() {
+        checking = true
+        DispatchQueue.global(qos: .userInitiated).async {
+            var conf: [String: Bool] = [:]
+            var cli: [String: Bool] = [:]
+            for v in VENDOR_AUTH {
+                conf[v.id] = vendorConfigured(v)
+                if v.kind == "oauth" { cli[v.id] = cliInstalled(v.cli) }
+            }
+            DispatchQueue.main.async {
+                self.configured = conf
+                self.cliPresent = cli
+                self.checking = false
+            }
+        }
+    }
+
+    private func statusText(_ v: VendorAuth) -> String {
+        if configured[v.id] == true { return "✓ Configurado" }
+        if v.kind == "oauth" {
+            if cliPresent[v.id] == false { return "⚠ \(v.cli) não instalado" }
+            return "⚠ Não logado — \(v.login)"
+        }
+        return "⚠ Sem API key — \(v.env)"
+    }
+
+    private func buttonLabel(_ v: VendorAuth) -> String {
+        if v.kind == "oauth" {
+            if configured[v.id] == true { return "Re-logar" }
+            if cliPresent[v.id] == false { return "Instalar + logar" }
+            return "Logar"
+        }
+        return "Configurar (TUI)"
+    }
+
+    private func action(_ v: VendorAuth) {
+        if v.kind == "oauth" { runInTerminal(oauthScript(v)) }
+        else { openTuiInTerminal() }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4) { refresh() }
+    }
+}
+
 struct SettingsView: View {
     @AppStorage("vendor") private var vendor = "anthropic"
     @AppStorage("interval") private var interval = 30.0
@@ -212,9 +386,10 @@ struct SettingsView: View {
                 Stepper("Intervalo: \(Int(interval))s", value: $interval, in: 5...3600, step: 5)
                 TextField("Caminho do binário (vazio = auto)", text: $binaryPath)
             }
+            VendorsSection()
         }
         .padding(20)
-        .frame(width: 420)
+        .frame(width: 460, height: 560)
     }
 }
 
