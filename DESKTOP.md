@@ -95,11 +95,24 @@ self-contained bundle (no .NET install needed to run): `dotnet publish -c Releas
 
 ## What it looks like
 
-**Windows tray** — by [EaeDave](https://github.com/EaeDave/ai-usagebar):
+### Linux — GNOME Shell extension
+
+Panel bars + dropdown, and the **Vendors** login tab:
+
+![GNOME panel and dropdown](docs/screenshots/linux-1.png)
+
+![GNOME Preferences — Vendors tab](docs/screenshots/linux-3.png)
+
+### macOS — menu bar app
+
+Menu-bar dropdown, and Preferences (per-severity colors + **Vendors** section):
+
+![macOS menu-bar dropdown](docs/screenshots/macosx-1.jpeg)
+
+![macOS Preferences — colors and Vendors](docs/screenshots/macosx-2.jpeg)
+
+### Windows — system tray (by [EaeDave](https://github.com/EaeDave/ai-usagebar))
 
 ![Windows tray panel](windows-tray/screenshots/panel-anthropic.png)
 
 ![Windows tray vendor menu](windows-tray/screenshots/vendor-menu.png)
-
-*(GNOME and macOS look the same in spirit — colored bars next to the clock and
-a per-window dropdown.)*
