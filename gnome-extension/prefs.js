@@ -4,8 +4,102 @@ import Adw from 'gi://Adw';
 import Gtk from 'gi://Gtk';
 import Gdk from 'gi://Gdk';
 import Gio from 'gi://Gio';
+import GLib from 'gi://GLib';
 
 import {ExtensionPreferences, gettext as _} from 'resource:///org/gnome/Shell/Extensions/js/extensions/prefs.js';
+
+// ── Vendor login / config ────────────────────────────────────────────────
+const VENDOR_AUTH = [
+    {id: 'anthropic', name: 'Anthropic (Claude)', kind: 'oauth', cli: 'claude', login: 'claude', pkg: '@anthropic-ai/claude-code'},
+    {id: 'openai', name: 'OpenAI (Codex)', kind: 'oauth', cli: 'codex', login: 'codex login', pkg: '@openai/codex'},
+    {id: 'zai', name: 'Z.AI (GLM)', kind: 'apikey', env: 'ZAI_API_KEY'},
+    {id: 'openrouter', name: 'OpenRouter', kind: 'apikey', env: 'OPENROUTER_API_KEY'},
+    {id: 'deepseek', name: 'DeepSeek', kind: 'apikey', env: 'DEEPSEEK_API_KEY'},
+];
+
+// Does ~/.config/ai-usagebar/config.toml have an uncommented api_key in [section]?
+function configHasApiKey(section) {
+    const path = `${GLib.get_home_dir()}/.config/ai-usagebar/config.toml`;
+    if (!GLib.file_test(path, GLib.FileTest.EXISTS))
+        return false;
+    try {
+        const [ok, bytes] = GLib.file_get_contents(path);
+        if (!ok)
+            return false;
+        let inSection = false;
+        for (const raw of new TextDecoder().decode(bytes).split('\n')) {
+            const t = raw.trim();
+            if (t.startsWith('['))
+                inSection = t === `[${section}]`;
+            else if (inSection && !t.startsWith('#') && /^api_key\s*=\s*["']\S/.test(t))
+                return true;
+        }
+    } catch (e) {}
+    return false;
+}
+
+function vendorConfigured(v) {
+    const home = GLib.get_home_dir();
+    if (v.id === 'anthropic')
+        return GLib.file_test(`${home}/.claude/.credentials.json`, GLib.FileTest.EXISTS);
+    if (v.id === 'openai')
+        return GLib.file_test(`${home}/.codex/auth.json`, GLib.FileTest.EXISTS);
+    return (GLib.getenv(v.env) || '').length > 0 || configHasApiKey(v.id);
+}
+
+// Open the user's terminal running `command` (login shell, so claude/codex are on PATH).
+function spawnInTerminal(command) {
+    for (const argv of [
+        ['kgx', '--', 'bash', '-lc', command],
+        ['gnome-terminal', '--', 'bash', '-lc', command],
+        ['xterm', '-e', 'bash', '-lc', command],
+    ]) {
+        if (!GLib.find_program_in_path(argv[0]))
+            continue;
+        try {
+            Gio.Subprocess.new(argv, Gio.SubprocessFlags.NONE);
+            return true;
+        } catch (e) {}
+    }
+    return false;
+}
+
+// Is `cli` on the login-shell PATH? (npm-global / nvm bins often aren't on the
+// prefs process PATH, so we ask a login shell.)
+function checkCliInstalled(cli, callback) {
+    try {
+        const p = Gio.Subprocess.new(
+            ['bash', '-lc', `command -v ${cli}`],
+            Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_SILENCE);
+        p.communicate_utf8_async(null, null, (proc, res) => {
+            try {
+                const [, out] = proc.communicate_utf8_finish(res);
+                callback((out || '').trim().length > 0);
+            } catch (e) {
+                callback(false);
+            }
+        });
+    } catch (e) {
+        callback(false);
+    }
+}
+
+// Terminal script: if the CLI is missing, offer to npm-install it (with
+// consent), then run the login. Runs in a login shell so PATH is complete.
+function oauthCommand(v) {
+    // Installs to ~/.local (already on PATH) so no sudo is needed even when the
+    // system npm prefix is root-owned (/usr/lib/node_modules).
+    return [
+        `export PATH="$HOME/.local/bin:$PATH";`,
+        `if command -v ${v.cli} >/dev/null 2>&1; then ${v.login};`,
+        `else echo "⚠ ${v.cli} nao encontrado.";`,
+        `echo "Instalo em ~/.local sem sudo (npm --prefix). Pacote: ${v.pkg}"; echo;`,
+        `read -p "Instalar agora? [y/N] " a;`,
+        `if [ "$a" = y ] || [ "$a" = Y ]; then npm i -g --prefix "$HOME/.local" ${v.pkg} && hash -r && ${v.login}; fi;`,
+        `fi;`,
+        `echo; read -p "Enter para fechar..."`,
+    ].join(' ');
+}
 
 // Bind an Adw.ComboRow (index-based) to a string GSetting via a value table.
 function bindCombo(settings, key, comboRow, values) {
@@ -156,5 +250,76 @@ export default class AiUsageBarPrefs extends ExtensionPreferences {
         });
         settings.bind('panel-index', index, 'value', Gio.SettingsBindFlags.DEFAULT);
         pos.add(index);
+
+        this._buildVendorsPage(window);
+    }
+
+    // A "Vendors" tab: per-vendor credential status + a login/config button.
+    _buildVendorsPage(window) {
+        const page = new Adw.PreferencesPage({
+            title: _('Vendors'),
+            icon_name: 'dialog-password-symbolic',
+        });
+        window.add(page);
+
+        const group = new Adw.PreferencesGroup({
+            title: _('Login / configuração por vendor'),
+            description: _('OAuth abre um terminal com o comando de login; vendors de API key são configurados no TUI. Reabra esta janela para reavaliar o status.'),
+        });
+        page.add(group);
+
+        const updates = [];
+        for (const v of VENDOR_AUTH) {
+            const row = new Adw.ActionRow({title: v.name});
+            const btn = new Gtk.Button({valign: Gtk.Align.CENTER});
+            btn.add_css_class('flat');
+            row.add_suffix(btn);
+
+            const update = () => {
+                if (v.kind !== 'oauth') {
+                    const ok = vendorConfigured(v);
+                    row.subtitle = ok ? _('✓ Configurado') : `⚠ ${_('Sem API key')} — ${v.env}`;
+                    btn.label = _('Configurar (TUI)');
+                    return;
+                }
+                if (vendorConfigured(v)) {
+                    row.subtitle = _('✓ Configurado');
+                    btn.label = _('Re-logar');
+                    return;
+                }
+                row.subtitle = _('verificando…');
+                checkCliInstalled(v.cli, (installed) => {
+                    row.subtitle = installed
+                        ? `⚠ ${_('Não logado')} — \`${v.login}\``
+                        : `⚠ ${v.cli} ${_('não instalado')} (instala em ~/.local, sem sudo)`;
+                    btn.label = installed ? _('Logar') : _('Instalar + logar');
+                });
+            };
+            update();
+            updates.push(update);
+
+            btn.connect('clicked', () => {
+                if (v.kind === 'oauth') {
+                    spawnInTerminal(oauthCommand(v));
+                } else {
+                    const tui = GLib.find_program_in_path('ai-usagebar-tui') ||
+                        `${GLib.get_home_dir()}/.cargo/bin/ai-usagebar-tui`;
+                    spawnInTerminal(`"${tui}"`);
+                }
+                GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 4, () => {
+                    update();
+                    return GLib.SOURCE_REMOVE;
+                });
+            });
+
+            group.add(row);
+        }
+
+        // Re-check when the window regains focus (e.g., after logging in via
+        // the terminal) — fixes the "still shows não logado" loop.
+        window.connect('notify::is-active', () => {
+            if (window.is_active)
+                updates.forEach(u => u());
+        });
     }
 }
