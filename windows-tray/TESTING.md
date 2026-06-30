@@ -103,3 +103,45 @@ windows-tray\bin\Release\net8.0-windows\win-x64\publish\
 
 Backend discovery order, poll-interval floor (60s, default 300s), and the
 full feature list are in **[README.md](README.md)**.
+
+## Build gotchas (real-world, Windows 11)
+
+These bit us on a first real run — documented so they don't bite you:
+
+1. **`NU1100` resolving `Microsoft.*.Runtime.win-x64 (= 8.0.x)`** — a stale
+   `obj/` from a previous `-c Release` (self-contained) build poisons later
+   builds, even Debug ones. **Fix:** clean and build framework-dependent:
+   ```cmd
+   rmdir /s /q bin
+   rmdir /s /q obj
+   dotnet build -c Debug
+   ```
+   Only `dotnet publish -c Release` (the portable bundle) legitimately needs
+   the win-x64 runtime packs.
+
+2. **`MSB3021: cannot copy … ai-usagebar-tray.exe — being used by another
+   process`** — you're rebuilding while the tray is running; it locks its own
+   exe. **Fix:** kill it first, then build:
+   ```cmd
+   taskkill /F /IM ai-usagebar-tray.exe
+   ```
+
+3. **"You must install .NET Desktop Runtime"** — usually a false alarm from a
+   half-written exe after a locked rebuild. The runtime ships with the SDK
+   (`dotnet --list-runtimes` shows `Microsoft.WindowsDesktop.App 8.0.x`); a
+   clean rebuild (after the `taskkill` above) fixes it.
+
+4. **`Remove-Item` / `'#'` not recognized** — those are **PowerShell**. In
+   **CMD** use `rmdir /s /q` and `::` for comments (or just use PowerShell).
+
+5. **Terminal "hangs" after `dotnet run`** — expected: it's a GUI app, so the
+   console blocks until the app exits, and `Ctrl+C` won't kill a WinForms app.
+   To keep the prompt free, run the **built exe** instead — it returns
+   immediately and the app lives in the **system tray**, not the console:
+   ```cmd
+   start "" "bin\Debug\net8.0-windows\ai-usagebar-tray.exe"
+   ```
+
+6. **"Where's the window?"** — there isn't one. Look at the **system tray**
+   (bottom-right; click the `^` to show hidden icons) for the colored dot.
+   Left-click → panel; right-click → menu (Refresh, Vendor picker, …).
