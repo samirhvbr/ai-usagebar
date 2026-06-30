@@ -20,3 +20,6 @@ packaging/aur/*.tar.gz
 
 # Claude Code - config local da sessao
 .claude/settings.local.json
+
+# GNOME extension — compiled schema (build artifact)
+gnome-extension/schemas/gschemas.compiled

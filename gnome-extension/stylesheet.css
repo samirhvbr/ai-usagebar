@@ -1,0 +1,16 @@
+/* Panel label: monospace so the █/░ bar cells line up evenly. */
+.aiub-label {
+    font-family: monospace;
+    font-feature-settings: "tnum";
+    padding: 0 4px;
+}
+
+/* Dropdown tooltip: the binary emits a bordered box drawn with
+   box-drawing + Nerd Font glyphs — needs a fixed-width font to align.
+   For the icons to render, set a Nerd Font as your monospace font
+   (e.g. "JetBrainsMono Nerd Font"); without one the glyphs show as
+   tofu but the bars and numbers still read fine. */
+.aiub-tip {
+    font-family: monospace;
+    padding: 6px 10px;
+}
