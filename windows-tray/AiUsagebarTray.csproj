@@ -1,0 +1,55 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>ai-usagebar-tray</AssemblyName>
+    <RootNamespace>AiUsagebarTray</RootNamespace>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <Version>0.1.1</Version>
+    <Product>ai-usagebar tray</Product>
+    <Description>Windows system-tray widget for ai-usagebar (Claude/GPT/GLM/OpenRouter usage).</Description>
+  </PropertyGroup>
+
+  <!-- Publish defaults: a single self-contained x64 exe that runs without a
+       preinstalled .NET runtime. Produce it with:
+         dotnet publish -c Release
+       Output: bin\Release\net8.0-windows\win-x64\publish\ai-usagebar-tray.exe -->
+  <PropertyGroup Condition="'$(Configuration)' == 'Release'">
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>true</SelfContained>
+    <PublishSingleFile>true</PublishSingleFile>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+    <!-- WinForms is not trimmer-safe; keep trimming off to avoid runtime
+         MissingMethod surprises. -->
+    <PublishTrimmed>false</PublishTrimmed>
+  </PropertyGroup>
+
+  <!-- Path to the Rust backend exe. Defaults to the repo's target\release;
+       override on the command line with -p:BackendExe=... if yours differs. -->
+  <PropertyGroup>
+    <BackendExe>$(MSBuildProjectDirectory)\..\target\release\ai-usagebar.exe</BackendExe>
+  </PropertyGroup>
+
+  <!-- After publishing, drop ai-usagebar.exe next to the tray exe so the
+       publish folder is a self-sufficient bundle: copy the whole folder to any
+       machine and it just works (the tray probes "next to me" first). -->
+  <Target Name="CopyBackendOnPublish" AfterTargets="Publish">
+    <Warning Condition="!Exists('$(BackendExe)')"
+             Text="Backend not found at $(BackendExe). Build it (cargo build --release) or pass -p:BackendExe=PATH. The published folder will NOT include ai-usagebar.exe." />
+    <Copy Condition="Exists('$(BackendExe)')"
+          SourceFiles="$(BackendExe)"
+          DestinationFolder="$(PublishDir)"
+          SkipUnchangedFiles="true" />
+    <Message Condition="Exists('$(BackendExe)')"
+             Importance="high"
+             Text="Bundled backend: $(BackendExe) -> $(PublishDir)ai-usagebar.exe" />
+  </Target>
+
+</Project>

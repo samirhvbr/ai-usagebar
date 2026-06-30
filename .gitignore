@@ -23,3 +23,6 @@ packaging/aur/*.tar.gz
 
 # GNOME extension — compiled schema (build artifact)
 gnome-extension/schemas/gschemas.compiled
+
+# Clones temporários (ex: fork do EaeDave) — nunca commitar
+/tmp/
