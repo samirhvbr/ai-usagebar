@@ -9,6 +9,8 @@ severity thresholds.
 
 A single Swift file (`NSStatusItem` + `NSAttributedString`); no Xcode project.
 
+> **Installing?** Follow the step-by-step in **[INSTALL.md](INSTALL.md)**.
+
 ## Requirements
 
 - macOS with the **Command Line Tools** (`xcode-select --install`) for `swiftc`.
