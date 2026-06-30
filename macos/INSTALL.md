@@ -85,9 +85,10 @@ launchctl unload ~/Library/LaunchAgents/com.akitaonrails.ai-usagebar-menubar.pli
 rm ~/Library/LaunchAgents/com.akitaonrails.ai-usagebar-menubar.plist
 ```
 
-**Change settings** — edit the constants at the top of
-`ai-usagebar-menubar.swift` (vendor, interval, colors, which bars, numbers-only)
-and rebuild with `./build.sh`, then reload the agent (see *Update* above).
+**Change settings** — open **Preferences** from the menu bar dropdown (or
+press **⌘,**): toggles for which bars, color pickers, vendor, interval, bar
+width, and binary path. Changes apply live and persist (no rebuild). The
+Preferences window needs macOS 12+.
 
 ## Troubleshooting
 

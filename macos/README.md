@@ -39,21 +39,24 @@ Start at login:
 
 ## Configuration
 
-Edit the constants at the top of `ai-usagebar-menubar.swift` and rebuild
-(`./build.sh`):
+Open **Preferences** from the dropdown (or press **⌘,**) — a native window
+with toggles, color pickers, vendor, interval, bar width, and binary path.
+Settings persist in `UserDefaults` and apply **live, no rebuild**.
 
-| Constant | Default | Meaning |
+| Setting | Default | Notes |
 |---|---|---|
-| `VENDOR` | `anthropic` | only Anthropic has the 5h + weekly windows |
-| `INTERVAL` | `30` | seconds between refreshes |
-| `BAR_WIDTH` | `8` | cells per menu-bar bar |
-| `SHOW_SESSION` / `SHOW_WEEKLY` / `SHOW_EXTRA` | on/on/off | which bars |
-| `SHOW_PERCENT` | `true` | numeric value next to each bar |
-| `SHOW_BARS` | `true` | `false` = numbers only, no bars |
-| `COLOR_LOW…CRITICAL`, `COLOR_EMPTY` | One Dark | bar colors by severity (≥90 / ≥75 / ≥50 / else) |
+| Show 5h / weekly / extra | on / on / off | which bars appear |
+| Show percentage/value | on | numeric value next to each bar |
+| Show bars | on | off = numbers only |
+| Bar width | 8 | cells per menu-bar bar (4–20) |
+| Colors (low/mid/high/critical/empty) | One Dark | bar color per severity (≥90 / ≥75 / ≥50 / else) |
+| Refresh interval | 30 s | 5–3600 |
+| Vendor | anthropic | only Anthropic has the 5h + weekly windows |
+| Binary path | auto | empty = `~/.cargo/bin`, Homebrew, then `PATH` |
 
-Tags and labels use the system label colors, so they adapt to a light or dark
-menu bar; only the bar fill/empty colors are fixed (and editable above).
+The Preferences window needs **macOS 12+** (the menu bar itself works on
+10.15+). Tags/labels use the system label colors, so they adapt to a light or
+dark menu bar; only the bar fill/empty colors are configurable.
 
 ## How it works
 

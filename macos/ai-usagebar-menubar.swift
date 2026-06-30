@@ -1,37 +1,57 @@
 // ai-usagebar-menubar — macOS menu bar app for ai-usagebar.
 //
 // Shows ai-usagebar's 5-hour (session), weekly, and optional extra-usage
-// bars in the macOS menu bar, next to the clock, with a native dropdown.
-// Mirrors the GNOME Shell extension: same binary, same One Dark colors and
-// severity thresholds. Runs as a menu-bar agent (no Dock icon).
+// bars in the macOS menu bar, next to the clock, with a native dropdown and
+// a Preferences window (⌘,). Mirrors the GNOME Shell extension: same binary,
+// same One Dark colors and severity thresholds. Runs as a menu-bar agent.
+//
+// Settings persist in UserDefaults (edit them in Preferences, no rebuild).
 //
 // Build:  swiftc -O ai-usagebar-menubar.swift -o ai-usagebar-menubar
 //         (needs the Xcode command-line tools: `xcode-select --install`)
 // Run:    ./ai-usagebar-menubar &      (or ./install-agent.sh for login start)
+// macOS:  12+ (Monterey) for the Preferences window; menu bar works on 10.15+.
 //
 // First, on the Mac: run `claude` once so the OAuth creds land in the login
 // Keychain — ai-usagebar reads them there (src/anthropic/keychain.rs).
 
 import Cocoa
+import SwiftUI
 
-// ─── Config (edit, then rebuild with ./build.sh) ─────────────────────────
-let VENDOR       = "anthropic"
-let INTERVAL     = 30.0      // seconds between refreshes
-let BAR_WIDTH    = 8         // cells per menu-bar bar
-let MENU_BAR_W   = 14        // cells per dropdown bar
-let SHOW_SESSION = true
-let SHOW_WEEKLY  = true
-let SHOW_EXTRA   = false     // extra-usage (cost) as a third bar
-let SHOW_PERCENT = true
-let SHOW_BARS    = true      // false = numbers only, no bars
+// ─── Settings (persisted in UserDefaults; edit in Preferences) ───────────
+let DEF = UserDefaults.standard
 
-// One Dark bar colors (>=90 critical, >=75 high, >=50 mid, else low).
-// Tags/labels use system colors so they adapt to a light/dark menu bar.
-let COLOR_LOW      = "#98c379"
-let COLOR_MID      = "#e5c07b"
-let COLOR_HIGH     = "#d19a66"
-let COLOR_CRITICAL = "#e06c75"
-let COLOR_EMPTY    = "#3e4451"
+let SETTINGS_DEFAULTS: [String: Any] = [
+    "vendor": "anthropic",
+    "interval": 30.0,
+    "barWidth": 8,
+    "showSession": true,
+    "showWeekly": true,
+    "showExtra": false,
+    "showPercent": true,
+    "showBars": true,
+    "colorLow": "#98c379",
+    "colorMid": "#e5c07b",
+    "colorHigh": "#d19a66",
+    "colorCritical": "#e06c75",
+    "colorEmpty": "#3e4451",
+    "binaryPath": "",
+]
+
+var VENDOR: String { DEF.string(forKey: "vendor") ?? "anthropic" }
+var INTERVAL: Double { let v = DEF.double(forKey: "interval"); return v > 0 ? v : 30 }
+var BAR_WIDTH: Int { max(4, min(20, DEF.integer(forKey: "barWidth"))) }
+let MENU_BAR_W = 14
+var SHOW_SESSION: Bool { DEF.bool(forKey: "showSession") }
+var SHOW_WEEKLY: Bool { DEF.bool(forKey: "showWeekly") }
+var SHOW_EXTRA: Bool { DEF.bool(forKey: "showExtra") }
+var SHOW_PERCENT: Bool { DEF.bool(forKey: "showPercent") }
+var SHOW_BARS: Bool { DEF.bool(forKey: "showBars") }
+var COLOR_LOW: String { DEF.string(forKey: "colorLow") ?? "#98c379" }
+var COLOR_MID: String { DEF.string(forKey: "colorMid") ?? "#e5c07b" }
+var COLOR_HIGH: String { DEF.string(forKey: "colorHigh") ?? "#d19a66" }
+var COLOR_CRITICAL: String { DEF.string(forKey: "colorCritical") ?? "#e06c75" }
+var COLOR_EMPTY: String { DEF.string(forKey: "colorEmpty") ?? "#3e4451" }
 
 let FORMAT = "{plan};;{session_pct};;{session_reset};;{weekly_pct};;{weekly_reset};;" +
              "{sonnet_pct};;{sonnet_reset};;{extra_pct};;{extra_spent};;{extra_limit}"
@@ -70,13 +90,16 @@ func barAttr(pct: Int, width: Int) -> NSAttributedString {
 }
 
 func resolveBinary(_ name: String) -> String? {
-    let home = NSHomeDirectory()
     let fm = FileManager.default
+    if name == "ai-usagebar" {
+        let configured = DEF.string(forKey: "binaryPath") ?? ""
+        if !configured.isEmpty, fm.isExecutableFile(atPath: configured) { return configured }
+    }
+    let home = NSHomeDirectory()
     for c in ["\(home)/.cargo/bin/\(name)", "/opt/homebrew/bin/\(name)", "/usr/local/bin/\(name)"]
     where fm.isExecutableFile(atPath: c) {
         return c
     }
-    // Fall back to `which` (login shells put cargo/brew on PATH).
     let p = Process()
     p.executableURL = URL(fileURLWithPath: "/usr/bin/which")
     p.arguments = [name]
@@ -124,10 +147,84 @@ func parse(_ text: String) -> Snapshot? {
                     extra: extra)
 }
 
+// ─── Preferences UI (SwiftUI) ────────────────────────────────────────────
+extension Color {
+    init(hexString: String) { self.init(nsColor: hexColor(hexString)) }
+    var hexString: String {
+        let ns = NSColor(self).usingColorSpace(.sRGB) ?? .black
+        return String(format: "#%02x%02x%02x",
+                      Int((ns.redComponent * 255).rounded()),
+                      Int((ns.greenComponent * 255).rounded()),
+                      Int((ns.blueComponent * 255).rounded()))
+    }
+}
+
+struct HexColorPicker: View {
+    let title: String
+    @Binding var hex: String
+    var body: some View {
+        ColorPicker(title, selection: Binding(
+            get: { Color(hexString: hex) },
+            set: { hex = $0.hexString }
+        ), supportsOpacity: false)
+    }
+}
+
+struct SettingsView: View {
+    @AppStorage("vendor") private var vendor = "anthropic"
+    @AppStorage("interval") private var interval = 30.0
+    @AppStorage("barWidth") private var barWidth = 8
+    @AppStorage("showSession") private var showSession = true
+    @AppStorage("showWeekly") private var showWeekly = true
+    @AppStorage("showExtra") private var showExtra = false
+    @AppStorage("showPercent") private var showPercent = true
+    @AppStorage("showBars") private var showBars = true
+    @AppStorage("colorLow") private var colorLow = "#98c379"
+    @AppStorage("colorMid") private var colorMid = "#e5c07b"
+    @AppStorage("colorHigh") private var colorHigh = "#d19a66"
+    @AppStorage("colorCritical") private var colorCritical = "#e06c75"
+    @AppStorage("colorEmpty") private var colorEmpty = "#3e4451"
+    @AppStorage("binaryPath") private var binaryPath = ""
+
+    private let vendors = ["anthropic", "openai", "zai", "openrouter", "deepseek"]
+
+    var body: some View {
+        Form {
+            Section("Exibição") {
+                Toggle("Mostrar barra de 5h (sessão)", isOn: $showSession)
+                Toggle("Mostrar barra semanal", isOn: $showWeekly)
+                Toggle("Mostrar barra de uso extra ($)", isOn: $showExtra)
+                Toggle("Mostrar porcentagem/valor", isOn: $showPercent)
+                Toggle("Mostrar barras (off = só números)", isOn: $showBars)
+                Stepper("Largura da barra: \(barWidth)", value: $barWidth, in: 4...20)
+            }
+            Section("Cores") {
+                HexColorPicker(title: "Baixo (<50%)", hex: $colorLow)
+                HexColorPicker(title: "Médio (50–74%)", hex: $colorMid)
+                HexColorPicker(title: "Alto (75–89%)", hex: $colorHigh)
+                HexColorPicker(title: "Crítico (≥90%)", hex: $colorCritical)
+                HexColorPicker(title: "Vazio (fundo da barra)", hex: $colorEmpty)
+            }
+            Section("Dados") {
+                Picker("Vendor", selection: $vendor) {
+                    ForEach(vendors, id: \.self) { Text($0) }
+                }
+                Stepper("Intervalo: \(Int(interval))s", value: $interval, in: 5...3600, step: 5)
+                TextField("Caminho do binário (vazio = auto)", text: $binaryPath)
+            }
+        }
+        .padding(20)
+        .frame(width: 420)
+    }
+}
+
 // ─── App ─────────────────────────────────────────────────────────────────
 class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
     var timer: Timer?
+    var prefsWindow: NSWindow?
+    var lastSnapshot: Snapshot?
+    var pendingRefresh: DispatchWorkItem?
     let binary = resolveBinary("ai-usagebar")
     let headerItem = NSMenuItem()
     var rows: [String: NSMenuItem] = [:]
@@ -137,39 +234,55 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.button?.title = "5h …"
         buildMenu()
         refresh()
-        timer = Timer.scheduledTimer(withTimeInterval: INTERVAL, repeats: true) { [weak self] _ in
-            self?.refresh()
-        }
+        restartTimer()
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(settingsChanged),
+            name: UserDefaults.didChangeNotification, object: nil)
     }
 
     func buildMenu() {
         let menu = NSMenu()
         menu.autoenablesItems = false
 
-        menu.addItem(headerItem)   // plan name (enabled so colors aren't dimmed)
-        for (key, _) in [("session", ""), ("weekly", ""), ("sonnet", ""), ("extra", "")] {
+        menu.addItem(headerItem)
+        for key in ["session", "weekly", "sonnet", "extra"] {
             let it = NSMenuItem()
             rows[key] = it
             menu.addItem(it)
         }
 
         menu.addItem(.separator())
-        let refreshIt = NSMenuItem(title: "Atualizar agora", action: #selector(refreshAction), keyEquivalent: "r")
-        refreshIt.target = self
-        menu.addItem(refreshIt)
-        let tuiIt = NSMenuItem(title: "Abrir TUI", action: #selector(openTui), keyEquivalent: "t")
-        tuiIt.target = self
-        menu.addItem(tuiIt)
+        addAction(menu, "Atualizar agora", #selector(refreshAction), "r")
+        addAction(menu, "Abrir TUI", #selector(openTui), "t")
+        addAction(menu, "Preferências…", #selector(openPrefs), ",")
         menu.addItem(.separator())
-        let quitIt = NSMenuItem(title: "Sair", action: #selector(quit), keyEquivalent: "q")
-        quitIt.target = self
-        menu.addItem(quitIt)
+        addAction(menu, "Sair", #selector(quit), "q")
 
         statusItem.menu = menu
     }
 
+    func addAction(_ menu: NSMenu, _ title: String, _ sel: Selector, _ key: String) {
+        let it = NSMenuItem(title: title, action: sel, keyEquivalent: key)
+        it.target = self
+        menu.addItem(it)
+    }
+
     @objc func refreshAction() { refresh() }
     @objc func quit() { NSApp.terminate(nil) }
+
+    @objc func openPrefs() {
+        if prefsWindow == nil {
+            let host = NSHostingController(rootView: SettingsView())
+            let w = NSWindow(contentViewController: host)
+            w.title = "AI Usage Bar — Preferências"
+            w.styleMask = [.titled, .closable]
+            w.isReleasedWhenClosed = false
+            w.center()
+            prefsWindow = w
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        prefsWindow?.makeKeyAndOrderFront(nil)
+    }
 
     @objc func openTui() {
         guard let tui = resolveBinary("ai-usagebar-tui") else { return }
@@ -177,6 +290,24 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
         p.arguments = ["-e", "tell application \"Terminal\" to do script \"\(tui)\""]
         try? p.run()
+    }
+
+    // Settings changed in Preferences: re-render instantly from cache, re-arm
+    // the timer, and re-fetch (debounced) in case vendor/binary changed.
+    @objc func settingsChanged() {
+        if let s = lastSnapshot { renderPanel(s); renderMenu(s) }
+        restartTimer()
+        pendingRefresh?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.refresh() }
+        pendingRefresh = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6, execute: work)
+    }
+
+    func restartTimer() {
+        timer?.invalidate()
+        timer = Timer.scheduledTimer(withTimeInterval: INTERVAL, repeats: true) { [weak self] _ in
+            self?.refresh()
+        }
     }
 
     func refresh() {
@@ -213,9 +344,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         guard let snap = parse(text) else {
+            lastSnapshot = nil
             statusItem.button?.attributedTitle = run(stripMarkup(text), .labelColor)  // Loading… / ⚠
             return
         }
+        lastSnapshot = snap
         renderPanel(snap)
         renderMenu(snap)
     }
@@ -232,7 +365,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if SHOW_SESSION { seg("5h", s.session.pct, "\(s.session.pct)%") }
         if SHOW_WEEKLY { seg("7d", s.weekly.pct, "\(s.weekly.pct)%") }
         if SHOW_EXTRA, let e = s.extra { seg("ex", e.pct, e.spent) }
-        statusItem.button?.attributedTitle = title
+        statusItem.button?.attributedTitle = title.length > 0 ? title : run("ai", .secondaryLabelColor)
     }
 
     func renderMenu(_ s: Snapshot) {
@@ -258,12 +391,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func setError(_ msg: String) {
+        lastSnapshot = nil
         statusItem.button?.attributedTitle = run("⚠ ai", hexColor(COLOR_CRITICAL))
         headerItem.attributedTitle = run(msg, .labelColor)
         for (_, it) in rows { it.isHidden = true }
     }
 }
 
+DEF.register(defaults: SETTINGS_DEFAULTS)
 let app = NSApplication.shared
 let delegate = AppDelegate()
 app.delegate = delegate
