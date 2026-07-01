@@ -518,6 +518,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             setError("saída inválida")
             return
         }
+        // Re-auth: the widget flags an expired/invalid Claude Code token by
+        // appending "⚠ re-login" to the bar text. A refresh can't clear it —
+        // only an interactive login — so surface the prompt, not stale numbers.
+        if stripMarkup(text).contains("re-login") {
+            setReauth()
+            return
+        }
         guard let snap = parse(text) else {
             lastSnapshot = nil
             statusItem.button?.attributedTitle = run(stripMarkup(text), .labelColor)  // Loading… / ⚠
@@ -569,6 +576,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         lastSnapshot = nil
         statusItem.button?.attributedTitle = run("⚠ ai", hexColor(COLOR_CRITICAL))
         headerItem.attributedTitle = run(msg, .labelColor)
+        for (_, it) in rows { it.isHidden = true }
+    }
+
+    // Claude Code's OAuth session expired. Unlike a transient error, the fix is
+    // a login (this app shares the token and can't refresh it), so show a clear
+    // call to action instead of stale numbers. Recovers on the next tick once
+    // you re-login (the widget re-reads the shared credentials).
+    func setReauth() {
+        lastSnapshot = nil
+        statusItem.button?.attributedTitle = run("⚠ login", hexColor(COLOR_CRITICAL))
+        headerItem.attributedTitle = run(
+            "Sessão expirada — rode `claude` ou refaça login no IDE",
+            .labelColor, NSFont.boldSystemFont(ofSize: 13))
         for (_, it) in rows { it.isHidden = true }
     }
 }
