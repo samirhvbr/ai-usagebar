@@ -4,7 +4,7 @@ A native macOS menu bar app for [`ai-usagebar`](../README.md). It shows the
 **5-hour (session)** and **weekly** usage bars — plus an optional
 **extra-usage (cost)** bar — in the menu bar next to the clock, with a native
 dropdown. It's the macOS counterpart to the [GNOME Shell
-extension](../gnome-extension/): same binary, same One Dark colors and
+extension](https://github.com/akitaonrails/ai-usagebar/tree/main/gnome-extension): same binary, same One Dark colors and
 severity thresholds.
 
 A single Swift file (`NSStatusItem` + `NSAttributedString`); no Xcode project.

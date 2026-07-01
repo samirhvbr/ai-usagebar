@@ -134,12 +134,20 @@ func stripMarkup(_ s: String) -> String {
 func parse(_ text: String) -> Snapshot? {
     let f = stripMarkup(text).components(separatedBy: ";;")
     guard f.count >= 10 else { return nil }
-    func t(_ i: Int) -> String { f[i].trimmingCharacters(in: .whitespaces) }
+    func unknownPlaceholder(_ s: String) -> Bool {
+        s.hasPrefix("{") && s.hasSuffix("}")
+    }
+    func t(_ i: Int) -> String {
+        let v = f[i].trimmingCharacters(in: .whitespaces)
+        return unknownPlaceholder(v) ? "" : v
+    }
     func n(_ i: Int) -> Int? { Int(t(i)) }
-    let sonnet = n(5).map { Window(pct: $0, reset: t(6)) }
+    let sonnetReset = t(6)
+    let sonnet = sonnetReset.isEmpty || sonnetReset == "—" ? nil : n(5).map { Window(pct: $0, reset: sonnetReset) }
     let spent = t(8)
+    let limit = t(9)
     let extra: (pct: Int, spent: String, limit: String)? =
-        spent.isEmpty ? nil : (n(7) ?? 0, spent, t(9))
+        (spent.isEmpty || limit.isEmpty) ? nil : n(7).map { (pct: $0, spent: spent, limit: limit) }
     return Snapshot(plan: t(0),
                     session: Window(pct: n(1) ?? 0, reset: t(2)),
                     weekly: Window(pct: n(3) ?? 0, reset: t(4)),
@@ -400,7 +408,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var prefsWindow: NSWindow?
     var lastSnapshot: Snapshot?
     var pendingRefresh: DispatchWorkItem?
-    let binary = resolveBinary("ai-usagebar")
     let headerItem = NSMenuItem()
     var rows: [String: NSMenuItem] = [:]
 
@@ -486,7 +493,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func refresh() {
-        guard let bin = binary else {
+        guard let bin = resolveBinary("ai-usagebar") else {
             setError("ai-usagebar não encontrado (PATH / ~/.cargo/bin / homebrew)")
             return
         }
