@@ -24,5 +24,8 @@ packaging/aur/*.tar.gz
 # GNOME extension — compiled schema (build artifact)
 gnome-extension/schemas/gschemas.compiled
 
+# macOS menubar — compiled Swift binary (build artifact of macos/build.sh)
+macos/ai-usagebar-menubar
+
 # Clones temporários (ex: fork do EaeDave) — nunca commitar
 /tmp/
