@@ -99,14 +99,38 @@ pub fn sections_for(tab: &TabState, now: DateTime<Utc>, pace_tolerance: u32) -> 
                 && *code != 0
             {
                 sections.push(Section::Spacer);
-                sections.push(Section::Text {
-                    label: format!("HTTP {code}"),
-                    value: msg.clone(),
-                });
+                if is_reauth_error(msg) {
+                    // The widget can't mint a token itself — only an interactive
+                    // login (Claude Code) can. Surface it prominently instead of
+                    // the muted "HTTP 400" line users overlook; it auto-recovers
+                    // on the next refresh once the shared credentials are renewed.
+                    sections.push(Section::Text {
+                        label: "Reauth".into(),
+                        value: "Sign-in expired — run `claude` or re-login in your IDE; refreshes automatically once you do".into(),
+                    });
+                } else {
+                    sections.push(Section::Text {
+                        label: format!("HTTP {code}"),
+                        value: msg.clone(),
+                    });
+                }
             }
             sections
         }
     }
+}
+
+/// True when a fetch error means the OAuth session must be re-established
+/// interactively — the widget shares Claude Code's single refresh token and
+/// can't mint a new one itself, so the only fix is a login (run `claude` or
+/// re-login in the IDE). Matched on the error *message* (code-agnostic) so it
+/// works for both a `Ready` tab's `last_error` and a bare `Error` string:
+///   - "Refresh token not found or invalid" / "Refresh token expired" (server)
+///   - "token refresh failed; run `claude` to re-auth" (our no-cache path)
+///   - "…Run `claude` to re-authenticate." (our creds-parse path)
+pub fn is_reauth_error(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    m.contains("refresh token") || m.contains("invalid_grant") || m.contains("re-auth")
 }
 
 fn anthropic_sections(
@@ -490,6 +514,19 @@ fn render_section(f: &mut Frame, area: Rect, theme: &Theme, bubble: &BubbleTheme
                 f.render_widget(Paragraph::new(line), area);
                 return;
             }
+            if label == "Reauth" {
+                // Warning-colored + bold (action needed), not the error ✗ (crash).
+                let style = bubble
+                    .text
+                    .fg(bubble.palette.warning)
+                    .add_modifier(Modifier::BOLD);
+                let line = Line::from(vec![
+                    Span::styled(format!("  {} ", bubble.symbols.selected), style),
+                    Span::styled(value.clone(), style),
+                ]);
+                f.render_widget(Paragraph::new(line), area);
+                return;
+            }
             let mut spans = Vec::new();
             if !label.is_empty() {
                 spans.push(Span::styled(
@@ -612,6 +649,80 @@ mod tests {
             last_error: None,
             fetched_at: Some(now() - chrono::Duration::seconds(15)),
         }))
+    }
+
+    fn ready_with_error(code: u16, msg: &str) -> TabState {
+        TabState::Ready(Box::new(crate::tui::app::ReadyTab {
+            snapshot: VendorSnapshot::Anthropic(AnthropicSnapshot {
+                plan: "Max 20x".into(),
+                session: UsageWindow {
+                    utilization_pct: 2,
+                    resets_at: Some(now() + chrono::Duration::hours(1)),
+                    window_duration: chrono::Duration::hours(5),
+                },
+                weekly: UsageWindow {
+                    utilization_pct: 5,
+                    resets_at: Some(now() + chrono::Duration::days(6)),
+                    window_duration: chrono::Duration::days(7),
+                },
+                sonnet: None,
+                extra: None,
+            }),
+            stale: true,
+            last_error: Some((code, msg.to_string())),
+            fetched_at: Some(now() - chrono::Duration::seconds(15)),
+        }))
+    }
+
+    #[test]
+    fn is_reauth_error_matches_oauth_failures_only() {
+        // The messages fetch.rs/oauth.rs/creds.rs actually produce.
+        assert!(is_reauth_error("Refresh token not found or invalid"));
+        assert!(is_reauth_error("Refresh token expired"));
+        assert!(is_reauth_error(
+            "token refresh failed; run `claude` to re-auth"
+        ));
+        assert!(is_reauth_error(
+            "could not parse …. Run `claude` to re-authenticate."
+        ));
+        assert!(is_reauth_error("invalid_grant"));
+        // Unrelated transient/HTTP errors must NOT masquerade as re-auth.
+        assert!(!is_reauth_error("slow down"));
+        assert!(!is_reauth_error("rate_limit_error"));
+        assert!(!is_reauth_error("Internal server error"));
+    }
+
+    #[test]
+    fn reauth_error_renders_prominent_prompt_not_http_line() {
+        let sections = sections_for(
+            &ready_with_error(400, "Refresh token not found or invalid"),
+            now(),
+            5,
+        );
+        // A prominent "Reauth" prompt is emitted…
+        assert!(sections.iter().any(|s| matches!(
+            s,
+            Section::Text { label, value }
+                if label == "Reauth" && value.contains("Sign-in expired")
+        )));
+        // …and the muted "HTTP 400" line is suppressed.
+        assert!(!sections.iter().any(|s| matches!(
+            s,
+            Section::Text { label, .. } if label.starts_with("HTTP")
+        )));
+    }
+
+    #[test]
+    fn non_reauth_http_error_still_renders_http_line() {
+        let sections = sections_for(&ready_with_error(429, "slow down"), now(), 5);
+        assert!(sections.iter().any(|s| matches!(
+            s,
+            Section::Text { label, value } if label == "HTTP 429" && value == "slow down"
+        )));
+        assert!(!sections.iter().any(|s| matches!(
+            s,
+            Section::Text { label, .. } if label == "Reauth"
+        )));
     }
 
     #[test]

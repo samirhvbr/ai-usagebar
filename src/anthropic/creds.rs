@@ -159,12 +159,12 @@ fn merge_oauth(existing: Option<&str>, new_oauth: &OauthCreds) -> Result<serde_j
 /// copy and rotating the refresh token out from under it.
 pub fn write_back(path: &Path, new_oauth: &OauthCreds) -> Result<()> {
     #[cfg(target_os = "macos")]
-    if !path.exists() {
-        if let Some(existing) = keychain::read_raw()? {
-            let doc = merge_oauth(Some(&existing), new_oauth)?;
-            let json = serde_json::to_string(&doc).map_err(AppError::Json)?;
-            return keychain::write_raw(&json);
-        }
+    if !path.exists()
+        && let Some(existing) = keychain::read_raw()?
+    {
+        let doc = merge_oauth(Some(&existing), new_oauth)?;
+        let json = serde_json::to_string(&doc).map_err(AppError::Json)?;
+        return keychain::write_raw(&json);
     }
 
     let existing = std::fs::read_to_string(path).ok();
