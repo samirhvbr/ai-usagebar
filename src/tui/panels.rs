@@ -99,7 +99,7 @@ pub fn sections_for(tab: &TabState, now: DateTime<Utc>, pace_tolerance: u32) -> 
                 && *code != 0
             {
                 sections.push(Section::Spacer);
-                if is_reauth_error(msg) {
+                if crate::anthropic::is_reauth_error(msg) {
                     // The widget can't mint a token itself — only an interactive
                     // login (Claude Code) can. Surface it prominently instead of
                     // the muted "HTTP 400" line users overlook; it auto-recovers
@@ -118,19 +118,6 @@ pub fn sections_for(tab: &TabState, now: DateTime<Utc>, pace_tolerance: u32) -> 
             sections
         }
     }
-}
-
-/// True when a fetch error means the OAuth session must be re-established
-/// interactively — the widget shares Claude Code's single refresh token and
-/// can't mint a new one itself, so the only fix is a login (run `claude` or
-/// re-login in the IDE). Matched on the error *message* (code-agnostic) so it
-/// works for both a `Ready` tab's `last_error` and a bare `Error` string:
-///   - "Refresh token not found or invalid" / "Refresh token expired" (server)
-///   - "token refresh failed; run `claude` to re-auth" (our no-cache path)
-///   - "…Run `claude` to re-authenticate." (our creds-parse path)
-pub fn is_reauth_error(msg: &str) -> bool {
-    let m = msg.to_ascii_lowercase();
-    m.contains("refresh token") || m.contains("invalid_grant") || m.contains("re-auth")
 }
 
 fn anthropic_sections(
@@ -672,24 +659,6 @@ mod tests {
             last_error: Some((code, msg.to_string())),
             fetched_at: Some(now() - chrono::Duration::seconds(15)),
         }))
-    }
-
-    #[test]
-    fn is_reauth_error_matches_oauth_failures_only() {
-        // The messages fetch.rs/oauth.rs/creds.rs actually produce.
-        assert!(is_reauth_error("Refresh token not found or invalid"));
-        assert!(is_reauth_error("Refresh token expired"));
-        assert!(is_reauth_error(
-            "token refresh failed; run `claude` to re-auth"
-        ));
-        assert!(is_reauth_error(
-            "could not parse …. Run `claude` to re-authenticate."
-        ));
-        assert!(is_reauth_error("invalid_grant"));
-        // Unrelated transient/HTTP errors must NOT masquerade as re-auth.
-        assert!(!is_reauth_error("slow down"));
-        assert!(!is_reauth_error("rate_limit_error"));
-        assert!(!is_reauth_error("Internal server error"));
     }
 
     #[test]

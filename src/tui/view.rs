@@ -166,13 +166,13 @@ fn tab_status(tab: Option<&TabState>) -> &'static str {
         Some(TabState::Loading) => "fetching",
         // A re-auth failure outranks the generic "error"/"stale" labels: it's
         // the one state the user must act on (login), so name it explicitly.
-        Some(TabState::Error(e)) if panels::is_reauth_error(e) => "sign-in expired",
+        Some(TabState::Error(e)) if crate::anthropic::is_reauth_error(e) => "sign-in expired",
         Some(TabState::Error(_)) => "error",
         Some(TabState::Ready(ready))
             if ready
                 .last_error
                 .as_ref()
-                .is_some_and(|(_, msg)| panels::is_reauth_error(msg)) =>
+                .is_some_and(|(_, msg)| crate::anthropic::is_reauth_error(msg)) =>
         {
             "sign-in expired"
         }

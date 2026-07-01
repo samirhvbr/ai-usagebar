@@ -38,8 +38,19 @@ pub struct RenderInput<'a> {
 /// Compose the full Waybar output for an Anthropic snapshot.
 pub fn render_anthropic(input: &RenderInput) -> WaybarOutput {
     let snap = &input.outcome.snapshot;
-    let class = Class::from(anthropic_severity(snap));
-    let bar_text = render_bar_text(input, class);
+    let reauth = input
+        .outcome
+        .last_error
+        .as_ref()
+        .is_some_and(|(code, msg)| *code != 0 && crate::anthropic::is_reauth_error(msg));
+    // A re-auth failure is the one state the user must act on — force the
+    // Critical class so the bar goes red regardless of the (stale) usage level.
+    let class = if reauth {
+        Class::Critical
+    } else {
+        Class::from(anthropic_severity(snap))
+    };
+    let bar_text = render_bar_text(input, class, reauth);
     let tooltip = if let Some(fmt) = input.tooltip_format {
         // Custom tooltip uses the same placeholder set as the bar.
         let values = build_placeholders(input);
@@ -57,12 +68,16 @@ pub fn render_anthropic(input: &RenderInput) -> WaybarOutput {
 
 /// Build the bar-text string with all placeholders substituted and the
 /// surrounding `<span foreground='…'>` wrapper applied.
-fn render_bar_text(input: &RenderInput, class: Class) -> String {
+fn render_bar_text(input: &RenderInput, class: Class, reauth: bool) -> String {
     let values = build_placeholders(input);
     let mut text = substitute(input.format, &values);
 
-    // Append stale indicator (claudebar:687-690).
-    if input.outcome.stale {
+    // Re-auth outranks the plain stale ⏸: the data is stale *and* a refresh
+    // can't fix it (only a login can), so flag it distinctly. Otherwise append
+    // the stale indicator (claudebar:687-690).
+    if reauth {
+        text.push_str(" ⚠ re-login");
+    } else if input.outcome.stale {
         text.push_str(" ⏸");
     }
 
@@ -426,20 +441,36 @@ fn render_default_tooltip(input: &RenderInput) -> String {
     if let Some((code, msg)) = input.outcome.last_error.as_ref()
         && *code != 0
     {
-        let (icon, color) = if *code >= 500 {
-            ("󰅚", theme.red.as_str())
-        } else {
-            ("󰀪", theme.orange.as_str())
-        };
         lines.push(Line::Body("".into()));
         lines.push(Line::Sep);
-        lines.push(Line::Body(format!(
-            " <span foreground='{color}'>  {icon}  HTTP {code}</span>"
-        )));
-        for wrapped in wrap_words(&escape(msg), 35) {
+        if crate::anthropic::is_reauth_error(msg) {
+            // Actionable prompt, not the muted "HTTP 400" a refresh can't clear.
+            let orange = theme.orange.as_str();
             lines.push(Line::Body(format!(
-                "     <span foreground='{dim}'>{wrapped}</span>"
+                " <span font_weight='bold' foreground='{orange}'>  󰀪  Sign-in expired</span>"
             )));
+            for wrapped in wrap_words(
+                "Run `claude` or re-login in your IDE — refreshes automatically once you do.",
+                35,
+            ) {
+                lines.push(Line::Body(format!(
+                    "     <span foreground='{dim}'>{wrapped}</span>"
+                )));
+            }
+        } else {
+            let (icon, color) = if *code >= 500 {
+                ("󰅚", theme.red.as_str())
+            } else {
+                ("󰀪", theme.orange.as_str())
+            };
+            lines.push(Line::Body(format!(
+                " <span foreground='{color}'>  {icon}  HTTP {code}</span>"
+            )));
+            for wrapped in wrap_words(&escape(msg), 35) {
+                lines.push(Line::Body(format!(
+                    "     <span foreground='{dim}'>{wrapped}</span>"
+                )));
+            }
         }
     }
 
@@ -633,6 +664,31 @@ mod tests {
         let theme = Theme::default();
         let out = render_anthropic(&input(&oc, &theme));
         assert!(!out.tooltip.contains("HTTP 0"));
+    }
+
+    #[test]
+    fn reauth_error_forces_critical_class_and_bar_marker() {
+        let mut oc = sample_outcome();
+        oc.stale = true;
+        oc.last_error = Some((400, "Refresh token not found or invalid".into()));
+        let theme = Theme::default();
+        let out = render_anthropic(&input(&oc, &theme));
+        // Forced red regardless of the (Mid) usage level.
+        assert_eq!(out.class, Class::Critical);
+        assert!(out.text.contains("re-login"));
+        // The plain stale ⏸ is superseded by the re-login marker.
+        assert!(!out.text.contains("⏸"));
+    }
+
+    #[test]
+    fn reauth_tooltip_shows_prompt_not_http_line() {
+        let mut oc = sample_outcome();
+        oc.last_error = Some((400, "Refresh token not found or invalid".into()));
+        let theme = Theme::default();
+        let out = render_anthropic(&input(&oc, &theme));
+        assert!(out.tooltip.contains("Sign-in expired"));
+        assert!(out.tooltip.contains("re-login"));
+        assert!(!out.tooltip.contains("HTTP 400"));
     }
 
     #[test]
