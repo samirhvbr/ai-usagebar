@@ -11,6 +11,30 @@ Each release is also published at
 
 Nothing yet.
 
+## [0.7.2] — 2026-06-24
+
+### Fixed
+
+- **Anthropic widget no longer shows a false `0%` on recent Claude Code (macOS).**
+  Newer Claude Code builds rotate the OAuth access token via a host-side
+  trusted-device flow and leave `refreshToken` **empty** in the shared
+  credential blob (Keychain / `~/.claude/.credentials.json`). Once the access
+  token expired, the widget POSTed that empty string as a `refresh_token` grant,
+  the token endpoint answered `400 "Invalid request format"`, and the bar cached
+  a zeroed snapshot — `0%` on session/weekly/sonnet with an `HTTP 400` tooltip.
+  The fetch now skips the refresh when no refresh token is present, clears any
+  stale token-endpoint error from older builds, and still attempts the usage
+  request with the current access token before deciding whether to fall back to
+  cache. The usage request was also trimmed to the four
+  headers the live endpoint actually accepts — `Authorization`, `anthropic-beta`,
+  a Claude Code `User-Agent` (without which the endpoint hard-rate-limits to
+  `429`), and `Content-Type`.
+- **`anthropic_live` smoke test no longer hard-fails on macOS Keychain-only
+  setups.** It assumed `~/.claude/.credentials.json` always exists, but recent
+  Claude Code keeps the blob in the login Keychain (no file). The test now falls
+  back to the Keychain reader and skips cleanly when no credentials exist at all,
+  matching the module doc's "won't fail on machines without creds" promise.
+
 ## [0.7.1] — 2026-06-08
 
 ### Changed
@@ -380,7 +404,8 @@ vendors. Highlights:
 - Live API smoke test suite (`make smoke`) that exercises the real
   undocumented endpoints to detect schema drift before users do.
 
-[Unreleased]: https://github.com/akitaonrails/ai-usagebar/compare/v0.7.1...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-usagebar/compare/v0.7.2...HEAD
+[0.7.2]: https://github.com/akitaonrails/ai-usagebar/releases/tag/v0.7.2
 [0.7.1]: https://github.com/akitaonrails/ai-usagebar/releases/tag/v0.7.1
 [0.7.0]: https://github.com/akitaonrails/ai-usagebar/releases/tag/v0.7.0
 [0.6.0]: https://github.com/akitaonrails/ai-usagebar/releases/tag/v0.6.0
