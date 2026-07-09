@@ -409,6 +409,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var lastSnapshot: Snapshot?
     var pendingRefresh: DispatchWorkItem?
     let headerItem = NSMenuItem()
+    let reauthItem = NSMenuItem()
     var rows: [String: NSMenuItem] = [:]
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -427,6 +428,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         menu.autoenablesItems = false
 
         menu.addItem(headerItem)
+
+        // Shown only when the OAuth session expires (setReauth). One click runs
+        // the vendor's interactive login in Terminal — no need to open
+        // Preferences or know the `claude` command.
+        reauthItem.title = "Fazer login agora"
+        reauthItem.target = self
+        reauthItem.action = #selector(reauthAction)
+        reauthItem.isHidden = true
+        menu.addItem(reauthItem)
+
         for key in ["session", "weekly", "sonnet", "extra"] {
             let it = NSMenuItem()
             rows[key] = it
@@ -451,6 +462,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc func refreshAction() { refresh() }
     @objc func quit() { NSApp.terminate(nil) }
+
+    // 1-click re-login from the expired state: run the current vendor's
+    // interactive login in Terminal (same path as Preferences → Vendors), then
+    // re-check shortly after so the bar recovers as soon as the shared
+    // credential is refreshed.
+    @objc func reauthAction() {
+        let v = VENDOR_AUTH.first { $0.id == VENDOR } ?? VENDOR_AUTH[0]
+        if v.kind == "oauth" { runInTerminal(oauthScript(v)) } else { openTuiInTerminal() }
+        pendingRefresh?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.refresh() }
+        pendingRefresh = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5, execute: work)
+    }
 
     @objc func openPrefs() {
         if prefsWindow == nil {
@@ -534,6 +558,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         guard let snap = parse(text) else {
             lastSnapshot = nil
+            reauthItem.isHidden = true
             statusItem.button?.attributedTitle = run(stripMarkup(text), .labelColor)  // Loading… / ⚠
             return
         }
@@ -560,6 +585,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func renderMenu(_ s: Snapshot) {
         headerItem.attributedTitle = run(s.plan.isEmpty ? "AI Usage" : s.plan,
                                          .labelColor, NSFont.boldSystemFont(ofSize: 13))
+        reauthItem.isHidden = true
 
         func row(_ key: String, _ name: String, _ pct: Int, _ value: String, _ reset: String?) {
             guard let item = rows[key] else { return }
@@ -583,6 +609,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         lastSnapshot = nil
         statusItem.button?.attributedTitle = run("⚠ ai", hexColor(COLOR_CRITICAL))
         headerItem.attributedTitle = run(msg, .labelColor)
+        reauthItem.isHidden = true
         for (_, it) in rows { it.isHidden = true }
     }
 
@@ -594,8 +621,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         lastSnapshot = nil
         statusItem.button?.attributedTitle = run("⚠ login", hexColor(COLOR_CRITICAL))
         headerItem.attributedTitle = run(
-            "Sessão expirada — rode `claude` ou refaça login no IDE",
+            "Sessão expirada — faça login novamente",
             .labelColor, NSFont.boldSystemFont(ofSize: 13))
+        reauthItem.isHidden = false
+        reauthItem.attributedTitle = run("🔑  Fazer login agora (abre o Terminal)",
+                                         hexColor(COLOR_CRITICAL))
         for (_, it) in rows { it.isHidden = true }
     }
 }

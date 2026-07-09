@@ -48,7 +48,9 @@ Checklist antes de abrir:
 
 ### PR 2 — App de menu bar macOS (`macos/`)
 Conteúdo: squash de `c3e8f26` + `c5d9923` + `e5d556a` + `7f108d1` +
-`3527572` + `3ef6567` + audit fixes `c63ce4c`.
+`3527572` + `3ef6567` + audit fixes `c63ce4c` + **re-login 1-clique no
+dropdown** (item que aparece só no estado de sessão expirada e dispara o
+login do vendor no Terminal; reusa `oauthScript`/`runInTerminal`).
 Antes era necessário (achados da revisão):
 - [ ] `macos/INSTALL.md:19` — trocar clone URL `samirhvbr` → `akitaonrails`.
 - [ ] Traduzir strings de UI PT-BR → EN (`Preferências…`, `Sair`,
