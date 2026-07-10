@@ -24,6 +24,9 @@ pub const USAGE_USER_AGENT: &str = "claude-code/2.1.183";
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 const REFRESH_TIMEOUT: Duration = Duration::from_secs(25);
 const LOCK_TIMEOUT: Duration = Duration::from_secs(45);
+/// After a 429, skip the network for this long instead of retrying every poll —
+/// the endpoint rate-limits on a window, so hammering it keeps it saturated.
+const RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(300);
 
 /// Endpoints (parameterized for tests).
 #[derive(Debug, Clone)]
@@ -76,8 +79,16 @@ pub async fn fetch_snapshot(
         return Ok(reuse_cache(bytes, plan_label, cache, false));
     }
 
-    // Maybe refresh.
     let now = Utc::now().timestamp();
+
+    // Rate-limit backoff: a recent 429 told us to slow down. Serve cache and
+    // skip the network entirely until the deadline — otherwise the widget's
+    // fixed-interval polling keeps the rate limit saturated and never recovers.
+    if cache.backoff_until().is_some_and(|until| now < until) {
+        return serve_backoff(cache, plan_label);
+    }
+
+    // Maybe refresh.
     let stale_token = oauth::needs_refresh(creds.claude_ai_oauth.expires_at_secs(), now);
     let have_refresh = oauth::can_refresh(&creds.claude_ai_oauth.refresh_token);
     if stale_token && !have_refresh {
@@ -148,6 +159,11 @@ pub async fn fetch_snapshot(
         Ok(Err(AppError::Http { status, body })) => {
             cache.mark_stale();
             cache.write_last_error(status, &body);
+            if status == 429 {
+                // Stop hammering: the endpoint rate-limits on a window, and
+                // retrying every poll just keeps it saturated.
+                cache.set_backoff_until(now + RATE_LIMIT_BACKOFF.as_secs() as i64);
+            }
             fallback_to_cache(cache, plan_label, Some((status, body)))
         }
         Ok(Err(e)) if e.is_transient() => {
@@ -187,6 +203,25 @@ fn fallback_to_cache(
         snapshot: snap,
         stale: true,
         last_error,
+        cache_age: cache.payload_age(),
+    })
+}
+
+/// Serve cache during a rate-limit backoff window without touching the network.
+/// Keeps the last 429 as `last_error` so the widget shows the stale (⏸) state
+/// and a rate-limit tooltip. Errors only when there's no cache to show.
+fn serve_backoff(cache: &Cache, plan_label: String) -> Result<FetchOutcome> {
+    let Some(bytes) = cache.maybe_payload()? else {
+        return Err(AppError::Http {
+            status: 429,
+            body: "Rate limited — backing off".into(),
+        });
+    };
+    let snap = parse_payload(&bytes, plan_label)?;
+    Ok(FetchOutcome {
+        snapshot: snap,
+        stale: true,
+        last_error: cache.read_last_error(),
         cache_age: cache.payload_age(),
     })
 }
@@ -550,5 +585,54 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.is_transient(), "expected transient error, got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn http_429_arms_backoff_and_second_call_skips_network() {
+        let mut server = mockito::Server::new_async().await;
+        // Exactly ONE usage hit — the second fetch must serve from the backoff.
+        let usage = server
+            .mock("GET", "/api/oauth/usage")
+            .with_status(429)
+            .with_body(r#"{"error":{"type":"rate_limit_error","message":"slow down"}}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let (_td, cache) = cache_fixture();
+        cache
+            .write_payload(
+                br#"{"five_hour":{"utilization":12,"resets_at":"2026-05-23T17:30:00Z"},
+                     "seven_day":{"utilization":5,"resets_at":"2026-05-30T12:00:00Z"}}"#,
+            )
+            .unwrap();
+        let creds = future_creds();
+        let client = reqwest::Client::new();
+        let endpoints = Endpoints {
+            usage: format!("{}/api/oauth/usage", server.url()),
+            token: format!("{}/v1/oauth/token", server.url()),
+        };
+
+        // First call hits the 429 and arms the backoff (TTL=0 skips fast path).
+        let first =
+            fetch_snapshot(&client, creds.path(), &cache, &endpoints, Duration::from_secs(0))
+                .await
+                .unwrap();
+        assert!(first.stale);
+        assert_eq!(first.last_error.as_ref().map(|(c, _)| *c), Some(429));
+        assert!(
+            cache.backoff_until().is_some(),
+            "a 429 must arm a backoff deadline"
+        );
+
+        // Second call, still within the window, serves cache and never hits the
+        // network — the `.expect(1)` above is the real assertion.
+        let second =
+            fetch_snapshot(&client, creds.path(), &cache, &endpoints, Duration::from_secs(0))
+                .await
+                .unwrap();
+        assert!(second.stale);
+        assert_eq!(second.snapshot.session.utilization_pct, 12);
+        usage.assert_async().await;
     }
 }

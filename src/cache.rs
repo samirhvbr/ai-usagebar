@@ -5,6 +5,7 @@
 //!   `~/.cache/ai-usagebar/<vendor>/usage.json`         payload
 //!   `~/.cache/ai-usagebar/<vendor>/.stale`             marker (cache is stale)
 //!   `~/.cache/ai-usagebar/<vendor>/.last_error`        HTTP code\nmessage
+//!   `~/.cache/ai-usagebar/<vendor>/.backoff`           rate-limit deadline (epoch s)
 //!   `~/.cache/ai-usagebar/<vendor>/.fetch.lock`        flock target
 //!
 //! Multi-monitor safety: callers should `acquire_lock()` before the refresh+
@@ -64,6 +65,9 @@ impl Cache {
     }
     pub fn last_error_path(&self) -> PathBuf {
         self.dir.join(".last_error")
+    }
+    pub fn backoff_path(&self) -> PathBuf {
+        self.dir.join(".backoff")
     }
     pub fn lock_path(&self) -> PathBuf {
         self.dir.join(".fetch.lock")
@@ -126,6 +130,7 @@ impl Cache {
         // A successful write clears any stale marker.
         let _ = fs::remove_file(self.stale_path());
         let _ = fs::remove_file(self.last_error_path());
+        let _ = fs::remove_file(self.backoff_path());
         Ok(())
     }
 
@@ -160,6 +165,28 @@ impl Cache {
         let code = lines.next()?.parse::<u16>().ok()?;
         let msg = lines.next().unwrap_or_default().to_string();
         Some((code, msg))
+    }
+
+    /// Persist a rate-limit backoff deadline (Unix epoch seconds). While it's in
+    /// the future, callers skip the network instead of hammering an endpoint
+    /// that just returned 429 — which would keep the rate limit saturated.
+    pub fn set_backoff_until(&self, epoch_secs: i64) {
+        let _ = self.ensure_dir();
+        let _ = atomic_write(&self.backoff_path(), epoch_secs.to_string().as_bytes());
+    }
+
+    /// The backoff deadline (Unix epoch seconds), if one is set.
+    pub fn backoff_until(&self) -> Option<i64> {
+        fs::read_to_string(self.backoff_path())
+            .ok()?
+            .trim()
+            .parse::<i64>()
+            .ok()
+    }
+
+    /// Best-effort removal of the backoff marker.
+    pub fn clear_backoff(&self) {
+        let _ = fs::remove_file(self.backoff_path());
     }
 }
 

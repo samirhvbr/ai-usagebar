@@ -7,6 +7,21 @@ Formato [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 > fork vivem aqui, agrupadas pela versão do `VERSION` (`<base>+fork.<N>`).
 > Convenção completa em [`docs/FORK.md`](docs/FORK.md).
 
+## [0.7.2+fork.2] — 2026-07-10
+
+Base upstream: **v0.7.2** (o sync pro v0.8.0 ficou pendente — o ambiente
+bloqueou puxar o repo do upstream; dá pra fazer na máquina do dev depois. O
+v0.8.0 **não** corrige o 429, então não é bloqueador).
+
+### Fixed
+- **Backoff de rate-limit (HTTP 429).** O widget não recuava depois de um 429 —
+  reintentava a cada poll (~30s), o que mantinha o rate-limit do endpoint de uso
+  **saturado** e ele nunca recuperava (era a causa real do "7d 0%" preso no
+  Linux). Agora um 429 arma um backoff (~5 min, arquivo `.backoff` no cache):
+  durante a janela serve o cache **sem tocar na rede**, e o `.backoff` é limpo no
+  primeiro fetch bem-sucedido. Regressão testada (o 2º fetch dentro da janela não
+  chama a rede).
+
 ## [0.7.2+fork.1] — 2026-07-10
 
 Base upstream: **v0.7.2**.
