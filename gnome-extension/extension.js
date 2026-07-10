@@ -28,7 +28,7 @@ const RED = '#e06c75';
 // All ten fields we pull from the binary, joined by ';;'.
 const FORMAT = '{plan};;{session_pct};;{session_reset};;{weekly_pct};;{weekly_reset};;' +
     '{sonnet_pct};;{sonnet_reset};;{extra_pct};;{extra_spent};;{extra_limit};;' +
-    '{scoped_label};;{scoped_pct};;{scoped_reset}';
+    '{scoped_label};;{scoped_pct};;{scoped_reset};;{version}';
 const REFRESH_TIMEOUT_SECS = 60;
 
 // severity_for(pct) from src/pango.rs: >=90 critical, >=75 high, >=50 mid, else low.
@@ -318,6 +318,7 @@ class AiUsageBarIndicator extends PanelMenu.Button {
             // Model-scoped weekly window (currently "Fable") — fields 10-12;
             // absent on binaries older than 0.12.0+fork.1.
             scoped: {label: field(f[10]), pct: num(f[11]), reset: field(f[12])},
+            version: field(f[13]),  // fork version (binaries >= 0.12.0+fork.2)
             stale,
             reauth,
         };
@@ -370,9 +371,12 @@ class AiUsageBarIndicator extends PanelMenu.Button {
     }
 
     _renderDropdown(d, colors) {
+        const ver = d.version
+            ? `  <span foreground="${DIM}" size="smaller">v${esc(d.version)}</span>`
+            : '';
         this._planLabel.clutter_text.set_markup(d.stale
             ? `<span foreground="${RED}">⏸ Desatualizado — sem conexão com a conta</span>`
-            : `<span foreground="${FG}">${esc(d.plan || 'AI Usage')}</span>`);
+            : `<span foreground="${FG}">${esc(d.plan || 'AI Usage')}</span>${ver}`);
 
         const upd = (key, pct, valueText, reset, visible) => {
             const r = this._rows[key];

@@ -21,6 +21,10 @@ use crate::waybar::{Class, WaybarOutput};
 /// Default format string when `--format` is omitted (claudebar:55).
 pub const DEFAULT_FORMAT: &str = "{session_pct}% · {session_reset}";
 
+/// Fork version (repo-root VERSION file), surfaced via `{version}` so desktop
+/// apps can show what's actually running without a separate subprocess call.
+pub const FORK_VERSION: &str = include_str!("../../VERSION");
+
 /// All inputs needed to render the widget — packaged so tests can construct
 /// it without any I/O.
 pub struct RenderInput<'a> {
@@ -175,6 +179,7 @@ fn build_placeholders(input: &RenderInput) -> HashMap<&'static str, String> {
         ("icon", "󰚩".to_string()),
         ("vendor_short", "cld".to_string()),
         ("plan", snap.plan.clone()),
+        ("version", FORK_VERSION.trim().to_string()),
         ("session_pct", snap.session.utilization_pct.to_string()),
         (
             "session_reset",
@@ -807,6 +812,18 @@ mod tests {
         inp.format = "[{scoped_label}|{scoped_pct}|{scoped_reset}]";
         let out = render_anthropic(&inp);
         assert!(out.text.contains("[|0|\u{2014}]"), "got: {}", out.text);
+    }
+
+    #[test]
+    fn version_placeholder_emits_fork_version() {
+        let oc = sample_outcome();
+        let theme = Theme::default();
+        let mut inp = input(&oc, &theme);
+        inp.format = "v{version}";
+        let out = render_anthropic(&inp);
+        // Embedded from the repo-root VERSION file (e.g. "0.12.0+fork.N").
+        assert!(out.text.contains("fork."), "got: {}", out.text);
+        assert!(!out.text.contains("{version}"));
     }
 
     #[test]

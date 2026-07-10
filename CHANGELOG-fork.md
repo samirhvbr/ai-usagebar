@@ -7,6 +7,16 @@ Formato [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 > fork vivem aqui, agrupadas pela versão do `VERSION` (`<base>+fork.<N>`).
 > Convenção completa em [`docs/FORK.md`](docs/FORK.md).
 
+## [0.12.0+fork.2] — 2026-07-10
+
+Base upstream: **v0.12.0**.
+
+### Added
+- **Versão do fork visível no header** dos apps de desktop. Novo placeholder
+  `{version}` no binário (embute o arquivo `VERSION` em tempo de compilação),
+  e GNOME/macOS/Windows mostram `vX.Y.Z+fork.N` (dim) ao lado do plano
+  ("Max 20x") no dropdown — pra sempre saber o que está rodando sem `--version`.
+
 ## [0.12.0+fork.1] — 2026-07-10
 
 Base upstream: **v0.12.0** (sync completo v0.7.2 → v0.12.0 via

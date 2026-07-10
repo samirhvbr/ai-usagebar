@@ -55,7 +55,7 @@ var COLOR_EMPTY: String { DEF.string(forKey: "colorEmpty") ?? "#3e4451" }
 
 let FORMAT = "{plan};;{session_pct};;{session_reset};;{weekly_pct};;{weekly_reset};;" +
              "{sonnet_pct};;{sonnet_reset};;{extra_pct};;{extra_spent};;{extra_limit};;" +
-             "{scoped_label};;{scoped_pct};;{scoped_reset}"
+             "{scoped_label};;{scoped_pct};;{scoped_reset};;{version}"
 
 // ─── Color / text helpers ────────────────────────────────────────────────
 func hexColor(_ hex: String) -> NSColor {
@@ -130,6 +130,8 @@ struct Snapshot {
     let extra: (pct: Int, spent: String, limit: String)?
     /// The binary appended ⏸: live fetch failed, numbers are from cache.
     let stale: Bool
+    /// Fork version the binary reports via {version} (e.g. "0.12.0+fork.2").
+    let version: String
 }
 
 func stripMarkup(_ s: String) -> String {
@@ -160,13 +162,15 @@ func parse(_ text: String) -> Snapshot? {
     // Fields 10-12 (scoped window) only exist on binaries >= 0.12.0+fork.1.
     let scoped: (label: String, pct: Int, reset: String)? =
         f.count >= 13 && !t(10).isEmpty ? (label: t(10), pct: n(11) ?? 0, reset: t(12)) : nil
+    let version = f.count >= 14 ? t(13) : ""
     return Snapshot(plan: t(0),
                     session: Window(pct: n(1) ?? 0, reset: t(2)),
                     weekly: Window(pct: n(3) ?? 0, reset: t(4)),
                     sonnet: sonnet,
                     scoped: scoped,
                     extra: extra,
-                    stale: stale)
+                    stale: stale,
+                    version: version)
 }
 
 // ─── Preferences UI (SwiftUI) ────────────────────────────────────────────
@@ -598,11 +602,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func renderMenu(_ s: Snapshot) {
-        headerItem.attributedTitle = s.stale
-            ? run("⏸ Desatualizado — sem conexão com a conta",
-                  hexColor(COLOR_CRITICAL), NSFont.boldSystemFont(ofSize: 13))
-            : run(s.plan.isEmpty ? "AI Usage" : s.plan,
-                  .labelColor, NSFont.boldSystemFont(ofSize: 13))
+        if s.stale {
+            headerItem.attributedTitle = run("⏸ Desatualizado — sem conexão com a conta",
+                                             hexColor(COLOR_CRITICAL), NSFont.boldSystemFont(ofSize: 13))
+        } else {
+            let h = NSMutableAttributedString()
+            h.append(run(s.plan.isEmpty ? "AI Usage" : s.plan,
+                         .labelColor, NSFont.boldSystemFont(ofSize: 13)))
+            if !s.version.isEmpty {
+                h.append(run("   v\(s.version)", .tertiaryLabelColor,
+                             NSFont.monospacedSystemFont(ofSize: 10, weight: .regular)))
+            }
+            headerItem.attributedTitle = h
+        }
         reauthItem.isHidden = true
 
         func row(_ key: String, _ name: String, _ pct: Int, _ value: String, _ reset: String?) {
