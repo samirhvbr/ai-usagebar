@@ -7,6 +7,23 @@ Formato [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 > fork vivem aqui, agrupadas pela versão do `VERSION` (`<base>+fork.<N>`).
 > Convenção completa em [`docs/FORK.md`](docs/FORK.md).
 
+## [0.12.0+fork.3] — 2026-07-10
+
+Base upstream: **v0.12.0**.
+
+### Added
+- **`install.sh` na raiz** — instalador único (macOS + Linux/GNOME): detecta o
+  SO e faz tudo (git pull → `cargo install` → build do app da plataforma →
+  instalar → habilitar no login/reboot). macOS via LaunchAgent
+  (`macos/install-agent.sh`), Linux via `gnome-extensions enable`. O corpo
+  fica em `main()` pra um `git pull` que atualize o próprio script não
+  emendar linhas velhas/novas no meio da execução.
+- **`install.ps1` na raiz** — o mesmo pro **Windows** (PowerShell): git pull →
+  `cargo install` → `dotnet publish -c Release` (tray self-contained, embute o
+  backend do lado) → copia pra `%LOCALAPPDATA%\Programs\ai-usagebar-tray` →
+  registra auto-start no `HKCU\…\Run` (valor `AiUsagebarTray`, o mesmo do toggle
+  do app) → lança. Rodar: `powershell -ExecutionPolicy Bypass -File install.ps1`.
+
 ## [0.12.0+fork.2] — 2026-07-10
 
 Base upstream: **v0.12.0**.
