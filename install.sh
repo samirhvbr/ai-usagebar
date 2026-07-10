@@ -72,6 +72,20 @@ main() {
             ( cd macos && ./build.sh )
             pkill -f ai-usagebar-menubar 2>/dev/null || true   # derruba cópia antiga
             ( cd macos && ./install-agent.sh )                 # LaunchAgent: sobe no login
+            # Creds sanity-check: sem credenciais a barra fica vazia. No macOS elas
+            # vivem no login Keychain (serviço "Claude Code-credentials"); o arquivo
+            # ~/.claude/.credentials.json normalmente nem existe. Checar só a
+            # existência do item (sem -w) NÃO dispara prompt de acesso ao Keychain.
+            if security find-generic-password -s "Claude Code-credentials" >/dev/null 2>&1; then
+                echo "✓ credenciais do Claude achadas no Keychain."
+            elif [ -f "$HOME/.claude/.credentials.json" ]; then
+                echo "✓ credenciais do Claude achadas em ~/.claude/.credentials.json."
+            else
+                echo "⚠ NÃO achei as credenciais do Claude (nem Keychain, nem arquivo) —"
+                echo "   a barra vai ficar vazia até você logar. Faça uma vez:"
+                echo "     claude          # e dentro dele:  /login"
+                echo "   depois confira:  ai-usagebar --vendor anthropic --pretty"
+            fi
             echo "✓ macOS pronto — a barra sobe sozinha no login."
             ;;
         Linux)

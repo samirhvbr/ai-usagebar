@@ -30,21 +30,33 @@ fn account() -> String {
 /// the file path / a "run `claude`" error), and `Err` only on an unexpected
 /// `security` failure.
 pub fn read_raw() -> Result<Option<String>> {
-    let mut cmd = Command::new("/usr/bin/security");
-    cmd.args(["find-generic-password", "-s", SERVICE, "-w"]);
+    // Try the account-scoped lookup first (the item Claude Code created for this
+    // user), then fall back to a service-only lookup. The item's account is not
+    // guaranteed to equal $USER across Claude Code builds/logins, and there is
+    // normally exactly one `Claude Code-credentials` item — without this fallback
+    // a mismatched account silently looks like "no credentials in Keychain" and
+    // the widget surfaces a bogus "file missing" error.
     let acct = account();
-    if !acct.is_empty() {
-        cmd.args(["-a", &acct]);
+    if !acct.is_empty()
+        && let Some(v) =
+            security_read(&["find-generic-password", "-s", SERVICE, "-a", &acct, "-w"])?
+    {
+        return Ok(Some(v));
     }
+    security_read(&["find-generic-password", "-s", SERVICE, "-w"])
+}
 
-    let out = cmd
+/// Run `security` with `args`; `Ok(Some(value))` on success with a non-empty
+/// password, `Ok(None)` when the item is absent (non-zero exit — `security`
+/// returns 44 / errSecItemNotFound). Never a hard error, so callers can still
+/// fall back to the file path / a friendlier "run `claude`" message.
+fn security_read(args: &[&str]) -> Result<Option<String>> {
+    let out = Command::new("/usr/bin/security")
+        .args(args)
         .output()
         .map_err(|e| AppError::Other(format!("could not run `security`: {e}")))?;
 
     if !out.status.success() {
-        // `security` exits 44 (errSecItemNotFound) when the item is absent.
-        // Treat any non-success as "not in Keychain" — never a hard error,
-        // so the caller can still surface the friendlier file-missing message.
         return Ok(None);
     }
 

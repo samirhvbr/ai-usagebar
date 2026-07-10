@@ -7,6 +7,26 @@ Formato [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 > fork vivem aqui, agrupadas pela versão do `VERSION` (`<base>+fork.<N>`).
 > Convenção completa em [`docs/FORK.md`](docs/FORK.md).
 
+## [0.12.0+fork.5] — 2026-07-10
+
+Base upstream: **v0.12.0**.
+
+### Fixed
+- **macOS: leitura do Keychain robusta a conta divergente.** `keychain::read_raw`
+  filtrava por `-a $USER`; se o item `Claude Code-credentials` foi gravado com
+  outra conta (varia entre builds/logins do Claude Code), o `security` não achava
+  → o widget mostrava um "arquivo ~/.claude/.credentials.json não existe" enganoso
+  e a barra ficava vazia. Agora tenta com a conta e **cai pra busca só por
+  serviço** (normalmente há um único item). *Candidato a PR pro upstream — o bug
+  é da árvore dele.*
+
+### Added
+- **`install.sh`: health-check de credenciais no macOS.** Depois de instalar,
+  confere se as credenciais do Claude existem (Keychain ou arquivo) e, se não,
+  avisa na hora pra rodar `claude` / `/login` — em vez de deixar a barra vazia
+  sem explicação. Checa só a existência do item (sem `-w`), então não dispara
+  prompt de Keychain.
+
 ## [0.12.0+fork.4] — 2026-07-10
 
 Base upstream: **v0.12.0**.
