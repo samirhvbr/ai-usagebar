@@ -13,6 +13,15 @@ git pull          # already allow-listed
 
 Working on a stale base causes conflicts. Pull first, every time. To inspect only: `git fetch && git status`.
 
+## Fork conventions (this fork)
+
+This is a fork of `akitaonrails/ai-usagebar`. Fork-specific organization —
+versioning (`VERSION` = `<upstream-base>+fork.<N>`), the push ritual, the
+what's-ours-vs-upstream file map, and how to sync — lives in
+[`docs/FORK.md`](docs/FORK.md). Fork deltas over upstream are logged in
+[`CHANGELOG-fork.md`](CHANGELOG-fork.md) (the root `CHANGELOG.md` stays
+upstream's). Upstreaming plan: [`docs/UPSTREAM_PLAN.md`](docs/UPSTREAM_PLAN.md).
+
 ## Release checklist — must do all of these
 
 When cutting a new version (patch, minor, or major):

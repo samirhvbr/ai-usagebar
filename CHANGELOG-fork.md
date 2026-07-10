@@ -1,0 +1,31 @@
+# Changelog do fork — `samirhvbr/ai-usagebar`
+
+Mudanças que **este fork** faz sobre o upstream (`akitaonrails/ai-usagebar`).
+Formato [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
+
+> O `CHANGELOG.md` da raiz é do **upstream** — não editar lá. As entradas do
+> fork vivem aqui, agrupadas pela versão do `VERSION` (`<base>+fork.<N>`).
+> Convenção completa em [`docs/FORK.md`](docs/FORK.md).
+
+## [0.7.2+fork.1] — 2026-07-10
+
+Base upstream: **v0.7.2**.
+
+### Added
+- **macOS:** re-login em 1 clique no dropdown da menu bar quando a sessão
+  expira (roda o login do vendor no Terminal e re-checa em 5s).
+- **GNOME:** o painel agora surfa os sinais de saúde do binário — antes engolidos:
+  `⏸` = desatualizado ("sem conexão com a conta"); `re-login` = sessão expirada
+  (estado "⚠ login" em vez de mostrar números velhos).
+- `docs/UPSTREAM_PLAN.md` — plano fatiado de PRs pro upstream.
+- Convenção do fork: `VERSION`, este changelog e `docs/FORK.md`.
+
+### Fixed
+- **Congelamento do widget em dado velho** — via sync do upstream **v0.7.2**:
+  pula o refresh quando `refreshToken` está vazio (Claude Code ≥ 2.1.x), evitando
+  o HTTP 400 que zerava o snapshot.
+
+### Changed
+- Recuperados audit fixes órfãos das branches `feat/`: macOS `install-agent.sh`
+  gera o plist sem `KeepAlive` (⌘Q não ressuscita o app; `RunAtLoad` mantém a
+  volta no login); correções de auditoria da extensão GNOME.
