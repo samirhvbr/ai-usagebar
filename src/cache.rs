@@ -43,6 +43,18 @@ impl Cache {
         Ok(Self { dir: base })
     }
 
+    /// Cache for a specific named account of a vendor, rooted at
+    /// `~/.cache/ai-usagebar/<vendor>/<label>`. Only *extra* accounts use
+    /// this; the default account keeps [`Cache::for_vendor`] so its path never
+    /// moves (issue #14, back-compat rule 2).
+    pub fn for_vendor_account(vendor: &str, label: &str) -> Result<Self> {
+        let base = xdg_cache_dir()?
+            .join("ai-usagebar")
+            .join(vendor)
+            .join(label);
+        Ok(Self { dir: base })
+    }
+
     /// Cache rooted at an arbitrary directory — for tests.
     pub fn at(path: PathBuf) -> Self {
         Self { dir: path }
@@ -278,6 +290,22 @@ pub fn home_dir() -> Result<PathBuf> {
     directories::BaseDirs::new()
         .map(|b| b.home_dir().to_path_buf())
         .ok_or_else(|| AppError::Other("could not resolve home directory (no HOME?)".into()))
+}
+
+/// Test-only: a named file inside a fresh `TempDir` with **no open handle** on
+/// it. [`atomic_write`] replaces its destination via rename, which on Windows
+/// fails while the destination is held open (as a live `NamedTempFile` handle
+/// would be) — so tests that exercise a write-back must target a closed file.
+/// Returns the dir (the caller keeps it alive) and the file's path; the file
+/// exists only when `contents` is given.
+#[cfg(test)]
+pub(crate) fn closed_temp_file(name: &str, contents: Option<&str>) -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join(name);
+    if let Some(c) = contents {
+        std::fs::write(&path, c).unwrap();
+    }
+    (dir, path)
 }
 
 #[cfg(test)]

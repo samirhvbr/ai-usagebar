@@ -66,17 +66,17 @@ fn is_missing_credentials(err: &AppError) -> bool {
 async fn anthropic_live() {
     let creds_path = anthropic::creds::default_path().expect("resolve home directory");
     // Creds live in this file (Linux) or the login Keychain (recent macOS, no
-    // file). Skip cleanly when neither source resolves — a no-op on machines
-    // without creds, as the module doc promises, not a hard failure.
-    if !creds_path.exists() {
-        match anthropic::creds::read_from(&creds_path) {
-            Ok(_) => {}
-            Err(err) if is_missing_credentials(&err) => {
-                eprintln!("anthropic_live: no Claude credentials (file or Keychain) — skipping");
-                return;
-            }
-            Err(err) => panic!("anthropic_live: failed to read Claude credentials: {err}"),
+    // file) — CredsTarget::Default covers both. Skip cleanly when neither
+    // source resolves — a no-op on machines without creds, as the module doc
+    // promises, not a hard failure.
+    let creds_target = anthropic::creds::CredsTarget::Default(creds_path);
+    match anthropic::creds::resolve(&creds_target) {
+        Ok(_) => {}
+        Err(err) if is_missing_credentials(&err) => {
+            eprintln!("anthropic_live: no Claude credentials (file or Keychain) — skipping");
+            return;
         }
+        Err(err) => panic!("anthropic_live: failed to read Claude credentials: {err}"),
     }
     let cache = xdg_cache_for("anthropic");
     let client = reqwest::Client::builder()
@@ -86,7 +86,7 @@ async fn anthropic_live() {
     let endpoints = anthropic::fetch::Endpoints::default();
     let out = anthropic::fetch_snapshot(
         &client,
-        &creds_path,
+        &creds_target,
         &cache,
         &endpoints,
         Duration::from_secs(0),

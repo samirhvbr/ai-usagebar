@@ -247,6 +247,90 @@ If you'd rather see them all at once:
 
 > Why 300s? The Anthropic and OpenAI Codex endpoints are undocumented and rate-limit aggressively below ~300s. The cache TTL is 60s so multi-monitor instances coexist, but Waybar's polling interval should stay at 300s.
 
+### Multiple accounts (advanced)
+
+To watch **more than one account of the same vendor** — say a personal and a
+work Claude subscription — run one module per account, giving each its own
+credentials file and its own cache directory:
+
+```jsonc
+"modules-right": ["custom/claude-personal", "custom/claude-work", ...],
+
+"custom/claude-personal": {
+    "exec": "ai-usagebar --vendor anthropic --icon '󰚩' --format 'p {session_pct}% · {session_reset}'",
+    "return-type": "json",
+    "interval": 300,
+    "tooltip": true
+},
+"custom/claude-work": {
+    "exec": "ai-usagebar --vendor anthropic --icon '󰚩' --format 'w {session_pct}% · {session_reset}' --creds-path ~/.config/ai-usagebar/accounts/work.credentials.json --cache-dir ~/.cache/ai-usagebar/anthropic-work",
+    "return-type": "json",
+    "interval": 300,
+    "tooltip": true
+}
+```
+
+- `--creds-path` points the module at a different OAuth credentials file
+  (same JSON shape Claude Code writes). To capture a second account's file,
+  log in with `claude` under that account and copy
+  `~/.claude/.credentials.json` somewhere stable — token refreshes are
+  written back to whatever file the flag names, so each account keeps
+  itself alive independently. `chmod 600` the copies.
+- `--cache-dir` gives the module a private cache so the two accounts don't
+  overwrite each other's 60-second cache window. Any directory works; the
+  per-vendor default is `~/.cache/ai-usagebar/<vendor>`.
+- `--creds-path` currently applies to the **Anthropic vendor only**. For
+  API-key vendors (Z.AI, OpenRouter, DeepSeek) point each module at a
+  different key via a wrapper script that sets the env var, plus its own
+  `--cache-dir`.
+- The TUI shows the default Claude tab plus one tab per configured
+  `[[anthropic.accounts]]` entry (see the config example below); Tab / `h` / `l`
+  cycle through them like any other tab.
+- On macOS, the login Keychain can hold only one Claude credential per OS
+  user, so additional accounts must be file-based as shown above.
+
+#### Config-driven accounts (`--account`)
+
+Instead of repeating `--creds-path`/`--cache-dir` on every module, name your
+extra Anthropic accounts once in config and select them with `--account
+<label>`:
+
+```toml
+[anthropic]
+# The default account. `--vendor anthropic` with no `--account` uses this,
+# exactly as before. Optional — falls back to ~/.claude/.credentials.json.
+# credentials_path = "~/.claude/.credentials.json"
+
+[[anthropic.accounts]]
+label = "work"
+credentials_path = "~/.config/ai-usagebar/accounts/work.json"
+
+[[anthropic.accounts]]
+label = "personal"
+credentials_path = "~/.config/ai-usagebar/accounts/personal.json"
+```
+
+```jsonc
+"custom/claude-work": {
+    "exec": "ai-usagebar --vendor anthropic --account work --format 'w {session_pct}% · {session_reset}'",
+    "return-type": "json",
+    "interval": 300,
+    "tooltip": true
+}
+```
+
+- The **default account** is the singular `[anthropic] credentials_path` (or the
+  platform default file). `--vendor anthropic` without `--account` uses it, with
+  the same output and the same `~/.cache/ai-usagebar/anthropic/` cache as today.
+- Each `--account <label>` gets an isolated cache at
+  `~/.cache/ai-usagebar/anthropic/<label>/` automatically — no `--cache-dir`
+  needed. Only *extra* accounts get a subdir; the default never moves.
+- `--account` is Anthropic-only and can't be combined with `--creds-path` (both
+  name a credentials file). A typo'd label fails loudly, listing the known ones.
+- **`ai-usagebar-tui`** reads the same `[[anthropic.accounts]]` and shows one
+  tab per account (after the default Claude tab), so the config above wires up
+  the widget and the TUI at once.
+
 ## Hyprland: float the TUI window
 
 By default Hyprland tiles the TUI. To make `ai-usagebar-tui` open as a centered floating window, the same way Omarchy floats its own settings TUIs (Wi-Fi/`impala`, audio/`wiremix`, Bluetooth/`bluetui`), add this to `~/.config/hypr/hyprland.conf` or any sourced `.conf`, such as `looknfeel.conf`:
@@ -270,7 +354,7 @@ Then `hyprctl reload` (no logout needed).
 
 | Vendor | Endpoint | What you see |
 |---|---|---|
-| **Anthropic** | `api.anthropic.com/api/oauth/usage` (undocumented) | Session (5h), Weekly (7d), Sonnet (7d), Extra usage $ |
+| **Anthropic** | `api.anthropic.com/api/oauth/usage` (undocumented) | Session (5h), Weekly (7d), Sonnet (7d), model-scoped weekly (e.g. Fable), Extra usage $ |
 | **OpenAI** | `chatgpt.com/backend-api/wham/usage` (undocumented; used by official `codex` CLI) | Codex 5h, Codex weekly, Code-review weekly, Credits |
 | **Z.AI** | `api.z.ai/api/monitor/usage/quota/limit` (undocumented) | Session 5h, Weekly 7d, MCP tools monthly |
 | **OpenRouter** | `openrouter.ai/api/v1/{credits,key}` (documented) | Balance, today/week/month spend, free vs paid tier |
