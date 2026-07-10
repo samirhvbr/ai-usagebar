@@ -83,9 +83,11 @@ main() {
                 echo "✓ credenciais do Claude OK (token presente no Keychain)."
             elif [ -n "$kc" ]; then
                 echo "⚠ o item do Keychain existe MAS está sem token utilizável (accessToken vazio)."
-                echo "   É o 'trusted-device flow' do Claude Code recente no macOS: ele não"
-                echo "   persiste um token OAuth legível, então o menu bar não tem de onde"
-                echo "   buscar o uso do Anthropic neste Mac. (No Linux, funciona normal.)"
+                echo "   É o estado 'trusted-device' do Claude Code: um /login simples vê"
+                echo "   'já logado' e NÃO regrava o token (por isso o botão re-login não"
+                echo "   adianta). Force um login limpo pra resolver:"
+                echo "       claude   →  /logout  →  /login"
+                echo "   depois confira:  ai-usagebar --vendor anthropic --pretty"
             elif [ -f "$HOME/.claude/.credentials.json" ]; then
                 echo "✓ credenciais do Claude achadas em ~/.claude/.credentials.json."
             else

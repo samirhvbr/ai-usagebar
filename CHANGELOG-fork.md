@@ -7,6 +7,31 @@ Formato [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 > fork vivem aqui, agrupadas pela versão do `VERSION` (`<base>+fork.<N>`).
 > Convenção completa em [`docs/FORK.md`](docs/FORK.md).
 
+## [0.12.0+fork.7] — 2026-07-10
+
+Base upstream: **v0.12.0**.
+
+### Fixed
+- **macOS: mensagem de erro acionável para o token vazio do "trusted-device".**
+  Quando o arquivo não existe **e** o item do Keychain está com `accessToken`
+  vazio (estado "trusted-device" do Claude Code recente), o widget mostrava
+  `I/O error at ~/.claude/.credentials.json / No such file` — enganoso, porque o
+  problema real é o token vazio, não o arquivo. Agora o `creds::read_default_with`
+  detecta esse caso específico (arquivo ausente/ilegível + Keychain presente mas
+  vazio) e devolve uma mensagem **acionável, em inglês** (candidata a PR pro
+  upstream — atinge qualquer usuário macOS do akita): um `/login` simples vê "já
+  logado" e não regrava o token; o conserto é `claude` → `/logout` → `/login`.
+  Descoberto no MacBook do dev — forçar logout+login repopulou o token e a barra
+  (Session / Weekly / **Fable** / Extra) voltou a funcionar no Mac, igual ao
+  Linux. Teste hermético cobre o caso; contrato do arquivo presente-mas-inválido
+  fica intacto.
+
+### Changed
+- **`install.sh`: health-check aponta o conserto `/logout` + `/login`.** A
+  mensagem do token vazio (fork.6) agora, além de identificar o estado
+  "trusted-device", diz exatamente como resolver — em vez de tratá-lo como
+  irreversível.
+
 ## [0.12.0+fork.6] — 2026-07-10
 
 Base upstream: **v0.12.0**.
