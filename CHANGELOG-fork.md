@@ -7,6 +7,32 @@ Formato [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 > fork vivem aqui, agrupadas pela versão do `VERSION` (`<base>+fork.<N>`).
 > Convenção completa em [`docs/FORK.md`](docs/FORK.md).
 
+## [0.12.0+fork.1] — 2026-07-10
+
+Base upstream: **v0.12.0** (sync completo v0.7.2 → v0.12.0 via
+`sync/upstream-0.8.0`). O upstream trouxe: desktop integrations (o merge do
+akita dos nossos apps macOS/GNOME), multi-conta Anthropic (`--account` +
+`[[anthropic.accounts]]`), abas por conta no TUI, e os **limites semanais por
+modelo (Fable)** do PR #19. Nossos deltas preservados no merge: backoff de
+429, re-login 1-clique (macOS), sinais ⏸/re-login (GNOME), vendor ShvIA,
+docs do fork.
+
+### Added
+- **Barra "Fable" no lugar da "Sonnet only"** nos três apps de desktop. Novos
+  placeholders `{scoped_label}` / `{scoped_pct}` / `{scoped_reset}` /
+  `{scoped_bar}` expõem a 1ª janela por-modelo da API (`limits[]` — hoje
+  "Fable"); GNOME, macOS e Windows preferem essa janela e caem pro Sonnet
+  antigo se ela não vier. Nome da linha é dinâmico (o que a API mandar).
+- **macOS: badge ⏸ de desatualizado** (paridade com o GNOME) — ⏸ vermelho na
+  menu bar + "⏸ Desatualizado — sem conexão com a conta" no dropdown quando o
+  binário serve cache velho; antes o app engolia o marcador e dados congelados
+  pareciam saudáveis.
+
+### Fixed
+- Testes nossos adaptados às APIs novas do upstream (assinatura `CredsTarget`
+  no fetch, campo `scoped` no snapshot, fixture de tabs do TUI desliga o
+  vendor fork-only shvia).
+
 ## [0.7.2+fork.3] — 2026-07-10
 
 ### Added

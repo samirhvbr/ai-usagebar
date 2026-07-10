@@ -27,7 +27,8 @@ const RED = '#e06c75';
 
 // All ten fields we pull from the binary, joined by ';;'.
 const FORMAT = '{plan};;{session_pct};;{session_reset};;{weekly_pct};;{weekly_reset};;' +
-    '{sonnet_pct};;{sonnet_reset};;{extra_pct};;{extra_spent};;{extra_limit}';
+    '{sonnet_pct};;{sonnet_reset};;{extra_pct};;{extra_spent};;{extra_limit};;' +
+    '{scoped_label};;{scoped_pct};;{scoped_reset}';
 const REFRESH_TIMEOUT_SECS = 60;
 
 // severity_for(pct) from src/pango.rs: >=90 critical, >=75 high, >=50 mid, else low.
@@ -171,7 +172,7 @@ class AiUsageBarIndicator extends PanelMenu.Button {
         item.add_child(vbox);
         this.menu.addMenuItem(item);
 
-        this._rows[key] = {item, valL, barL, resetL};
+        this._rows[key] = {item, nameL, valL, barL, resetL};
     }
 
     _colors() {
@@ -314,6 +315,9 @@ class AiUsageBarIndicator extends PanelMenu.Button {
             weekly: {pct: num(f[3]) ?? 0, reset: field(f[4])},
             sonnet: {pct: num(f[5]), reset: field(f[6])},
             extra: {pct: num(f[7]), spent: field(f[8]), limit: field(f[9])},
+            // Model-scoped weekly window (currently "Fable") — fields 10-12;
+            // absent on binaries older than 0.12.0+fork.1.
+            scoped: {label: field(f[10]), pct: num(f[11]), reset: field(f[12])},
             stale,
             reauth,
         };
@@ -387,7 +391,15 @@ class AiUsageBarIndicator extends PanelMenu.Button {
 
         upd('session', d.session.pct, `${d.session.pct}%`, d.session.reset, true);
         upd('weekly', d.weekly.pct, `${d.weekly.pct}%`, d.weekly.reset, true);
-        upd('sonnet', d.sonnet.pct, `${d.sonnet.pct ?? 0}%`, d.sonnet.reset, d.sonnet.pct != null);
+        // Prefer the model-scoped weekly window (e.g. "Fable") — the API
+        // replaced the old sonnet-only window with scoped limits[].
+        const sc = d.scoped ?? {};
+        const hasScoped = sc.pct != null && !!sc.label;
+        this._rows['sonnet'].nameL.text = hasScoped ? sc.label : 'Sonnet only';
+        if (hasScoped)
+            upd('sonnet', sc.pct, `${sc.pct}%`, sc.reset, true);
+        else
+            upd('sonnet', d.sonnet.pct, `${d.sonnet.pct ?? 0}%`, d.sonnet.reset, d.sonnet.pct != null);
         upd('extra', d.extra.pct, `${d.extra.spent} / ${d.extra.limit}`, null,
             d.extra.pct != null && !!d.extra.spent && !!d.extra.limit);
     }

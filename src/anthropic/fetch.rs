@@ -616,7 +616,13 @@ mod tests {
 
         // First call hits the 429 and arms the backoff (TTL=0 skips fast path).
         let first =
-            fetch_snapshot(&client, creds.path(), &cache, &endpoints, Duration::from_secs(0))
+            fetch_snapshot(
+                &client,
+                &creds::CredsTarget::Explicit(creds.path().to_path_buf()),
+                &cache,
+                &endpoints,
+                Duration::from_secs(0),
+            )
                 .await
                 .unwrap();
         assert!(first.stale);
@@ -629,7 +635,13 @@ mod tests {
         // Second call, still within the window, serves cache and never hits the
         // network — the `.expect(1)` above is the real assertion.
         let second =
-            fetch_snapshot(&client, creds.path(), &cache, &endpoints, Duration::from_secs(0))
+            fetch_snapshot(
+                &client,
+                &creds::CredsTarget::Explicit(creds.path().to_path_buf()),
+                &cache,
+                &endpoints,
+                Duration::from_secs(0),
+            )
                 .await
                 .unwrap();
         assert!(second.stale);

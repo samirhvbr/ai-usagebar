@@ -137,11 +137,17 @@ fn build_placeholders(input: &RenderInput) -> HashMap<&'static str, String> {
             input.pace_tolerance,
         )
     });
+    // First model-scoped weekly window from the API's `limits[]` (currently
+    // "Fable"). Exposed as generic `{scoped_*}` placeholders so desktop apps
+    // can render whichever model Anthropic scopes next without a rename.
+    let scoped_window = snap.scoped.first();
 
     let session_color = pango::severity_color(severity_for(snap.session.utilization_pct), theme);
     let weekly_color = pango::severity_color(severity_for(snap.weekly.utilization_pct), theme);
     let sonnet_color =
         sonnet_window.map(|w| pango::severity_color(severity_for(w.utilization_pct), theme));
+    let scoped_color = scoped_window
+        .map(|s| pango::severity_color(severity_for(s.window.utilization_pct), theme));
     let extra_color = snap
         .extra
         .as_ref()
@@ -156,6 +162,11 @@ fn build_placeholders(input: &RenderInput) -> HashMap<&'static str, String> {
     };
     let extra_bar = if let (Some(e), Some(c)) = (snap.extra.as_ref(), extra_color) {
         pango::progress_bar(e.percent(), c, theme, None)
+    } else {
+        String::new()
+    };
+    let scoped_bar = if let (Some(s), Some(c)) = (scoped_window, scoped_color) {
+        pango::progress_bar(s.window.utilization_pct, c, theme, None)
     } else {
         String::new()
     };
@@ -198,6 +209,23 @@ fn build_placeholders(input: &RenderInput) -> HashMap<&'static str, String> {
                 .unwrap_or_else(|| "0".into()),
         ),
         ("sonnet_bar", sonnet_bar.clone()),
+        (
+            "scoped_label",
+            scoped_window.map(|s| s.label.clone()).unwrap_or_default(),
+        ),
+        (
+            "scoped_pct",
+            scoped_window
+                .map(|s| s.window.utilization_pct.to_string())
+                .unwrap_or_else(|| "0".into()),
+        ),
+        (
+            "scoped_reset",
+            scoped_window
+                .map(|s| countdown::format(s.window.resets_at, input.now))
+                .unwrap_or_else(|| "—".into()),
+        ),
+        ("scoped_bar", scoped_bar),
         (
             "extra_spent",
             snap.extra
@@ -747,6 +775,38 @@ mod tests {
         let out = render_anthropic(&inp);
         // Wrapper color should be the foreground (neutral), not severity.
         assert!(out.text.contains(&theme.fg));
+    }
+
+    #[test]
+    fn scoped_placeholders_render_first_scoped_window() {
+        // The API's model-scoped weekly limit (currently "Fable") must be
+        // reachable from --format so desktop apps can render it as a bar.
+        let mut oc = sample_outcome();
+        oc.snapshot.scoped = vec![crate::usage::ScopedWindow {
+            label: "Fable".into(),
+            window: UsageWindow {
+                utilization_pct: 43,
+                resets_at: Some(now() + chrono::Duration::days(2)),
+                window_duration: chrono::Duration::days(7),
+            },
+        }];
+        let theme = Theme::default();
+        let mut inp = input(&oc, &theme);
+        inp.format = "{scoped_label}:{scoped_pct}%:{scoped_reset}";
+        let out = render_anthropic(&inp);
+        assert!(out.text.contains("Fable:43%:2d"), "got: {}", out.text);
+    }
+
+    #[test]
+    fn scoped_placeholders_empty_when_absent() {
+        // No scoped windows → label empty, pct 0, reset em-dash; never the
+        // literal `{scoped_*}` braces.
+        let oc = sample_outcome();
+        let theme = Theme::default();
+        let mut inp = input(&oc, &theme);
+        inp.format = "[{scoped_label}|{scoped_pct}|{scoped_reset}]";
+        let out = render_anthropic(&inp);
+        assert!(out.text.contains("[|0|\u{2014}]"), "got: {}", out.text);
     }
 
     #[test]

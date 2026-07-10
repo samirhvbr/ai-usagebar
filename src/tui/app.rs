@@ -355,6 +355,7 @@ mod tests {
         config.openai.enabled = false;
         config.zai.enabled = false;
         config.openrouter.enabled = false;
+        config.shvia.enabled = false; // fork-only vendor; keep the fixture Anthropic-only
         config.anthropic.accounts = labels
             .iter()
             .map(|l| crate::config::AnthropicAccount {

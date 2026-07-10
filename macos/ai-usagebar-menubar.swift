@@ -54,7 +54,8 @@ var COLOR_CRITICAL: String { DEF.string(forKey: "colorCritical") ?? "#e06c75" }
 var COLOR_EMPTY: String { DEF.string(forKey: "colorEmpty") ?? "#3e4451" }
 
 let FORMAT = "{plan};;{session_pct};;{session_reset};;{weekly_pct};;{weekly_reset};;" +
-             "{sonnet_pct};;{sonnet_reset};;{extra_pct};;{extra_spent};;{extra_limit}"
+             "{sonnet_pct};;{sonnet_reset};;{extra_pct};;{extra_spent};;{extra_limit};;" +
+             "{scoped_label};;{scoped_pct};;{scoped_reset}"
 
 // ─── Color / text helpers ────────────────────────────────────────────────
 func hexColor(_ hex: String) -> NSColor {
@@ -124,7 +125,11 @@ struct Snapshot {
     let session: Window
     let weekly: Window
     let sonnet: Window?
+    /// Model-scoped weekly window (currently "Fable") from the API's limits[].
+    let scoped: (label: String, pct: Int, reset: String)?
     let extra: (pct: Int, spent: String, limit: String)?
+    /// The binary appended ⏸: live fetch failed, numbers are from cache.
+    let stale: Bool
 }
 
 func stripMarkup(_ s: String) -> String {
@@ -132,7 +137,11 @@ func stripMarkup(_ s: String) -> String {
 }
 
 func parse(_ text: String) -> Snapshot? {
-    let f = stripMarkup(text).components(separatedBy: ";;")
+    let raw = stripMarkup(text)
+    // Health marker: the widget appends ⏸ when it served stale cache. Capture
+    // it before splitting so the UI can badge the data as out of date.
+    let stale = raw.contains("⏸")
+    let f = raw.replacingOccurrences(of: "⏸", with: "").components(separatedBy: ";;")
     guard f.count >= 10 else { return nil }
     func unknownPlaceholder(_ s: String) -> Bool {
         s.hasPrefix("{") && s.hasSuffix("}")
@@ -148,11 +157,16 @@ func parse(_ text: String) -> Snapshot? {
     let limit = t(9)
     let extra: (pct: Int, spent: String, limit: String)? =
         (spent.isEmpty || limit.isEmpty) ? nil : n(7).map { (pct: $0, spent: spent, limit: limit) }
+    // Fields 10-12 (scoped window) only exist on binaries >= 0.12.0+fork.1.
+    let scoped: (label: String, pct: Int, reset: String)? =
+        f.count >= 13 && !t(10).isEmpty ? (label: t(10), pct: n(11) ?? 0, reset: t(12)) : nil
     return Snapshot(plan: t(0),
                     session: Window(pct: n(1) ?? 0, reset: t(2)),
                     weekly: Window(pct: n(3) ?? 0, reset: t(4)),
                     sonnet: sonnet,
-                    extra: extra)
+                    scoped: scoped,
+                    extra: extra,
+                    stale: stale)
 }
 
 // ─── Preferences UI (SwiftUI) ────────────────────────────────────────────
@@ -576,6 +590,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             if SHOW_BARS { title.append(barAttr(pct: pct, width: BAR_WIDTH)) }
             if !SHOW_PERCENT && !SHOW_BARS { title.append(run(value, colorForPct(pct))) }
         }
+        if s.stale { title.append(run("⏸ ", hexColor(COLOR_CRITICAL))) }
         if SHOW_SESSION { seg("5h", s.session.pct, "\(s.session.pct)%") }
         if SHOW_WEEKLY { seg("7d", s.weekly.pct, "\(s.weekly.pct)%") }
         if SHOW_EXTRA, let e = s.extra { seg("ex", e.pct, e.spent) }
@@ -583,8 +598,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func renderMenu(_ s: Snapshot) {
-        headerItem.attributedTitle = run(s.plan.isEmpty ? "AI Usage" : s.plan,
-                                         .labelColor, NSFont.boldSystemFont(ofSize: 13))
+        headerItem.attributedTitle = s.stale
+            ? run("⏸ Desatualizado — sem conexão com a conta",
+                  hexColor(COLOR_CRITICAL), NSFont.boldSystemFont(ofSize: 13))
+            : run(s.plan.isEmpty ? "AI Usage" : s.plan,
+                  .labelColor, NSFont.boldSystemFont(ofSize: 13))
         reauthItem.isHidden = true
 
         func row(_ key: String, _ name: String, _ pct: Int, _ value: String, _ reset: String?) {
@@ -599,7 +617,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         row("session", "Session", s.session.pct, "\(s.session.pct)%", s.session.reset)
         row("weekly", "Weekly", s.weekly.pct, "\(s.weekly.pct)%", s.weekly.reset)
-        if let sn = s.sonnet { row("sonnet", "Sonnet only", sn.pct, "\(sn.pct)%", sn.reset) }
+        // Prefer the model-scoped weekly window (e.g. "Fable") — the API
+        // replaced the old sonnet-only window with scoped limits[].
+        if let sc = s.scoped { row("sonnet", sc.label, sc.pct, "\(sc.pct)%", sc.reset) }
+        else if let sn = s.sonnet { row("sonnet", "Sonnet only", sn.pct, "\(sn.pct)%", sn.reset) }
         else { rows["sonnet"]?.isHidden = true }
         if let e = s.extra { row("extra", "Extra usage", e.pct, "\(e.spent) / \(e.limit)", nil) }
         else { rows["extra"]?.isHidden = true }

@@ -46,7 +46,8 @@ public static class VendorFormat
         // anthropic (default)
         _ => Join(
             "{plan}", "{session_pct}", "{session_reset}",
-            "{weekly_pct}", "{weekly_reset}", "{sonnet_pct}"),
+            "{weekly_pct}", "{weekly_reset}", "{sonnet_pct}",
+            "{scoped_label}", "{scoped_pct}"),
     };
 
     private static string Join(params string[] parts) => string.Join(Sep, parts);
@@ -104,9 +105,11 @@ public static class VendorFormat
         var rows = new List<UsageRow>();
         AddPct(rows, GClock, "Session", f(1), f(2));
         AddPct(rows, GCalendar, "Weekly", f(3), f(4));
-        // Sonnet only shows when there's actual usage (it's an Anthropic-only,
-        // often-zero window).
-        if (ParsePct(f(5)) > 0)
+        // Model-scoped weekly window (currently "Fable") replaced the old
+        // sonnet-only window in the API; prefer it, fall back to Sonnet.
+        if (!string.IsNullOrWhiteSpace(f(6)))
+            AddPct(rows, GLayers, f(6), f(7), "");
+        else if (ParsePct(f(5)) > 0)
             AddPct(rows, GLayers, "Sonnet", f(5), "");
         return new UsageSnapshot { Vendor = vendor, Severity = sev, Title = f(0), Rows = rows };
     }

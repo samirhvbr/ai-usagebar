@@ -663,6 +663,7 @@ mod tests {
                     window_duration: chrono::Duration::days(7),
                 },
                 sonnet: None,
+                scoped: vec![],
                 extra: None,
             }),
             stale: true,
