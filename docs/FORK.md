@@ -44,14 +44,28 @@ A cada mudança relevante que for pro remoto:
 
 ## Sincronizar com o upstream
 
+Rode o checador — ele adiciona o remote se faltar, busca o upstream e mostra o
+gap de versão, os releases novos e **os nossos deltas a preservar** (não muda
+nada):
+
 ```bash
-git remote add upstream https://github.com/akitaonrails/ai-usagebar.git   # 1x
-git fetch upstream
-git merge upstream/main        # ou cherry-pick de commits específicos
+./scripts/sync-upstream.sh
+```
+
+Se houver novidade, num working tree limpo:
+
+```bash
+git merge upstream/main --no-commit --no-ff   # traz o upstream, não commita
+# resolver conflitos preservando os deltas que o script listou
+cargo test && cargo clippy --all-targets -- -D warnings
 ```
 
 Depois: atualizar a **base** no `VERSION` e resetar `N` pra `1`, registrar no
-`CHANGELOG-fork.md`, rodar o gate, commit + push.
+`CHANGELOG-fork.md`, commit + push.
+
+> Dica: o merge direto pode ficar pesado se a gente deixar a base envelhecer
+> muitas versões (o upstream reescreve arquivos). Rodar o checador de vez em
+> quando evita a surpresa de descobrir o upstream 5 versões à frente.
 
 ## Propor mudanças nossas pro upstream
 

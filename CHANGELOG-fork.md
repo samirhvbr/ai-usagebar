@@ -7,6 +7,14 @@ Formato [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 > fork vivem aqui, agrupadas pela versão do `VERSION` (`<base>+fork.<N>`).
 > Convenção completa em [`docs/FORK.md`](docs/FORK.md).
 
+## [0.7.2+fork.3] — 2026-07-10
+
+### Added
+- `scripts/sync-upstream.sh` — checa se o upstream (akita) tem releases novos,
+  mostra o gap de versão e lista os nossos deltas a preservar num merge. Evita
+  a surpresa de descobrir tarde que o upstream avançou (na 1ª rodada ele já
+  estava no v0.12.0). `docs/FORK.md` aponta pra ele.
+
 ## [0.7.2+fork.2] — 2026-07-10
 
 Base upstream: **v0.7.2** (o sync pro v0.8.0 ficou pendente — o ambiente
