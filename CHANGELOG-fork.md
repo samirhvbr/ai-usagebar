@@ -7,6 +7,24 @@ Formato [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 > fork vivem aqui, agrupadas pela versão do `VERSION` (`<base>+fork.<N>`).
 > Convenção completa em [`docs/FORK.md`](docs/FORK.md).
 
+## [0.12.0+fork.6] — 2026-07-10
+
+Base upstream: **v0.12.0**.
+
+### Changed
+- **`install.sh`: health-check de credenciais no macOS agora detecta o token
+  VAZIO do "trusted-device flow".** O check do fork.5 só via se o item do
+  Keychain existia (sem `-w`) — mas o Claude Code recente no macOS mantém o item
+  `Claude Code-credentials` e grava `accessToken:""` / `refreshToken:""`
+  (trusted-device flow). Item presente + token vazio dava um "✓ credenciais
+  achadas" enganoso enquanto a barra ficava vazia. Agora o check lê o valor
+  (`-w`) e distingue os três casos: token presente (OK), item presente mas token
+  vazio (avisa que é o trusted-device flow e que não há token pro menu bar ler —
+  por isso o Linux funciona e o Mac não), ou nada (pede `claude` / `/login`). O
+  token fica só numa variável local e nunca é impresso. O `-w` não adiciona
+  prompt de Keychain que o próprio app da menu bar já não dispare (ele lê com
+  `-w` também).
+
 ## [0.12.0+fork.5] — 2026-07-10
 
 Base upstream: **v0.12.0**.

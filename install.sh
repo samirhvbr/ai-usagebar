@@ -72,20 +72,26 @@ main() {
             ( cd macos && ./build.sh )
             pkill -f ai-usagebar-menubar 2>/dev/null || true   # derruba cópia antiga
             ( cd macos && ./install-agent.sh )                 # LaunchAgent: sobe no login
-            # Creds sanity-check: sem credenciais a barra fica vazia. No macOS elas
-            # vivem no login Keychain (serviço "Claude Code-credentials"); o arquivo
-            # ~/.claude/.credentials.json normalmente nem existe. Checar só a
-            # existência do item (sem -w) NÃO dispara prompt de acesso ao Keychain.
-            if security find-generic-password -s "Claude Code-credentials" >/dev/null 2>&1; then
-                echo "✓ credenciais do Claude achadas no Keychain."
+            # Creds sanity-check: sem token utilizável a barra fica vazia. No macOS
+            # o token vive no login Keychain (serviço "Claude Code-credentials"),
+            # mas o Claude Code recente ("trusted-device flow") pode manter o item
+            # e deixar o token VAZIO — então checamos o token, não só a existência.
+            # (O token fica só numa variável local, nunca é impresso.)
+            kc="$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null || true)"
+            at="$(printf '%s' "$kc" | grep -o '"accessToken":"[^"]*"' | head -1)"
+            if [ -n "$at" ] && [ "$at" != '"accessToken":""' ]; then
+                echo "✓ credenciais do Claude OK (token presente no Keychain)."
+            elif [ -n "$kc" ]; then
+                echo "⚠ o item do Keychain existe MAS está sem token utilizável (accessToken vazio)."
+                echo "   É o 'trusted-device flow' do Claude Code recente no macOS: ele não"
+                echo "   persiste um token OAuth legível, então o menu bar não tem de onde"
+                echo "   buscar o uso do Anthropic neste Mac. (No Linux, funciona normal.)"
             elif [ -f "$HOME/.claude/.credentials.json" ]; then
                 echo "✓ credenciais do Claude achadas em ~/.claude/.credentials.json."
             else
-                echo "⚠ NÃO achei as credenciais do Claude (nem Keychain, nem arquivo) —"
-                echo "   a barra vai ficar vazia até você logar. Faça uma vez:"
-                echo "     claude          # e dentro dele:  /login"
-                echo "   depois confira:  ai-usagebar --vendor anthropic --pretty"
+                echo "⚠ NÃO achei as credenciais do Claude — faça login: claude  (e dentro: /login)."
             fi
+            unset kc at
             echo "✓ macOS pronto — a barra sobe sozinha no login."
             ;;
         Linux)
