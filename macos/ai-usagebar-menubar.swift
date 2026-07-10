@@ -445,6 +445,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let menu = NSMenu()
         menu.autoenablesItems = false
 
+        headerItem.attributedTitle = run("Carregando…", .secondaryLabelColor)
         menu.addItem(headerItem)
 
         // Shown only when the OAuth session expires (setReauth). One click runs
@@ -458,6 +459,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         for key in ["session", "weekly", "sonnet", "extra"] {
             let it = NSMenuItem()
+            it.isHidden = true   // fica escondida até chegar dado de verdade (evita "NSMenuItem" vazio)
             rows[key] = it
             menu.addItem(it)
         }
@@ -577,7 +579,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         guard let snap = parse(text) else {
             lastSnapshot = nil
             reauthItem.isHidden = true
-            statusItem.button?.attributedTitle = run(stripMarkup(text), .labelColor)  // Loading… / ⚠
+            let msg = stripMarkup(text).trimmingCharacters(in: .whitespacesAndNewlines)
+            statusItem.button?.attributedTitle = run(msg.isEmpty ? "…" : msg, .labelColor)  // Loading… / ⚠
+            // Sem snapshot ainda: mostra o estado no header e ESCONDE as linhas,
+            // pra elas nunca renderizarem como "NSMenuItem" vazio.
+            headerItem.attributedTitle = run(msg.isEmpty ? "Carregando…" : msg, .secondaryLabelColor)
+            for (_, it) in rows { it.isHidden = true }
             return
         }
         lastSnapshot = snap

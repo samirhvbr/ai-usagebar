@@ -1,19 +1,54 @@
 #!/usr/bin/env bash
 #
-# One-shot installer for ai-usagebar. Detects the OS and does the whole dance:
-#   git pull → cargo install (binary) → build + install the desktop app for
-#   this platform → enable it to start on login/reboot.
+# One-shot installer for ai-usagebar (macOS + Linux/GNOME). Detects the OS and:
+#   git pull → cargo install (binary) → build + install the desktop app →
+#   enable it to start on login/reboot.
+#   Windows: use install.ps1 instead.
 #
-#   macOS         → menu bar app (LaunchAgent, RunAtLoad)
-#   Linux (GNOME) → GNOME Shell extension (enabled = loads every login)
+# Usage:  ./install.sh              (from anywhere; cd's to its own dir)
+#         SKIP_PULL=1 ./install.sh  (don't touch git)
 #
-# Usage:  ./install.sh          (from anywhere; it cd's to its own dir)
-#         SKIP_PULL=1 ./install.sh   (don't touch git)
-#
-# The whole body lives in main() so a `git pull` that updates this very file
-# mid-run can't splice old/new lines together (bash parses main() up front).
+# Body lives in main() so a `git pull` that rewrites this very file mid-run
+# can't splice old/new lines (bash parses the functions up front).
 
 set -euo pipefail
+
+# Update the checkout — best-effort, with diagnostics when the pull fails.
+# The pull is the flakiest step (missing/wrong remote, auth, or no git at all),
+# so we test each precondition and, on failure, point at the likely culprit
+# instead of silently moving on.
+update_repo() {
+    if [ "${SKIP_PULL:-0}" = "1" ]; then
+        echo "› git pull pulado (SKIP_PULL=1)."; return 0
+    fi
+    if ! command -v git >/dev/null 2>&1; then
+        echo "⚠ git não está no PATH — pulando o update. Instale o git, ou rode com SKIP_PULL=1."; return 0
+    fi
+    if [ ! -d .git ]; then
+        echo "⚠ isto não é um checkout git — pulando o update."; return 0
+    fi
+    if [ -z "$(git remote 2>/dev/null)" ]; then
+        echo "⚠ nenhum remote configurado — não dá pra atualizar."
+        echo "    conserto:  git remote add origin <URL-do-fork>"
+        return 0
+    fi
+
+    local branch remote url
+    branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)"
+    remote="$(git config "branch.${branch}.remote" 2>/dev/null || echo origin)"
+    url="$(git remote get-url "$remote" 2>/dev/null || echo '?')"
+
+    echo "› git pull (${remote}/${branch})…"
+    if git pull --ff-only "$remote" "$branch"; then
+        echo "  ✓ atualizado."
+    else
+        echo "  ⚠ git pull FALHOU — seguindo com o que já está no disco. Cheque:" >&2
+        echo "     • remote   → ${remote}: ${url}          (git remote -v)" >&2
+        echo "     • alcança? → git ls-remote ${remote}    (rede / auth / URL errada)" >&2
+        echo "     • local    → git status                 (mudança não commitada / conflito)" >&2
+    fi
+    return 0
+}
 
 main() {
     local dir os uuid
@@ -25,13 +60,8 @@ main() {
         exit 1
     }
 
-    # 1. Update the checkout (best-effort; a dirty tree shouldn't abort the install).
-    if [ "${SKIP_PULL:-0}" != "1" ] && [ -d .git ]; then
-        echo "› git pull…"
-        git pull --ff-only || echo "  ⚠ git pull pulou (resolva à mão se precisar); seguindo com o que está no disco."
-    fi
+    update_repo
 
-    # 2. Build + install the binaries (ai-usagebar + ai-usagebar-tui → ~/.cargo/bin).
     echo "› cargo install (binário)…"
     cargo install --path . --force
 
@@ -40,7 +70,7 @@ main() {
         Darwin)
             echo "› macOS detectado — app da menu bar"
             ( cd macos && ./build.sh )
-            pkill -f ai-usagebar-menubar 2>/dev/null || true   # derruba cópia manual antiga
+            pkill -f ai-usagebar-menubar 2>/dev/null || true   # derruba cópia antiga
             ( cd macos && ./install-agent.sh )                 # LaunchAgent: sobe no login
             echo "✓ macOS pronto — a barra sobe sozinha no login."
             ;;
@@ -51,9 +81,9 @@ main() {
             if command -v gnome-extensions >/dev/null 2>&1; then
                 gnome-extensions enable "$uuid" 2>/dev/null \
                     && echo "✓ Extensão habilitada — carrega em todo login." \
-                    || echo "⚠ Não consegui habilitar via CLI; ative em: gnome-extensions enable $uuid"
+                    || echo "⚠ Não consegui habilitar via CLI; ative: gnome-extensions enable $uuid"
             else
-                echo "⚠ 'gnome-extensions' não encontrado — habilite manualmente depois de recarregar o Shell."
+                echo "⚠ 'gnome-extensions' não encontrado — habilite após recarregar o Shell."
             fi
             echo
             echo "→ Recarregue o GNOME Shell pra ver agora:"

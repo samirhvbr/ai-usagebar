@@ -7,6 +7,24 @@ Formato [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 > fork vivem aqui, agrupadas pela versão do `VERSION` (`<base>+fork.<N>`).
 > Convenção completa em [`docs/FORK.md`](docs/FORK.md).
 
+## [0.12.0+fork.4] — 2026-07-10
+
+Base upstream: **v0.12.0**.
+
+### Fixed
+- **macOS: "NSMenuItem" no dropdown.** Quando o binário não devolvia um snapshot
+  (rate-limit / loading / erro), o app deixava as linhas do dropdown vazias e o
+  macOS as renderizava como "NSMenuItem". Agora as linhas nascem escondidas e
+  ficam escondidas até chegar dado de verdade; o header mostra "Carregando…" ou
+  a mensagem do binário nesse meio-tempo.
+
+### Changed
+- **Instaladores testam o git de verdade.** `install.sh` e `install.ps1` agora
+  checam `git` no PATH, remote configurado e branch/remote, e — se o `git pull`
+  falhar — apontam o provável culpado (remote/URL, rede/auth, conflito local) em
+  vez de seguir mudo. `install.ps1` também confere `$LASTEXITCODE` de cada
+  ferramenta nativa (cargo/dotnet) pra falhar claro.
+
 ## [0.12.0+fork.3] — 2026-07-10
 
 Base upstream: **v0.12.0**.
