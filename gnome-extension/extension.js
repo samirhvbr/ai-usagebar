@@ -283,11 +283,17 @@ class AiUsageBarIndicator extends PanelMenu.Button {
             return;
         }
         const raw = (data.text ?? '').toString().replace(/<[^>]*>/g, '');
-        const f = raw.split(';;');
+        // Health markers the binary appends to the bar text. The extension used
+        // to strip these out with the rest of the markup, so stale/expired data
+        // looked identical to healthy data. Capture them before splitting.
+        const reauth = raw.includes('re-login');
+        const stale = !reauth && raw.includes('⏸');
+        const clean = raw.replace(/\s*⚠\s*re-login\s*$/, '').replace(/\s*⏸\s*$/, '');
+        const f = clean.split(';;');
         if (f.length < 10) {
             // Loading… / ⚠ — show the binary's own text.
             this._data = null;
-            this._label.clutter_text.set_markup(`<span foreground="${FG}">${esc(raw) || '…'}</span>`);
+            this._label.clutter_text.set_markup(`<span foreground="${FG}">${esc(clean) || '…'}</span>`);
             return;
         }
         const isPlaceholder = s => /^\{[^}]+\}$/.test(String(s).trim());
@@ -308,6 +314,8 @@ class AiUsageBarIndicator extends PanelMenu.Button {
             weekly: {pct: num(f[3]) ?? 0, reset: field(f[4])},
             sonnet: {pct: num(f[5]), reset: field(f[6])},
             extra: {pct: num(f[7]), spent: field(f[8]), limit: field(f[9])},
+            stale,
+            reauth,
         };
         this._render();
     }
@@ -317,6 +325,10 @@ class AiUsageBarIndicator extends PanelMenu.Button {
         const d = this._data;
         if (!d)
             return;
+        if (d.reauth) {
+            this._setReauth();
+            return;
+        }
         const colors = this._colors();
         this._renderPanel(d, colors);
         this._renderDropdown(d, colors);
@@ -339,6 +351,8 @@ class AiUsageBarIndicator extends PanelMenu.Button {
         };
 
         const parts = [];
+        if (d.stale)
+            parts.push(`<span foreground="${RED}">⏸</span>`);
         if (this._settings.get_boolean('show-session'))
             parts.push(seg('5h', d.session.pct, `${d.session.pct}%`));
         if (this._settings.get_boolean('show-weekly'))
@@ -352,7 +366,9 @@ class AiUsageBarIndicator extends PanelMenu.Button {
     }
 
     _renderDropdown(d, colors) {
-        this._planLabel.text = d.plan || 'AI Usage';
+        this._planLabel.clutter_text.set_markup(d.stale
+            ? `<span foreground="${RED}">⏸ Desatualizado — sem conexão com a conta</span>`
+            : `<span foreground="${FG}">${esc(d.plan || 'AI Usage')}</span>`);
 
         const upd = (key, pct, valueText, reset, visible) => {
             const r = this._rows[key];
@@ -381,6 +397,17 @@ class AiUsageBarIndicator extends PanelMenu.Button {
         this._label.clutter_text.set_markup(`<span foreground="${RED}">⚠ ai</span>`);
         const msg = detail ? `${short}\n${esc(detail).slice(0, 300)}` : short;
         this._planLabel.clutter_text.set_markup(`<span foreground="${FG}">${esc(msg)}</span>`);
+        for (const r of Object.values(this._rows))
+            r.item.visible = false;
+    }
+
+    // OAuth session expired: the binary flags it with a "re-login" marker in the
+    // bar text. Show a clear call to action instead of stale numbers (mirrors
+    // the macOS menu bar app). Recovers on the next tick once you re-login.
+    _setReauth() {
+        this._label.clutter_text.set_markup(`<span foreground="${RED}">⚠ login</span>`);
+        this._planLabel.clutter_text.set_markup(
+            `<span foreground="${FG}">Sessão expirada — rode 'claude' ou refaça login no IDE</span>`);
         for (const r of Object.values(this._rows))
             r.item.visible = false;
     }
