@@ -17,11 +17,14 @@ public enum Severity
 
 /// <summary>
 /// One displayable usage window: a label, a percentage (0..100), an optional
-/// "resets in …" string, and a Nerd Font glyph. Vendors that don't expose a
-/// percentage (OpenRouter/DeepSeek credit balances) use <see cref="Detail"/>
+/// "resets in …" string, a Nerd Font glyph, and an optional meta position
+/// (<see cref="Elapsed"/>) — the fraction of the window that has elapsed, used
+/// to draw the pace marker and color the fill by delta. Null when the window
+/// has no time-based meta ($ budget / no reset). Vendors that don't expose a
+/// percentage (OpenRouter/DeepSeek credit balances) use <see cref="DetailRow"/>
 /// rows instead.
 /// </summary>
-public sealed record UsageRow(string Glyph, string Label, double Percent, string Reset);
+public sealed record UsageRow(string Glyph, string Label, double Percent, string Reset, double? Elapsed = null);
 
 /// <summary>A label/value line for vendors whose data isn't a percentage.</summary>
 public sealed record DetailRow(string Glyph, string Label, string Value);

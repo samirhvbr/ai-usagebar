@@ -22,7 +22,9 @@ const ONE_DARK_BLUE: &str = "#61afef";
 const ONE_DARK_DIM: &str = "#5c6370";
 const ONE_DARK_FG: &str = "#abb2bf";
 const ONE_DARK_BAR_EMPTY: &str = "#3e4451";
-const ONE_DARK_MARKER: &str = "#d19a66";
+// The pace/meta marker is a blue reference line, distinct from the amber
+// (orange) over-pace fill so the two never blend into each other.
+const ONE_DARK_MARKER: &str = "#61afef";
 
 /// Full resolved palette used by the widget tooltip and the TUI.
 ///
@@ -141,7 +143,9 @@ impl Theme {
             && let Some(dim) = hex_blend(fg, bg)
         {
             self.dim = dim;
-            self.marker = self.dim.clone();
+            // Keep the meta marker on the theme's accent (blue) so it stays a
+            // visible reference line rather than fading into the dim palette.
+            self.marker = self.blue.clone();
             if let Some(bar_empty) = hex_blend(bg, &self.dim) {
                 self.bar_empty = bar_empty;
             }
@@ -279,7 +283,8 @@ mod tests {
         assert_eq!(t.yellow, "#ffff00");
         // dim = blend(fg, bg) = blend(#fff, #000) = #7f7f7f
         assert_eq!(t.dim, "#7f7f7f");
-        assert_eq!(t.marker, "#7f7f7f");
+        // The meta marker follows the accent (blue), not dim.
+        assert_eq!(t.marker, "#aabbcc");
         // bar_empty = blend(bg, dim) = blend(#000, #7f7f7f) = #3f3f3f
         assert_eq!(t.bar_empty, "#3f3f3f");
     }

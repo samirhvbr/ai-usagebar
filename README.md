@@ -10,6 +10,14 @@ This started as a Rust port of [`claudebar`](https://github.com/mryll/claudebar)
 
 ## Features
 
+- **Meta marker (pace line) on every usage bar.** A blue reference line marks
+  where consumption *should* be given how much of the window has elapsed, and
+  the bar is colored by pace — green when you're at/under the meta, amber when
+  slightly ahead (within `--pace-tolerance`), red when over pace. So a glance
+  tells you if you're ahead of or behind schedule without doing the math.
+  Windows with no time-based reset ($ Extra usage, credit balances) keep the
+  absolute-usage color and no marker. On by default across Waybar, the TUI, and
+  the GNOME / macOS / Windows desktop apps.
 - **Per-vendor Waybar modules** with the same JSON shape as claudebar.
 - **Tabbed TUI** (`ai-usagebar-tui`) with Tab/h/l switching, per-tab refresh, and 60-second auto-refresh. Native ratatui widgets fill the available terminal width and keep the vendor tabs visually consistent.
 - **Scroll-to-cycle on the bar**: wire `on-scroll-up` / `on-scroll-down`, and one bar item cycles through your enabled vendors.

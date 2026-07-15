@@ -42,6 +42,11 @@ var VENDOR: String { DEF.string(forKey: "vendor") ?? "anthropic" }
 var INTERVAL: Double { let v = DEF.double(forKey: "interval"); return v > 0 ? v : 30 }
 var BAR_WIDTH: Int { max(4, min(20, DEF.integer(forKey: "barWidth"))) }
 let MENU_BAR_W = 14
+// The meta marker (pace/elapsed reference line) is a fixed blue, matching the
+// binary's default theme `marker` color and distinct from the amber over-pace
+// fill. Pace tolerance mirrors the binary's `--pace-tolerance` default of 5.
+let COLOR_MARKER = "#61afef"
+let PACE_TOL = 5
 var SHOW_SESSION: Bool { DEF.bool(forKey: "showSession") }
 var SHOW_WEEKLY: Bool { DEF.bool(forKey: "showWeekly") }
 var SHOW_EXTRA: Bool { DEF.bool(forKey: "showExtra") }
@@ -53,8 +58,11 @@ var COLOR_HIGH: String { DEF.string(forKey: "colorHigh") ?? "#d19a66" }
 var COLOR_CRITICAL: String { DEF.string(forKey: "colorCritical") ?? "#e06c75" }
 var COLOR_EMPTY: String { DEF.string(forKey: "colorEmpty") ?? "#3e4451" }
 
+// Indices 10-12 (the `*_elapsed` meta positions) are optional: an older binary
+// or a no-reset window yields an empty/non-numeric value → "no meta marker".
 let FORMAT = "{plan};;{session_pct};;{session_reset};;{weekly_pct};;{weekly_reset};;" +
-             "{sonnet_pct};;{sonnet_reset};;{extra_pct};;{extra_spent};;{extra_limit}"
+             "{sonnet_pct};;{sonnet_reset};;{extra_pct};;{extra_spent};;{extra_limit};;" +
+             "{session_elapsed};;{weekly_elapsed};;{sonnet_elapsed}"
 
 // ─── Color / text helpers ────────────────────────────────────────────────
 func hexColor(_ hex: String) -> NSColor {
@@ -74,18 +82,54 @@ func colorForPct(_ pct: Int) -> NSColor {
     return hexColor(COLOR_LOW)
 }
 
+// pace_fill_severity(delta) from src/pacing.rs: <=0 green, <=tol amber, else red.
+func colorForDelta(_ delta: Int) -> NSColor {
+    if delta <= 0 { return hexColor(COLOR_LOW) }
+    if delta <= PACE_TOL { return hexColor(COLOR_HIGH) }
+    return hexColor(COLOR_CRITICAL)
+}
+
+// Fill color for a window: by pace delta when a meta (elapsed) is known,
+// otherwise by absolute usage.
+func winColor(_ pct: Int, _ elapsed: Int?) -> NSColor {
+    if let e = elapsed { return colorForDelta(pct - e) }
+    return colorForPct(pct)
+}
+
 let barFont = NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
 
 func run(_ s: String, _ color: NSColor, _ font: NSFont = barFont) -> NSAttributedString {
     NSAttributedString(string: s, attributes: [.foregroundColor: color, .font: font])
 }
 
-func barAttr(pct: Int, width: Int) -> NSAttributedString {
+// Block bar. When `elapsed` (0..100) is non-nil the fill is colored by pace
+// delta and a blue marker cell sits at the elapsed position (mirrors
+// src/pango.rs `progress_bar`); otherwise it's a plain absolute-color bar.
+func barAttr(pct: Int, width: Int, elapsed: Int?) -> NSAttributedString {
     let p = max(0, min(100, pct))
     let filled = Int((Double(p) * Double(width) / 100.0).rounded())
     let out = NSMutableAttributedString()
-    out.append(run(String(repeating: "█", count: filled), colorForPct(p)))
-    out.append(run(String(repeating: "░", count: max(0, width - filled)), hexColor(COLOR_EMPTY)))
+
+    guard let elapsedVal = elapsed else {
+        out.append(run(String(repeating: "█", count: filled), colorForPct(p)))
+        out.append(run(String(repeating: "░", count: max(0, width - filled)), hexColor(COLOR_EMPTY)))
+        return out
+    }
+
+    let e = max(0, min(100, elapsedVal))
+    let fill = colorForDelta(p - e)
+    var m = Int(Double(e) * Double(width) / 100.0) // floor
+    if m > width - 1 { m = width - 1 }
+    if m < 0 { m = 0 }
+    let preF = min(filled, m)
+    let postF = filled > m + 1 ? filled - m - 1 : 0
+    let preE = m - preF
+    let postE = width - m - 1 - postF
+    out.append(run(String(repeating: "█", count: max(0, preF)), fill))
+    out.append(run(String(repeating: "░", count: max(0, preE)), hexColor(COLOR_EMPTY)))
+    out.append(run("│", hexColor(COLOR_MARKER)))
+    out.append(run(String(repeating: "█", count: max(0, postF)), fill))
+    out.append(run(String(repeating: "░", count: max(0, postE)), hexColor(COLOR_EMPTY)))
     return out
 }
 
@@ -118,7 +162,7 @@ func resolveBinary(_ name: String) -> String? {
 }
 
 // ─── Data model ──────────────────────────────────────────────────────────
-struct Window { let pct: Int; let reset: String }
+struct Window { let pct: Int; let reset: String; let elapsed: Int? }
 struct Snapshot {
     let plan: String
     let session: Window
@@ -134,15 +178,16 @@ func stripMarkup(_ s: String) -> String {
 func parse(_ text: String) -> Snapshot? {
     let f = stripMarkup(text).components(separatedBy: ";;")
     guard f.count >= 10 else { return nil }
-    func t(_ i: Int) -> String { f[i].trimmingCharacters(in: .whitespaces) }
+    // Bounds-safe: the optional `*_elapsed` fields (10-12) may be absent.
+    func t(_ i: Int) -> String { i < f.count ? f[i].trimmingCharacters(in: .whitespaces) : "" }
     func n(_ i: Int) -> Int? { Int(t(i)) }
-    let sonnet = n(5).map { Window(pct: $0, reset: t(6)) }
+    let sonnet = n(5).map { Window(pct: $0, reset: t(6), elapsed: n(12)) }
     let spent = t(8)
     let extra: (pct: Int, spent: String, limit: String)? =
         spent.isEmpty ? nil : (n(7) ?? 0, spent, t(9))
     return Snapshot(plan: t(0),
-                    session: Window(pct: n(1) ?? 0, reset: t(2)),
-                    weekly: Window(pct: n(3) ?? 0, reset: t(4)),
+                    session: Window(pct: n(1) ?? 0, reset: t(2), elapsed: n(10)),
+                    weekly: Window(pct: n(3) ?? 0, reset: t(4), elapsed: n(11)),
                     sonnet: sonnet,
                     extra: extra)
 }
@@ -537,16 +582,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func renderPanel(_ s: Snapshot) {
         let title = NSMutableAttributedString()
-        func seg(_ tag: String, _ pct: Int, _ value: String) {
+        func seg(_ tag: String, _ pct: Int, _ value: String, _ elapsed: Int?) {
             if title.length > 0 { title.append(run("   ", .secondaryLabelColor)) }
             title.append(run("\(tag) ", .secondaryLabelColor))
-            if SHOW_PERCENT { title.append(run(value + (SHOW_BARS ? " " : ""), colorForPct(pct))) }
-            if SHOW_BARS { title.append(barAttr(pct: pct, width: BAR_WIDTH)) }
-            if !SHOW_PERCENT && !SHOW_BARS { title.append(run(value, colorForPct(pct))) }
+            let col = winColor(pct, elapsed)
+            if SHOW_PERCENT { title.append(run(value + (SHOW_BARS ? " " : ""), col)) }
+            if SHOW_BARS { title.append(barAttr(pct: pct, width: BAR_WIDTH, elapsed: elapsed)) }
+            if !SHOW_PERCENT && !SHOW_BARS { title.append(run(value, col)) }
         }
-        if SHOW_SESSION { seg("5h", s.session.pct, "\(s.session.pct)%") }
-        if SHOW_WEEKLY { seg("7d", s.weekly.pct, "\(s.weekly.pct)%") }
-        if SHOW_EXTRA, let e = s.extra { seg("ex", e.pct, e.spent) }
+        if SHOW_SESSION { seg("5h", s.session.pct, "\(s.session.pct)%", s.session.elapsed) }
+        if SHOW_WEEKLY { seg("7d", s.weekly.pct, "\(s.weekly.pct)%", s.weekly.elapsed) }
+        if SHOW_EXTRA, let e = s.extra { seg("ex", e.pct, e.spent, nil) } // $ budget → no meta
         statusItem.button?.attributedTitle = title.length > 0 ? title : run("ai", .secondaryLabelColor)
     }
 
@@ -554,21 +600,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         headerItem.attributedTitle = run(s.plan.isEmpty ? "AI Usage" : s.plan,
                                          .labelColor, NSFont.boldSystemFont(ofSize: 13))
 
-        func row(_ key: String, _ name: String, _ pct: Int, _ value: String, _ reset: String?) {
+        func row(_ key: String, _ name: String, _ pct: Int, _ value: String, _ reset: String?, _ elapsed: Int?) {
             guard let item = rows[key] else { return }
             item.isHidden = false
             let a = NSMutableAttributedString()
             a.append(run(name.padding(toLength: 12, withPad: " ", startingAt: 0), .labelColor))
-            a.append(barAttr(pct: pct, width: MENU_BAR_W))
-            a.append(run("  \(value)", colorForPct(pct)))
+            a.append(barAttr(pct: pct, width: MENU_BAR_W, elapsed: elapsed))
+            a.append(run("  \(value)", winColor(pct, elapsed)))
             if let r = reset, !r.isEmpty { a.append(run("   ↺ \(r)", .secondaryLabelColor)) }
             item.attributedTitle = a
         }
-        row("session", "Session", s.session.pct, "\(s.session.pct)%", s.session.reset)
-        row("weekly", "Weekly", s.weekly.pct, "\(s.weekly.pct)%", s.weekly.reset)
-        if let sn = s.sonnet { row("sonnet", "Sonnet only", sn.pct, "\(sn.pct)%", sn.reset) }
+        row("session", "Session", s.session.pct, "\(s.session.pct)%", s.session.reset, s.session.elapsed)
+        row("weekly", "Weekly", s.weekly.pct, "\(s.weekly.pct)%", s.weekly.reset, s.weekly.elapsed)
+        if let sn = s.sonnet { row("sonnet", "Sonnet only", sn.pct, "\(sn.pct)%", sn.reset, sn.elapsed) }
         else { rows["sonnet"]?.isHidden = true }
-        if let e = s.extra { row("extra", "Extra usage", e.pct, "\(e.spent) / \(e.limit)", nil) }
+        if let e = s.extra { row("extra", "Extra usage", e.pct, "\(e.spent) / \(e.limit)", nil, nil) }
         else { rows["extra"]?.isHidden = true }
     }
 

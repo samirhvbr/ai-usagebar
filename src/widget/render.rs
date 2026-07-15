@@ -104,6 +104,23 @@ fn bar_color_for(class: Class, theme: &Theme) -> &str {
     }
 }
 
+/// Resolve a usage window's fill color and optional meta marker.
+///
+/// When the window has a known reset, the fill is colored by pace *delta*
+/// (green under the meta, amber slightly ahead, red over pace) and a marker is
+/// placed at the elapsed-time position. Without a reset there is no meta, so it
+/// falls back to absolute-usage color and no marker (spec: "sem reset conhecido
+/// → renderiza só o preenchimento").
+fn window_bar<'a>(
+    pct: i32,
+    p: &pacing::Pacing,
+    has_reset: bool,
+    tol: u32,
+    theme: &'a Theme,
+) -> (&'a str, Option<i32>) {
+    pango::meta_bar_style(pct, p, has_reset, tol, theme)
+}
+
 /// Build the full placeholder map for an Anthropic snapshot.
 ///
 /// Mirrors claudebar's "{...}" surface (claudebar:625-667). Per-window pacing
@@ -138,23 +155,50 @@ fn build_placeholders(input: &RenderInput) -> HashMap<&'static str, String> {
         )
     });
 
-    let session_color = pango::severity_color(severity_for(snap.session.utilization_pct), theme);
-    let weekly_color = pango::severity_color(severity_for(snap.weekly.utilization_pct), theme);
-    let sonnet_color =
-        sonnet_window.map(|w| pango::severity_color(severity_for(w.utilization_pct), theme));
-    let extra_color = snap
-        .extra
-        .as_ref()
-        .map(|e| pango::severity_color(severity_for(e.percent()), theme));
-
-    let session_bar = pango::progress_bar(snap.session.utilization_pct, session_color, theme, None);
-    let weekly_bar = pango::progress_bar(snap.weekly.utilization_pct, weekly_color, theme, None);
-    let sonnet_bar = if let (Some(w), Some(c)) = (sonnet_window, sonnet_color) {
-        pango::progress_bar(w.utilization_pct, c, theme, None)
+    // Meta-marker bars: when the window has a known reset, the fill is colored
+    // by pace delta and a marker sits at the elapsed-time position; otherwise
+    // it's absolute-usage color with no marker.
+    let (session_fill, session_marker) = window_bar(
+        snap.session.utilization_pct,
+        &session,
+        snap.session.resets_at.is_some(),
+        input.pace_tolerance,
+        theme,
+    );
+    let (weekly_fill, weekly_marker) = window_bar(
+        snap.weekly.utilization_pct,
+        &weekly,
+        snap.weekly.resets_at.is_some(),
+        input.pace_tolerance,
+        theme,
+    );
+    let session_bar = pango::progress_bar(
+        snap.session.utilization_pct,
+        session_fill,
+        theme,
+        session_marker,
+    );
+    let weekly_bar = pango::progress_bar(
+        snap.weekly.utilization_pct,
+        weekly_fill,
+        theme,
+        weekly_marker,
+    );
+    let sonnet_bar = if let (Some(w), Some(p)) = (sonnet_window, sonnet.as_ref()) {
+        let (fill, marker) = window_bar(
+            w.utilization_pct,
+            p,
+            w.resets_at.is_some(),
+            input.pace_tolerance,
+            theme,
+        );
+        pango::progress_bar(w.utilization_pct, fill, theme, marker)
     } else {
         String::new()
     };
-    let extra_bar = if let (Some(e), Some(c)) = (snap.extra.as_ref(), extra_color) {
+    // Extra usage is a $ budget with no time window → absolute color, no marker.
+    let extra_bar = if let Some(e) = snap.extra.as_ref() {
+        let c = pango::severity_color(severity_for(e.percent()), theme);
         pango::progress_bar(e.percent(), c, theme, None)
     } else {
         String::new()
@@ -169,14 +213,20 @@ fn build_placeholders(input: &RenderInput) -> HashMap<&'static str, String> {
             "session_reset",
             countdown::format(snap.session.resets_at, input.now),
         ),
-        ("session_elapsed", session.elapsed_pct.to_string()),
+        (
+            "session_elapsed",
+            session.elapsed_field(snap.session.resets_at.is_some()),
+        ),
         ("session_bar", session_bar.clone()),
         ("weekly_pct", snap.weekly.utilization_pct.to_string()),
         (
             "weekly_reset",
             countdown::format(snap.weekly.resets_at, input.now),
         ),
-        ("weekly_elapsed", weekly.elapsed_pct.to_string()),
+        (
+            "weekly_elapsed",
+            weekly.elapsed_field(snap.weekly.resets_at.is_some()),
+        ),
         ("weekly_bar", weekly_bar.clone()),
         (
             "sonnet_pct",
@@ -192,10 +242,10 @@ fn build_placeholders(input: &RenderInput) -> HashMap<&'static str, String> {
         ),
         (
             "sonnet_elapsed",
-            sonnet
-                .as_ref()
-                .map(|s| s.elapsed_pct.to_string())
-                .unwrap_or_else(|| "0".into()),
+            match (sonnet.as_ref(), sonnet_window) {
+                (Some(s), Some(w)) => s.elapsed_field(w.resets_at.is_some()),
+                _ => String::new(),
+            },
         ),
         ("sonnet_bar", sonnet_bar.clone()),
         (
@@ -301,9 +351,6 @@ fn render_default_tooltip(input: &RenderInput) -> String {
     let dim = &theme.dim;
     let fg = &theme.fg;
 
-    let session_color = pango::severity_color(severity_for(snap.session.utilization_pct), theme);
-    let weekly_color = pango::severity_color(severity_for(snap.weekly.utilization_pct), theme);
-
     let session_pacing = pacing::calc(
         snap.session.utilization_pct,
         snap.session.resets_at,
@@ -319,26 +366,35 @@ fn render_default_tooltip(input: &RenderInput) -> String {
         input.pace_tolerance,
     );
 
-    let session_bar = if input.tooltip_pace_pts {
-        pango::progress_bar(
-            snap.session.utilization_pct,
-            session_color,
-            theme,
-            Some(session_pacing.elapsed_pct),
-        )
-    } else {
-        pango::progress_bar(snap.session.utilization_pct, session_color, theme, None)
-    };
-    let weekly_bar = if input.tooltip_pace_pts {
-        pango::progress_bar(
-            snap.weekly.utilization_pct,
-            weekly_color,
-            theme,
-            Some(weekly_pacing.elapsed_pct),
-        )
-    } else {
-        pango::progress_bar(snap.weekly.utilization_pct, weekly_color, theme, None)
-    };
+    // Meta marker + pace-delta fill, on by default whenever the window has a
+    // known reset. The fill color also colors the "NN%" label so number and bar
+    // read as one signal.
+    let (session_color, session_marker) = window_bar(
+        snap.session.utilization_pct,
+        &session_pacing,
+        snap.session.resets_at.is_some(),
+        input.pace_tolerance,
+        theme,
+    );
+    let (weekly_color, weekly_marker) = window_bar(
+        snap.weekly.utilization_pct,
+        &weekly_pacing,
+        snap.weekly.resets_at.is_some(),
+        input.pace_tolerance,
+        theme,
+    );
+    let session_bar = pango::progress_bar(
+        snap.session.utilization_pct,
+        session_color,
+        theme,
+        session_marker,
+    );
+    let weekly_bar = pango::progress_bar(
+        snap.weekly.utilization_pct,
+        weekly_color,
+        theme,
+        weekly_marker,
+    );
 
     let session_pace_glyph = pick_pace_glyph(input.tooltip_pace_pts, &session_pacing);
     let weekly_pace_glyph = pick_pace_glyph(input.tooltip_pace_pts, &weekly_pacing);
@@ -384,7 +440,6 @@ fn render_default_tooltip(input: &RenderInput) -> String {
     )));
 
     if let Some(sw) = snap.sonnet.as_ref() {
-        let sonnet_color = pango::severity_color(severity_for(sw.utilization_pct), theme);
         let sonnet_pacing = pacing::calc(
             sw.utilization_pct,
             sw.resets_at,
@@ -392,16 +447,15 @@ fn render_default_tooltip(input: &RenderInput) -> String {
             sw.window_duration,
             input.pace_tolerance,
         );
-        let sonnet_bar = if input.tooltip_pace_pts {
-            pango::progress_bar(
-                sw.utilization_pct,
-                sonnet_color,
-                theme,
-                Some(sonnet_pacing.elapsed_pct),
-            )
-        } else {
-            pango::progress_bar(sw.utilization_pct, sonnet_color, theme, None)
-        };
+        let (sonnet_color, sonnet_marker) = window_bar(
+            sw.utilization_pct,
+            &sonnet_pacing,
+            sw.resets_at.is_some(),
+            input.pace_tolerance,
+            theme,
+        );
+        let sonnet_bar =
+            pango::progress_bar(sw.utilization_pct, sonnet_color, theme, sonnet_marker);
         lines.push(Line::Body("".into()));
         lines.push(Line::Body(format!(
             " <span foreground='{fg}'>  󱤔  Sonnet only</span>"
@@ -710,6 +764,61 @@ mod tests {
         let out = render_anthropic(&inp);
         // Wrapper color should be the foreground (neutral), not severity.
         assert!(out.text.contains(&theme.fg));
+    }
+
+    #[test]
+    fn tooltip_marker_and_pace_fill_are_default_on() {
+        // Session is 62% used with ~70% of the window elapsed → UNDER pace, so
+        // the fill is green even though 62% absolute usage was "mid" (yellow)
+        // before. The blue meta marker cell is present without any flag.
+        let oc = sample_outcome();
+        let theme = Theme::default();
+        let out = render_anthropic(&input(&oc, &theme)); // tooltip_pace_pts = false
+        // A blue thin-line marker (`│` in marker color) sits on the bar.
+        assert!(
+            out.tooltip
+                .contains(&format!("foreground='{}'>│</span>", theme.marker))
+        );
+        // Under-pace fill is green, not absolute-usage yellow.
+        assert!(
+            out.tooltip
+                .contains(&format!("foreground='{}'>█", theme.green))
+        );
+        assert!(
+            !out.tooltip
+                .contains(&format!("foreground='{}'>█", theme.yellow))
+        );
+    }
+
+    #[test]
+    fn tooltip_over_pace_window_fills_red() {
+        // 95% used with ~70% elapsed → delta 25 > tolerance → red fill.
+        let mut oc = sample_outcome();
+        oc.snapshot.session.utilization_pct = 95;
+        let theme = Theme::default();
+        let out = render_anthropic(&input(&oc, &theme));
+        assert!(
+            out.tooltip
+                .contains(&format!("foreground='{}'>█", theme.red))
+        );
+    }
+
+    #[test]
+    fn no_reset_window_has_no_marker_and_absolute_color() {
+        // Without a reset there is no meta: the elapsed placeholder is empty
+        // (the desktop "no marker" signal) and the bar keeps its absolute-usage
+        // color with no marker cell.
+        let mut oc = sample_outcome();
+        oc.snapshot.session.resets_at = None;
+        oc.snapshot.session.utilization_pct = 80; // absolute "high" → orange
+        let theme = Theme::default();
+        let values = build_placeholders(&input(&oc, &theme));
+        assert_eq!(values.get("session_elapsed").map(String::as_str), Some(""));
+        // No blue marker line in the bar; absolute-usage orange fill.
+        assert!(
+            !values["session_bar"].contains(&format!("foreground='{}'>│</span>", theme.marker))
+        );
+        assert!(values["session_bar"].contains(&format!("foreground='{}'>█", theme.orange)));
     }
 
     #[test]

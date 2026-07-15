@@ -26,6 +26,8 @@ public sealed class PanelForm : Form
     private const int BarHeight = 8;
     private const int PctColumn = 52;    // reserved width for the "NN%" text
     private const int SectionGap = 16;
+    private const int MarkerW = 2;       // width of the meta (pace) marker tick
+    private const int PaceTol = 5;       // pace tolerance band (matches binary default)
 
     // Resolved once: a Nerd Font family if installed, else null (text fallback).
     private static readonly string? GlyphFont = ResolveGlyphFont();
@@ -166,7 +168,11 @@ public sealed class PanelForm : Form
         // Label row (glyph + name).
         DrawGlyphText(g, row.Glyph, "  " + row.Label, labelFont, fgBrush, x, y);
 
-        var barColor = IconFactory.ColorFor(SeverityForPct(row.Percent));
+        // With a known meta, color the fill by pace delta; otherwise by
+        // absolute usage.
+        var barColor = row.Elapsed is double elapsedPct
+            ? IconFactory.ColorFor(SeverityForDelta(row.Percent - elapsedPct))
+            : IconFactory.ColorFor(SeverityForPct(row.Percent));
 
         int barY = y + 24;
         int barW = Width - 2 * Pad - PctColumn;
@@ -184,6 +190,17 @@ public sealed class PanelForm : Form
             using var fpath = RoundedRect(fillRect, BarHeight / 2);
             using var fbrush = new SolidBrush(barColor);
             g.FillPath(fbrush, fpath);
+        }
+
+        // Meta marker: a blue vertical tick at the elapsed-time position, drawn
+        // over the fill so it reads as the pace reference line.
+        if (row.Elapsed is double meta)
+        {
+            double clamped = Math.Clamp(meta, 0, 100);
+            int mx = x + (int)Math.Round(barW * clamped / 100.0);
+            mx = Math.Clamp(mx, x, x + barW - MarkerW);
+            using var mbrush = new SolidBrush(Accent);
+            g.FillRectangle(mbrush, mx, barY - 1, MarkerW, BarHeight + 2);
         }
 
         // % text, vertically centered on the bar, right-aligned in its column.
@@ -237,6 +254,15 @@ public sealed class PanelForm : Form
         >= 75 => Severity.High,
         >= 50 => Severity.Mid,
         _ => Severity.Low,
+    };
+
+    // pace_fill_severity(delta) from src/pacing.rs: <=0 green, <=tol amber (High),
+    // else red. Colors the bar by how far usage runs ahead of the elapsed meta.
+    private static Severity SeverityForDelta(double delta) => delta switch
+    {
+        <= 0 => Severity.Low,
+        <= PaceTol => Severity.High,
+        _ => Severity.Critical,
     };
 
     /// <summary>Build a rounded-rectangle path.</summary>

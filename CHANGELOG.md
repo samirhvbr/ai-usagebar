@@ -9,7 +9,34 @@ Each release is also published at
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+- **Meta marker (pace line) on every usage bar.** Each time-windowed bar now
+  draws a blue reference line at the *meta* — the fraction of the window that
+  has already elapsed — so a glance tells you whether you're ahead of or behind
+  the pace of your quota, without doing the math. The line is on by default
+  across every surface: the Waybar tooltip and `{*_bar}` placeholders, the TUI
+  gauges, the GNOME extension, the macOS menu-bar app, and the Windows tray.
+
+### Changed
+
+- **Usage bars are now colored by pace, not by absolute fill.** A bar is green
+  when usage is at or under the meta, amber when it's ahead by up to
+  `--pace-tolerance` points, and red when it's over pace — replacing the old
+  "how full is it" coloring. Windows without a known reset ($ Extra usage,
+  credit balances, count-only quotas) keep the absolute-usage color and draw no
+  marker. The `--tooltip-pace-pts` flag no longer gates the marker (which is
+  always drawn); it now only selects the point vs ratio pace glyph.
+- The default `marker` theme color is now blue (`#61afef`) instead of amber, so
+  the meta line stays distinct from the amber over-pace fill; under an Omarchy
+  theme the marker follows the accent color.
+
+### Added (placeholders)
+
+- `{session_elapsed}` / `{weekly_elapsed}` cross-vendor aliases and
+  `{zai_*_elapsed}` are now exposed by the OpenAI and Z.AI renderers (Anthropic
+  already had `{*_elapsed}`); they carry the meta position (or empty when the
+  window has no reset), which the desktop surfaces use to place the marker.
 
 ## [0.7.1] — 2026-06-08
 

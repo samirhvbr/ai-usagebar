@@ -58,6 +58,18 @@ pub struct Pacing {
 }
 
 impl Pacing {
+    /// The `{*_elapsed}` field value: the integer meta position when the window
+    /// has a known reset, or an empty string when it doesn't. Desktop surfaces
+    /// (GNOME/macOS/Windows) key off "is this a number?" to decide whether to
+    /// draw the meta marker at all.
+    pub fn elapsed_field(&self, has_reset: bool) -> String {
+        if has_reset {
+            self.elapsed_pct.to_string()
+        } else {
+            String::new()
+        }
+    }
+
     /// Neutral pacing for windows with no `resets_at` (e.g. vendors that don't
     /// expose one). Matches claudebar's early-return value.
     pub fn neutral() -> Self {
@@ -159,6 +171,48 @@ pub fn pace_severity(delta: i32) -> PaceSeverity {
     } else {
         PaceSeverity::Low
     }
+}
+
+/// Fill severity for the **pace-marker** feature (the `.continue`
+/// "marcador de meta" spec). Colors a usage bar by how far consumption runs
+/// *ahead of the meta* — the fraction of the window that has already elapsed —
+/// using the user-tunable `--pace-tolerance` band:
+///
+/// - `delta <= 0` → Low (green): at or under the meta; breathing room.
+/// - `0 < delta <= tolerance` → High (amber): slightly ahead; attention.
+/// - `delta > tolerance` → Critical (red): over pace; will overrun the reset.
+///
+/// Deliberately distinct from [`pace_severity`], whose fixed ±10 bands drive
+/// the legacy `{*_pace}` *color* placeholders. The marker fill tracks the
+/// user's tolerance so the amber band widens/narrows with their setting.
+pub fn pace_fill_severity(delta: i32, tolerance: u32) -> PaceSeverity {
+    let tol = tolerance as i32;
+    if delta <= 0 {
+        PaceSeverity::Low
+    } else if delta <= tol {
+        PaceSeverity::High
+    } else {
+        PaceSeverity::Critical
+    }
+}
+
+/// Below this elapsed fraction (percent), a linear reset projection divides by
+/// a tiny number and swings wildly, so callers should suppress or soften it.
+/// Mirrors the spec's "janela recém-iniciada" caveat (~15%).
+pub const MIN_PROJECTION_ELAPSED: i32 = 15;
+
+/// Linear extrapolation of end-of-window usage at the current pace:
+/// `usage_pct / elapsed_frac`, i.e. `usage_pct * 100 / elapsed_pct`.
+///
+/// Returns `None` when too little of the window has elapsed for a stable
+/// estimate (`elapsed_pct < MIN_PROJECTION_ELAPSED`), which also guards the
+/// divide-by-zero at the window's start. A value `> 100` means "at this pace
+/// the quota runs out before the window resets".
+pub fn projection_pct(usage_pct: i32, elapsed_pct: i32) -> Option<i32> {
+    if elapsed_pct < MIN_PROJECTION_ELAPSED {
+        return None;
+    }
+    Some((usage_pct * 100) / elapsed_pct)
 }
 
 #[cfg(test)]
@@ -289,6 +343,39 @@ mod tests {
         assert_eq!(pace_severity(9), PaceSeverity::High);
         assert_eq!(pace_severity(10), PaceSeverity::Critical);
         assert_eq!(pace_severity(100), PaceSeverity::Critical);
+    }
+
+    #[test]
+    fn pace_fill_severity_maps_delta_to_three_tiers() {
+        // delta <= 0 → green (at/under the meta).
+        assert_eq!(pace_fill_severity(-50, 5), PaceSeverity::Low);
+        assert_eq!(pace_fill_severity(0, 5), PaceSeverity::Low);
+        // 0 < delta <= tolerance → amber (attention).
+        assert_eq!(pace_fill_severity(1, 5), PaceSeverity::High);
+        assert_eq!(pace_fill_severity(5, 5), PaceSeverity::High);
+        // delta > tolerance → red (over pace).
+        assert_eq!(pace_fill_severity(6, 5), PaceSeverity::Critical);
+        assert_eq!(pace_fill_severity(80, 5), PaceSeverity::Critical);
+    }
+
+    #[test]
+    fn pace_fill_severity_amber_band_tracks_tolerance() {
+        // A wider tolerance keeps a larger over-pace delta in the amber band.
+        assert_eq!(pace_fill_severity(10, 5), PaceSeverity::Critical);
+        assert_eq!(pace_fill_severity(10, 15), PaceSeverity::High);
+        // Zero tolerance: any positive delta is immediately red.
+        assert_eq!(pace_fill_severity(1, 0), PaceSeverity::Critical);
+        assert_eq!(pace_fill_severity(0, 0), PaceSeverity::Low);
+    }
+
+    #[test]
+    fn projection_suppressed_until_enough_time_elapsed() {
+        // Below the stability floor → None (avoids divide-by-tiny + zero).
+        assert_eq!(projection_pct(10, 0), None);
+        assert_eq!(projection_pct(10, MIN_PROJECTION_ELAPSED - 1), None);
+        // At/above the floor → linear extrapolation.
+        assert_eq!(projection_pct(10, 50), Some(20)); // 10% used at 50% elapsed → ~20%
+        assert_eq!(projection_pct(35, 16), Some(218)); // over pace → projects to overrun
     }
 
     #[test]

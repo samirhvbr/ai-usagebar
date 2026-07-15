@@ -72,10 +72,18 @@ pub fn build_placeholders(
             "session_reset",
             countdown::format(snap.session.resets_at, now),
         ),
+        (
+            "session_elapsed",
+            session_p.elapsed_field(snap.session.resets_at.is_some()),
+        ),
         ("weekly_pct", snap.weekly.utilization_pct.to_string()),
         (
             "weekly_reset",
             countdown::format(snap.weekly.resets_at, now),
+        ),
+        (
+            "weekly_elapsed",
+            weekly_p.elapsed_field(snap.weekly.resets_at.is_some()),
         ),
         ("plan", snap.plan.clone()),
         ("oai_plan", snap.plan.clone()),
@@ -147,7 +155,7 @@ pub fn render(
     let tooltip = if let Some(fmt) = opts.tooltip_format.as_deref() {
         substitute(fmt, &values)
     } else {
-        render_tooltip(outcome, snap, theme, now)
+        render_tooltip(outcome, snap, theme, opts.pace_tolerance, now)
     };
 
     WaybarOutput {
@@ -161,6 +169,7 @@ fn render_tooltip(
     outcome: &VendorOutcome,
     snap: &OpenAiSnapshot,
     theme: &Theme,
+    tol: u32,
     now: DateTime<Utc>,
 ) -> String {
     let blue = &theme.blue;
@@ -175,13 +184,20 @@ fn render_tooltip(
     lines.push(TooltipLine::Sep);
     lines.push(TooltipLine::Body("".into()));
 
-    push_window(&mut lines, "  󰔟  Codex 5h", &snap.session, theme, now);
+    push_window(&mut lines, "  󰔟  Codex 5h", &snap.session, theme, tol, now);
     lines.push(TooltipLine::Body("".into()));
-    push_window(&mut lines, "  󰃰  Codex weekly", &snap.weekly, theme, now);
+    push_window(
+        &mut lines,
+        "  󰃰  Codex weekly",
+        &snap.weekly,
+        theme,
+        tol,
+        now,
+    );
 
     if let Some(cr) = snap.code_review.as_ref() {
         lines.push(TooltipLine::Body("".into()));
-        push_window(&mut lines, "  󱦰  Code review (weekly)", cr, theme, now);
+        push_window(&mut lines, "  󱦰  Code review (weekly)", cr, theme, tol, now);
     }
 
     if let Some(c) = snap.credits.as_ref() {
@@ -256,10 +272,13 @@ fn push_window(
     label: &str,
     w: &crate::usage::UsageWindow,
     theme: &Theme,
+    tol: u32,
     now: DateTime<Utc>,
 ) {
-    let color = severity_color(severity_for(w.utilization_pct), theme);
-    let bar = pango::progress_bar(w.utilization_pct, color, theme, None);
+    let p = pacing::calc(w.utilization_pct, w.resets_at, now, w.window_duration, tol);
+    let (color, marker) =
+        pango::meta_bar_style(w.utilization_pct, &p, w.resets_at.is_some(), tol, theme);
+    let bar = pango::progress_bar(w.utilization_pct, color, theme, marker);
     let fg = &theme.fg;
     let dim = &theme.dim;
     lines.push(TooltipLine::Body(format!(

@@ -9,7 +9,7 @@
 //! Helpers also include the bordered tooltip frame builder
 //! ([`render_bordered_box`]), used by the default tooltip layout.
 
-use crate::pacing::PaceSeverity;
+use crate::pacing::{self, PaceSeverity};
 use crate::theme::Theme;
 
 /// Width of the progress bar in characters. Matches `BAR_LEN=20` (claudebar:169).
@@ -17,6 +17,9 @@ pub const BAR_LEN: u32 = 20;
 
 const FILLED: char = '█';
 const EMPTY: char = '░';
+/// The meta marker is a thin vertical line (not a full block) so it reads as a
+/// reference line laid *over* the bar rather than as filled usage.
+const MARKER: char = '│';
 
 /// Wrap `text` in a Pango `<span foreground='COLOR'>…</span>`.
 ///
@@ -56,6 +59,28 @@ pub fn severity_color(sev: PaceSeverity, theme: &Theme) -> &str {
         PaceSeverity::Mid => &theme.yellow,
         PaceSeverity::High => &theme.orange,
         PaceSeverity::Critical => &theme.red,
+    }
+}
+
+/// Fill color + optional meta marker for a usage window — the shared bar style
+/// used by every Rust surface (Waybar tooltip + per-vendor tooltips).
+///
+/// When the window has a known reset the fill is colored by pace *delta*
+/// (green under the meta, amber slightly ahead, red over pace) and a marker is
+/// placed at the elapsed-time position (`Some(elapsed_pct)`). Without a reset
+/// there is no meta, so it falls back to absolute-usage color and no marker.
+pub fn meta_bar_style<'a>(
+    pct: i32,
+    p: &pacing::Pacing,
+    has_reset: bool,
+    tolerance: u32,
+    theme: &'a Theme,
+) -> (&'a str, Option<i32>) {
+    if has_reset {
+        let sev = pacing::pace_fill_severity(p.delta, tolerance);
+        (severity_color(sev, theme), Some(p.elapsed_pct))
+    } else {
+        (severity_color(severity_for(pct), theme), None)
     }
 }
 
@@ -108,10 +133,10 @@ pub fn progress_bar(pct: i32, fill_color: &str, theme: &Theme, marker_pct: Optio
         theme.bar_empty,
         repeat_char(EMPTY, pre_e)
     ));
-    // Marker (single filled cell in marker color).
+    // Marker (single thin vertical line in marker color).
     out.push_str(&format!(
         "<span foreground='{}'>{}</span>",
-        theme.marker, FILLED
+        theme.marker, MARKER
     ));
     // Post-marker segment: filled run, then empties to fill the bar.
     out.push_str(&format!(
@@ -233,8 +258,9 @@ mod tests {
         // everything to the left of the marker; the marker is the last cell.
         let b = progress_bar(100, "#ff0000", &theme(), Some(100));
         assert_eq!(visible_width(&b), BAR_LEN as usize);
-        // Filled cells before marker = 19, marker = 1, nothing after.
-        assert_eq!(b.matches('█').count(), BAR_LEN as usize);
+        // Filled cells before marker = 19, thin marker `│` = 1, nothing after.
+        assert_eq!(b.matches('█').count(), (BAR_LEN - 1) as usize);
+        assert_eq!(b.matches('│').count(), 1);
         assert_eq!(b.matches('░').count(), 0);
     }
 

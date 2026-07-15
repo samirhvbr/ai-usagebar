@@ -42,6 +42,10 @@ pub enum Section {
         severity: PaceSeverity,
         value_label: String,
         footnote: String,
+        /// Meta marker position (0..=100) — the fraction of the window that has
+        /// elapsed. `Some` draws a vertical tick on the gauge at that column;
+        /// `None` (no known reset, e.g. $-budget or count windows) draws none.
+        marker_pct: Option<u16>,
     },
     /// Free-form key/value text line.
     Text { label: String, value: String },
@@ -144,6 +148,8 @@ fn anthropic_sections(
             severity: severity_for(pct as i32),
             value_label: format!("{} of {}", e.spent.fmt_dollars(), e.limit.fmt_dollars()),
             footnote: format!("{}% of monthly limit consumed", pct),
+            // $-budget, no time window → no meta marker (spec).
+            marker_pct: None,
         });
     }
     v
@@ -267,6 +273,9 @@ fn push_shvia_window(
                 remaining,
                 reset_text
             ),
+            // ShvIA windows track a count/limit with no window duration to pace
+            // against → no meta marker.
+            marker_pct: None,
         });
     }
 }
@@ -300,6 +309,8 @@ fn openrouter_sections(s: &crate::usage::OpenRouterSnapshot) -> Vec<Section> {
             "${:.2} of ${:.2} used ({pct}%)",
             s.total_usage, s.total_credits
         ),
+        // Credit balance is not time-windowed → no meta marker.
+        marker_pct: None,
     });
     v.push(Section::Spacer);
     v.push(Section::Block {
@@ -375,11 +386,29 @@ fn push_window(
 ) {
     let pct = w.utilization_pct.clamp(0, 100) as u16;
     let reset_text = countdown::format(w.resets_at, now);
-    let footnote = if show_pacing {
-        let p = pacing::calc(w.utilization_pct, w.resets_at, now, w.window_duration, tol);
+    let has_reset = w.resets_at.is_some();
+    let p = pacing::calc(w.utilization_pct, w.resets_at, now, w.window_duration, tol);
+
+    // With a known reset, color the gauge by pace delta and mark the meta
+    // (elapsed-time) position; otherwise fall back to absolute-usage color.
+    let (severity, marker_pct) = if has_reset {
+        (
+            pacing::pace_fill_severity(p.delta, tol),
+            Some(p.elapsed_pct.clamp(0, 100) as u16),
+        )
+    } else {
+        (severity_for(pct as i32), None)
+    };
+
+    let footnote = if show_pacing && has_reset {
+        // Soften the linear projection early in the window (spec caveat).
+        let projection = match pacing::projection_pct(w.utilization_pct, p.elapsed_pct) {
+            Some(proj) => format!(" · ~{proj}% at reset"),
+            None => String::new(),
+        };
         format!(
-            "Resets in {} · {}% elapsed · {}",
-            reset_text, p.elapsed_pct, p.point_label
+            "Resets in {} · {}% elapsed · {}{}",
+            reset_text, p.elapsed_pct, p.point_label, projection
         )
     } else {
         format!("Resets in {}", reset_text)
@@ -388,9 +417,10 @@ fn push_window(
     sections.push(Section::Metric {
         label: label.into(),
         pct,
-        severity: severity_for(pct as i32),
+        severity,
         value_label: format!("{pct}%"),
         footnote,
+        marker_pct,
     });
 }
 
@@ -477,6 +507,7 @@ fn render_section(f: &mut Frame, area: Rect, theme: &Theme, bubble: &BubbleTheme
             severity,
             value_label,
             footnote,
+            marker_pct,
         } => render_metric(
             f,
             area,
@@ -487,6 +518,7 @@ fn render_section(f: &mut Frame, area: Rect, theme: &Theme, bubble: &BubbleTheme
             *severity,
             value_label,
             footnote,
+            *marker_pct,
         ),
         Section::Text { label, value } => {
             if label.is_empty() && value.contains("Loading") {
@@ -554,6 +586,7 @@ fn render_metric(
     severity: PaceSeverity,
     value_label: &str,
     footnote: &str,
+    marker_pct: Option<u16>,
 ) {
     let bar_color = severity_color(theme, bubble, severity);
     let bar_empty = color(&theme.bar_empty).unwrap_or(bubble.palette.selected_background);
@@ -594,6 +627,21 @@ fn render_metric(
         .theme(progress_theme)
         .show_percentage(false);
     f.render_widget(&progress, gauge_area);
+
+    // Overlay the meta marker: a vertical tick at the elapsed-time column,
+    // drawn after the gauge so it sits on top of the fill/track.
+    if let Some(m) = marker_pct
+        && gauge_area.width > 0
+    {
+        let m = m.min(100) as u32;
+        let span = gauge_area.width.saturating_sub(1) as u32;
+        let col = gauge_area.x + (span * m / 100) as u16;
+        let marker_color = color(&theme.marker).unwrap_or(bubble.palette.focused_border);
+        if let Some(cell) = f.buffer_mut().cell_mut((col, gauge_area.y)) {
+            cell.set_symbol("│").set_fg(marker_color);
+        }
+    }
+
     let value = Paragraph::new(Line::from(Span::styled(
         value_label.to_string(),
         Style::default().fg(bar_color).add_modifier(Modifier::BOLD),
@@ -734,6 +782,41 @@ mod tests {
             .filter(|s| matches!(s, Section::Metric { .. }))
             .count();
         assert_eq!(metric_count, 4);
+    }
+
+    #[test]
+    fn time_windows_get_meta_marker_dollar_budget_does_not() {
+        let snap = AnthropicSnapshot {
+            plan: "Max 20x".into(),
+            session: UsageWindow {
+                utilization_pct: 60,
+                resets_at: Some(now() + chrono::Duration::hours(1)),
+                window_duration: chrono::Duration::hours(5),
+            },
+            weekly: UsageWindow {
+                utilization_pct: 30,
+                resets_at: Some(now() + chrono::Duration::days(3)),
+                window_duration: chrono::Duration::days(7),
+            },
+            sonnet: None,
+            extra: Some(ExtraUsage {
+                limit: Cents(5000),
+                spent: Cents(250),
+            }),
+        };
+        let sections = sections_for(&ready(VendorSnapshot::Anthropic(snap)), now(), 5);
+        for s in &sections {
+            if let Section::Metric {
+                label, marker_pct, ..
+            } = s
+            {
+                if label == "Extra usage" {
+                    assert!(marker_pct.is_none(), "extra ($) must have no meta marker");
+                } else {
+                    assert!(marker_pct.is_some(), "{label} must carry a meta marker");
+                }
+            }
+        }
     }
 
     #[test]

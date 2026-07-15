@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 
 use crate::countdown;
 use crate::format::{placeholders, substitute, updated_at_hm};
-use crate::pacing::PaceSeverity;
+use crate::pacing::{self, PaceSeverity};
 use crate::pango::{self, color_span, escape, severity_color, severity_for};
 use crate::theme::Theme;
 use crate::tooltip::{Line as TooltipLine, render_bordered};
@@ -18,7 +18,11 @@ use super::fetch::FetchOutcome;
 
 pub const DEFAULT_FORMAT: &str = "{zai_session_pct}% · {zai_session_reset}";
 
-pub fn build_placeholders(snap: &ZaiSnapshot, now: DateTime<Utc>) -> HashMap<&'static str, String> {
+pub fn build_placeholders(
+    snap: &ZaiSnapshot,
+    tol: u32,
+    now: DateTime<Utc>,
+) -> HashMap<&'static str, String> {
     let session_pct = snap
         .session
         .as_ref()
@@ -26,6 +30,9 @@ pub fn build_placeholders(snap: &ZaiSnapshot, now: DateTime<Utc>) -> HashMap<&'s
         .unwrap_or(0);
     let weekly_pct = snap.weekly.as_ref().map(|w| w.utilization_pct).unwrap_or(0);
     let mcp_pct = snap.mcp.as_ref().map(|w| w.utilization_pct).unwrap_or(0);
+    let session_elapsed = window_elapsed(&snap.session, tol, now);
+    let weekly_elapsed = window_elapsed(&snap.weekly, tol, now);
+    let mcp_elapsed = window_elapsed(&snap.mcp, tol, now);
     placeholders(vec![
         ("icon", "󰚩".to_string()),
         ("vendor_short", "zai".to_string()),
@@ -35,11 +42,13 @@ pub fn build_placeholders(snap: &ZaiSnapshot, now: DateTime<Utc>) -> HashMap<&'s
             "session_reset",
             countdown::format(window_reset(&snap.session), now),
         ),
+        ("session_elapsed", session_elapsed.clone()),
         ("weekly_pct", weekly_pct.to_string()),
         (
             "weekly_reset",
             countdown::format(window_reset(&snap.weekly), now),
         ),
+        ("weekly_elapsed", weekly_elapsed.clone()),
         ("plan", snap.plan.clone()),
         ("zai_plan", snap.plan.clone()),
         ("zai_session_pct", session_pct.to_string()),
@@ -47,21 +56,36 @@ pub fn build_placeholders(snap: &ZaiSnapshot, now: DateTime<Utc>) -> HashMap<&'s
             "zai_session_reset",
             countdown::format(window_reset(&snap.session), now),
         ),
+        ("zai_session_elapsed", session_elapsed),
         ("zai_weekly_pct", weekly_pct.to_string()),
         (
             "zai_weekly_reset",
             countdown::format(window_reset(&snap.weekly), now),
         ),
+        ("zai_weekly_elapsed", weekly_elapsed),
         ("zai_mcp_pct", mcp_pct.to_string()),
         (
             "zai_mcp_reset",
             countdown::format(window_reset(&snap.mcp), now),
         ),
+        ("zai_mcp_elapsed", mcp_elapsed),
     ])
 }
 
 fn window_reset(w: &Option<UsageWindow>) -> Option<DateTime<Utc>> {
     w.as_ref().and_then(|w| w.resets_at)
+}
+
+/// The `{*_elapsed}` meta field for an optional window: empty when the window
+/// or its reset is absent, else the elapsed-time percentage.
+fn window_elapsed(w: &Option<UsageWindow>, tol: u32, now: DateTime<Utc>) -> String {
+    match w {
+        Some(w) => {
+            let p = pacing::calc(w.utilization_pct, w.resets_at, now, w.window_duration, tol);
+            p.elapsed_field(w.resets_at.is_some())
+        }
+        None => String::new(),
+    }
 }
 
 pub fn severity(snap: &ZaiSnapshot) -> PaceSeverity {
@@ -87,7 +111,7 @@ pub fn render(
         .format
         .clone()
         .unwrap_or_else(|| DEFAULT_FORMAT.to_string());
-    let values = build_placeholders(snap, now);
+    let values = build_placeholders(snap, opts.pace_tolerance, now);
 
     let mut text = substitute(&format, &values);
     if outcome.stale {
@@ -103,7 +127,7 @@ pub fn render(
     let tooltip = if let Some(fmt) = opts.tooltip_format.as_deref() {
         substitute(fmt, &values)
     } else {
-        render_tooltip(outcome, snap, theme, now)
+        render_tooltip(outcome, snap, theme, opts.pace_tolerance, now)
     };
 
     WaybarOutput {
@@ -117,6 +141,7 @@ fn render_tooltip(
     outcome: &VendorOutcome,
     snap: &ZaiSnapshot,
     theme: &Theme,
+    tol: u32,
     now: DateTime<Utc>,
 ) -> String {
     let blue = &theme.blue;
@@ -130,18 +155,18 @@ fn render_tooltip(
     lines.push(TooltipLine::Body("".into()));
 
     if let Some(w) = snap.session.as_ref() {
-        push_window(&mut lines, "  󰔟  Session (5h)", w, theme, now);
+        push_window(&mut lines, "  󰔟  Session (5h)", w, theme, tol, now);
     }
     if let Some(w) = snap.weekly.as_ref() {
         if snap.session.is_some() {
             lines.push(TooltipLine::Body("".into()));
         }
-        push_window(&mut lines, "  󰃰  Weekly", w, theme, now);
+        push_window(&mut lines, "  󰃰  Weekly", w, theme, tol, now);
     }
     if let Some(w) = snap.mcp.as_ref() {
         lines.push(TooltipLine::Body("".into()));
         lines.push(TooltipLine::Sep);
-        push_window(&mut lines, "  󰓹  MCP tools (monthly)", w, theme, now);
+        push_window(&mut lines, "  󰓹  MCP tools (monthly)", w, theme, tol, now);
     }
     if snap.session.is_none() && snap.weekly.is_none() && snap.mcp.is_none() {
         lines.push(TooltipLine::Body(format!(
@@ -183,10 +208,13 @@ fn push_window(
     label: &str,
     w: &UsageWindow,
     theme: &Theme,
+    tol: u32,
     now: DateTime<Utc>,
 ) {
-    let color = severity_color(severity_for(w.utilization_pct), theme);
-    let bar = pango::progress_bar(w.utilization_pct, color, theme, None);
+    let p = pacing::calc(w.utilization_pct, w.resets_at, now, w.window_duration, tol);
+    let (color, marker) =
+        pango::meta_bar_style(w.utilization_pct, &p, w.resets_at.is_some(), tol, theme);
+    let bar = pango::progress_bar(w.utilization_pct, color, theme, marker);
     let fg = &theme.fg;
     let dim = &theme.dim;
     lines.push(TooltipLine::Body(format!(

@@ -28,16 +28,21 @@ public static class VendorFormat
     private static readonly Regex PangoTag = new("<[^>]*>", RegexOptions.Compiled);
 
     /// <summary>The `--format` string to pass for a given vendor.</summary>
+    // The `*_elapsed` meta positions are appended AFTER each vendor's existing
+    // fields so the leading indices stay stable. An empty/non-numeric value
+    // (old binary, or a window with no reset) means "no meta marker".
     public static string FormatFor(string vendor) => vendor.ToLowerInvariant() switch
     {
         "openai" => Join(
             "{oai_plan}", "{oai_session_pct}", "{oai_session_reset}",
             "{oai_weekly_pct}", "{oai_weekly_reset}",
-            "{oai_code_review_pct}", "{oai_credit_balance}"),
+            "{oai_code_review_pct}", "{oai_credit_balance}",
+            "{oai_session_elapsed}", "{oai_weekly_elapsed}"),
         "zai" => Join(
             "{zai_plan}", "{zai_session_pct}", "{zai_session_reset}",
             "{zai_weekly_pct}", "{zai_weekly_reset}",
-            "{zai_mcp_pct}", "{zai_mcp_reset}"),
+            "{zai_mcp_pct}", "{zai_mcp_reset}",
+            "{zai_session_elapsed}", "{zai_weekly_elapsed}", "{zai_mcp_elapsed}"),
         "openrouter" => Join(
             "{or_label}", "{or_balance}", "{or_consumed_pct}",
             "{or_used_today}", "{or_used_week}", "{or_used_month}"),
@@ -46,7 +51,8 @@ public static class VendorFormat
         // anthropic (default)
         _ => Join(
             "{plan}", "{session_pct}", "{session_reset}",
-            "{weekly_pct}", "{weekly_reset}", "{sonnet_pct}"),
+            "{weekly_pct}", "{weekly_reset}", "{sonnet_pct}",
+            "{session_elapsed}", "{weekly_elapsed}", "{sonnet_elapsed}"),
     };
 
     private static string Join(params string[] parts) => string.Join(Sep, parts);
@@ -102,20 +108,20 @@ public static class VendorFormat
     private static UsageSnapshot ParseAnthropic(string vendor, Severity sev, Func<int, string> f)
     {
         var rows = new List<UsageRow>();
-        AddPct(rows, GClock, "Session", f(1), f(2));
-        AddPct(rows, GCalendar, "Weekly", f(3), f(4));
+        AddPct(rows, GClock, "Session", f(1), f(2), f(6));
+        AddPct(rows, GCalendar, "Weekly", f(3), f(4), f(7));
         // Sonnet only shows when there's actual usage (it's an Anthropic-only,
         // often-zero window).
         if (ParsePct(f(5)) > 0)
-            AddPct(rows, GLayers, "Sonnet", f(5), "");
+            AddPct(rows, GLayers, "Sonnet", f(5), "", f(8));
         return new UsageSnapshot { Vendor = vendor, Severity = sev, Title = f(0), Rows = rows };
     }
 
     private static UsageSnapshot ParseOpenAi(string vendor, Severity sev, Func<int, string> f)
     {
         var rows = new List<UsageRow>();
-        AddPct(rows, GClock, "Session", f(1), f(2));
-        AddPct(rows, GCalendar, "Weekly", f(3), f(4));
+        AddPct(rows, GClock, "Session", f(1), f(2), f(7));
+        AddPct(rows, GCalendar, "Weekly", f(3), f(4), f(8));
         if (ParsePct(f(5)) > 0)
             AddPct(rows, GReview, "Code review", f(5), "");
 
@@ -135,9 +141,9 @@ public static class VendorFormat
     private static UsageSnapshot ParseZai(string vendor, Severity sev, Func<int, string> f)
     {
         var rows = new List<UsageRow>();
-        AddPct(rows, GClock, "Session", f(1), f(2));
-        AddPct(rows, GCalendar, "Weekly", f(3), f(4));
-        AddPct(rows, GTools, "MCP tools", f(5), f(6));
+        AddPct(rows, GClock, "Session", f(1), f(2), f(7));
+        AddPct(rows, GCalendar, "Weekly", f(3), f(4), f(8));
+        AddPct(rows, GTools, "MCP tools", f(5), f(6), f(9));
         return new UsageSnapshot { Vendor = vendor, Severity = sev, Title = f(0), Rows = rows };
     }
 
@@ -176,16 +182,27 @@ public static class VendorFormat
         return new UsageSnapshot { Vendor = vendor, Severity = sev, Title = "DeepSeek", Details = details };
     }
 
-    private static void AddPct(List<UsageRow> rows, string glyph, string label, string pct, string reset)
+    private static void AddPct(
+        List<UsageRow> rows, string glyph, string label, string pct, string reset, string elapsed = "")
     {
         if (string.IsNullOrWhiteSpace(pct)) return;
-        rows.Add(new UsageRow(glyph, label, ParsePct(pct), reset));
+        rows.Add(new UsageRow(glyph, label, ParsePct(pct), reset, ParseElapsed(elapsed)));
     }
 
     private static double ParsePct(string s) =>
         double.TryParse(s, NumberStyles.Float, CultureInfo.InvariantCulture, out var v)
             ? Math.Clamp(v, 0, 100)
             : 0;
+
+    /// <summary>
+    /// The meta (elapsed-time) position 0..100, or null when the field is
+    /// empty/non-numeric — i.e. the window has no time-based meta, so no marker
+    /// is drawn.
+    /// </summary>
+    private static double? ParseElapsed(string s) =>
+        double.TryParse(s, NumberStyles.Float, CultureInfo.InvariantCulture, out var v)
+            ? Math.Clamp(v, 0, 100)
+            : null;
 
     public static string StripPango(string s) =>
         System.Net.WebUtility.HtmlDecode(PangoTag.Replace(s, "")).Trim();

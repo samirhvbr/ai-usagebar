@@ -55,7 +55,8 @@ pub struct Cli {
     pub format_pace_color: bool,
 
     /// Use point-based pacing in the tooltip's pace column (vs ratio-based).
-    /// Also enables an elapsed-position marker on the tooltip progress bars.
+    /// The elapsed-position meta marker is now always drawn on the tooltip
+    /// bars; this flag only selects the point vs ratio pace glyph.
     /// Claudebar `--tooltip-pace-pts`.
     #[arg(long)]
     pub tooltip_pace_pts: bool,
