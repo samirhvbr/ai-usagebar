@@ -2,7 +2,6 @@
 //!
 //! Mirrors claudebar:402-491 — the lock + refresh + fetch state machine.
 
-use std::path::Path;
 use std::time::Duration;
 
 use chrono::Utc;
@@ -17,9 +16,16 @@ use super::types::UsageResponse;
 
 pub const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 pub const USAGE_BETA_HEADER: &str = "oauth-2025-04-20";
+/// The usage endpoint rate-limits hard unless the request carries a Claude Code
+/// `User-Agent`. The exact patch version isn't validated, so a stable recent
+/// `claude-code/<version>` (what the official client sends) is fine.
+pub const USAGE_USER_AGENT: &str = "claude-code/2.1.183";
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 const REFRESH_TIMEOUT: Duration = Duration::from_secs(25);
 const LOCK_TIMEOUT: Duration = Duration::from_secs(45);
+/// After a 429, skip the network for this long instead of retrying every poll —
+/// the endpoint rate-limits on a window, so hammering it keeps it saturated.
+const RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(300);
 
 /// Endpoints (parameterized for tests).
 #[derive(Debug, Clone)]
@@ -55,7 +61,7 @@ pub struct FetchOutcome {
 /// failure. All under a flock so multi-monitor Waybar instances coexist.
 pub async fn fetch_snapshot(
     client: &reqwest::Client,
-    creds_path: &Path,
+    creds_target: &creds::CredsTarget,
     cache: &Cache,
     endpoints: &Endpoints,
     cache_ttl: Duration,
@@ -64,19 +70,38 @@ pub async fn fetch_snapshot(
     let _lock = acquire_lock(&cache.lock_path(), LOCK_TIMEOUT)?;
 
     // Fast path: cache is fresh, no work needed. We still need creds for the
-    // plan label though, so read them either way.
-    let mut creds = creds::read_from(creds_path)?;
+    // plan label though, so read them either way. `resolve` also reports where
+    // the creds actually came from (file vs macOS Keychain) so the refresh
+    // write-back follows the same source instead of forking a stale copy.
+    let (mut creds, creds_source) = creds::resolve(creds_target)?;
     let plan_label = creds.claude_ai_oauth.plan_label();
 
     if let Some(bytes) = cache.fresh_payload(cache_ttl)? {
         return Ok(reuse_cache(bytes, plan_label, cache, false));
     }
 
-    // Maybe refresh.
-    let mut auth_ok = true;
-    let mut refresh_transient = false;
     let now = Utc::now().timestamp();
-    if oauth::needs_refresh(creds.claude_ai_oauth.expires_at_secs(), now) {
+
+    // Rate-limit backoff: a recent 429 told us to slow down. Serve cache and
+    // skip the network entirely until the deadline — otherwise the widget's
+    // fixed-interval polling keeps the rate limit saturated and never recovers.
+    if cache.backoff_until().is_some_and(|until| now < until) {
+        return serve_backoff(cache, plan_label);
+    }
+
+    // Maybe refresh.
+    let stale_token = oauth::needs_refresh(creds.claude_ai_oauth.expires_at_secs(), now);
+    let have_refresh = oauth::can_refresh(&creds.claude_ai_oauth.refresh_token);
+    if stale_token && !have_refresh {
+        // No refresh token to refresh with — the Claude Code client owns token
+        // rotation (trusted-device flow) and leaves `refreshToken` empty. Don't
+        // POST an empty grant (the token endpoint answers 400 "Invalid request
+        // format" and we'd cache a zeroed snapshot). Also clear any stale
+        // token-endpoint error from older builds, then continue with the current
+        // access token: only the real usage request decides whether to fall
+        // back to cache.
+        cache.clear_last_error();
+    } else if stale_token {
         match tokio::time::timeout(
             REFRESH_TIMEOUT,
             oauth::refresh(
@@ -95,30 +120,24 @@ pub async fn fetch_snapshot(
                 creds.claude_ai_oauth.expires_at_ms =
                     Utc::now().timestamp_millis() + (rr.expires_in as i64) * 1000;
                 // Best-effort persist; the refresh worked, so callers should
-                // still see fresh data even if writing the cred file failed.
-                let _ = creds::write_back(creds_path, &creds.claude_ai_oauth);
+                // still see fresh data even if writing the creds back failed.
+                let _ = creds::write_back_to(&creds_source, &creds.claude_ai_oauth);
             }
             Ok(Err(AppError::Http { status, body })) => {
-                auth_ok = false;
                 cache.write_last_error(status, &body);
+                return handle_auth_failure(cache, plan_label, false);
             }
             Ok(Err(e)) if e.is_transient() => {
-                auth_ok = false;
-                refresh_transient = true;
+                return handle_auth_failure(cache, plan_label, true);
             }
             Ok(Err(e)) => {
-                auth_ok = false;
                 cache.write_last_error(0, &e.to_string());
+                return handle_auth_failure(cache, plan_label, false);
             }
             Err(_elapsed) => {
-                auth_ok = false;
-                refresh_transient = true;
+                return handle_auth_failure(cache, plan_label, true);
             }
         }
-    }
-
-    if !auth_ok {
-        return handle_auth_failure(cache, plan_label, refresh_transient);
     }
 
     // Fetch usage.
@@ -141,6 +160,11 @@ pub async fn fetch_snapshot(
         Ok(Err(AppError::Http { status, body })) => {
             cache.mark_stale();
             cache.write_last_error(status, &body);
+            if status == 429 {
+                // Stop hammering: the endpoint rate-limits on a window, and
+                // retrying every poll just keeps it saturated.
+                cache.set_backoff_until(now + RATE_LIMIT_BACKOFF.as_secs() as i64);
+            }
             fallback_to_cache(cache, plan_label, Some((status, body)))
         }
         Ok(Err(e)) if e.is_transient() => {
@@ -180,6 +204,25 @@ fn fallback_to_cache(
         snapshot: snap,
         stale: true,
         last_error,
+        cache_age: cache.payload_age(),
+    })
+}
+
+/// Serve cache during a rate-limit backoff window without touching the network.
+/// Keeps the last 429 as `last_error` so the widget shows the stale (⏸) state
+/// and a rate-limit tooltip. Errors only when there's no cache to show.
+fn serve_backoff(cache: &Cache, plan_label: String) -> Result<FetchOutcome> {
+    let Some(bytes) = cache.maybe_payload()? else {
+        return Err(AppError::Http {
+            status: 429,
+            body: "Rate limited — backing off".into(),
+        });
+    };
+    let snap = parse_payload(&bytes, plan_label)?;
+    Ok(FetchOutcome {
+        snapshot: snap,
+        stale: true,
+        last_error: cache.read_last_error(),
         cache_age: cache.payload_age(),
     })
 }
@@ -234,6 +277,10 @@ async fn fetch_usage(client: &reqwest::Client, url: &str, creds: &OauthCreds) ->
         .get(url)
         .header("Authorization", format!("Bearer {}", creds.access_token))
         .header("anthropic-beta", USAGE_BETA_HEADER)
+        // These four headers are exactly what the endpoint accepts — the
+        // `User-Agent` is load-bearing (without it the endpoint 429s hard).
+        .header("User-Agent", USAGE_USER_AGENT)
+        .header("Content-Type", "application/json")
         .send()
         .await?;
 
@@ -279,6 +326,23 @@ mod tests {
         f
     }
 
+    /// Expired access token AND an empty `refreshToken` — the trusted-device
+    /// shape recent Claude Code builds leave in the shared credential blob.
+    fn expired_creds_no_refresh() -> NamedTempFile {
+        let mut f = NamedTempFile::new().unwrap();
+        let expires_ms = (Utc::now().timestamp_millis()) - 3_600_000; // 1h ago
+        let s = format!(
+            r#"{{"claudeAiOauth":{{
+                "accessToken":"AT","refreshToken":"",
+                "expiresAt": {expires_ms},
+                "subscriptionType":"max","rateLimitTier":"default_claude_max_5x"
+            }}}}"#
+        );
+        f.write_all(s.as_bytes()).unwrap();
+        f.flush().unwrap();
+        f
+    }
+
     fn cache_fixture() -> (TempDir, Cache) {
         let td = TempDir::new().unwrap();
         let cache = Cache::at(td.path().join("anthropic"));
@@ -304,7 +368,7 @@ mod tests {
         };
         let outcome = fetch_snapshot(
             &client,
-            creds.path(),
+            &creds::CredsTarget::Explicit(creds.path().to_path_buf()),
             &cache,
             &endpoints,
             Duration::from_secs(60),
@@ -337,7 +401,7 @@ mod tests {
         };
         let outcome = fetch_snapshot(
             &client,
-            creds.path(),
+            &creds::CredsTarget::Explicit(creds.path().to_path_buf()),
             &cache,
             &endpoints,
             Duration::from_secs(0),
@@ -377,7 +441,7 @@ mod tests {
         };
         let outcome = fetch_snapshot(
             &client,
-            creds.path(),
+            &creds::CredsTarget::Explicit(creds.path().to_path_buf()),
             &cache,
             &endpoints,
             Duration::from_secs(0),
@@ -391,6 +455,112 @@ mod tests {
             outcome.last_error.as_ref().map(|(_, m)| m.as_str()),
             Some("slow down")
         );
+    }
+
+    #[tokio::test]
+    async fn empty_refresh_token_skips_refresh_and_fetches_usage() {
+        // Expired token, empty refresh token. `.expect(0)` is the assertion: an
+        // empty grant must never be POSTed (it would 400 and poison the cache).
+        let mut server = mockito::Server::new_async().await;
+        let refresh = server
+            .mock("POST", "/v1/oauth/token")
+            .with_status(400)
+            .with_body(
+                r#"{"error":{"type":"invalid_request_error","message":"Invalid request format"}}"#,
+            )
+            .expect(0)
+            .create_async()
+            .await;
+        let usage = server
+            .mock("GET", "/api/oauth/usage")
+            .match_header("authorization", "Bearer AT")
+            .match_header("user-agent", USAGE_USER_AGENT)
+            .match_header("anthropic-beta", USAGE_BETA_HEADER)
+            .with_status(200)
+            .with_body(
+                r#"{"five_hour":{"utilization":61,"resets_at":"2026-06-25T17:30:00Z"},
+                    "seven_day":{"utilization":31,"resets_at":"2026-06-26T12:00:00Z"}}"#,
+            )
+            .create_async()
+            .await;
+
+        let (_td, cache) = cache_fixture();
+        cache
+            .write_payload(
+                br#"{"five_hour":{"utilization":17,"resets_at":"2026-06-25T17:30:00Z"},
+                     "seven_day":{"utilization":77,"resets_at":"2026-06-26T12:00:00Z"}}"#,
+            )
+            .unwrap();
+
+        let creds = expired_creds_no_refresh();
+        let client = reqwest::Client::new();
+        let endpoints = Endpoints {
+            usage: format!("{}/api/oauth/usage", server.url()),
+            token: format!("{}/v1/oauth/token", server.url()),
+        };
+        let outcome = fetch_snapshot(
+            &client,
+            &creds::CredsTarget::Explicit(creds.path().to_path_buf()),
+            &cache,
+            &endpoints,
+            Duration::from_secs(0),
+        )
+        .await
+        .unwrap();
+
+        assert!(!outcome.stale);
+        assert_eq!(outcome.snapshot.session.utilization_pct, 61);
+        assert!(
+            outcome.last_error.is_none(),
+            "empty-refresh path must not poison .last_error, got {:?}",
+            outcome.last_error
+        );
+        refresh.assert_async().await; // refresh endpoint was never called
+        usage.assert_async().await; // usage endpoint was still called
+    }
+
+    #[tokio::test]
+    async fn empty_refresh_token_clears_old_last_error_on_transient_fallback() {
+        let mut server = mockito::Server::new_async().await;
+        let refresh = server
+            .mock("POST", "/v1/oauth/token")
+            .expect(0)
+            .create_async()
+            .await;
+
+        let (_td, cache) = cache_fixture();
+        cache
+            .write_payload(
+                br#"{"five_hour":{"utilization":17,"resets_at":"2026-06-25T17:30:00Z"},
+                     "seven_day":{"utilization":77,"resets_at":"2026-06-26T12:00:00Z"}}"#,
+            )
+            .unwrap();
+        cache.write_last_error(400, "Invalid request format");
+
+        let creds = expired_creds_no_refresh();
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(200))
+            .build()
+            .unwrap();
+        let endpoints = Endpoints {
+            usage: "http://127.0.0.1:1/api/oauth/usage".into(),
+            token: format!("{}/v1/oauth/token", server.url()),
+        };
+        let outcome = fetch_snapshot(
+            &client,
+            &creds::CredsTarget::Explicit(creds.path().to_path_buf()),
+            &cache,
+            &endpoints,
+            Duration::from_secs(0),
+        )
+        .await
+        .unwrap();
+
+        assert!(outcome.stale);
+        assert_eq!(outcome.snapshot.session.utilization_pct, 17);
+        assert!(outcome.last_error.is_none());
+        assert!(cache.read_last_error().is_none());
+        refresh.assert_async().await;
     }
 
     #[tokio::test]
@@ -408,7 +578,7 @@ mod tests {
         };
         let err = fetch_snapshot(
             &client,
-            creds.path(),
+            &creds::CredsTarget::Explicit(creds.path().to_path_buf()),
             &cache,
             &endpoints,
             Duration::from_secs(0),
@@ -416,5 +586,66 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.is_transient(), "expected transient error, got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn http_429_arms_backoff_and_second_call_skips_network() {
+        let mut server = mockito::Server::new_async().await;
+        // Exactly ONE usage hit — the second fetch must serve from the backoff.
+        let usage = server
+            .mock("GET", "/api/oauth/usage")
+            .with_status(429)
+            .with_body(r#"{"error":{"type":"rate_limit_error","message":"slow down"}}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let (_td, cache) = cache_fixture();
+        cache
+            .write_payload(
+                br#"{"five_hour":{"utilization":12,"resets_at":"2026-05-23T17:30:00Z"},
+                     "seven_day":{"utilization":5,"resets_at":"2026-05-30T12:00:00Z"}}"#,
+            )
+            .unwrap();
+        let creds = future_creds();
+        let client = reqwest::Client::new();
+        let endpoints = Endpoints {
+            usage: format!("{}/api/oauth/usage", server.url()),
+            token: format!("{}/v1/oauth/token", server.url()),
+        };
+
+        // First call hits the 429 and arms the backoff (TTL=0 skips fast path).
+        let first =
+            fetch_snapshot(
+                &client,
+                &creds::CredsTarget::Explicit(creds.path().to_path_buf()),
+                &cache,
+                &endpoints,
+                Duration::from_secs(0),
+            )
+                .await
+                .unwrap();
+        assert!(first.stale);
+        assert_eq!(first.last_error.as_ref().map(|(c, _)| *c), Some(429));
+        assert!(
+            cache.backoff_until().is_some(),
+            "a 429 must arm a backoff deadline"
+        );
+
+        // Second call, still within the window, serves cache and never hits the
+        // network — the `.expect(1)` above is the real assertion.
+        let second =
+            fetch_snapshot(
+                &client,
+                &creds::CredsTarget::Explicit(creds.path().to_path_buf()),
+                &cache,
+                &endpoints,
+                Duration::from_secs(0),
+            )
+                .await
+                .unwrap();
+        assert!(second.stale);
+        assert_eq!(second.snapshot.session.utilization_pct, 12);
+        usage.assert_async().await;
     }
 }

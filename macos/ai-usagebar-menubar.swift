@@ -54,7 +54,8 @@ var COLOR_CRITICAL: String { DEF.string(forKey: "colorCritical") ?? "#e06c75" }
 var COLOR_EMPTY: String { DEF.string(forKey: "colorEmpty") ?? "#3e4451" }
 
 let FORMAT = "{plan};;{session_pct};;{session_reset};;{weekly_pct};;{weekly_reset};;" +
-             "{sonnet_pct};;{sonnet_reset};;{extra_pct};;{extra_spent};;{extra_limit}"
+             "{sonnet_pct};;{sonnet_reset};;{extra_pct};;{extra_spent};;{extra_limit};;" +
+             "{scoped_label};;{scoped_pct};;{scoped_reset};;{version}"
 
 // ─── Color / text helpers ────────────────────────────────────────────────
 func hexColor(_ hex: String) -> NSColor {
@@ -124,7 +125,13 @@ struct Snapshot {
     let session: Window
     let weekly: Window
     let sonnet: Window?
+    /// Model-scoped weekly window (currently "Fable") from the API's limits[].
+    let scoped: (label: String, pct: Int, reset: String)?
     let extra: (pct: Int, spent: String, limit: String)?
+    /// The binary appended ⏸: live fetch failed, numbers are from cache.
+    let stale: Bool
+    /// Fork version the binary reports via {version} (e.g. "0.12.0+fork.2").
+    let version: String
 }
 
 func stripMarkup(_ s: String) -> String {
@@ -132,19 +139,38 @@ func stripMarkup(_ s: String) -> String {
 }
 
 func parse(_ text: String) -> Snapshot? {
-    let f = stripMarkup(text).components(separatedBy: ";;")
+    let raw = stripMarkup(text)
+    // Health marker: the widget appends ⏸ when it served stale cache. Capture
+    // it before splitting so the UI can badge the data as out of date.
+    let stale = raw.contains("⏸")
+    let f = raw.replacingOccurrences(of: "⏸", with: "").components(separatedBy: ";;")
     guard f.count >= 10 else { return nil }
-    func t(_ i: Int) -> String { f[i].trimmingCharacters(in: .whitespaces) }
+    func unknownPlaceholder(_ s: String) -> Bool {
+        s.hasPrefix("{") && s.hasSuffix("}")
+    }
+    func t(_ i: Int) -> String {
+        let v = f[i].trimmingCharacters(in: .whitespaces)
+        return unknownPlaceholder(v) ? "" : v
+    }
     func n(_ i: Int) -> Int? { Int(t(i)) }
-    let sonnet = n(5).map { Window(pct: $0, reset: t(6)) }
+    let sonnetReset = t(6)
+    let sonnet = sonnetReset.isEmpty || sonnetReset == "—" ? nil : n(5).map { Window(pct: $0, reset: sonnetReset) }
     let spent = t(8)
+    let limit = t(9)
     let extra: (pct: Int, spent: String, limit: String)? =
-        spent.isEmpty ? nil : (n(7) ?? 0, spent, t(9))
+        (spent.isEmpty || limit.isEmpty) ? nil : n(7).map { (pct: $0, spent: spent, limit: limit) }
+    // Fields 10-12 (scoped window) only exist on binaries >= 0.12.0+fork.1.
+    let scoped: (label: String, pct: Int, reset: String)? =
+        f.count >= 13 && !t(10).isEmpty ? (label: t(10), pct: n(11) ?? 0, reset: t(12)) : nil
+    let version = f.count >= 14 ? t(13) : ""
     return Snapshot(plan: t(0),
                     session: Window(pct: n(1) ?? 0, reset: t(2)),
                     weekly: Window(pct: n(3) ?? 0, reset: t(4)),
                     sonnet: sonnet,
-                    extra: extra)
+                    scoped: scoped,
+                    extra: extra,
+                    stale: stale,
+                    version: version)
 }
 
 // ─── Preferences UI (SwiftUI) ────────────────────────────────────────────
@@ -400,8 +426,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var prefsWindow: NSWindow?
     var lastSnapshot: Snapshot?
     var pendingRefresh: DispatchWorkItem?
-    let binary = resolveBinary("ai-usagebar")
     let headerItem = NSMenuItem()
+    let reauthItem = NSMenuItem()
     var rows: [String: NSMenuItem] = [:]
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -419,9 +445,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let menu = NSMenu()
         menu.autoenablesItems = false
 
+        headerItem.attributedTitle = run("Carregando…", .secondaryLabelColor)
         menu.addItem(headerItem)
+
+        // Shown only when the OAuth session expires (setReauth). One click runs
+        // the vendor's interactive login in Terminal — no need to open
+        // Preferences or know the `claude` command.
+        reauthItem.title = "Fazer login agora"
+        reauthItem.target = self
+        reauthItem.action = #selector(reauthAction)
+        reauthItem.isHidden = true
+        menu.addItem(reauthItem)
+
         for key in ["session", "weekly", "sonnet", "extra"] {
             let it = NSMenuItem()
+            it.isHidden = true   // fica escondida até chegar dado de verdade (evita "NSMenuItem" vazio)
             rows[key] = it
             menu.addItem(it)
         }
@@ -444,6 +482,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc func refreshAction() { refresh() }
     @objc func quit() { NSApp.terminate(nil) }
+
+    // 1-click re-login from the expired state: run the current vendor's
+    // interactive login in Terminal (same path as Preferences → Vendors), then
+    // re-check shortly after so the bar recovers as soon as the shared
+    // credential is refreshed.
+    @objc func reauthAction() {
+        let v = VENDOR_AUTH.first { $0.id == VENDOR } ?? VENDOR_AUTH[0]
+        if v.kind == "oauth" { runInTerminal(oauthScript(v)) } else { openTuiInTerminal() }
+        pendingRefresh?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.refresh() }
+        pendingRefresh = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5, execute: work)
+    }
 
     @objc func openPrefs() {
         if prefsWindow == nil {
@@ -486,7 +537,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func refresh() {
-        guard let bin = binary else {
+        guard let bin = resolveBinary("ai-usagebar") else {
             setError("ai-usagebar não encontrado (PATH / ~/.cargo/bin / homebrew)")
             return
         }
@@ -527,7 +578,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         guard let snap = parse(text) else {
             lastSnapshot = nil
-            statusItem.button?.attributedTitle = run(stripMarkup(text), .labelColor)  // Loading… / ⚠
+            reauthItem.isHidden = true
+            let msg = stripMarkup(text).trimmingCharacters(in: .whitespacesAndNewlines)
+            statusItem.button?.attributedTitle = run(msg.isEmpty ? "…" : msg, .labelColor)  // Loading… / ⚠
+            // Sem snapshot ainda: mostra o estado no header e ESCONDE as linhas,
+            // pra elas nunca renderizarem como "NSMenuItem" vazio.
+            headerItem.attributedTitle = run(msg.isEmpty ? "Carregando…" : msg, .secondaryLabelColor)
+            for (_, it) in rows { it.isHidden = true }
             return
         }
         lastSnapshot = snap
@@ -544,6 +601,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             if SHOW_BARS { title.append(barAttr(pct: pct, width: BAR_WIDTH)) }
             if !SHOW_PERCENT && !SHOW_BARS { title.append(run(value, colorForPct(pct))) }
         }
+        if s.stale { title.append(run("⏸ ", hexColor(COLOR_CRITICAL))) }
         if SHOW_SESSION { seg("5h", s.session.pct, "\(s.session.pct)%") }
         if SHOW_WEEKLY { seg("7d", s.weekly.pct, "\(s.weekly.pct)%") }
         if SHOW_EXTRA, let e = s.extra { seg("ex", e.pct, e.spent) }
@@ -551,8 +609,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func renderMenu(_ s: Snapshot) {
-        headerItem.attributedTitle = run(s.plan.isEmpty ? "AI Usage" : s.plan,
-                                         .labelColor, NSFont.boldSystemFont(ofSize: 13))
+        if s.stale {
+            headerItem.attributedTitle = run("⏸ Desatualizado — sem conexão com a conta",
+                                             hexColor(COLOR_CRITICAL), NSFont.boldSystemFont(ofSize: 13))
+        } else {
+            let h = NSMutableAttributedString()
+            h.append(run(s.plan.isEmpty ? "AI Usage" : s.plan,
+                         .labelColor, NSFont.boldSystemFont(ofSize: 13)))
+            if !s.version.isEmpty {
+                h.append(run("   v\(s.version)", .tertiaryLabelColor,
+                             NSFont.monospacedSystemFont(ofSize: 10, weight: .regular)))
+            }
+            headerItem.attributedTitle = h
+        }
+        reauthItem.isHidden = true
 
         func row(_ key: String, _ name: String, _ pct: Int, _ value: String, _ reset: String?) {
             guard let item = rows[key] else { return }
@@ -566,7 +636,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         row("session", "Session", s.session.pct, "\(s.session.pct)%", s.session.reset)
         row("weekly", "Weekly", s.weekly.pct, "\(s.weekly.pct)%", s.weekly.reset)
-        if let sn = s.sonnet { row("sonnet", "Sonnet only", sn.pct, "\(sn.pct)%", sn.reset) }
+        // Prefer the model-scoped weekly window (e.g. "Fable") — the API
+        // replaced the old sonnet-only window with scoped limits[].
+        if let sc = s.scoped { row("sonnet", sc.label, sc.pct, "\(sc.pct)%", sc.reset) }
+        else if let sn = s.sonnet { row("sonnet", "Sonnet only", sn.pct, "\(sn.pct)%", sn.reset) }
         else { rows["sonnet"]?.isHidden = true }
         if let e = s.extra { row("extra", "Extra usage", e.pct, "\(e.spent) / \(e.limit)", nil) }
         else { rows["extra"]?.isHidden = true }
@@ -576,6 +649,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         lastSnapshot = nil
         statusItem.button?.attributedTitle = run("⚠ ai", hexColor(COLOR_CRITICAL))
         headerItem.attributedTitle = run(msg, .labelColor)
+        reauthItem.isHidden = true
         for (_, it) in rows { it.isHidden = true }
     }
 
@@ -587,8 +661,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         lastSnapshot = nil
         statusItem.button?.attributedTitle = run("⚠ login", hexColor(COLOR_CRITICAL))
         headerItem.attributedTitle = run(
-            "Sessão expirada — rode `claude` ou refaça login no IDE",
+            "Sessão expirada — faça login novamente",
             .labelColor, NSFont.boldSystemFont(ofSize: 13))
+        reauthItem.isHidden = false
+        reauthItem.attributedTitle = run("🔑  Fazer login agora (abre o Terminal)",
+                                         hexColor(COLOR_CRITICAL))
         for (_, it) in rows { it.isHidden = true }
     }
 }

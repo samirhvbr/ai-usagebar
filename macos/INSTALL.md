@@ -16,7 +16,7 @@ bar. For configuration and how it works, see [README.md](README.md).
 ### 1. Get the code
 
 ```bash
-git clone git@github.com:samirhvbr/ai-usagebar.git
+git clone git@github.com:akitaonrails/ai-usagebar.git
 cd ai-usagebar/macos
 # (already cloned? just `git pull` and cd into macos/)
 ```
@@ -57,8 +57,8 @@ per-window dropdown (Session / Weekly / Sonnet / Extra).
 
 This installs a LaunchAgent at
 `~/Library/LaunchAgents/com.akitaonrails.ai-usagebar-menubar.plist` with
-`RunAtLoad`, so the app comes back on every login (and is restarted if it
-quits).
+`RunAtLoad`, so the app starts on every login. It is not kept alive after you
+choose **Sair/Quit**.
 
 ### 7. Verify it's running
 

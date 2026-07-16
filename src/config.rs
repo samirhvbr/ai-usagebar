@@ -16,6 +16,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::anthropic::creds::CredsTarget;
+use crate::cache::Cache;
 use crate::error::{AppError, Result};
 use crate::vendor::VendorId;
 
@@ -46,7 +48,12 @@ pub struct UiConfig {
 pub struct AnthropicConfig {
     pub enabled: bool,
     /// Override the credentials file path (defaults to `~/.claude/.credentials.json`).
+    /// This is the *default* account; extra subscriptions go in `accounts`.
     pub credentials_path: Option<PathBuf>,
+    /// Extra Anthropic accounts beyond the default, each selected on the CLI
+    /// with `--account <label>` (issue #14). Empty by default, so existing
+    /// single-account configs are byte-for-byte unchanged.
+    pub accounts: Vec<AnthropicAccount>,
 }
 
 impl Default for AnthropicConfig {
@@ -54,8 +61,81 @@ impl Default for AnthropicConfig {
         Self {
             enabled: true,
             credentials_path: None,
+            accounts: Vec::new(),
         }
     }
+}
+
+/// One extra Anthropic account beyond the default (issue #14). The default
+/// account stays the singular `[anthropic] credentials_path`; each entry here
+/// is an additional subscription selected on the CLI with `--account <label>`.
+///
+/// ```toml
+/// [[anthropic.accounts]]
+/// label = "work"
+/// credentials_path = "~/.config/ai-usagebar/accounts/work.json"
+/// ```
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct AnthropicAccount {
+    /// Stable name used on the CLI (`--account <label>`) and as the cache
+    /// subdir (`~/.cache/ai-usagebar/anthropic/<label>`).
+    pub label: String,
+    /// OAuth credentials file for this account (same JSON shape Claude Code
+    /// writes). Token refreshes are written back here, so each account keeps
+    /// itself alive independently.
+    pub credentials_path: PathBuf,
+}
+
+impl AnthropicConfig {
+    /// Find a configured extra account by label, or error listing the known
+    /// labels so a typo fails loudly instead of silently hitting the default.
+    pub fn account(&self, label: &str) -> Result<&AnthropicAccount> {
+        validate_account_label(label)?;
+        self.accounts
+            .iter()
+            .find(|a| a.label == label)
+            .ok_or_else(|| {
+                let known: Vec<&str> = self.accounts.iter().map(|a| a.label.as_str()).collect();
+                AppError::Credentials(format!(
+                    "anthropic account {label:?} not found in [[anthropic.accounts]]; \
+                     known labels: {known:?}"
+                ))
+            })
+    }
+
+    /// Resolve a named account to the credentials target + isolated cache it
+    /// fetches through: a strict [`CredsTarget::Explicit`] on the account's file
+    /// (never the Keychain — issue #15) and an `anthropic/<label>` cache subdir.
+    /// Shared by the widget (`--account`) and the TUI's per-account tab (#14,
+    /// #17) so both resolve accounts identically; the widget layers its
+    /// `--cache-dir` override on top of the cache returned here.
+    pub fn account_target(&self, label: &str) -> Result<(CredsTarget, Cache)> {
+        let account = self.account(label)?;
+        Ok((
+            CredsTarget::Explicit(account.credentials_path.clone()),
+            Cache::for_vendor_account("anthropic", label)?,
+        ))
+    }
+}
+
+/// The label doubles as a cache subdirectory name
+/// (`~/.cache/ai-usagebar/anthropic/<label>/`), which nests inside the default
+/// account's cache dir — so path separators or dot-dirs would escape or
+/// collide with the cache layout (`usage.json`, `.stale`, …). Reject anything
+/// that isn't a plain single-segment name.
+fn validate_account_label(label: &str) -> Result<()> {
+    let bad = label.is_empty()
+        || label == "."
+        || label == ".."
+        || label.contains(['/', '\\'])
+        || label == "usage.json";
+    if bad {
+        return Err(AppError::Credentials(format!(
+            "invalid anthropic account label {label:?}: must be a non-empty name \
+             without path separators (it becomes a cache subdirectory)"
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -473,5 +553,49 @@ enabled = false
         assert_eq!(c.shvia.api_key.as_deref(), Some("sk-shvia-inline"));
         assert_eq!(c.shvia.base_url.as_deref(), Some("https://ia.example.test"));
         assert_eq!(c.shvia.plan.as_deref(), Some("Gateway"));
+    }
+
+    #[test]
+    fn parses_anthropic_accounts_and_looks_them_up() {
+        let f = write_toml(
+            r#"
+            [anthropic]
+            enabled = true
+
+            [[anthropic.accounts]]
+            label = "personal"
+            credentials_path = "/creds/personal.json"
+
+            [[anthropic.accounts]]
+            label = "work"
+            credentials_path = "/creds/work.json"
+            "#,
+        );
+        let c = Config::load_from(f.path()).unwrap();
+        assert_eq!(c.anthropic.accounts.len(), 2);
+        let work = c.anthropic.account("work").unwrap();
+        assert_eq!(work.credentials_path, PathBuf::from("/creds/work.json"));
+        // A typo names the offending label and lists the known ones.
+        let err = format!("{:?}", c.anthropic.account("missing").unwrap_err());
+        assert!(err.contains("missing") && err.contains("work"), "{err}");
+    }
+
+    #[test]
+    fn account_label_rejects_path_like_names() {
+        let cfg = AnthropicConfig::default();
+        for bad in ["", ".", "..", "a/b", r"a\b", "usage.json"] {
+            let err = cfg.account(bad).unwrap_err();
+            assert!(
+                format!("{err:?}").contains("invalid anthropic account label"),
+                "{bad:?} should be rejected as a label"
+            );
+        }
+    }
+
+    #[test]
+    fn anthropic_accounts_default_to_empty() {
+        // No [[anthropic.accounts]] → the single default account, empty list,
+        // nothing to migrate (issue #14, back-compat rule 1).
+        assert!(Config::default().anthropic.accounts.is_empty());
     }
 }

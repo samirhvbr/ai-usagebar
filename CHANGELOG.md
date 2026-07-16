@@ -11,6 +11,115 @@ Each release is also published at
 
 Nothing yet.
 
+## [0.12.0] — 2026-07-08
+
+### Added
+
+- **Model-scoped weekly limits (e.g. the Fable weekly cap)** now render in the
+  widget tooltip, the TUI Claude tab, and the bar's severity class. Anthropic's
+  usage endpoint reports these only inside the newer `limits[]` array
+  (`kind == "weekly_scoped"`, labeled by `scope.model.display_name`) — there is
+  no dedicated `seven_day_<model>` field — so they were previously invisible:
+  a Fable week at 84%/warning showed nothing while the bar stayed green on a
+  55% overall weekly. Labels come from the API, so future scoped models show
+  up without a code change. Accounts without scoped limits are unchanged.
+
+## [0.11.0] — 2026-07-06
+
+### Added
+
+- **Per-account tabs in the TUI** (#17, follow-up to #14). `ai-usagebar-tui`
+  now shows the default Claude tab plus one tab per `[[anthropic.accounts]]`
+  entry, each fetching with its own credentials file and `anthropic/<label>`
+  cache (the same resolution the widget's `--account` uses, extracted into a
+  shared `AnthropicConfig::account_target`). Anthropic-only; other vendors are
+  still one tab each. With no extra accounts configured the tab set and order
+  are unchanged.
+
+## [0.10.0] — 2026-07-05
+
+### Added
+
+- **Config-driven multiple Anthropic accounts** (#14). Declare extra
+  subscriptions once under `[[anthropic.accounts]]` (`label` +
+  `credentials_path`) and select one on the CLI with `--account <label>`,
+  instead of repeating `--creds-path`/`--cache-dir` on every widget module.
+  Each named account gets an isolated cache at
+  `~/.cache/ai-usagebar/anthropic/<label>/`. Anthropic-only; `--account`
+  conflicts with `--creds-path`. Fully back-compatible: the singular
+  `[anthropic] credentials_path` stays the default account, `--vendor
+  anthropic` with no `--account` is byte-identical to before, and configs
+  with zero or one account keep the unchanged `~/.cache/ai-usagebar/anthropic/`
+  cache path (no migration). Per-account TUI tabs remain a follow-up.
+  (thanks @zanlucathiago)
+
+### Fixed
+
+- **macOS: the Keychain fallback now also rescues a stale
+  `~/.claude/.credentials.json`** (#15). Previously the Keychain was only
+  consulted when the file was *missing*, so a leftover zeroed file (no
+  access token, no refresh token, no expiry — e.g. from a pre-Keychain
+  Claude Code install) shadowed valid Keychain credentials forever and
+  Anthropic refresh failed with a stale cache. The default location now
+  falls back to the Keychain when the file is missing **or** clearly
+  unusable, and token refreshes are written back to whichever source was
+  actually read. The predicate is deliberately narrow: a file with a live
+  access token but empty refresh token (the trusted-device shape handled
+  in v0.7.2) stays authoritative. Explicit paths (`--creds-path`, config
+  `credentials_path`, and named accounts) are now read **strictly** — they
+  never consult the Keychain, so a typo'd path fails loudly instead of
+  silently showing a different account's usage. (thanks @igorsdm)
+
+## [0.9.0] — 2026-07-04
+
+### Changed
+
+- **`--cache-dir` and `--creds-path` are now documented, supported flags**
+  (previously hidden, "for tests / debugging"). Together they are the
+  official way to track multiple accounts of the same vendor: one widget
+  instance per account, each with its own credentials file and cache
+  directory. `--creds-path` applies to the Anthropic vendor only. See the
+  new "Multiple accounts (advanced)" section in the README. Behavior is
+  unchanged — the flags parse and act exactly as before; they only became
+  visible in `--help` and part of the stable CLI surface. First-class
+  `[[accounts]]` config remains under discussion in #14.
+
+## [0.8.0] — 2026-07-01
+
+### Added
+
+- **GNOME Shell extension** under `gnome-extension/` for showing the 5-hour,
+  weekly, optional Sonnet-only, and optional extra-usage bars in the GNOME top
+  panel. It shells out to the existing `ai-usagebar` binary, renders native `St`
+  widgets, includes libadwaita preferences, and adds vendor credential helpers.
+- **macOS menu bar app** under `macos/` for showing the same usage bars as a
+  native `NSStatusItem` menu-bar agent with SwiftUI preferences, LaunchAgent
+  install helper, vendor credential status, and login/config helper actions.
+
+## [0.7.2] — 2026-06-24
+
+### Fixed
+
+- **Anthropic widget no longer shows a false `0%` on recent Claude Code (macOS).**
+  Newer Claude Code builds rotate the OAuth access token via a host-side
+  trusted-device flow and leave `refreshToken` **empty** in the shared
+  credential blob (Keychain / `~/.claude/.credentials.json`). Once the access
+  token expired, the widget POSTed that empty string as a `refresh_token` grant,
+  the token endpoint answered `400 "Invalid request format"`, and the bar cached
+  a zeroed snapshot — `0%` on session/weekly/sonnet with an `HTTP 400` tooltip.
+  The fetch now skips the refresh when no refresh token is present, clears any
+  stale token-endpoint error from older builds, and still attempts the usage
+  request with the current access token before deciding whether to fall back to
+  cache. The usage request was also trimmed to the four
+  headers the live endpoint actually accepts — `Authorization`, `anthropic-beta`,
+  a Claude Code `User-Agent` (without which the endpoint hard-rate-limits to
+  `429`), and `Content-Type`.
+- **`anthropic_live` smoke test no longer hard-fails on macOS Keychain-only
+  setups.** It assumed `~/.claude/.credentials.json` always exists, but recent
+  Claude Code keeps the blob in the login Keychain (no file). The test now falls
+  back to the Keychain reader and skips cleanly when no credentials exist at all,
+  matching the module doc's "won't fail on machines without creds" promise.
+
 ## [0.7.1] — 2026-06-08
 
 ### Changed
@@ -45,6 +154,14 @@ Nothing yet.
 
 ### Fixed
 
+- **The widget now honors `[anthropic] credentials_path` from config.**
+  `anthropic_output()` only consulted the `--creds-path` CLI flag before
+  falling back to the default `~/.claude/.credentials.json`, silently
+  ignoring a `credentials_path` set in `config.toml` — so the widget
+  errored on the default path while the TUI (which already read the
+  config value) worked. Resolution order is now `--creds-path` flag →
+  config `credentials_path` → default, mirroring the existing OpenAI
+  behavior. (thanks @mauricio-ms)
 - **AUR source install no longer fails for users with a customized
   `active_vendor`.** The PKGBUILD's `check()` runs `cargo test --release`
   against the building user's real `$HOME`, so a planted
@@ -380,7 +497,13 @@ vendors. Highlights:
 - Live API smoke test suite (`make smoke`) that exercises the real
   undocumented endpoints to detect schema drift before users do.
 
-[Unreleased]: https://github.com/akitaonrails/ai-usagebar/compare/v0.7.1...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-usagebar/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/akitaonrails/ai-usagebar/releases/tag/v0.12.0
+[0.11.0]: https://github.com/akitaonrails/ai-usagebar/releases/tag/v0.11.0
+[0.10.0]: https://github.com/akitaonrails/ai-usagebar/releases/tag/v0.10.0
+[0.9.0]: https://github.com/akitaonrails/ai-usagebar/releases/tag/v0.9.0
+[0.8.0]: https://github.com/akitaonrails/ai-usagebar/releases/tag/v0.8.0
+[0.7.2]: https://github.com/akitaonrails/ai-usagebar/releases/tag/v0.7.2
 [0.7.1]: https://github.com/akitaonrails/ai-usagebar/releases/tag/v0.7.1
 [0.7.0]: https://github.com/akitaonrails/ai-usagebar/releases/tag/v0.7.0
 [0.6.0]: https://github.com/akitaonrails/ai-usagebar/releases/tag/v0.6.0

@@ -83,7 +83,7 @@ async fn full_response_renders_expected_waybar_json() {
     };
     let outcome = anthropic::fetch_snapshot(
         &client,
-        creds.path(),
+        &anthropic::creds::CredsTarget::Explicit(creds.path().to_path_buf()),
         &cache,
         &endpoints,
         Duration::from_secs(0),
@@ -135,7 +135,7 @@ async fn no_sonnet_no_extra_renders_minimal_tooltip() {
     };
     let outcome = anthropic::fetch_snapshot(
         &client,
-        creds.path(),
+        &anthropic::creds::CredsTarget::Explicit(creds.path().to_path_buf()),
         &cache,
         &endpoints,
         Duration::from_secs(0),
@@ -189,7 +189,7 @@ async fn http_429_falls_back_to_stale_cache_with_pause_indicator() {
     };
     let outcome = anthropic::fetch_snapshot(
         &client,
-        creds.path(),
+        &anthropic::creds::CredsTarget::Explicit(creds.path().to_path_buf()),
         &cache,
         &endpoints,
         Duration::from_secs(0),

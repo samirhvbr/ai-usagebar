@@ -21,6 +21,10 @@ use crate::waybar::{Class, WaybarOutput};
 /// Default format string when `--format` is omitted (claudebar:55).
 pub const DEFAULT_FORMAT: &str = "{session_pct}% · {session_reset}";
 
+/// Fork version (repo-root VERSION file), surfaced via `{version}` so desktop
+/// apps can show what's actually running without a separate subprocess call.
+pub const FORK_VERSION: &str = include_str!("../../VERSION");
+
 /// All inputs needed to render the widget — packaged so tests can construct
 /// it without any I/O.
 pub struct RenderInput<'a> {
@@ -137,11 +141,17 @@ fn build_placeholders(input: &RenderInput) -> HashMap<&'static str, String> {
             input.pace_tolerance,
         )
     });
+    // First model-scoped weekly window from the API's `limits[]` (currently
+    // "Fable"). Exposed as generic `{scoped_*}` placeholders so desktop apps
+    // can render whichever model Anthropic scopes next without a rename.
+    let scoped_window = snap.scoped.first();
 
     let session_color = pango::severity_color(severity_for(snap.session.utilization_pct), theme);
     let weekly_color = pango::severity_color(severity_for(snap.weekly.utilization_pct), theme);
     let sonnet_color =
         sonnet_window.map(|w| pango::severity_color(severity_for(w.utilization_pct), theme));
+    let scoped_color = scoped_window
+        .map(|s| pango::severity_color(severity_for(s.window.utilization_pct), theme));
     let extra_color = snap
         .extra
         .as_ref()
@@ -159,11 +169,17 @@ fn build_placeholders(input: &RenderInput) -> HashMap<&'static str, String> {
     } else {
         String::new()
     };
+    let scoped_bar = if let (Some(s), Some(c)) = (scoped_window, scoped_color) {
+        pango::progress_bar(s.window.utilization_pct, c, theme, None)
+    } else {
+        String::new()
+    };
 
     let mut v = placeholders(vec![
         ("icon", "󰚩".to_string()),
         ("vendor_short", "cld".to_string()),
         ("plan", snap.plan.clone()),
+        ("version", FORK_VERSION.trim().to_string()),
         ("session_pct", snap.session.utilization_pct.to_string()),
         (
             "session_reset",
@@ -198,6 +214,23 @@ fn build_placeholders(input: &RenderInput) -> HashMap<&'static str, String> {
                 .unwrap_or_else(|| "0".into()),
         ),
         ("sonnet_bar", sonnet_bar.clone()),
+        (
+            "scoped_label",
+            scoped_window.map(|s| s.label.clone()).unwrap_or_default(),
+        ),
+        (
+            "scoped_pct",
+            scoped_window
+                .map(|s| s.window.utilization_pct.to_string())
+                .unwrap_or_else(|| "0".into()),
+        ),
+        (
+            "scoped_reset",
+            scoped_window
+                .map(|s| countdown::format(s.window.resets_at, input.now))
+                .unwrap_or_else(|| "—".into()),
+        ),
+        ("scoped_bar", scoped_bar),
         (
             "extra_spent",
             snap.extra
@@ -418,6 +451,42 @@ fn render_default_tooltip(input: &RenderInput) -> String {
         )));
     }
 
+    for sw in &snap.scoped {
+        let scoped_color = pango::severity_color(severity_for(sw.window.utilization_pct), theme);
+        let scoped_pacing = pacing::calc(
+            sw.window.utilization_pct,
+            sw.window.resets_at,
+            input.now,
+            sw.window.window_duration,
+            input.pace_tolerance,
+        );
+        let scoped_bar = if input.tooltip_pace_pts {
+            pango::progress_bar(
+                sw.window.utilization_pct,
+                scoped_color,
+                theme,
+                Some(scoped_pacing.elapsed_pct),
+            )
+        } else {
+            pango::progress_bar(sw.window.utilization_pct, scoped_color, theme, None)
+        };
+        lines.push(Line::Body("".into()));
+        lines.push(Line::Body(format!(
+            " <span foreground='{fg}'>  󰆧  {label} weekly</span>",
+            label = escape(&sw.label)
+        )));
+        lines.push(Line::Body(format!(
+            "   {bar}  <span font_weight='bold' foreground='{color}'>{pct}%</span>",
+            bar = scoped_bar,
+            color = scoped_color,
+            pct = sw.window.utilization_pct
+        )));
+        lines.push(Line::Body(format!(
+            " <span foreground='{dim}'>  ⏱  Resets in {cd}</span>",
+            cd = escape(&countdown::format(sw.window.resets_at, input.now))
+        )));
+    }
+
     if let Some(extra) = snap.extra {
         let extra_color = pango::severity_color(severity_for(extra.percent()), theme);
         let extra_bar = pango::progress_bar(extra.percent(), extra_color, theme, None);
@@ -546,6 +615,7 @@ mod tests {
             session,
             weekly,
             sonnet: Some(sonnet),
+            scoped: vec![],
             extra: Some(ExtraUsage {
                 limit: Cents(5000),
                 spent: Cents(250),
@@ -710,6 +780,50 @@ mod tests {
         let out = render_anthropic(&inp);
         // Wrapper color should be the foreground (neutral), not severity.
         assert!(out.text.contains(&theme.fg));
+    }
+
+    #[test]
+    fn scoped_placeholders_render_first_scoped_window() {
+        // The API's model-scoped weekly limit (currently "Fable") must be
+        // reachable from --format so desktop apps can render it as a bar.
+        let mut oc = sample_outcome();
+        oc.snapshot.scoped = vec![crate::usage::ScopedWindow {
+            label: "Fable".into(),
+            window: UsageWindow {
+                utilization_pct: 43,
+                resets_at: Some(now() + chrono::Duration::days(2)),
+                window_duration: chrono::Duration::days(7),
+            },
+        }];
+        let theme = Theme::default();
+        let mut inp = input(&oc, &theme);
+        inp.format = "{scoped_label}:{scoped_pct}%:{scoped_reset}";
+        let out = render_anthropic(&inp);
+        assert!(out.text.contains("Fable:43%:2d"), "got: {}", out.text);
+    }
+
+    #[test]
+    fn scoped_placeholders_empty_when_absent() {
+        // No scoped windows → label empty, pct 0, reset em-dash; never the
+        // literal `{scoped_*}` braces.
+        let oc = sample_outcome();
+        let theme = Theme::default();
+        let mut inp = input(&oc, &theme);
+        inp.format = "[{scoped_label}|{scoped_pct}|{scoped_reset}]";
+        let out = render_anthropic(&inp);
+        assert!(out.text.contains("[|0|\u{2014}]"), "got: {}", out.text);
+    }
+
+    #[test]
+    fn version_placeholder_emits_fork_version() {
+        let oc = sample_outcome();
+        let theme = Theme::default();
+        let mut inp = input(&oc, &theme);
+        inp.format = "v{version}";
+        let out = render_anthropic(&inp);
+        // Embedded from the repo-root VERSION file (e.g. "0.12.0+fork.N").
+        assert!(out.text.contains("fork."), "got: {}", out.text);
+        assert!(!out.text.contains("{version}"));
     }
 
     #[test]
