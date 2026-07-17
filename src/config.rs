@@ -2,10 +2,12 @@
 //!
 //! Layout:
 //! ```toml
-//! [anthropic] enabled = true
-//! [openai]    enabled = true   # Codex OAuth from ~/.codex/auth.json
-//! [zai]       enabled = true
+//! [anthropic]  enabled = true
+//! [openai]     enabled = true   # Codex OAuth from ~/.codex/auth.json
+//! [zai]        enabled = true
 //! [openrouter] enabled = true
+//! [deepseek]   enabled = false
+//! [kimi]       enabled = false
 //! ```
 //!
 //! Every field is optional with sensible defaults — missing config file is
@@ -30,6 +32,7 @@ pub struct Config {
     pub zai: ZaiConfig,
     pub openrouter: OpenRouterConfig,
     pub deepseek: DeepseekConfig,
+    pub kimi: KimiConfig,
     pub shvia: ShviaConfig,
 }
 
@@ -220,6 +223,24 @@ impl Default for DeepseekConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
+pub struct KimiConfig {
+    pub enabled: bool,
+    pub api_key_env: String,
+    pub api_key: Option<String>,
+}
+
+impl Default for KimiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            api_key_env: "KIMI_API_KEY".to_string(),
+            api_key: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
 pub struct ShviaConfig {
     pub enabled: bool,
     /// Env var name to read the key from (env wins over `api_key`).
@@ -246,14 +267,15 @@ impl Default for ShviaConfig {
     }
 }
 
-/// Resolve an API key for a vendor: env var wins, then inline config, then
-/// a clear error naming both fields. Used by Z.AI and OpenRouter vendors.
+/// Resolve an API key for a vendor: a valid env-var name wins, then inline
+/// config. Used by Z.AI, OpenRouter, DeepSeek, Kimi, and ShvIA vendors.
 pub fn resolve_api_key(
     vendor_label: &str,
     env_var_name: &str,
     inline: Option<&str>,
 ) -> crate::error::Result<String> {
-    if !env_var_name.is_empty()
+    let valid_env_name = is_valid_env_var_name(env_var_name);
+    if valid_env_name
         && let Ok(v) = std::env::var(env_var_name)
         && !v.is_empty()
     {
@@ -264,12 +286,25 @@ pub fn resolve_api_key(
     {
         return Ok(v.to_string());
     }
+    let advice = if valid_env_name {
+        "set an API key in a valid environment variable or set `api_key`"
+    } else {
+        "fix the invalid `api_key_env` with a valid environment variable name or set `api_key`"
+    };
     Err(crate::error::AppError::Credentials(format!(
-        "{vendor_label}: no API key. Either export {env_var_name} or set \
-         `api_key` under [{}] in {}.",
+        "{vendor_label}: no API key. Either {advice} under [{}] in {}.",
         vendor_label.to_lowercase(),
         config_path_hint()
     )))
+}
+
+fn is_valid_env_var_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 impl Config {
@@ -297,6 +332,7 @@ impl Config {
             VendorId::Zai => self.zai.enabled,
             VendorId::Openrouter => self.openrouter.enabled,
             VendorId::Deepseek => self.deepseek.enabled,
+            VendorId::Kimi => self.kimi.enabled,
             VendorId::Shvia => self.shvia.enabled,
         }
     }
@@ -339,7 +375,7 @@ mod tests {
     }
 
     #[test]
-    fn defaults_enable_all_vendors() {
+    fn defaults_enable_core_vendors_deepseek_and_kimi_default_off() {
         let c = Config::default();
         assert!(c.is_enabled(VendorId::Anthropic));
         assert!(c.is_enabled(VendorId::Openai));
@@ -347,9 +383,10 @@ mod tests {
         assert!(c.is_enabled(VendorId::Openrouter));
         // ShvIA points at a self-hosted gateway and is enabled by default.
         assert!(c.is_enabled(VendorId::Shvia));
-        // DeepSeek requires an explicit API key, so it defaults to disabled.
+        // DeepSeek and Kimi require explicit API keys, so they default to disabled.
         assert!(!c.is_enabled(VendorId::Deepseek));
-        // anthropic + openai + zai + openrouter + shvia = 5 (deepseek off).
+        assert!(!c.is_enabled(VendorId::Kimi));
+        // anthropic + openai + zai + openrouter + shvia = 5 (deepseek + kimi off).
         assert_eq!(c.enabled_vendors().len(), 5);
     }
 
@@ -445,7 +482,6 @@ enabled = false
         let err = resolve_api_key("Zai", var, None).unwrap_err();
         match err {
             crate::error::AppError::Credentials(msg) => {
-                assert!(msg.contains(var), "error should name env var: {msg}");
                 assert!(
                     msg.contains("api_key"),
                     "error should suggest config field: {msg}"
@@ -473,6 +509,64 @@ enabled = false
     }
 
     #[test]
+    fn resolve_api_key_rejects_invalid_env_var_name_without_leaking_it() {
+        let _g = env_guard();
+        // Simulates a user accidentally pasting the key into api_key_env.
+        let bad = "sk-kimi-very-real-looking-pasted-secret";
+        let err = resolve_api_key("Kimi", bad, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("invalid") && msg.contains("api_key_env"),
+            "error should explain misconfiguration: {msg}"
+        );
+        assert!(
+            !msg.contains(bad),
+            "error must not echo the misconfigured value: {msg}"
+        );
+        assert!(msg.contains("valid environment variable name"));
+        assert!(
+            msg.contains("[kimi]"),
+            "error should point at the lowercase TOML section: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_api_key_invalid_env_name_falls_back_to_inline() {
+        let _g = env_guard();
+        let got = resolve_api_key("Kimi", "sk-pasted-secret", Some("inline-key")).unwrap();
+        assert_eq!(got, "inline-key");
+    }
+
+    #[test]
+    fn resolve_api_key_never_leaks_valid_looking_configured_env_name() {
+        let _g = env_guard();
+        // This is syntactically a valid environment variable name, but could
+        // be a pasted secret and must not be reflected in the error.
+        let pasted_secret = "sk_pasted_secret";
+        unsafe { std::env::remove_var(pasted_secret) };
+        let err = resolve_api_key("Kimi", pasted_secret, None).unwrap_err();
+        assert!(
+            !err.to_string().contains(pasted_secret),
+            "error must not echo configured api_key_env values"
+        );
+    }
+
+    #[test]
+    fn is_valid_env_var_name_rules() {
+        // Valid: alphabetic or underscore first, then alnum/underscore.
+        for valid in ["KIMI_API_KEY", "_PRIVATE", "a", "Z9", "MY_ZAI_2"] {
+            assert!(is_valid_env_var_name(valid), "{valid} should be valid");
+        }
+        // Invalid: empty, digit-first, or shell-illegal characters.
+        for invalid in ["", "9LIVES", "sk-kimi", "MY KEY", "A.B", "sk/k"] {
+            assert!(
+                !is_valid_env_var_name(invalid),
+                "{invalid} should be invalid"
+            );
+        }
+    }
+
+    #[test]
     fn config_parses_with_inline_api_key_and_primary() {
         let f = write_toml(
             r#"
@@ -497,8 +591,8 @@ enabled = false
 
     #[test]
     fn enabled_vendors_preserves_canonical_order() {
-        // DeepSeek is disabled by default (requires explicit API key config),
-        // so it is absent from the enabled list unless the user enables it.
+        // DeepSeek and Kimi are disabled by default (require explicit API key
+        // config), so they are absent from the enabled list unless enabled.
         let c = Config::default();
         assert_eq!(
             c.enabled_vendors(),
@@ -553,6 +647,50 @@ enabled = false
         assert_eq!(c.shvia.api_key.as_deref(), Some("sk-shvia-inline"));
         assert_eq!(c.shvia.base_url.as_deref(), Some("https://ia.example.test"));
         assert_eq!(c.shvia.plan.as_deref(), Some("Gateway"));
+    }
+
+    #[test]
+    fn kimi_appears_when_enabled() {
+        let f = write_toml(
+            r#"
+            [kimi]
+            enabled = true
+            api_key = "sk-test"
+            "#,
+        );
+        let c = Config::load_from(f.path()).unwrap();
+        assert!(c.is_enabled(VendorId::Kimi));
+        assert!(c.enabled_vendors().contains(&VendorId::Kimi));
+        assert_eq!(c.kimi.api_key.as_deref(), Some("sk-test"));
+    }
+
+    #[test]
+    fn enabled_deepseek_and_kimi_appear_in_canonical_order_ending_with_them() {
+        let f = write_toml(
+            r#"
+            [deepseek]
+            enabled = true
+            api_key = "sk-ds"
+
+            [kimi]
+            enabled = true
+            api_key = "sk-kimi"
+            "#,
+        );
+        let c = Config::load_from(f.path()).unwrap();
+        assert_eq!(
+            c.enabled_vendors(),
+            vec![
+                VendorId::Anthropic,
+                VendorId::Openai,
+                VendorId::Zai,
+                VendorId::Openrouter,
+                VendorId::Deepseek,
+                VendorId::Kimi,
+                // Fork: ShvIA is enabled by default, so it trails the canonical list.
+                VendorId::Shvia,
+            ]
+        );
     }
 
     #[test]

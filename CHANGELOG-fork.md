@@ -7,6 +7,41 @@ Formato [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 > fork vivem aqui, agrupadas pela versão do `VERSION` (`<base>+fork.<N>`).
 > Convenção completa em [`docs/FORK.md`](docs/FORK.md).
 
+## [0.12.0+fork.8] — 2026-07-17
+
+Base upstream: **v0.12.0** (sincronizado com `upstream/main` @ PR #22).
+
+Sync do upstream via `git merge upstream/main --no-ff`. O Akita mergeou os
+**nossos** PRs #20 (`feat/scoped-desktop-surfaces`) e #21
+(`feat/desktop-meta-marker`), então a versão refinada desse trabalho volta
+pelo upstream; o merge concilia isso com os deltas fork-only.
+
+### Added
+- **Vendor Kimi Code** (upstream, PR #22 do `pvpmartins`): quota semanal + janela
+  5h rolling. Registrado em todo o core (enum `VendorId::Kimi`, `KimiConfig`,
+  `VendorSnapshot::Kimi`, TUI, widget, `config.example.toml`) **ao lado** do nosso
+  vendor fork-only `shvia` — os dois coexistem; `shvia` continua por último na
+  ordem canônica e habilitado por default.
+- **Marcadores de meta/pace nas barras desktop** (nosso PR #21, via upstream):
+  campos `{*_elapsed}` + sentinela `__aiub_end__` no FORMAT do GNOME/macOS.
+
+### Changed
+- **Desktop (GNOME + macOS) convergido para a versão refinada do upstream** dos
+  nossos PRs #20/#21 (barras Fable model-scoped com fallback sonnet correto +
+  markers de pace), **preservando os deltas fork-only**: header de versão do fork
+  no dropdown e sinais de saúde `stale`/`re-login`.
+- **FORMAT do GNOME/macOS reindexado**: `{version}` passou para o índice **16**
+  (logo antes do sentinela `__aiub_end__`, agora 17), pois os campos
+  `{*_elapsed}` do upstream ocupam 13–15. `gnome-extension/marker-logic.js`
+  (`FORMAT`/`FIELD`) e seu teste de tabela atualizados; o binário (`render.rs`,
+  do upstream) já emite `{version}` **e** os campos de elapsed.
+
+### Notes
+- Validado no clone: `cargo test` (361 ok), `cargo clippy --all-targets -D
+  warnings` (limpo), `node --check` + `marker-logic.test.mjs` (ok). O app **macOS
+  não pôde ser compilado no ambiente do sync** (sem `swiftc`) — merge conciliado
+  por revisão de código; convém um build/smoke real do menu bar antes de confiar.
+
 ## [0.12.0+fork.7] — 2026-07-10
 
 Base upstream: **v0.12.0**.
