@@ -27,6 +27,10 @@ pub enum VendorId {
     Deepseek,
     Kimi,
     Shvia,
+    Kilo,
+    Novita,
+    Moonshot,
+    Grok,
 }
 
 impl VendorId {
@@ -39,6 +43,10 @@ impl VendorId {
             VendorId::Deepseek => "deepseek",
             VendorId::Kimi => "kimi",
             VendorId::Shvia => "shvia",
+            VendorId::Kilo => "kilo",
+            VendorId::Novita => "novita",
+            VendorId::Moonshot => "moonshot",
+            VendorId::Grok => "grok",
         }
     }
 
@@ -51,6 +59,10 @@ impl VendorId {
             VendorId::Deepseek,
             VendorId::Kimi,
             VendorId::Shvia,
+            VendorId::Kilo,
+            VendorId::Novita,
+            VendorId::Moonshot,
+            VendorId::Grok,
         ]
     }
 }

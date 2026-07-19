@@ -86,6 +86,10 @@ fn parse_slug(s: &str) -> Option<VendorId> {
         "deepseek" => Some(VendorId::Deepseek),
         "kimi" => Some(VendorId::Kimi),
         "shvia" => Some(VendorId::Shvia),
+        "kilo" => Some(VendorId::Kilo),
+        "novita" => Some(VendorId::Novita),
+        "moonshot" => Some(VendorId::Moonshot),
+        "grok" => Some(VendorId::Grok),
         _ => None,
     }
 }
