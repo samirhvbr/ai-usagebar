@@ -285,6 +285,7 @@ struct VendorAuth {
 
 let VENDOR_AUTH: [VendorAuth] = [
     VendorAuth(id: "anthropic", name: "Anthropic (Claude)", kind: "oauth", cli: "claude", login: "claude", pkg: "@anthropic-ai/claude-code", env: ""),
+    VendorAuth(id: "anthropic_api", name: "Anthropic (API)", kind: "apikey", cli: "", login: "", pkg: "", env: "ANTHROPIC_ADMIN_KEY"),
     VendorAuth(id: "openai", name: "OpenAI (Codex)", kind: "oauth", cli: "codex", login: "codex login", pkg: "@openai/codex", env: ""),
     VendorAuth(id: "zai", name: "Z.AI (GLM)", kind: "apikey", cli: "", login: "", pkg: "", env: "ZAI_API_KEY"),
     VendorAuth(id: "openrouter", name: "OpenRouter", kind: "apikey", cli: "", login: "", pkg: "", env: "OPENROUTER_API_KEY"),
@@ -400,6 +401,14 @@ func cacheBalanceDisplay(_ vendorId: String, _ dir: String) -> String? {
         cur == "CNY" ? String(format: "¥%.2f", v) : String(format: "$%.2f", v)
     }
     switch vendorId {
+    case "anthropic_api":
+        // Month-to-date spend, optionally against a configured monthly limit.
+        guard let spent = num(snap["spent"]) else { return nil }
+        if let limit = num(snap["limit"]), limit > 0 {
+            let pct = Int((spent / limit) * 100)
+            return String(format: "$%.2f / $%.0f · %d%%", spent, limit, pct)
+        }
+        return String(format: "$%.2f/mo", spent)
     case "kilo", "grok":
         return num(snap["balance"]).map { money($0, "USD") }
     case "novita":
@@ -420,7 +429,7 @@ func cacheBalanceDisplay(_ vendorId: String, _ dir: String) -> String? {
 // config's `[vendor] enabled = false`, except DeepSeek, which is opt-in (off).
 func configVendorEnabled(_ id: String) -> Bool {
     // Opt-in vendors (require an explicit key) default to disabled.
-    let dflt = !["deepseek", "kilo", "novita", "moonshot", "grok"].contains(id)
+    let dflt = !["anthropic_api", "deepseek", "kilo", "novita", "moonshot", "grok"].contains(id)
     let path = aiubConfigPath()
     guard let text = try? String(contentsOfFile: path, encoding: .utf8) else { return dflt }
     var inSection = false

@@ -7,6 +7,30 @@ Formato [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 > fork vivem aqui, agrupadas pela versão do `VERSION` (`<base>+fork.<N>`).
 > Convenção completa em [`docs/FORK.md`](docs/FORK.md).
 
+## [0.12.0+fork.9] — 2026-07-19
+
+Base upstream: **v0.12.0**.
+
+### Added
+- **Vendor Anthropic (API)** — controle financeiro da conta de **API/Console**
+  da Anthropic, distinta da conta do **Claude Code** (que é OAuth e já existe
+  como vendor `anthropic`). Complementa a família de vendors de saldo do fork
+  (Kilo/Novita/Moonshot/Grok).
+  - Mostra o **gasto do mês** (month-to-date) via a Admin API
+    `GET /v1/organizations/cost_report`, opcionalmente contra um
+    `monthly_limit` configurável → barra `$1.34 / $1000 · 0%`; sem limite,
+    mostra `$1.34/mo`.
+  - Autentica com uma **Admin key** do Console (`sk-ant-admin01-…`, header
+    `x-api-key`) — diferente da API key de inferência e do login OAuth.
+    Inserível pelo **Settings do TUI** ou `[anthropic_api] api_key`.
+  - O `amount` do cost_report vem em **centavos** (decimal string, confirmado
+    nos docs oficiais); convertido p/ dólares (÷100). Paginação seguida via
+    `has_more`/`next_page`.
+  - O **saldo de créditos pré-pagos NÃO é exposto por API** (só no dashboard do
+    Console); por isso reportamos gasto, não saldo.
+  - **macOS:** linha **Anthropic (API)** logo abaixo de **Anthropic (Claude)**
+    no menu; opt-in (só aparece com key ativa). Reusa o último fetch do cache.
+
 ## [0.12.0+fork.8] — 2026-07-17
 
 Base upstream: **v0.12.0** (sincronizado com `upstream/main` @ PR #22).
