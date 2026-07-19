@@ -26,8 +26,13 @@ Base upstream: **v0.12.0**.
   - O `amount` do cost_report vem em **centavos** (decimal string, confirmado
     nos docs oficiais); convertido p/ dólares (÷100). Paginação seguida via
     `has_more`/`next_page`.
-  - O **saldo de créditos pré-pagos NÃO é exposto por API** (só no dashboard do
-    Console); por isso reportamos gasto, não saldo.
+  - Ao contrário dos outros vendors de saldo (que mostram o **restante**), o
+    **saldo de créditos pré-pagos NÃO é exposto por API** (só no dashboard do
+    Console); por isso este reporta o **consumido** (gasto do mês), não o saldo.
+  - A Admin key só existe para contas de **organização**: é preciso configurar
+    uma org antes (Console → Settings → Organization); `.../settings/admin-keys`
+    dá 404 em contas individuais. Documentado no `config.example.toml`; o tooltip
+    dá a dica em erros 401/403.
   - **macOS:** linha **Anthropic (API)** logo abaixo de **Anthropic (Claude)**
     no menu; opt-in (só aparece com key ativa). Reusa o último fetch do cache.
 

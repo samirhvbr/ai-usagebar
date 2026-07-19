@@ -17,11 +17,17 @@ enabled = true
 # the default ~/.claude/.credentials.json.
 # credentials_path = "/home/you/.claude/.credentials.json"
 
-# Anthropic (API) — month-to-date spend for your API/Console account, separate
-# from the Claude Code OAuth login above. Opt-in (disabled until you set a key).
-# Requires a Console *Admin key* (`sk-ant-admin01-...`, header `x-api-key`) —
-# distinct from an inference key. The prepaid credit balance is NOT exposed by
-# any API (Console dashboard only), so this reports spend, not remaining balance.
+# Anthropic (API) — unlike the balance vendors above (which show your REMAINING
+# credit), Anthropic does not expose the prepaid credit balance over any API
+# (Console dashboard only), so this reports your month-to-date SPEND (consumed)
+# instead — for your API/Console account, which is separate from the Claude Code
+# OAuth login above.
+#
+# Opt-in (disabled until you set a key). Requires a Console *Admin key*
+# (`sk-ant-admin01-...`, sent as the `x-api-key` header), distinct from an
+# inference key. Admin keys exist only for ORGANIZATION accounts: set one up
+# first (Console > Settings > Organization) — the .../settings/admin-keys page
+# 404s for individual accounts.
 [anthropic_api]
 enabled = false
 api_key_env = "ANTHROPIC_ADMIN_KEY"  # checked first; if set + non-empty, used

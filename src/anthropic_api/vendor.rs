@@ -141,7 +141,10 @@ fn render_tooltip(
     }
     lines.push(TooltipLine::Body("".into()));
     lines.push(TooltipLine::Body(format!(
-        " <span foreground='{dim}'>  󰋼  credit balance is Console-only (no API)</span>"
+        " <span foreground='{dim}'>  󰋼  spend consumed, not balance —</span>"
+    )));
+    lines.push(TooltipLine::Body(format!(
+        " <span foreground='{dim}'>     remaining credit is Console-only (no API)</span>"
     )));
 
     if let Some((code, msg)) = outcome.last_error.as_ref() {
@@ -164,6 +167,14 @@ fn render_tooltip(
             "     <span foreground='{dim}'>{}</span>",
             escape(msg)
         )));
+        if *code == 401 || *code == 403 {
+            lines.push(TooltipLine::Body(format!(
+                "     <span foreground='{dim}'>needs an org Admin key (sk-ant-admin01-); set up an</span>"
+            )));
+            lines.push(TooltipLine::Body(format!(
+                "     <span foreground='{dim}'>organization in Console → Settings → Organization</span>"
+            )));
+        }
     }
 
     let updated = updated_at_hm(now, outcome.cache_age);
