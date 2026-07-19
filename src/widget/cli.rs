@@ -132,6 +132,10 @@ pub enum Vendor {
     Deepseek,
     Kimi,
     Shvia,
+    Kilo,
+    Novita,
+    Moonshot,
+    Grok,
 }
 
 impl Vendor {
@@ -144,6 +148,10 @@ impl Vendor {
             Vendor::Deepseek => crate::vendor::VendorId::Deepseek,
             Vendor::Kimi => crate::vendor::VendorId::Kimi,
             Vendor::Shvia => crate::vendor::VendorId::Shvia,
+            Vendor::Kilo => crate::vendor::VendorId::Kilo,
+            Vendor::Novita => crate::vendor::VendorId::Novita,
+            Vendor::Moonshot => crate::vendor::VendorId::Moonshot,
+            Vendor::Grok => crate::vendor::VendorId::Grok,
         }
     }
 }
@@ -223,6 +231,10 @@ fn id_to_vendor(id: crate::vendor::VendorId) -> Vendor {
         crate::vendor::VendorId::Deepseek => Vendor::Deepseek,
         crate::vendor::VendorId::Kimi => Vendor::Kimi,
         crate::vendor::VendorId::Shvia => Vendor::Shvia,
+        crate::vendor::VendorId::Kilo => Vendor::Kilo,
+        crate::vendor::VendorId::Novita => Vendor::Novita,
+        crate::vendor::VendorId::Moonshot => Vendor::Moonshot,
+        crate::vendor::VendorId::Grok => Vendor::Grok,
     }
 }
 
