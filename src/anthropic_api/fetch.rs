@@ -174,7 +174,7 @@ async fn fetch_live(
 
         let report: CostReport = serde_json::from_slice(&bytes)
             .map_err(|e| AppError::Schema(format!("anthropic-api cost_report: {e}")))?;
-        total += page_dollars(&report);
+        total += page_dollars(&report)?;
 
         match (report.has_more, report.next_page) {
             (true, Some(p)) => page = Some(p),

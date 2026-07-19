@@ -402,10 +402,13 @@ func cacheBalanceDisplay(_ vendorId: String, _ dir: String) -> String? {
     }
     switch vendorId {
     case "anthropic_api":
-        // Month-to-date spend, optionally against a configured monthly limit.
+        // Month-to-date spend, optionally against the configured monthly limit.
+        // The limit is config-authoritative (not in the API), so read it from
+        // config — not the possibly-stale cached payload — and round the % to
+        // match the binary's own pct() (usage.rs).
         guard let spent = num(snap["spent"]) else { return nil }
-        if let limit = num(snap["limit"]), limit > 0 {
-            let pct = Int((spent / limit) * 100)
+        if let limit = configMonthlyLimit("anthropic_api") ?? num(snap["limit"]), limit > 0 {
+            let pct = Int(((spent / limit) * 100).rounded())
             return String(format: "$%.2f / $%.0f · %d%%", spent, limit, pct)
         }
         return String(format: "$%.2f/mo", spent)
@@ -443,6 +446,24 @@ func configVendorEnabled(_ id: String) -> Bool {
         }
     }
     return dflt
+}
+
+// The monthly spend limit is config-authoritative (the API never exposes it),
+// so read it from config.toml on every render — mirroring how the binary
+// re-applies it — instead of trusting the value frozen in the cache payload.
+func configMonthlyLimit(_ id: String) -> Double? {
+    guard let text = try? String(contentsOfFile: aiubConfigPath(), encoding: .utf8) else { return nil }
+    var inSection = false
+    for raw in text.split(separator: "\n", omittingEmptySubsequences: false) {
+        let line = String(raw).trimmingCharacters(in: .whitespaces)
+        if line.hasPrefix("[") { inSection = tomlHeaderIs(line, id); continue }
+        if inSection, line.hasPrefix("monthly_limit"), let eq = line.firstIndex(of: "=") {
+            var v = String(line[line.index(after: eq)...])
+            if let hash = v.firstIndex(of: "#") { v = String(v[..<hash]) }  // strip inline comment
+            return Double(v.trimmingCharacters(in: .whitespaces))
+        }
+    }
+    return nil
 }
 
 func fmtAge(_ s: TimeInterval) -> String {

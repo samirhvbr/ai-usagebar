@@ -10,6 +10,8 @@
 
 use serde::Deserialize;
 
+use crate::error::{AppError, Result};
+
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
 pub struct CostReport {
@@ -31,15 +33,19 @@ pub struct CostResult {
     pub amount: String,
 }
 
-/// Sum every result's cents on one page and return dollars.
-pub fn page_dollars(report: &CostReport) -> f64 {
-    let cents: f64 = report
-        .data
-        .iter()
-        .flat_map(|b| b.results.iter())
-        .map(|r| r.amount.trim().parse::<f64>().unwrap_or(0.0))
-        .sum();
-    cents / 100.0
+/// Sum every result's cents on one page and return dollars. A non-numeric
+/// `amount` (e.g. a field-rename on schema drift, which `#[serde(default)]`
+/// turns into an empty string) raises `AppError::Schema` rather than silently
+/// coercing to 0 — so the fetch layer marks the cache stale and records the
+/// drift instead of reporting a bogus $0.00.
+pub fn page_dollars(report: &CostReport) -> Result<f64> {
+    let mut cents = 0.0_f64;
+    for r in report.data.iter().flat_map(|b| b.results.iter()) {
+        cents += r.amount.trim().parse::<f64>().map_err(|e| {
+            AppError::Schema(format!("anthropic-api cost_report amount {:?}: {e}", r.amount))
+        })?;
+    }
+    Ok(cents / 100.0)
 }
 
 #[cfg(test)]
@@ -63,13 +69,21 @@ mod tests {
     fn sums_cents_and_converts_to_dollars() {
         let report: CostReport = serde_json::from_str(BODY).unwrap();
         // 100.0 + 34.5 = 134.5 cents = $1.345
-        assert!((page_dollars(&report) - 1.345).abs() < 1e-9);
+        assert!((page_dollars(&report).unwrap() - 1.345).abs() < 1e-9);
         assert!(!report.has_more);
     }
 
     #[test]
     fn empty_report_is_zero() {
         let report: CostReport = serde_json::from_str("{}").unwrap();
-        assert_eq!(page_dollars(&report), 0.0);
+        assert_eq!(page_dollars(&report).unwrap(), 0.0);
+    }
+
+    #[test]
+    fn non_numeric_amount_is_a_schema_error() {
+        // Schema drift: `amount` renamed → serde default fills "" → parse fails.
+        let body = r#"{"data":[{"results":[{"amount":""}]}]}"#;
+        let report: CostReport = serde_json::from_str(body).unwrap();
+        assert!(matches!(page_dollars(&report), Err(AppError::Schema(_))));
     }
 }

@@ -898,13 +898,14 @@ api_key_env = "OPENROUTER_API_KEY"
 
     #[test]
     fn left_right_cycles_primary_vendor() {
+        // Canonical order (VendorId::all): Anthropic, AnthropicApi, Openai, …
         let mut s = blank_state(VendorId::Anthropic);
         handle_key(&mut s, KeyCode::Right, KeyModifiers::NONE);
-        assert_eq!(s.primary, VendorId::Openai);
+        assert_eq!(s.primary, VendorId::AnthropicApi);
         handle_key(&mut s, KeyCode::Right, KeyModifiers::NONE);
-        assert_eq!(s.primary, VendorId::Zai);
-        handle_key(&mut s, KeyCode::Left, KeyModifiers::NONE);
         assert_eq!(s.primary, VendorId::Openai);
+        handle_key(&mut s, KeyCode::Left, KeyModifiers::NONE);
+        assert_eq!(s.primary, VendorId::AnthropicApi);
     }
 
     #[test]

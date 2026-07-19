@@ -144,18 +144,21 @@ fn render_tooltip(
         " <span foreground='{dim}'>  󰋼  credit balance is Console-only (no API)</span>"
     )));
 
-    if let Some((code, msg)) = outcome.last_error.as_ref()
-        && *code != 0
-    {
-        let (icon, ecolor) = if *code >= 500 {
-            ("󰅚", theme.red.as_str())
+    if let Some((code, msg)) = outcome.last_error.as_ref() {
+        // code 0 = a non-HTTP failure (schema drift, transport). Show it under a
+        // "Sync error" header rather than the nonsensical "HTTP 0" — and never
+        // suppress it, so the reason for a stale state is always visible.
+        let (icon, ecolor, header) = if *code == 0 {
+            ("󰀪", theme.orange.as_str(), "Sync error".to_string())
+        } else if *code >= 500 {
+            ("󰅚", theme.red.as_str(), format!("HTTP {code}"))
         } else {
-            ("󰀪", theme.orange.as_str())
+            ("󰀪", theme.orange.as_str(), format!("HTTP {code}"))
         };
         lines.push(TooltipLine::Body("".into()));
         lines.push(TooltipLine::Sep);
         lines.push(TooltipLine::Body(format!(
-            " <span foreground='{ecolor}'>  {icon}  HTTP {code}</span>"
+            " <span foreground='{ecolor}'>  {icon}  {header}</span>"
         )));
         lines.push(TooltipLine::Body(format!(
             "     <span foreground='{dim}'>{}</span>",
