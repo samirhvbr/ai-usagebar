@@ -41,6 +41,11 @@ let SETTINGS_DEFAULTS: [String: Any] = [
 
 var VENDOR: String { DEF.string(forKey: "vendor") ?? "anthropic" }
 var INTERVAL: Double { let v = DEF.double(forKey: "interval"); return v > 0 ? v : 30 }
+/// Upper bound on one `ai-usagebar` invocation. It can block on the cache
+/// flock (up to 15s) and then refresh OAuth over the network, so without a
+/// bound a hung run holds a worker indefinitely and the panel simply stops
+/// updating with no explanation. Matches the GNOME extension's own timeout.
+let REFRESH_TIMEOUT: Double = 45
 var BAR_WIDTH: Int { max(4, min(20, DEF.integer(forKey: "barWidth"))) }
 let MENU_BAR_W = 14
 var SHOW_SESSION: Bool { DEF.bool(forKey: "showSession") }
@@ -65,14 +70,13 @@ let POINT_CRITICAL_MIN = 10
 // The `{scoped_*}` fields (10-12) carry the model-scoped weekly window (e.g.
 // "Fable") from the API's `limits[]`; empty on older binaries → the row falls
 // back to the flat `{sonnet_*}` window and the "Sonnet only" label. The trailing
-// `*_elapsed` fields (13-15) carry the meta (pace) position. Fork: `{version}`
-// (16) is the fork build tag for the menu header; it sits before the final
-// literal sentinel (17), which absorbs the widget's stale suffix, preserving
-// the elapsed and version fields.
+// `*_elapsed` fields (13-15) carry the meta (pace) position; `vendor_short`
+// (16) lets balance-only vendors suppress meaningless quota rows. A final
+// literal sentinel absorbs the widget's stale suffix, preserving these fields.
 let FORMAT = "{plan};;{session_pct};;{session_reset};;{weekly_pct};;{weekly_reset};;" +
              "{sonnet_pct};;{sonnet_reset};;{extra_pct};;{extra_spent};;{extra_limit};;" +
              "{scoped_model};;{scoped_pct};;{scoped_reset};;" +
-             "{session_elapsed};;{weekly_elapsed};;{scoped_elapsed};;{version}"
+             "{session_elapsed};;{weekly_elapsed};;{scoped_elapsed};;{vendor_short}"
 
 let FORMAT_WITH_SENTINEL = FORMAT + ";;__aiub_end__"
 
@@ -180,6 +184,7 @@ func resolveBinary(_ name: String) -> String? {
 struct Window { let pct: Int; let reset: String; let elapsed: Int? }
 struct Snapshot {
     let plan: String
+    let hasUsageWindows: Bool
     let session: Window
     let weekly: Window
     /// The per-model weekly bar (model-scoped window, e.g. Fable, or the legacy
@@ -188,22 +193,22 @@ struct Snapshot {
     /// Label for that bar: the scoped model name ("Fable") or "Sonnet only".
     let sonnetLabel: String
     let extra: (pct: Int, spent: String, limit: String)?
-    /// The binary appended ⏸: live fetch failed, numbers are from cache.
-    let stale: Bool
-    /// Fork version the binary reports via {version} (e.g. "0.12.0+fork.2").
-    let version: String
 }
 
 func stripMarkup(_ s: String) -> String {
+    // Decode exactly one layer after removing tags. Rust escapes API-controlled
+    // labels for Pango; the native surface consumes plain text and must not
+    // display those entities literally or reactivate decoded markup.
     s.replacingOccurrences(of: "<[^>]*>", with: "", options: .regularExpression)
+        .replacingOccurrences(of: "&lt;", with: "<")
+        .replacingOccurrences(of: "&gt;", with: ">")
+        .replacingOccurrences(of: "&quot;", with: "\"")
+        .replacingOccurrences(of: "&apos;", with: "'")
+        .replacingOccurrences(of: "&amp;", with: "&")
 }
 
 func parse(_ text: String) -> Snapshot? {
-    let raw = stripMarkup(text)
-    // Health marker: the widget appends ⏸ when it served stale cache. Capture
-    // it before splitting so the UI can badge the data as out of date.
-    let stale = raw.contains("⏸")
-    let f = raw.replacingOccurrences(of: "⏸", with: "").components(separatedBy: ";;")
+    let f = stripMarkup(text).components(separatedBy: ";;")
     guard f.count >= 10 else { return nil }
     func unknownPlaceholder(_ s: String) -> Bool {
         s.hasPrefix("{") && s.hasSuffix("}")
@@ -242,17 +247,13 @@ func parse(_ text: String) -> Snapshot? {
     let limit = t(9)
     let extra: (pct: Int, spent: String, limit: String)? =
         (spent.isEmpty || limit.isEmpty) ? nil : n(7).map { (pct: $0, spent: spent, limit: limit) }
-    // Fork: {version} is field 16 (after the elapsed fields), before the
-    // sentinel; only present on binaries that emit it (>= 0.12.0+fork.8 merge).
-    let version = f.count >= 17 ? t(16) : ""
     return Snapshot(plan: t(0),
+                    hasUsageWindows: t(16) != "dsk",
                     session: Window(pct: n(1) ?? 0, reset: t(2), elapsed: markerElapsed(reset: t(2), elapsed: n(13))),
                     weekly: Window(pct: n(3) ?? 0, reset: t(4), elapsed: markerElapsed(reset: t(4), elapsed: n(14))),
                     sonnet: sonnet,
                     sonnetLabel: sonnetLabel,
-                    extra: extra,
-                    stale: stale,
-                    version: version)
+                    extra: extra)
 }
 
 // ─── Preferences UI (SwiftUI) ────────────────────────────────────────────
@@ -296,14 +297,15 @@ let VENDOR_AUTH: [VendorAuth] = [
     VendorAuth(id: "grok", name: "Grok (xAI)", kind: "apikey", cli: "", login: "", pkg: "", env: "XAI_MANAGEMENT_KEY"),
 ]
 
-// The Rust binary resolves its config via `directories::ProjectDirs`, which on
-// macOS is ~/Library/Application Support/ai-usagebar — NOT ~/.config. Read the
-// same file so the menu's "configured"/"enabled" checks match what the binary
-// actually uses when it fetches.
-func aiubConfigPath() -> String {
-    let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first?.path
-        ?? "\(NSHomeDirectory())/Library/Application Support"
-    return "\(base)/ai-usagebar/config.toml"
+// The config file the Rust binary would actually read. On macOS
+// `directories::ProjectDirs` resolves to ~/Library/Application Support, so
+// checking only ~/.config reported "no key configured" for a key the binary
+// was happily using. Prefer the canonical location, fall back to the legacy
+// Unix path the docs have always shown (the binary accepts both).
+func configPathTOML() -> String {
+    let appSupport = "\(NSHomeDirectory())/Library/Application Support/ai-usagebar/config.toml"
+    if FileManager.default.fileExists(atPath: appSupport) { return appSupport }
+    return "\(NSHomeDirectory())/.config/ai-usagebar/config.toml"
 }
 
 // A TOML section header may carry a trailing inline comment ("[zai] # note")
@@ -317,18 +319,15 @@ func tomlHeaderIs(_ line: String, _ section: String) -> Bool {
 }
 
 func configHasApiKeyTOML(_ section: String) -> Bool {
-    let path = aiubConfigPath()
+    let path = configPathTOML()
     guard let text = try? String(contentsOfFile: path, encoding: .utf8) else { return false }
     var inSection = false
     for raw in text.split(separator: "\n", omittingEmptySubsequences: false) {
         let line = String(raw).trimmingCharacters(in: .whitespaces)
         if line.hasPrefix("[") {
-            inSection = tomlHeaderIs(line, section)
+            inSection = (line == "[\(section)]")
         } else if inSection && !line.hasPrefix("#") &&
-                  // Require a real char after the opening quote so `api_key = ""`
-                  // (empty) is NOT treated as configured — matching the binary,
-                  // which rejects an empty inline key.
-                  line.range(of: "^api_key\\s*=\\s*[\"'][^\"'\\s]", options: .regularExpression) != nil {
+                  line.range(of: "^api_key\\s*=\\s*[\"']\\S", options: .regularExpression) != nil {
             return true
         }
     }
@@ -428,12 +427,30 @@ func cacheBalanceDisplay(_ vendorId: String, _ dir: String) -> String? {
     }
 }
 
+// The monthly spend limit is config-authoritative (the API never exposes it),
+// so read it from config.toml on every render — mirroring how the binary
+// re-applies it — instead of trusting the value frozen in the cache payload.
+func configMonthlyLimit(_ id: String) -> Double? {
+    guard let text = try? String(contentsOfFile: configPathTOML(), encoding: .utf8) else { return nil }
+    var inSection = false
+    for raw in text.split(separator: "\n", omittingEmptySubsequences: false) {
+        let line = String(raw).trimmingCharacters(in: .whitespaces)
+        if line.hasPrefix("[") { inSection = tomlHeaderIs(line, id); continue }
+        if inSection, line.hasPrefix("monthly_limit"), let eq = line.firstIndex(of: "=") {
+            var v = String(line[line.index(after: eq)...])
+            if let hash = v.firstIndex(of: "#") { v = String(v[..<hash]) }  // strip inline comment
+            return Double(v.trimmingCharacters(in: .whitespaces))
+        }
+    }
+    return nil
+}
+
 // Mirrors the binary's config defaults: every vendor is enabled unless the
 // config's `[vendor] enabled = false`, except DeepSeek, which is opt-in (off).
 func configVendorEnabled(_ id: String) -> Bool {
     // Opt-in vendors (require an explicit key) default to disabled.
     let dflt = !["anthropic_api", "deepseek", "kilo", "novita", "moonshot", "grok"].contains(id)
-    let path = aiubConfigPath()
+    let path = configPathTOML()
     guard let text = try? String(contentsOfFile: path, encoding: .utf8) else { return dflt }
     var inSection = false
     for raw in text.split(separator: "\n", omittingEmptySubsequences: false) {
@@ -446,24 +463,6 @@ func configVendorEnabled(_ id: String) -> Bool {
         }
     }
     return dflt
-}
-
-// The monthly spend limit is config-authoritative (the API never exposes it),
-// so read it from config.toml on every render — mirroring how the binary
-// re-applies it — instead of trusting the value frozen in the cache payload.
-func configMonthlyLimit(_ id: String) -> Double? {
-    guard let text = try? String(contentsOfFile: aiubConfigPath(), encoding: .utf8) else { return nil }
-    var inSection = false
-    for raw in text.split(separator: "\n", omittingEmptySubsequences: false) {
-        let line = String(raw).trimmingCharacters(in: .whitespaces)
-        if line.hasPrefix("[") { inSection = tomlHeaderIs(line, id); continue }
-        if inSection, line.hasPrefix("monthly_limit"), let eq = line.firstIndex(of: "=") {
-            var v = String(line[line.index(after: eq)...])
-            if let hash = v.firstIndex(of: "#") { v = String(v[..<hash]) }  // strip inline comment
-            return Double(v.trimmingCharacters(in: .whitespaces))
-        }
-    }
-    return nil
 }
 
 func fmtAge(_ s: TimeInterval) -> String {
@@ -745,8 +744,18 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var prefsHost: NSHostingController<SettingsView>?
     var lastSnapshot: Snapshot?
     var pendingRefresh: DispatchWorkItem?
+    /// Bumped on every refresh attempt. A result whose generation is no longer
+    /// current belongs to a superseded attempt — most often the previously
+    /// selected vendor — and must not be rendered. Without this, the timer,
+    /// the Preferences window and a vendor change could each start their own
+    /// subprocess and whichever finished last won, regardless of what the user
+    /// had actually selected. Main-thread only.
+    var refreshGeneration: Int = 0
+    /// At most one subprocess in flight; a request arriving while one runs is
+    /// coalesced rather than stacked.
+    var refreshInFlight = false
+    var refreshQueued = false
     let headerItem = NSMenuItem()
-    let reauthItem = NSMenuItem()
     var rows: [String: NSMenuItem] = [:]
     // Collapsible "Status das APIs" section (starts collapsed; the toggle click
     // dismisses the menu, so the rows appear on the next open).
@@ -772,21 +781,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let menu = NSMenu()
         menu.autoenablesItems = false
 
-        headerItem.attributedTitle = run("Carregando…", .secondaryLabelColor)
         menu.addItem(headerItem)
-
-        // Shown only when the OAuth session expires (setReauth). One click runs
-        // the vendor's interactive login in Terminal — no need to open
-        // Preferences or know the `claude` command.
-        reauthItem.title = "Fazer login agora"
-        reauthItem.target = self
-        reauthItem.action = #selector(reauthAction)
-        reauthItem.isHidden = true
-        menu.addItem(reauthItem)
-
         for key in ["session", "weekly", "sonnet", "extra"] {
             let it = NSMenuItem()
-            it.isHidden = true   // fica escondida até chegar dado de verdade (evita "NSMenuItem" vazio)
             rows[key] = it
             menu.addItem(it)
         }
@@ -961,19 +958,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func refreshAction() { refresh() }
     @objc func quit() { NSApp.terminate(nil) }
 
-    // 1-click re-login from the expired state: run the current vendor's
-    // interactive login in Terminal (same path as Preferences → Vendors), then
-    // re-check shortly after so the bar recovers as soon as the shared
-    // credential is refreshed.
-    @objc func reauthAction() {
-        let v = VENDOR_AUTH.first { $0.id == VENDOR } ?? VENDOR_AUTH[0]
-        if v.kind == "oauth" { runInTerminal(oauthScript(v)) } else { openTuiInTerminal() }
-        pendingRefresh?.cancel()
-        let work = DispatchWorkItem { [weak self] in self?.refresh() }
-        pendingRefresh = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 5, execute: work)
-    }
-
     @objc func openPrefs() {
         if prefsWindow == nil {
             let host = NSHostingController(rootView: SettingsView())
@@ -1032,13 +1016,34 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             setError("ai-usagebar não encontrado (PATH / ~/.cargo/bin / homebrew)")
             return
         }
+        // Coalesce: one subprocess at a time, and remember that another was
+        // asked for so a vendor change during a fetch is not simply dropped.
+        if refreshInFlight {
+            refreshQueued = true
+            return
+        }
+        refreshInFlight = true
+        refreshGeneration += 1
+        let generation = refreshGeneration
+        // Captured for THIS attempt: reading `VENDOR` again on completion would
+        // label a late result with whatever is selected by then.
+        let vendor = VENDOR
+
         DispatchQueue.global(qos: .utility).async { [weak self] in
             let p = Process()
             p.executableURL = URL(fileURLWithPath: bin)
-            p.arguments = ["--vendor", VENDOR, "--format", FORMAT_WITH_SENTINEL]
+            p.arguments = ["--vendor", vendor, "--format", FORMAT_WITH_SENTINEL]
             let pipe = Pipe()
             p.standardOutput = pipe
             p.standardError = FileHandle.nullDevice
+
+            // The subprocess takes the cache lock and may refresh OAuth over
+            // the network; without a bound it can hold this worker for a very
+            // long time. Kill it and report instead of hanging silently.
+            let watchdog = DispatchWorkItem { if p.isRunning { p.terminate() } }
+            DispatchQueue.global(qos: .utility)
+                .asyncAfter(deadline: .now() + REFRESH_TIMEOUT, execute: watchdog)
+
             var out = ""
             do {
                 try p.run()
@@ -1046,10 +1051,39 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 p.waitUntilExit()
                 out = String(data: data, encoding: .utf8) ?? ""
             } catch {
-                DispatchQueue.main.async { self?.setError("falha ao executar ai-usagebar") }
+                watchdog.cancel()
+                DispatchQueue.main.async {
+                    self?.finishRefresh(generation) { $0.setError("falha ao executar ai-usagebar") }
+                }
                 return
             }
-            DispatchQueue.main.async { self?.consume(out) }
+            watchdog.cancel()
+            let timedOut = out.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            DispatchQueue.main.async {
+                self?.finishRefresh(generation) { me in
+                    // Selection may have changed while this ran.
+                    guard vendor == VENDOR else { return }
+                    if timedOut {
+                        me.setError("ai-usagebar demorou demais (>\(Int(REFRESH_TIMEOUT))s)")
+                    } else {
+                        me.consume(out)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Applies `body` only when `generation` is still the current attempt, then
+    /// releases the in-flight slot and runs any request that arrived meanwhile.
+    private func finishRefresh(_ generation: Int, _ body: (AppDelegate) -> Void) {
+        let current = generation == refreshGeneration
+        if current {
+            refreshInFlight = false
+            body(self)
+        }
+        if current && refreshQueued {
+            refreshQueued = false
+            refresh()
         }
     }
 
@@ -1060,22 +1094,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             setError("saída inválida")
             return
         }
-        // Re-auth: the widget flags an expired/invalid Claude Code token by
-        // appending "⚠ re-login" to the bar text. A refresh can't clear it —
-        // only an interactive login — so surface the prompt, not stale numbers.
-        if stripMarkup(text).contains("re-login") {
-            setReauth()
-            return
-        }
         guard let snap = parse(text) else {
             lastSnapshot = nil
-            reauthItem.isHidden = true
-            let msg = stripMarkup(text).trimmingCharacters(in: .whitespacesAndNewlines)
-            statusItem.button?.attributedTitle = run(msg.isEmpty ? "…" : msg, .labelColor)  // Loading… / ⚠
-            // Sem snapshot ainda: mostra o estado no header e ESCONDE as linhas,
-            // pra elas nunca renderizarem como "NSMenuItem" vazio.
-            headerItem.attributedTitle = run(msg.isEmpty ? "Carregando…" : msg, .secondaryLabelColor)
-            for (_, it) in rows { it.isHidden = true }
+            statusItem.button?.attributedTitle = run(stripMarkup(text), .labelColor)  // Loading… / ⚠
             return
         }
         lastSnapshot = snap
@@ -1092,28 +1113,19 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if SHOW_BARS { title.append(barAttr(pct: pct, width: BAR_WIDTH, elapsed: elapsed)) }
             if !SHOW_PERCENT && !SHOW_BARS { title.append(run(value, colorForPct(pct))) }
         }
-        if s.stale { title.append(run("⏸ ", hexColor(COLOR_CRITICAL))) }
-        if SHOW_SESSION { seg("5h", s.session.pct, "\(s.session.pct)%", s.session.elapsed) }
-        if SHOW_WEEKLY { seg("7d", s.weekly.pct, "\(s.weekly.pct)%", s.weekly.elapsed) }
+        if s.hasUsageWindows && SHOW_SESSION {
+            seg("5h", s.session.pct, "\(s.session.pct)%", s.session.elapsed)
+        }
+        if s.hasUsageWindows && SHOW_WEEKLY {
+            seg("7d", s.weekly.pct, "\(s.weekly.pct)%", s.weekly.elapsed)
+        }
         if SHOW_EXTRA, let e = s.extra { seg("ex", e.pct, e.spent, nil) } // $ budget → no meta
         statusItem.button?.attributedTitle = title.length > 0 ? title : run("ai", .secondaryLabelColor)
     }
 
     func renderMenu(_ s: Snapshot) {
-        if s.stale {
-            headerItem.attributedTitle = run("⏸ Desatualizado — sem conexão com a conta",
-                                             hexColor(COLOR_CRITICAL), NSFont.boldSystemFont(ofSize: 13))
-        } else {
-            let h = NSMutableAttributedString()
-            h.append(run(s.plan.isEmpty ? "AI Usage" : s.plan,
-                         .labelColor, NSFont.boldSystemFont(ofSize: 13)))
-            if !s.version.isEmpty {
-                h.append(run("   v\(s.version)", .tertiaryLabelColor,
-                             NSFont.monospacedSystemFont(ofSize: 10, weight: .regular)))
-            }
-            headerItem.attributedTitle = h
-        }
-        reauthItem.isHidden = true
+        headerItem.attributedTitle = run(s.plan.isEmpty ? "AI Usage" : s.plan,
+                                         .labelColor, NSFont.boldSystemFont(ofSize: 13))
 
         func row(_ key: String, _ name: String, _ pct: Int, _ value: String, _ reset: String?, _ elapsed: Int?) {
             guard let item = rows[key] else { return }
@@ -1128,9 +1140,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if let r = reset, !r.isEmpty { a.append(run("   ↺ \(r)", .secondaryLabelColor)) }
             item.attributedTitle = a
         }
-        row("session", "Session", s.session.pct, "\(s.session.pct)%", s.session.reset, s.session.elapsed)
-        row("weekly", "Weekly", s.weekly.pct, "\(s.weekly.pct)%", s.weekly.reset, s.weekly.elapsed)
-        // Per-model weekly row, labeled by the scoped model (e.g. "Fable").
+        if s.hasUsageWindows {
+            row("session", "Session", s.session.pct, "\(s.session.pct)%", s.session.reset, s.session.elapsed)
+            row("weekly", "Weekly", s.weekly.pct, "\(s.weekly.pct)%", s.weekly.reset, s.weekly.elapsed)
+        } else {
+            rows["session"]?.isHidden = true
+            rows["weekly"]?.isHidden = true
+        }
         if let sn = s.sonnet { row("sonnet", s.sonnetLabel, sn.pct, "\(sn.pct)%", sn.reset, sn.elapsed) }
         else { rows["sonnet"]?.isHidden = true }
         if let e = s.extra { row("extra", "Extra usage", e.pct, "\(e.spent) / \(e.limit)", nil, nil) }
@@ -1141,23 +1157,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         lastSnapshot = nil
         statusItem.button?.attributedTitle = run("⚠ ai", hexColor(COLOR_CRITICAL))
         headerItem.attributedTitle = run(msg, .labelColor)
-        reauthItem.isHidden = true
-        for (_, it) in rows { it.isHidden = true }
-    }
-
-    // Claude Code's OAuth session expired. Unlike a transient error, the fix is
-    // a login (this app shares the token and can't refresh it), so show a clear
-    // call to action instead of stale numbers. Recovers on the next tick once
-    // you re-login (the widget re-reads the shared credentials).
-    func setReauth() {
-        lastSnapshot = nil
-        statusItem.button?.attributedTitle = run("⚠ login", hexColor(COLOR_CRITICAL))
-        headerItem.attributedTitle = run(
-            "Sessão expirada — faça login novamente",
-            .labelColor, NSFont.boldSystemFont(ofSize: 13))
-        reauthItem.isHidden = false
-        reauthItem.attributedTitle = run("🔑  Fazer login agora (abre o Terminal)",
-                                         hexColor(COLOR_CRITICAL))
         for (_, it) in rows { it.isHidden = true }
     }
 }

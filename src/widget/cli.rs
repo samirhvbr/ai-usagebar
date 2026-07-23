@@ -133,11 +133,12 @@ pub enum Vendor {
     Openrouter,
     Deepseek,
     Kimi,
-    Shvia,
     Kilo,
     Novita,
     Moonshot,
     Grok,
+    Antigravity,
+    Shvia,
 }
 
 impl Vendor {
@@ -150,11 +151,12 @@ impl Vendor {
             Vendor::Openrouter => crate::vendor::VendorId::Openrouter,
             Vendor::Deepseek => crate::vendor::VendorId::Deepseek,
             Vendor::Kimi => crate::vendor::VendorId::Kimi,
-            Vendor::Shvia => crate::vendor::VendorId::Shvia,
             Vendor::Kilo => crate::vendor::VendorId::Kilo,
             Vendor::Novita => crate::vendor::VendorId::Novita,
             Vendor::Moonshot => crate::vendor::VendorId::Moonshot,
             Vendor::Grok => crate::vendor::VendorId::Grok,
+            Vendor::Antigravity => crate::vendor::VendorId::Antigravity,
+            Vendor::Shvia => crate::vendor::VendorId::Shvia,
         }
     }
 }
@@ -234,11 +236,12 @@ fn id_to_vendor(id: crate::vendor::VendorId) -> Vendor {
         crate::vendor::VendorId::Openrouter => Vendor::Openrouter,
         crate::vendor::VendorId::Deepseek => Vendor::Deepseek,
         crate::vendor::VendorId::Kimi => Vendor::Kimi,
-        crate::vendor::VendorId::Shvia => Vendor::Shvia,
         crate::vendor::VendorId::Kilo => Vendor::Kilo,
         crate::vendor::VendorId::Novita => Vendor::Novita,
         crate::vendor::VendorId::Moonshot => Vendor::Moonshot,
         crate::vendor::VendorId::Grok => Vendor::Grok,
+        crate::vendor::VendorId::Antigravity => Vendor::Antigravity,
+        crate::vendor::VendorId::Shvia => Vendor::Shvia,
     }
 }
 
@@ -337,6 +340,16 @@ mod tests {
         let cli = Cli::parse_from(["ai-usagebar", "--vendor", "kimi"]);
         assert_eq!(cli.vendor, Some(Vendor::Kimi));
         assert_eq!(cli.vendor.unwrap().to_id(), crate::vendor::VendorId::Kimi);
+    }
+
+    #[test]
+    fn vendor_anthropic_api_uses_the_documented_slug() {
+        let cli = Cli::parse_from(["ai-usagebar", "--vendor", "anthropic_api"]);
+        assert_eq!(cli.vendor, Some(Vendor::AnthropicApi));
+        assert_eq!(
+            cli.vendor.unwrap().to_id(),
+            crate::vendor::VendorId::AnthropicApi
+        );
     }
 
     #[test]

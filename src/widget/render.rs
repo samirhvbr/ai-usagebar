@@ -15,15 +15,11 @@ use crate::pacing;
 use crate::pango::{self, color_span, escape, severity_for};
 use crate::theme::Theme;
 use crate::tooltip::{self, Line};
-use crate::usage::anthropic_severity;
+use crate::usage::{ExtraUsage, anthropic_severity};
 use crate::waybar::{Class, WaybarOutput};
 
 /// Default format string when `--format` is omitted (claudebar:55).
 pub const DEFAULT_FORMAT: &str = "{session_pct}% · {session_reset}";
-
-/// Fork version (repo-root VERSION file), surfaced via `{version}` so desktop
-/// apps can show what's actually running without a separate subprocess call.
-pub const FORK_VERSION: &str = include_str!("../../VERSION");
 
 /// All inputs needed to render the widget — packaged so tests can construct
 /// it without any I/O.
@@ -42,19 +38,8 @@ pub struct RenderInput<'a> {
 /// Compose the full Waybar output for an Anthropic snapshot.
 pub fn render_anthropic(input: &RenderInput) -> WaybarOutput {
     let snap = &input.outcome.snapshot;
-    let reauth = input
-        .outcome
-        .last_error
-        .as_ref()
-        .is_some_and(|(code, msg)| *code != 0 && crate::anthropic::is_reauth_error(msg));
-    // A re-auth failure is the one state the user must act on — force the
-    // Critical class so the bar goes red regardless of the (stale) usage level.
-    let class = if reauth {
-        Class::Critical
-    } else {
-        Class::from(anthropic_severity(snap))
-    };
-    let bar_text = render_bar_text(input, class, reauth);
+    let class = Class::from(anthropic_severity(snap));
+    let bar_text = render_bar_text(input, class);
     let tooltip = if let Some(fmt) = input.tooltip_format {
         // Custom tooltip uses the same placeholder set as the bar.
         let values = build_placeholders(input);
@@ -72,16 +57,12 @@ pub fn render_anthropic(input: &RenderInput) -> WaybarOutput {
 
 /// Build the bar-text string with all placeholders substituted and the
 /// surrounding `<span foreground='…'>` wrapper applied.
-fn render_bar_text(input: &RenderInput, class: Class, reauth: bool) -> String {
+fn render_bar_text(input: &RenderInput, class: Class) -> String {
     let values = build_placeholders(input);
     let mut text = substitute(input.format, &values);
 
-    // Re-auth outranks the plain stale ⏸: the data is stale *and* a refresh
-    // can't fix it (only a login can), so flag it distinctly. Otherwise append
-    // the stale indicator (claudebar:687-690).
-    if reauth {
-        text.push_str(" ⚠ re-login");
-    } else if input.outcome.stale {
+    // Append stale indicator (claudebar:687-690).
+    if input.outcome.stale {
         text.push_str(" ⏸");
     }
 
@@ -141,17 +122,11 @@ fn build_placeholders(input: &RenderInput) -> HashMap<&'static str, String> {
             input.pace_tolerance,
         )
     });
-    // First model-scoped weekly window from the API's `limits[]` (currently
-    // "Fable"). Exposed as generic `{scoped_*}` placeholders so desktop apps
-    // can render whichever model Anthropic scopes next without a rename.
-    let scoped_window = snap.scoped.first();
 
     let session_color = pango::severity_color(severity_for(snap.session.utilization_pct), theme);
     let weekly_color = pango::severity_color(severity_for(snap.weekly.utilization_pct), theme);
     let sonnet_color =
         sonnet_window.map(|w| pango::severity_color(severity_for(w.utilization_pct), theme));
-    let scoped_color = scoped_window
-        .map(|s| pango::severity_color(severity_for(s.window.utilization_pct), theme));
     let extra_color = snap
         .extra
         .as_ref()
@@ -166,11 +141,6 @@ fn build_placeholders(input: &RenderInput) -> HashMap<&'static str, String> {
     };
     let extra_bar = if let (Some(e), Some(c)) = (snap.extra.as_ref(), extra_color) {
         pango::progress_bar(e.percent(), c, theme, None)
-    } else {
-        String::new()
-    };
-    let scoped_bar = if let (Some(s), Some(c)) = (scoped_window, scoped_color) {
-        pango::progress_bar(s.window.utilization_pct, c, theme, None)
     } else {
         String::new()
     };
@@ -202,7 +172,6 @@ fn build_placeholders(input: &RenderInput) -> HashMap<&'static str, String> {
         ("icon", "󰚩".to_string()),
         ("vendor_short", "cld".to_string()),
         ("plan", snap.plan.clone()),
-        ("version", FORK_VERSION.trim().to_string()),
         ("session_pct", snap.session.utilization_pct.to_string()),
         (
             "session_reset",
@@ -263,37 +232,26 @@ fn build_placeholders(input: &RenderInput) -> HashMap<&'static str, String> {
         ),
         ("scoped_bar", scoped0_bar.clone()),
         (
-            "scoped_label",
-            scoped_window.map(|s| s.label.clone()).unwrap_or_default(),
-        ),
-        (
-            "scoped_pct",
-            scoped_window
-                .map(|s| s.window.utilization_pct.to_string())
-                .unwrap_or_else(|| "0".into()),
-        ),
-        (
-            "scoped_reset",
-            scoped_window
-                .map(|s| countdown::format(s.window.resets_at, input.now))
-                .unwrap_or_else(|| "—".into()),
-        ),
-        ("scoped_bar", scoped_bar),
-        (
             "extra_spent",
             snap.extra
-                .map(|e| e.spent.fmt_dollars())
+                .as_ref()
+                .map(ExtraUsage::fmt_spent)
                 .unwrap_or_default(),
         ),
         (
             "extra_limit",
+            // "—" (not empty) for an uncapped plan: GNOME and the macOS menu
+            // bar hide the whole extra row when this field is empty, which
+            // would hide real spend — the exact symptom of #30.
             snap.extra
-                .map(|e| e.limit.fmt_dollars())
+                .as_ref()
+                .map(|e| e.fmt_limit().unwrap_or_else(|| "—".into()))
                 .unwrap_or_default(),
         ),
         (
             "extra_pct",
             snap.extra
+                .as_ref()
                 .map(|e| e.percent().to_string())
                 .unwrap_or_else(|| "0".into()),
         ),
@@ -535,7 +493,7 @@ fn render_default_tooltip(input: &RenderInput) -> String {
         )));
     }
 
-    if let Some(extra) = snap.extra {
+    if let Some(extra) = snap.extra.as_ref() {
         let extra_color = pango::severity_color(severity_for(extra.percent()), theme);
         let extra_bar = pango::progress_bar(extra.percent(), extra_color, theme, None);
         lines.push(Line::Body("".into()));
@@ -547,47 +505,39 @@ fn render_default_tooltip(input: &RenderInput) -> String {
             "   {bar}  <span font_weight='bold' foreground='{color}'>{spent}</span>",
             bar = extra_bar,
             color = extra_color,
-            spent = escape(&extra.spent.fmt_dollars())
+            spent = escape(&extra.fmt_spent())
         )));
+        let lim = match extra.fmt_limit() {
+            Some(l) => l,
+            // No usable `monthly_limit` in the payload (null — observed for
+            // uncapped plans — or absent). "none reported" states exactly
+            // that; inferring a plan tier from it would overclaim, and a
+            // $0.00 ceiling would be invented.
+            None => "none reported".into(),
+        };
         lines.push(Line::Body(format!(
             " <span foreground='{dim}'>  󰀓  Limit: {lim}</span>",
-            lim = escape(&extra.limit.fmt_dollars())
+            lim = escape(&lim)
         )));
     }
 
     if let Some((code, msg)) = input.outcome.last_error.as_ref()
         && *code != 0
     {
+        let (icon, color) = if *code >= 500 {
+            ("󰅚", theme.red.as_str())
+        } else {
+            ("󰀪", theme.orange.as_str())
+        };
         lines.push(Line::Body("".into()));
         lines.push(Line::Sep);
-        if crate::anthropic::is_reauth_error(msg) {
-            // Actionable prompt, not the muted "HTTP 400" a refresh can't clear.
-            let orange = theme.orange.as_str();
+        lines.push(Line::Body(format!(
+            " <span foreground='{color}'>  {icon}  HTTP {code}</span>"
+        )));
+        for wrapped in wrap_words(&escape(msg), 35) {
             lines.push(Line::Body(format!(
-                " <span font_weight='bold' foreground='{orange}'>  󰀪  Sign-in expired</span>"
+                "     <span foreground='{dim}'>{wrapped}</span>"
             )));
-            for wrapped in wrap_words(
-                "Run `claude` or re-login in your IDE — refreshes automatically once you do.",
-                35,
-            ) {
-                lines.push(Line::Body(format!(
-                    "     <span foreground='{dim}'>{wrapped}</span>"
-                )));
-            }
-        } else {
-            let (icon, color) = if *code >= 500 {
-                ("󰅚", theme.red.as_str())
-            } else {
-                ("󰀪", theme.orange.as_str())
-            };
-            lines.push(Line::Body(format!(
-                " <span foreground='{color}'>  {icon}  HTTP {code}</span>"
-            )));
-            for wrapped in wrap_words(&escape(msg), 35) {
-                lines.push(Line::Body(format!(
-                    "     <span foreground='{dim}'>{wrapped}</span>"
-                )));
-            }
         }
     }
 
@@ -665,8 +615,10 @@ mod tests {
             sonnet: Some(sonnet),
             scoped: vec![],
             extra: Some(ExtraUsage {
-                limit: Cents(5000),
+                limit: Some(Cents(5000)),
                 spent: Cents(250),
+                currency: None,
+                decimal_places: Some(2),
             }),
         };
         FetchOutcome {
@@ -689,6 +641,58 @@ mod tests {
             tooltip_pace_pts: false,
             now: now(),
         }
+    }
+
+    #[test]
+    fn uncapped_extra_usage_renders_spend_with_dash_limit() {
+        // The #30 shape: real spend, `monthly_limit: null`. The spend must
+        // stay visible and `{extra_limit}` must be "—", NOT empty — GNOME and
+        // the macOS menu bar hide the whole extra row on an empty limit,
+        // which would re-hide the spend the fix is recovering.
+        let mut oc = sample_outcome();
+        if let Some(e) = oc.snapshot.extra.as_mut() {
+            e.limit = None;
+            e.spent = Cents(14157);
+        }
+        let theme = Theme::default();
+        let mut inp = input(&oc, &theme);
+        inp.format = "{extra_spent}|{extra_limit}|{extra_pct}";
+        let out = render_anthropic(&inp);
+        assert!(out.text.contains("$141.57|—|0"), "got: {}", out.text);
+
+        // Default tooltip: spend shown, the missing limit stated as exactly
+        // that, and no fabricated "$0.00" anywhere near the extra block.
+        let inp2 = input(&oc, &theme);
+        let out2 = render_anthropic(&inp2);
+        assert!(out2.tooltip.contains("$141.57"));
+        assert!(out2.tooltip.contains("none reported"));
+        assert!(!out2.tooltip.contains("Limit: $0.00"));
+    }
+
+    #[test]
+    fn extra_usage_placeholders_and_tooltip_use_the_blocks_currency() {
+        // Non-vacuous currency pin: with BRL in the snapshot, formatting
+        // through fmt_dollars again ("$141.57") must fail this test — that is
+        // the wrong-currency claim the wiring exists to prevent.
+        let mut oc = sample_outcome();
+        if let Some(e) = oc.snapshot.extra.as_mut() {
+            e.limit = None;
+            e.spent = Cents(14157);
+            e.currency = Some("BRL".into());
+        }
+        let theme = Theme::default();
+        let mut inp = input(&oc, &theme);
+        inp.format = "{extra_spent}";
+        let out = render_anthropic(&inp);
+        assert!(out.text.contains("R$141.57"), "got: {}", out.text);
+        assert!(!out.text.contains("$141.57|"), "got: {}", out.text);
+
+        let inp2 = input(&oc, &theme);
+        let out2 = render_anthropic(&inp2);
+        assert!(
+            out2.tooltip.contains("R$141.57"),
+            "tooltip must carry the block's currency"
+        );
     }
 
     #[test]
@@ -826,31 +830,6 @@ mod tests {
     }
 
     #[test]
-    fn reauth_error_forces_critical_class_and_bar_marker() {
-        let mut oc = sample_outcome();
-        oc.stale = true;
-        oc.last_error = Some((400, "Refresh token not found or invalid".into()));
-        let theme = Theme::default();
-        let out = render_anthropic(&input(&oc, &theme));
-        // Forced red regardless of the (Mid) usage level.
-        assert_eq!(out.class, Class::Critical);
-        assert!(out.text.contains("re-login"));
-        // The plain stale ⏸ is superseded by the re-login marker.
-        assert!(!out.text.contains("⏸"));
-    }
-
-    #[test]
-    fn reauth_tooltip_shows_prompt_not_http_line() {
-        let mut oc = sample_outcome();
-        oc.last_error = Some((400, "Refresh token not found or invalid".into()));
-        let theme = Theme::default();
-        let out = render_anthropic(&input(&oc, &theme));
-        assert!(out.tooltip.contains("Sign-in expired"));
-        assert!(out.tooltip.contains("re-login"));
-        assert!(!out.tooltip.contains("HTTP 400"));
-    }
-
-    #[test]
     fn worst_window_promotes_class_to_critical() {
         let mut oc = sample_outcome();
         oc.snapshot.weekly.utilization_pct = 95;
@@ -869,50 +848,6 @@ mod tests {
         let out = render_anthropic(&inp);
         // Wrapper color should be the foreground (neutral), not severity.
         assert!(out.text.contains(&theme.fg));
-    }
-
-    #[test]
-    fn scoped_placeholders_render_first_scoped_window() {
-        // The API's model-scoped weekly limit (currently "Fable") must be
-        // reachable from --format so desktop apps can render it as a bar.
-        let mut oc = sample_outcome();
-        oc.snapshot.scoped = vec![crate::usage::ScopedWindow {
-            label: "Fable".into(),
-            window: UsageWindow {
-                utilization_pct: 43,
-                resets_at: Some(now() + chrono::Duration::days(2)),
-                window_duration: chrono::Duration::days(7),
-            },
-        }];
-        let theme = Theme::default();
-        let mut inp = input(&oc, &theme);
-        inp.format = "{scoped_label}:{scoped_pct}%:{scoped_reset}";
-        let out = render_anthropic(&inp);
-        assert!(out.text.contains("Fable:43%:2d"), "got: {}", out.text);
-    }
-
-    #[test]
-    fn scoped_placeholders_empty_when_absent() {
-        // No scoped windows → label empty, pct 0, reset em-dash; never the
-        // literal `{scoped_*}` braces.
-        let oc = sample_outcome();
-        let theme = Theme::default();
-        let mut inp = input(&oc, &theme);
-        inp.format = "[{scoped_label}|{scoped_pct}|{scoped_reset}]";
-        let out = render_anthropic(&inp);
-        assert!(out.text.contains("[|0|\u{2014}]"), "got: {}", out.text);
-    }
-
-    #[test]
-    fn version_placeholder_emits_fork_version() {
-        let oc = sample_outcome();
-        let theme = Theme::default();
-        let mut inp = input(&oc, &theme);
-        inp.format = "v{version}";
-        let out = render_anthropic(&inp);
-        // Embedded from the repo-root VERSION file (e.g. "0.12.0+fork.N").
-        assert!(out.text.contains("fork."), "got: {}", out.text);
-        assert!(!out.text.contains("{version}"));
     }
 
     #[test]

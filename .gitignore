@@ -4,6 +4,9 @@
 # Sandbox marker, not part of the project.
 .ai-jail
 
+# Claude Code local scratch state.
+.claude/
+
 # Local secrets — never commit
 .env
 .env.local
@@ -18,10 +21,7 @@ packaging/aur/src/
 packaging/aur/*.pkg.tar.*
 packaging/aur/*.tar.gz
 
-# Claude Code - config local da sessao
-.claude/settings.local.json
-
-# GNOME extension — compiled schema (build artifact)
+# GNOME extension - compiled schema (build artifact)
 gnome-extension/schemas/gschemas.compiled
 
 # Compiled macOS menu bar app (built by macos/build.sh)
@@ -29,6 +29,3 @@ macos/ai-usagebar-menubar
 
 # Local screenshots for PR bodies (not tracked; drag into the PR on GitHub)
 macos/printscreen/
-
-# Clones temporários (ex: fork do EaeDave) — nunca commitar
-/tmp/

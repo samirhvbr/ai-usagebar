@@ -85,11 +85,22 @@ pub struct App {
     pub tabs_meta: Vec<TabId>,
     pub active: usize,
     pub tabs: Vec<TabState>,
+    /// Monotonically increasing identity for a complete tab-set replacement.
+    /// Background fetches carry this with their tab identity so results from a
+    /// previous Settings reload cannot land in a new tab at the old index.
+    pub tab_generation: u64,
     pub theme: Theme,
-    pub last_refresh: chrono::DateTime<chrono::Utc>,
     pub quit: bool,
     /// When `Some`, the Settings overlay is open and consuming key events.
     pub settings: Option<crate::tui::settings::SettingsState>,
+    /// Local context monitoring is separately opt-in and never changes the
+    /// vendor tab set.
+    pub context_enabled: bool,
+    /// Monotonic across overlay close/reopen cycles so an old detached scan
+    /// can never share the new overlay's first generation number.
+    pub context_generation: u64,
+    /// When `Some`, the local Claude Code context overlay owns keyboard input.
+    pub context: Option<crate::tui::context::ContextState>,
 }
 
 impl App {
@@ -110,10 +121,13 @@ impl App {
             tabs_meta,
             active: 0,
             tabs: vec![TabState::Loading; n],
+            tab_generation: 0,
             theme,
-            last_refresh: Utc::now(),
             quit: false,
             settings: None,
+            context_enabled: false,
+            context_generation: 0,
+            context: None,
         }
     }
 
@@ -140,9 +154,25 @@ impl App {
     /// tab resets to `Loading` (the caller re-spawns fetches) and the
     /// selection is clamped in case the list shrank.
     pub fn set_tabs(&mut self, tabs_meta: Vec<TabId>) {
+        self.tab_generation = self.tab_generation.wrapping_add(1);
         self.active = self.active.min(tabs_meta.len().saturating_sub(1));
         self.tabs = vec![TabState::Loading; tabs_meta.len()];
         self.tabs_meta = tabs_meta;
+    }
+
+    /// Apply an asynchronous refresh only when it still belongs to this tab
+    /// generation and the captured tab identity still exists. Lookup by
+    /// identity, rather than the old positional index, also makes a reordered
+    /// tab list safe.
+    pub fn apply_refresh(&mut self, generation: u64, tab: &TabId, state: TabState) -> bool {
+        if generation != self.tab_generation {
+            return false;
+        }
+        let Some(index) = self.tabs_meta.iter().position(|current| current == tab) else {
+            return false;
+        };
+        self.tabs[index] = state;
+        true
     }
 
     /// Move to the first tab of `primary`'s vendor (the default account tab,
@@ -322,6 +352,25 @@ async fn build_outcome(client: &Client, config: &Config, tab: &TabId) -> Result<
                     .await?;
             Ok(outcome.into())
         }
+        VendorId::Kilo => {
+            let api_key = crate::config::resolve_api_key(
+                "Kilo",
+                &config.kilo.api_key_env,
+                config.kilo.api_key.as_deref(),
+            )?;
+            let cache = crate::cache::Cache::for_vendor("kilo")?;
+            let endpoints = crate::kilo::fetch::Endpoints::default();
+            let outcome = crate::kilo::fetch_snapshot(
+                client,
+                &api_key,
+                &cache,
+                &endpoints,
+                DEFAULT_TTL,
+                config.kilo.organization_id.as_deref(),
+            )
+            .await?;
+            Ok(outcome.into())
+        }
         VendorId::Shvia => {
             let api_key = crate::config::resolve_api_key(
                 "Shvia",
@@ -342,25 +391,6 @@ async fn build_outcome(client: &Client, config: &Config, tab: &TabId) -> Result<
                 &endpoints,
                 DEFAULT_TTL,
                 config.shvia.plan.as_deref(),
-            )
-            .await?;
-            Ok(outcome.into())
-        }
-        VendorId::Kilo => {
-            let api_key = crate::config::resolve_api_key(
-                "Kilo",
-                &config.kilo.api_key_env,
-                config.kilo.api_key.as_deref(),
-            )?;
-            let cache = crate::cache::Cache::for_vendor("kilo")?;
-            let endpoints = crate::kilo::fetch::Endpoints::default();
-            let outcome = crate::kilo::fetch_snapshot(
-                client,
-                &api_key,
-                &cache,
-                &endpoints,
-                DEFAULT_TTL,
-                config.kilo.organization_id.as_deref(),
             )
             .await?;
             Ok(outcome.into())
@@ -417,6 +447,12 @@ async fn build_outcome(client: &Client, config: &Config, tab: &TabId) -> Result<
             .await?;
             Ok(outcome.into())
         }
+        VendorId::Antigravity => {
+            // No credentials: the local Antigravity server is the source.
+            let cache = crate::cache::Cache::for_vendor("antigravity")?;
+            let outcome = crate::antigravity::fetch_snapshot(client, &cache, DEFAULT_TTL).await?;
+            Ok(outcome.into())
+        }
     }
 }
 
@@ -427,6 +463,7 @@ pub const REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
 
     // Use `App::with_theme(.., Theme::default())` rather than `App::new`, which
     // would read the real Omarchy theme file + `$HOME`. The tab-selection logic
@@ -458,7 +495,7 @@ mod tests {
         config.openai.enabled = false;
         config.zai.enabled = false;
         config.openrouter.enabled = false;
-        config.shvia.enabled = false; // fork-only vendor; keep the fixture Anthropic-only
+        config.shvia.enabled = false;
         config.anthropic.accounts = labels
             .iter()
             .map(|l| crate::config::AnthropicAccount {
@@ -509,6 +546,89 @@ mod tests {
         assert_eq!(app.tabs_meta, vec![TabId::vendor(VendorId::Anthropic)]);
         assert_eq!(app.active, 0, "selection clamped after shrink");
         assert!(matches!(app.tabs[0], TabState::Loading));
+    }
+
+    #[test]
+    fn refresh_from_old_generation_is_discarded() {
+        let mut app = App::with_theme(vec![TabId::vendor(VendorId::Anthropic)], Theme::default());
+        let old_generation = app.tab_generation;
+        app.set_tabs(vec![TabId::vendor(VendorId::Openai)]);
+
+        assert!(!app.apply_refresh(
+            old_generation,
+            &TabId::vendor(VendorId::Anthropic),
+            TabState::Error("old result".into()),
+        ));
+        assert!(matches!(app.tabs[0], TabState::Loading));
+    }
+
+    #[test]
+    fn refresh_identity_mismatch_is_discarded() {
+        let mut app = App::with_theme(vec![TabId::vendor(VendorId::Anthropic)], Theme::default());
+        let generation = app.tab_generation;
+
+        assert!(!app.apply_refresh(
+            generation,
+            &TabId::vendor(VendorId::Openai),
+            TabState::Error("wrong tab".into()),
+        ));
+        assert!(matches!(app.tabs[0], TabState::Loading));
+    }
+
+    #[test]
+    fn refresh_identity_lands_at_new_index_after_same_generation_reorder() {
+        let anthropic = TabId::vendor(VendorId::Anthropic);
+        let openai = TabId::vendor(VendorId::Openai);
+        let mut app = App::with_theme(vec![anthropic.clone(), openai.clone()], Theme::default());
+        let generation = app.tab_generation;
+
+        // A reorder is safe because delivery resolves the captured identity,
+        // not a stale positional index.
+        app.tabs_meta.swap(0, 1);
+        app.tabs.swap(0, 1);
+        assert!(app.apply_refresh(generation, &anthropic, TabState::Error("ready".into())));
+        assert!(matches!(app.tabs[0], TabState::Loading));
+        assert!(matches!(&app.tabs[1], TabState::Error(message) if message == "ready"));
+    }
+
+    fn ready_at(fetched_at: chrono::DateTime<Utc>) -> TabState {
+        TabState::Ready(Box::new(ReadyTab {
+            snapshot: crate::usage::VendorSnapshot::Openrouter(crate::usage::OpenRouterSnapshot {
+                label: "test".into(),
+                total_credits: 0.0,
+                total_usage: 0.0,
+                usage_daily: 0.0,
+                usage_weekly: 0.0,
+                usage_monthly: 0.0,
+                is_free_tier: false,
+                limit: None,
+                limit_remaining: None,
+            }),
+            stale: false,
+            last_error: None,
+            fetched_at: Some(fetched_at),
+        }))
+    }
+
+    #[test]
+    fn apply_refresh_stamps_fetched_at_on_only_the_matching_tab() {
+        // Pins the per-tab `fetched_at` the header now reads: a landed Anthropic
+        // response leaves the still-loading OpenAI tab with no time of its own.
+        // Dropping the global `last_refresh` clock is not observable from here
+        // (it was write-only) — that is asserted against the rendered header in
+        // `view::tests::header_refresh_*`.
+        let anthropic = TabId::vendor(VendorId::Anthropic);
+        let openai = TabId::vendor(VendorId::Openai);
+        let mut app = App::with_theme(vec![anthropic.clone(), openai], Theme::default());
+        let generation = app.tab_generation;
+        let fetched_at = Utc.with_ymd_and_hms(2026, 5, 23, 12, 0, 0).unwrap();
+
+        assert!(app.apply_refresh(generation, &anthropic, ready_at(fetched_at)));
+        match &app.tabs[0] {
+            TabState::Ready(ready) => assert_eq!(ready.fetched_at, Some(fetched_at)),
+            other => panic!("expected Anthropic tab Ready, got {other:?}"),
+        }
+        assert!(matches!(app.tabs[1], TabState::Loading));
     }
 
     #[test]

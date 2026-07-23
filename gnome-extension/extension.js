@@ -17,7 +17,8 @@ import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
-import {barMarkup, colorForPct, field, FIELD, FORMAT, integer, markerElapsed,
+import {barMarkup, colorForPct, disambiguateTags, field, FIELD, FORMAT, hasUsageWindows, integer,
+    isGrouped, markerElapsed, plainTextFromPango, selectPools,
     splitFormatOutput} from './marker-logic.js';
 
 const ROLE = 'ai-usagebar';
@@ -59,6 +60,8 @@ class AiUsageBarIndicator extends PanelMenu.Button {
         this._openPrefs = openPrefs;
         this._data = null;          // parsed snapshot for redraws
         this._busy = false;
+        // A refresh asked for while one was in flight, to run once it settles.
+        this._refreshPending = false;
         this._timer = 0;
         this._refreshTimeoutId = 0;
         this._refreshCancellable = null;
@@ -81,6 +84,7 @@ class AiUsageBarIndicator extends PanelMenu.Button {
             'bar-width', 'show-percent', 'show-bars', 'show-session',
             'show-weekly', 'show-extra', 'color-low', 'color-mid',
             'color-high', 'color-critical', 'color-empty',
+            'panel-pools', 'panel-auto-threshold',
         ];
         this._viewIds = viewKeys.map(k =>
             this._settings.connect(`changed::${k}`, () => this._render()));
@@ -101,17 +105,34 @@ class AiUsageBarIndicator extends PanelMenu.Button {
         this._restartTimer();
     }
 
-    _buildMenu() {
+    _buildMenu(grouped = false) {
+        this.menu.removeAll();
+        this._rows = {};
+        this._grouped = grouped;
+
         // Header (plan name).
         const header = new PopupMenu.PopupBaseMenuItem({reactive: false, can_focus: false});
         this._planLabel = new St.Label({text: 'AI Usage', x_expand: true, style_class: 'aiub-header'});
         header.add_child(this._planLabel);
         this.menu.addMenuItem(header);
 
-        this._addRow('session', 'Session');
-        this._addRow('weekly', 'Weekly');
-        this._addRow('sonnet', 'Sonnet only');
-        this._addRow('extra', 'Extra usage');
+        if (grouped) {
+            // Two independent quota pools per window type. Row order changes,
+            // but the data mapping does not: session/weekly still hold the
+            // primary pool, so the panel bar and the show-session/show-weekly
+            // toggles keep working exactly as they do for every other vendor.
+            this._addHeading('Session');
+            this._addRow('session', 'Session');
+            this._addRow('sonnet', 'Sonnet only');
+            this._addHeading('Weekly');
+            this._addRow('weekly', 'Weekly');
+            this._addRow('extra', 'Extra usage');
+        } else {
+            this._addRow('session', 'Session');
+            this._addRow('weekly', 'Weekly');
+            this._addRow('sonnet', 'Sonnet only');
+            this._addRow('extra', 'Extra usage');
+        }
 
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
 
@@ -126,6 +147,13 @@ class AiUsageBarIndicator extends PanelMenu.Button {
         const prefsItem = new PopupMenu.PopupMenuItem('Configurações');
         prefsItem.connect('activate', () => this._openPrefs());
         this.menu.addMenuItem(prefsItem);
+    }
+
+    // Group subtitle sitting above the rows that belong to it.
+    _addHeading(text) {
+        const item = new PopupMenu.PopupBaseMenuItem({reactive: false, can_focus: false});
+        item.add_child(new St.Label({text, x_expand: true, style_class: 'aiub-header'}));
+        this.menu.addMenuItem(item);
     }
 
     // A native, font-independent row: [name ........ value] / bar / reset.
@@ -179,12 +207,22 @@ class AiUsageBarIndicator extends PanelMenu.Button {
     }
 
     _refresh() {
-        if (this._busy)
+        // Dropping the request while busy meant a vendor change *during* a
+        // fetch never started one for the new vendor: the in-flight result for
+        // the OLD vendor was applied and stayed on the panel until the next
+        // timer tick. Remember that a refresh was asked for and run it as soon
+        // as the current one settles.
+        if (this._busy) {
+            this._refreshPending = true;
             return;
+        }
         this._busy = true;
         const token = ++this._refreshToken;
 
         const bin = resolveBinary(this._settings);
+        // Captured for THIS attempt: the setting can change while we wait, and
+        // a late result must not be rendered as if it belonged to the vendor
+        // now selected.
         const vendor = this._settings.get_string('vendor') || 'anthropic';
         const argv = [bin, '--vendor', vendor, '--format', FORMAT];
         const cancellable = new Gio.Cancellable();
@@ -200,6 +238,7 @@ class AiUsageBarIndicator extends PanelMenu.Button {
         } catch (e) {
             this._busy = false;
             this._refreshCancellable = null;
+            this._refreshPending = false;
             this._setError(`não consegui executar "${bin}"`, String(e));
             return;
         }
@@ -217,6 +256,11 @@ class AiUsageBarIndicator extends PanelMenu.Button {
             if (this._refreshToken === token) {
                 this._busy = false;
                 this._setError('ai-usagebar demorou demais', `timeout após ${REFRESH_TIMEOUT_SECS}s`);
+                // Do not strand a request that arrived while this one hung.
+                if (this._refreshPending) {
+                    this._refreshPending = false;
+                    this._refresh();
+                }
             }
             return GLib.SOURCE_REMOVE;
         });
@@ -234,12 +278,21 @@ class AiUsageBarIndicator extends PanelMenu.Button {
         };
 
         proc.communicate_utf8_async(null, cancellable, (p, res) => {
-            if (this._refreshToken === token)
+            const current = this._refreshToken === token;
+            if (current)
                 this._busy = false;
             try {
                 const [, out, err] = p.communicate_utf8_finish(res);
                 cleanup();
                 if (timedOut)
+                    return;
+                // A superseded attempt must not paint the panel: its numbers
+                // belong to whatever vendor was selected when it started.
+                if (!current)
+                    return;
+                // The selection may have changed while this ran even without a
+                // newer attempt (the change is queued as `_refreshPending`).
+                if ((this._settings.get_string('vendor') || 'anthropic') !== vendor)
                     return;
                 if ((!out || !out.trim()) && !p.get_successful()) {
                     this._setError('ai-usagebar falhou', err || '');
@@ -248,9 +301,15 @@ class AiUsageBarIndicator extends PanelMenu.Button {
                 this._consume(out || '');
             } catch (e) {
                 cleanup();
-                if (!(e instanceof GLib.Error &&
+                if (current && !(e instanceof GLib.Error &&
                       e.matches(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED)) && !timedOut)
                     this._setError('erro ao ler a saída', String(e));
+            } finally {
+                // Run whatever was requested while we were busy.
+                if (current && this._refreshPending) {
+                    this._refreshPending = false;
+                    this._refresh();
+                }
             }
         });
     }
@@ -263,27 +322,23 @@ class AiUsageBarIndicator extends PanelMenu.Button {
             this._setError('saída inválida', stdout);
             return;
         }
-        const raw = (data.text ?? '').toString().replace(/<[^>]*>/g, '');
-        // Health markers the binary appends to the bar text. The extension used
-        // to strip these out with the rest of the markup, so stale/expired data
-        // looked identical to healthy data. Capture them before splitting. The
-        // upstream sentinel field absorbs the same suffix; stripping here keeps
-        // it working on older binaries that append it to the last real field.
-        const reauth = raw.includes('re-login');
-        const stale = !reauth && raw.includes('⏸');
-        const clean = raw.replace(/\s*⚠\s*re-login\s*$/, '').replace(/\s*⏸\s*$/, '');
-        const f = splitFormatOutput(clean);
+        const raw = plainTextFromPango(data.text);
+        const f = splitFormatOutput(raw);
         if (f.length <= FIELD.extraLimit) {
             // Loading… / ⚠ — show the binary's own text.
             this._data = null;
-            this._label.clutter_text.set_markup(`<span foreground="${FG}">${esc(clean) || '…'}</span>`);
+            this._label.clutter_text.set_markup(`<span foreground="${FG}">${esc(raw) || '…'}</span>`);
             return;
         }
         this._data = {
             plan: field(f[FIELD.plan]),
+            hasUsageWindows: hasUsageWindows(f[FIELD.vendorShort]),
+            grouped: isGrouped(f[FIELD.sessionModel]),
             session: {pct: integer(f[FIELD.sessionPct]) ?? 0, reset: field(f[FIELD.sessionReset]),
+                model: field(f[FIELD.sessionModel]),
                 elapsed: markerElapsed(field(f[FIELD.sessionReset]), integer(f[FIELD.sessionElapsed]))},
             weekly: {pct: integer(f[FIELD.weeklyPct]) ?? 0, reset: field(f[FIELD.weeklyReset]),
+                model: field(f[FIELD.weeklyModel]),
                 elapsed: markerElapsed(field(f[FIELD.weeklyReset]), integer(f[FIELD.weeklyElapsed]))},
             // Per-model weekly bar: a non-empty scoped model is the presence
             // signal. A reset may be unavailable, which must not make us show
@@ -293,20 +348,22 @@ class AiUsageBarIndicator extends PanelMenu.Button {
                 if (scopedModel) {
                     const scopedPct = integer(f[FIELD.scopedPct]);
                     if (scopedPct != null && scopedPct >= 0 && scopedPct <= 100)
-                        return {pct: scopedPct, reset: field(f[FIELD.scopedReset]) || '—', label: scopedModel,
+                        return {pct: scopedPct, reset: field(f[FIELD.scopedReset]) || '—',
+                            model: scopedModel, label: scopedModel,
                             elapsed: markerElapsed(field(f[FIELD.scopedReset]), integer(f[FIELD.scopedElapsed]))};
                     // A scoped model with malformed data is unavailable; do
                     // not fall back to a potentially unrelated Sonnet window.
-                    return {pct: null, reset: '—', label: scopedModel, elapsed: null};
+                    return {pct: null, reset: '—', model: scopedModel, label: scopedModel, elapsed: null};
                 }
                 return {pct: integer(f[FIELD.sonnetPct]), reset: field(f[FIELD.sonnetReset]),
-                    label: 'Sonnet only', elapsed: null};
+                    model: '', label: 'Sonnet only', elapsed: null};
             })(),
+            // A named extra window (model + reset) renders as a percentage bar;
+            // without a name the slot stays a spent/limit money budget.
             extra: {pct: integer(f[FIELD.extraPct]), spent: field(f[FIELD.extraSpent]),
-                limit: field(f[FIELD.extraLimit])},
-            version: field(f[FIELD.version]),  // fork version header (fork-only)
-            stale,
-            reauth,
+                limit: field(f[FIELD.extraLimit]), model: field(f[FIELD.extraModel]),
+                reset: field(f[FIELD.extraReset]),
+                elapsed: markerElapsed(field(f[FIELD.extraReset]), integer(f[FIELD.extraElapsed]))},
         };
         this._render();
     }
@@ -316,10 +373,6 @@ class AiUsageBarIndicator extends PanelMenu.Button {
         const d = this._data;
         if (!d)
             return;
-        if (d.reauth) {
-            this._setReauth();
-            return;
-        }
         const colors = this._colors();
         this._renderPanel(d, colors);
         this._renderDropdown(d, colors);
@@ -341,28 +394,66 @@ class AiUsageBarIndicator extends PanelMenu.Button {
             return toks.join(' ');
         };
 
+        const showSession = this._settings.get_boolean('show-session');
+        const showWeekly = this._settings.get_boolean('show-weekly');
         const parts = [];
-        if (d.stale)
-            parts.push(`<span foreground="${RED}">⏸</span>`);
-        if (this._settings.get_boolean('show-session'))
-            parts.push(seg('5h', d.session.pct, `${d.session.pct}%`, d.session.elapsed));
-        if (this._settings.get_boolean('show-weekly'))
-            parts.push(seg('7d', d.weekly.pct, `${d.weekly.pct}%`, d.weekly.elapsed));
-        if (this._settings.get_boolean('show-extra') &&
-            d.extra.pct != null && d.extra.spent && d.extra.limit)
-            parts.push(seg('ex', d.extra.pct, d.extra.spent, null)); // $ budget → no meta
+
+        if (d.grouped) {
+            // Two independent pools. panel-pools picks the pools, show-session /
+            // show-weekly still pick the windows, so segments are pools ×
+            // windows and "just the 5h of both" needs no mode of its own.
+            for (const pool of this._selectedPools(d, showSession, showWeekly)) {
+                if (showSession && pool.session.pct != null) {
+                    parts.push(seg(`${pool.tag} 5h`, pool.session.pct,
+                        `${pool.session.pct}%`, pool.session.elapsed));
+                }
+                if (showWeekly && pool.weekly.pct != null) {
+                    parts.push(seg(`${pool.tag} 7d`, pool.weekly.pct,
+                        `${pool.weekly.pct}%`, pool.weekly.elapsed));
+                }
+            }
+        } else {
+            if (d.hasUsageWindows && showSession)
+                parts.push(seg('5h', d.session.pct, `${d.session.pct}%`, d.session.elapsed));
+            if (d.hasUsageWindows && showWeekly)
+                parts.push(seg('7d', d.weekly.pct, `${d.weekly.pct}%`, d.weekly.elapsed));
+            if (this._settings.get_boolean('show-extra') &&
+                d.extra.pct != null && d.extra.spent && d.extra.limit)
+                parts.push(seg('ex', d.extra.pct, d.extra.spent, null)); // $ budget → no meta
+        }
 
         const gap = `<span foreground="${DIM}">   </span>`;
         this._label.clutter_text.set_markup(parts.join(gap) || ' ');
     }
 
+    // The pools the panel should draw, tagged and in display order. Primary is
+    // the generic session/weekly pair; secondary reuses the scoped and extra
+    // slots, which for a grouped vendor hold the second pool's two windows.
+    _selectedPools(d, showSession, showWeekly) {
+        // Either secondary window may be absent. Derive its tag from whichever
+        // model-bearing slot exists instead of assuming the weekly one does.
+        const secondaryModel = d.sonnet.model || d.extra.model;
+        const [primaryTag, secondaryTag] = disambiguateTags(d.session.model, secondaryModel);
+        const primary = {tag: primaryTag, session: d.session, weekly: d.weekly};
+        const secondary = {tag: secondaryTag, session: d.sonnet, weekly: d.extra};
+        const pct = pool => ({
+            session: pool.session.pct,
+            weekly: pool.weekly.pct,
+        });
+        const pools = {primary, secondary};
+        return selectPools(pct(primary), pct(secondary),
+            this._settings.get_string('panel-pools'),
+            this._settings.get_int('panel-auto-threshold'),
+            {session: showSession, weekly: showWeekly})
+            .map(name => pools[name]);
+    }
+
     _renderDropdown(d, colors) {
-        const ver = d.version
-            ? `  <span foreground="${DIM}" size="smaller">v${esc(d.version)}</span>`
-            : '';
-        this._planLabel.clutter_text.set_markup(d.stale
-            ? `<span foreground="${RED}">⏸ Desatualizado — sem conexão com a conta</span>`
-            : `<span foreground="${FG}">${esc(d.plan || 'AI Usage')}</span>${ver}`);
+        // Switching vendors can flip the layout; rebuild once when it does.
+        if (!!d.grouped !== !!this._grouped)
+            this._buildMenu(d.grouped);
+
+        this._planLabel.text = d.plan || 'AI Usage';
 
         const upd = (key, pct, valueText, reset, visible, elapsed) => {
             const r = this._rows[key];
@@ -379,13 +470,25 @@ class AiUsageBarIndicator extends PanelMenu.Button {
             }
         };
 
-        upd('session', d.session.pct, `${d.session.pct}%`, d.session.reset, true, d.session.elapsed);
-        upd('weekly', d.weekly.pct, `${d.weekly.pct}%`, d.weekly.reset, true, d.weekly.elapsed);
-        // Label the per-model weekly row by the scoped model (e.g. "Fable").
+        // Under a group heading the row is named by its pool, not by the window.
+        this._rows.session.nameL.text = d.session.model || 'Session';
+        this._rows.weekly.nameL.text = d.weekly.model || 'Weekly';
+        upd('session', d.session.pct, `${d.session.pct}%`, d.session.reset,
+            d.hasUsageWindows, d.session.elapsed);
+        upd('weekly', d.weekly.pct, `${d.weekly.pct}%`, d.weekly.reset,
+            d.hasUsageWindows, d.weekly.elapsed);
         this._rows.sonnet.nameL.text = d.sonnet.label || 'Sonnet only';
         upd('sonnet', d.sonnet.pct, `${d.sonnet.pct ?? 0}%`, d.sonnet.reset, d.sonnet.pct != null, d.sonnet.elapsed);
-        upd('extra', d.extra.pct, `${d.extra.spent} / ${d.extra.limit}`, null,
-            d.extra.pct != null && !!d.extra.spent && !!d.extra.limit, null); // $ budget → no meta
+        if (d.extra.model) {
+            // Named quota window (e.g. Antigravity's "Claude & GPT OSS (weekly)").
+            this._rows.extra.nameL.text = d.extra.model;
+            upd('extra', d.extra.pct, `${d.extra.pct}%`, d.extra.reset || '—',
+                d.extra.pct != null, d.extra.elapsed);
+        } else {
+            this._rows.extra.nameL.text = 'Extra Usage';
+            upd('extra', d.extra.pct, `${d.extra.spent} / ${d.extra.limit}`, null,
+                d.extra.pct != null && !!d.extra.spent && !!d.extra.limit, null); // $ budget → no meta
+        }
     }
 
     _setError(short, detail) {
@@ -393,17 +496,6 @@ class AiUsageBarIndicator extends PanelMenu.Button {
         this._label.clutter_text.set_markup(`<span foreground="${RED}">⚠ ai</span>`);
         const msg = detail ? `${short}\n${esc(detail).slice(0, 300)}` : short;
         this._planLabel.clutter_text.set_markup(`<span foreground="${FG}">${esc(msg)}</span>`);
-        for (const r of Object.values(this._rows))
-            r.item.visible = false;
-    }
-
-    // OAuth session expired: the binary flags it with a "re-login" marker in the
-    // bar text. Show a clear call to action instead of stale numbers (mirrors
-    // the macOS menu bar app). Recovers on the next tick once you re-login.
-    _setReauth() {
-        this._label.clutter_text.set_markup(`<span foreground="${RED}">⚠ login</span>`);
-        this._planLabel.clutter_text.set_markup(
-            `<span foreground="${FG}">Sessão expirada — rode 'claude' ou refaça login no IDE</span>`);
         for (const r of Object.values(this._rows))
             r.item.visible = false;
     }

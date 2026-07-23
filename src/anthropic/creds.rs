@@ -184,21 +184,23 @@ pub fn resolve(target: &CredsTarget) -> Result<(CredentialsFile, CredsSource)> {
 /// selection is unit-testable on any platform (the hermeticity invariant —
 /// tests must never touch a real Keychain). Decision table:
 ///
-/// | file state          | keychain            | outcome                    |
-/// |---------------------|---------------------|----------------------------|
-/// | usable              | (not consulted*)    | file                       |
-/// | missing/unparsable  | usable              | keychain                   |
-/// | missing/unparsable  | absent              | original file error        |
-/// | missing/unparsable  | present-but-empty   | actionable re-login error  |
-/// | unusable (#15)      | usable              | keychain                   |
-/// | unusable (#15)      | absent/dead/empty   | file result, unchanged     |
+/// | file state          | keychain        | outcome                    |
+/// |---------------------|-----------------|----------------------------|
+/// | usable              | (not consulted*)| file                       |
+/// | missing             | usable          | keychain                   |
+/// | missing             | absent          | original I/O error         |
+/// | unusable (#15)      | usable          | keychain                   |
+/// | unusable (#15)      | absent          | file result, unchanged     |
+/// | unparsable JSON     | usable          | keychain                   |
+/// | unparsable JSON     | absent          | original parse error       |
+/// | any                 | **unreadable**  | the Keychain error         |
+///
+/// The last row matters: a *locked* login Keychain or a denied ACL is not the
+/// same as "no credentials". Reporting it as absent surfaced a "run `claude`"
+/// message and sent users to re-authenticate while their credentials were
+/// sitting there intact, so that failure now wins over the file's own error.
 ///
 /// *usable file short-circuits — no `security(1)` subprocess on the happy path.
-///
-/// The "present-but-empty" Keychain case is the Claude Code *trusted-device*
-/// sign-in state: the `Claude Code-credentials` item exists but its OAuth token
-/// is blank. With no file to fall back on, the bare "file not found" error is
-/// misleading, so we surface a re-login hint instead (see below).
 fn read_default_with(
     path: &Path,
     keychain_read: impl Fn() -> Result<Option<String>>,
@@ -212,21 +214,6 @@ fn read_default_with(
         _ => match keychain_read()? {
             Some(raw) => match parse(&raw, "macOS Keychain (Claude Code-credentials)") {
                 Ok(kc) if !is_unusable(&kc.claude_ai_oauth) => Ok((kc, CredsSource::Keychain)),
-                // Keychain item present but its OAuth token is empty — the Claude
-                // Code "trusted-device" sign-in state. When no file can stand in
-                // (missing/unparsable), the raw "file not found" is misleading:
-                // the real fix is a clean re-login, which a plain `/login` skips
-                // ("already logged in"). Surface that. A present-but-unusable
-                // *file* keeps its old outcome (falls through) so downstream
-                // re-auth handling still sees File creds.
-                Ok(_) if file_result.is_err() => Err(AppError::Credentials(
-                    "Claude's macOS Keychain item exists but its OAuth token is \
-                     empty (the Claude Code \"trusted-device\" sign-in state). A \
-                     plain `/login` sees you as already signed in and won't \
-                     rewrite it — run `claude`, then `/logout` and `/login`, to \
-                     store a fresh token."
-                        .into(),
-                )),
                 // Keychain no better than the file — surface the file outcome.
                 _ => Ok((file_result?, CredsSource::File(path.to_path_buf()))),
             },
@@ -453,21 +440,21 @@ mod tests {
     }
 
     #[test]
-    fn default_read_missing_file_with_empty_keychain_token_is_actionable() {
-        // macOS "trusted-device" state: no file, and the Keychain item exists
-        // but its OAuth token is empty. The old behavior surfaced the file's
-        // misleading "no such file" I/O error; now we surface a re-login hint
-        // (`/logout` + `/login`) so the widget's ⚠ tells the user how to fix it.
+    fn a_locked_keychain_wins_over_the_file_missing_error() {
+        // The regression this guards: `read_raw` mapped *every* `security`
+        // failure to Ok(None), so a locked login Keychain looked identical to
+        // "not logged in" and the user was told to run `claude` while their
+        // credentials sat there intact.
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("missing.json");
-        let err = read_default_with(&path, || Ok(Some(UNUSABLE.into()))).unwrap_err();
-        match err {
-            AppError::Credentials(msg) => {
-                assert!(msg.contains("/logout"), "expected re-login hint, got: {msg}");
-                assert!(msg.contains("/login"), "expected re-login hint, got: {msg}");
-            }
-            other => panic!("expected an actionable Credentials error, got {other:?}"),
-        }
+        let err = read_default_with(&path, || {
+            Err(AppError::Credentials("the Keychain is locked".into()))
+        })
+        .unwrap_err();
+        assert!(
+            matches!(err, AppError::Credentials(ref m) if m.contains("locked")),
+            "expected the Keychain error to surface, got {err:?}"
+        );
     }
 
     #[test]

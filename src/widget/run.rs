@@ -10,6 +10,7 @@ use reqwest::Client;
 
 use crate::anthropic::{self, creds::CredsTarget, fetch::FetchOutcome};
 use crate::anthropic_api;
+use crate::antigravity;
 use crate::cache::{Cache, DEFAULT_TTL};
 use crate::config::Config;
 use crate::deepseek;
@@ -48,7 +49,12 @@ pub async fn run(cli: Cli) -> i32 {
 /// Cycle to the next/prev enabled vendor and signal waybar to refresh.
 /// Always exits 0 — Waybar swallows non-zero exits anyway.
 async fn run_cycle(cli: &Cli) -> i32 {
-    let config = Config::load().unwrap_or_default();
+    // Cycling against the *default* vendor set because the config failed to
+    // parse would persist a selection the user never made. Do nothing instead;
+    // the next render surfaces the config error through the `⚠` fallback.
+    let Ok(config) = Config::load() else {
+        return 0;
+    };
     let enabled = config.enabled_vendors();
     if enabled.is_empty() {
         return 0;
@@ -61,7 +67,12 @@ async fn run_cycle(cli: &Cli) -> i32 {
         _ => enabled[0],
     };
     let delta = if cli.cycle_next { 1 } else { -1 };
-    let _ = crate::active::cycle(&enabled, start, delta);
+    // Signalling after a *failed* persist told Waybar to re-render a selection
+    // that was never written, so the bar redrew the same vendor and the scroll
+    // looked like it had been swallowed. Only announce a change that happened.
+    if crate::active::cycle(&enabled, start, delta).is_err() {
+        return 0;
+    }
 
     // Refresh the bar immediately. The Waybar module's `signal: 13` setting
     // means SIGRTMIN+13 re-runs the exec. SIGRTMIN is libc-dependent; the
@@ -70,11 +81,24 @@ async fn run_cycle(cli: &Cli) -> i32 {
     0
 }
 
+/// `--watch` repaints in place, which only makes sense on a terminal. Piped or
+/// redirected, the escape sequence is just garbage in the captured output.
+/// Split out from the loop so the decision is testable without a real TTY.
+fn should_clear_screen(stdout_is_tty: bool) -> bool {
+    stdout_is_tty
+}
+
 async fn run_watch(cli: Cli, secs: u64) -> i32 {
     let interval = Duration::from_secs(secs.max(1));
+    let clear = {
+        use std::io::IsTerminal;
+        should_clear_screen(std::io::stdout().is_terminal())
+    };
     loop {
-        // Clear screen + home cursor.
-        print!("\x1b[2J\x1b[H");
+        if clear {
+            // Clear screen + home cursor.
+            print!("\x1b[2J\x1b[H");
+        }
         let _ = std::io::stdout().flush();
         run_once(&cli, &mut std::io::stdout()).await;
         println!();
@@ -101,7 +125,10 @@ async fn run_once(cli: &Cli, out: &mut impl Write) {
 }
 
 async fn build_output(cli: &Cli) -> Result<WaybarOutput> {
-    let config = Config::load().unwrap_or_default();
+    // A broken config is reported through the `⚠` fallback (still exit 0)
+    // rather than silently reverting to the default vendor set — otherwise a
+    // typo'd section shows another account's usage with no diagnostic.
+    let config = Config::load()?;
     let vendor = cli.resolved_vendor(&config);
     if !dispatch_is_eligible(cli, &config, vendor) {
         return Err(AppError::Other(format!(
@@ -118,11 +145,12 @@ async fn build_output(cli: &Cli) -> Result<WaybarOutput> {
         Vendor::Zai => zai_output(cli, &config).await,
         Vendor::Deepseek => deepseek_output(cli, &config).await,
         Vendor::Kimi => kimi_output(cli, &config).await,
-        Vendor::Shvia => shvia_output(cli, &config).await,
         Vendor::Kilo => kilo_output(cli, &config).await,
         Vendor::Novita => novita_output(cli, &config).await,
         Vendor::Moonshot => moonshot_output(cli, &config).await,
         Vendor::Grok => grok_output(cli, &config).await,
+        Vendor::Antigravity => antigravity_output(cli, &config).await,
+        Vendor::Shvia => shvia_output(cli, &config).await,
     }
 }
 
@@ -131,6 +159,30 @@ async fn build_output(cli: &Cli) -> Result<WaybarOutput> {
 /// that default to disabled (such as Kimi).
 fn dispatch_is_eligible(cli: &Cli, config: &Config, vendor: Vendor) -> bool {
     cli.has_explicit_vendor() || config.is_enabled(vendor.to_id())
+}
+
+/// Antigravity authenticates through whichever local product is running (the
+/// 2.0 app, the `agy` CLI, or the IDE) — there is no API key to resolve.
+async fn antigravity_output(cli: &Cli, _config: &Config) -> Result<WaybarOutput> {
+    let client = http_client()?;
+    let cache = vendor_cache(cli, "antigravity")?;
+    let outcome = match antigravity::fetch_snapshot(&client, &cache, DEFAULT_TTL).await {
+        Ok(o) => o,
+        Err(e) if e.is_transient() => return Ok(WaybarOutput::loading(cli.icon.as_deref())),
+        Err(e) => return Err(e),
+    };
+
+    let theme = theme_from_cli(cli);
+    let snap = outcome.snapshot.clone();
+    let vendor_outcome: VendorOutcome = outcome.into();
+    let opts = RenderOpts::from_cli(cli);
+    Ok(antigravity::vendor::render(
+        &vendor_outcome,
+        &snap,
+        &theme,
+        &opts,
+        chrono::Utc::now(),
+    ))
 }
 
 async fn grok_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
@@ -699,6 +751,40 @@ mod tests {
         let out = fallback(&err, &cli_default());
         assert_eq!(out.text, "⚠");
         assert!(out.tooltip.contains("missing token"));
+    }
+
+    #[test]
+    fn watch_only_clears_the_screen_on_a_terminal() {
+        // Redirected to a file or piped, the clear-screen escape is garbage in
+        // the captured output.
+        assert!(should_clear_screen(true));
+        assert!(!should_clear_screen(false));
+    }
+
+    #[test]
+    fn a_failed_cycle_persist_is_not_announced_to_waybar() {
+        // Signalling after a failed persist made Waybar re-render the *same*
+        // vendor, so the scroll looked swallowed. An empty vendor set is the
+        // reachable failure: `cycle_at` errors and nothing is written.
+        let td = tempfile::TempDir::new().unwrap();
+        let path = td.path().join("active_vendor");
+        let r = crate::active::cycle_at(&path, &[], crate::vendor::VendorId::Anthropic, 1);
+        assert!(r.is_err());
+        assert!(
+            crate::active::read_from(&path).is_none(),
+            "a failed cycle must not have persisted anything"
+        );
+    }
+
+    #[test]
+    fn fallback_reports_a_broken_config_without_breaking_exit_0() {
+        // Propagating the config error must still land in the `⚠` fallback —
+        // Waybar hides modules that exit non-zero, so a broken config has to
+        // be *visible*, not fatal.
+        let toml_err = toml::from_str::<Config>("[zai\nenabled = true\n").unwrap_err();
+        let out = fallback(&AppError::Toml(toml_err), &cli_default());
+        assert_eq!(out.text, "⚠");
+        assert!(out.tooltip.contains("TOML error"));
     }
 
     #[test]

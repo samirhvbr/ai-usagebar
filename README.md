@@ -2,8 +2,6 @@
 
 Waybar widget and tabbed TUI for AI plan usage across **Anthropic Claude**, **OpenAI Codex/ChatGPT**, **Z.AI (GLM)**, **OpenRouter**, **DeepSeek**, and **Kimi**.
 
-> 🖥️ **Native desktop UIs (GNOME · macOS · Windows):** see **[DESKTOP.md](DESKTOP.md)** for how to run the panel/menu-bar/tray apps from a clone. (Windows tray by [EaeDave](https://github.com/EaeDave/ai-usagebar).)
-
 This started as a Rust port of [`claudebar`](https://github.com/mryll/claudebar) and stays drop-in compatible with it. It keeps the minimalist Pango-bordered tooltip, Omarchy theme auto-detection, and flock-protected OAuth refresh, then adds five more vendors and a proper testable codebase instead of one long shell script.
 
 ![Waybar widget showing `cld 29% · 1h 12m` in the top-right, with the hover tooltip showing Claude Max 20x session/weekly/sonnet/extra-usage progress bars](screenshot.png)
@@ -12,6 +10,9 @@ This started as a Rust port of [`claudebar`](https://github.com/mryll/claudebar)
 
 - **Per-vendor Waybar modules** with the same JSON shape as claudebar.
 - **Tabbed TUI** (`ai-usagebar-tui`) with Tab/h/l switching, per-tab refresh, and 60-second auto-refresh. Native ratatui widgets fill the available terminal width and keep the vendor tabs visually consistent.
+- **Optional local Claude Code context monitor** in the TUI, with a bounded,
+  compaction-aware view of recent session input-context usage.
+- **Native desktop integrations** for GNOME Shell and the macOS menu bar, with selectors for Anthropic, OpenAI, Z.AI, OpenRouter, and DeepSeek; the GNOME extension adds Google Antigravity.
 - **Scroll-to-cycle on the bar**: wire `on-scroll-up` / `on-scroll-down`, and one bar item cycles through your enabled vendors.
 - **Config-driven primary vendor**: set `[ui] primary` once; the widget shows that vendor by default and the TUI opens on its tab.
 - **Local testing tools**: `--pretty` renders ANSI-colored terminal output (auto-detects TTY), and `--watch N` re-renders every N seconds.
@@ -68,27 +69,62 @@ Credentials are read from the Windows user profile rather than `$HOME`:
 `%USERPROFILE%\.claude\.credentials.json` (Anthropic) and
 `%USERPROFILE%\.codex\auth.json` (OpenAI Codex). Run the official `claude` /
 `codex` CLI once on Windows to populate them, exactly as on Linux/macOS.
-API-key vendors (Z.AI, OpenRouter, DeepSeek, Kimi) work unchanged via environment
-variables or `config.toml`.
+API-key vendors work unchanged via environment variables or `config.toml`.
 
 ## Authentication
 
-Each vendor authenticates a little differently. Anthropic and OpenAI use OAuth credentials that their official CLIs already wrote to disk, so **no env vars are needed.** Z.AI, OpenRouter, DeepSeek, and Kimi use API keys. You can pass those through env vars or, if you don't source secrets in your shell, put them inline in `config.toml`.
+Each vendor authenticates a little differently. Anthropic and OpenAI use OAuth credentials that their official CLIs already wrote to disk, so **no env vars are needed.** Every other vendor uses an API key. You can pass those through env vars or, if you don't source secrets in your shell, put them inline in `config.toml`.
 
 | Vendor | Method | Action required |
 |---|---|---|
 | Anthropic | OAuth, read from `~/.claude/.credentials.json` (or the macOS login Keychain — see below) | Run `claude` once to log in. Token auto-refreshes. |
+| Anthropic (API) | Console Admin key (`ANTHROPIC_ADMIN_KEY` env or `[anthropic_api] api_key` in config) | Set either. Opt-in. This is an organization Admin key (`sk-ant-admin01-…`), not an inference key or Claude Code OAuth credential. |
 | OpenAI | OAuth, read from `~/.codex/auth.json` | Run `codex login` once. Token auto-refreshes. |
 | Z.AI | API key (`ZAI_API_KEY` env or `[zai] api_key` in config) | Set either. |
 | OpenRouter | API key (`OPENROUTER_API_KEY` env or `[openrouter] api_key` in config) | Set either. |
-| DeepSeek | API key (`DEEPSEEK_API_KEY` env or `[deepseek] api_key` in config) | Set either. Disabled by default — add `[deepseek] enabled = true` to config. |
-| Kimi | API key (`KIMI_API_KEY` env or `[kimi] api_key` in config) | Set either. Disabled by default — add `[kimi] enabled = true` to config. |
+| DeepSeek | API key (`DEEPSEEK_API_KEY` env or `[deepseek] api_key` in config) | Set either. Opt-in — see below. |
+| Kimi | API key (`KIMI_API_KEY` env or `[kimi] api_key` in config) | Set either. Opt-in — see below. |
+| Kilo | API key (`KILO_API_KEY` env or `[kilo] api_key` in config) | Set either. Opt-in. For a team balance, also set `[kilo] organization_id`; omit it for the personal balance. |
+| Novita | API key (`NOVITA_API_KEY` env or `[novita] api_key` in config) | Set either. Opt-in. |
+| Moonshot | API key (`MOONSHOT_API_KEY` env or `[moonshot] api_key` in config) | Set either. Opt-in. Set `[moonshot] region = "cn"` for `api.moonshot.cn` (balance in CNY); the default `"global"` uses `api.moonshot.ai` (USD). |
+| Grok (xAI) | **Management** key (`XAI_MANAGEMENT_KEY` env or `[grok] api_key` in config) | Set either. Opt-in. This is **not** the inference key — create it under xAI Console → Management keys. See the team note below. |
+| Google Antigravity | None — read from the local Antigravity server | Opt-in. Quota is served only while Antigravity 2.0, the Antigravity IDE, or an interactive `agy` session is running; all three share one account-wide quota. |
+
+#### Grok: team-scoped vs organization-scoped keys
+
+The balance lives at `/v1/billing/teams/{team}/prepaid/balance`, so a team has to
+be identified. With a **team-scoped** management key the team is read
+automatically from the key. With an **organization-scoped** key it cannot be —
+that key's `scopeId` is an *organization* id, not a team — so set the team
+explicitly:
+
+```toml
+[grok]
+team_id = "your-team-id"
+```
+
+Without it, an organization-scoped key reports an error saying exactly this
+rather than silently querying the wrong URL.
+
+### Enabling a vendor
+
+`enabled = true` is what makes a vendor fetch. Anthropic (API), DeepSeek, Kimi,
+Kilo, Novita, Moonshot, Grok, and Antigravity all default to **disabled** so that existing
+installs are unaffected until you opt in. Two ways to do it:
+
+- **Via the TUI Settings overlay** (`ai-usagebar-tui`, then `s`): saving a
+  non-empty API key sets that vendor's `enabled = true` for you. Clearing the
+  field again removes the inline key from `config.toml`.
+- **By hand**: add `enabled = true` to the vendor's section alongside the key.
+
+The primary-vendor selector only offers vendors that are currently enabled, so a
+vendor you haven't opted into cannot be set as primary.
 
 ### Credential resolution order (for API-key vendors)
 
 For each API-key vendor, ai-usagebar checks in this order:
 
-1. **Env var named by `api_key_env`** in config (defaults: `ZAI_API_KEY`, `OPENROUTER_API_KEY`, `DEEPSEEK_API_KEY`, `KIMI_API_KEY`). If set + non-empty, used.
+1. **Env var named by `api_key_env`** in config (defaults: `ANTHROPIC_ADMIN_KEY`, `ZAI_API_KEY`, `OPENROUTER_API_KEY`, `DEEPSEEK_API_KEY`, `KIMI_API_KEY`, `KILO_API_KEY`, `NOVITA_API_KEY`, `MOONSHOT_API_KEY`, `XAI_MANAGEMENT_KEY`). If set + non-empty, used.
 2. **Inline `api_key`** in the same config section.
 3. Otherwise, **error** with a message naming both options.
 
@@ -104,17 +140,33 @@ On macOS, recent Claude Code builds don't write `~/.claude/.credentials.json` �
 
 ## Configuration
 
-`~/.config/ai-usagebar/config.toml` (optional — defaults enable Anthropic, OpenAI, Z.AI, and OpenRouter; DeepSeek and Kimi are opt-in). Full example:
+`~/.config/ai-usagebar/config.toml` (optional — defaults enable Anthropic, OpenAI, Z.AI, and OpenRouter; all other vendors are opt-in). Full example:
 
 ```toml
 [ui]
 # Which vendor the widget shows when --vendor is omitted, AND which tab
 # is selected when the TUI opens. Defaults to anthropic when not set.
-# primary = "anthropic"   # anthropic | openai | zai | openrouter | deepseek | kimi
+# Only a vendor that is enabled can be primary.
+# primary = "anthropic"   # anthropic | anthropic_api | openai | zai
+#                         # | openrouter | deepseek | kimi | kilo | novita
+#                         # | moonshot | grok
+
+[context]
+enabled = false           # opt in, then press c in ai-usagebar-tui
+# projects_path = "~/.claude/projects"
+# context_window_tokens = 200000  # optional fallback denominator
+# [context.model_context_window_tokens]
+# "claude-opus-4-6" = 1000000    # exact model id overrides the fallback
 
 [anthropic]
 enabled = true
 # credentials_path = "/home/you/.claude/.credentials.json"
+
+[anthropic_api]
+enabled = true             # disabled by default; requires an organization Admin key
+api_key_env = "ANTHROPIC_ADMIN_KEY"
+# api_key = "sk-ant-admin01-..."  # not an inference key; chmod 600 if inline
+# monthly_limit = 1000     # optional positive, finite USD display limit
 
 [openai]
 enabled = true
@@ -140,6 +192,33 @@ api_key_env = "DEEPSEEK_API_KEY"
 enabled = true             # disabled by default; enable once you add an API key
 api_key_env = "KIMI_API_KEY"
 # api_key = "sk-..."       # used if KIMI_API_KEY is unset; chmod 600 the file!
+
+# --- Account-balance vendors (all opt-in) ---
+
+[kilo]
+enabled = true             # disabled by default; enable once you add an API key
+api_key_env = "KILO_API_KEY"
+# api_key = "..."          # used if KILO_API_KEY is unset; chmod 600 the file!
+# organization_id = "org_..."   # team balance; omit for the personal balance
+
+[novita]
+enabled = true             # disabled by default; enable once you add an API key
+api_key_env = "NOVITA_API_KEY"
+# api_key = "..."          # used if NOVITA_API_KEY is unset; chmod 600 the file!
+
+[moonshot]
+enabled = true             # disabled by default; enable once you add an API key
+api_key_env = "MOONSHOT_API_KEY"
+# api_key = "sk-..."       # used if MOONSHOT_API_KEY is unset; chmod 600 the file!
+# region = "global"        # global → api.moonshot.ai (USD) | cn → api.moonshot.cn (CNY)
+
+[grok]
+enabled = true             # disabled by default; enable once you add an API key
+# The xAI *Management* key, NOT the inference key.
+api_key_env = "XAI_MANAGEMENT_KEY"
+# api_key = "..."          # used if XAI_MANAGEMENT_KEY is unset; chmod 600 the file!
+# Required for organization-scoped keys; auto-resolved for team-scoped ones.
+# team_id = "..."
 ```
 
 ## Quick start
@@ -147,6 +226,7 @@ api_key_env = "KIMI_API_KEY"
 ```bash
 # Local testing — auto-detects TTY and renders human-readable output.
 ai-usagebar                        # uses [ui] primary (defaults to anthropic)
+ai-usagebar --vendor anthropic_api
 ai-usagebar --vendor openai
 ai-usagebar --vendor zai
 ai-usagebar --vendor openrouter
@@ -179,6 +259,10 @@ It runs in any terminal emulator (Kitty, Alacritty, Foot, Ghostty, etc.), works 
 
 The Waybar widget is optional. The TUI is the best way to see every enabled vendor at once, even if you never set up the widget.
 
+## Native desktop integrations (v0.13)
+
+The [GNOME Shell extension](gnome-extension/README.md) and [macOS menu bar app](macos/README.md) support selectors for **Anthropic, OpenAI, Z.AI, OpenRouter, and DeepSeek**; the GNOME extension also supports **Google Antigravity**, whose two independent quota pools it renders as grouped rows. **Kimi is widget/TUI-only in v0.13**; do not select it in either native desktop integration yet. Desktop protocol and marker parity for Kimi is dedicated future work.
+
 ## Waybar config
 
 ### Single module, scroll-to-cycle (recommended)
@@ -200,7 +284,7 @@ Use one bar item and scroll through your vendors. The TUI on-click still shows t
 }
 ```
 
-The `{vendor_short}` placeholder always expands to a 3-letter vendor ID (`cld` / `gpt` / `zai` / `opr` / `dsk` / `kmi`), so the bar text tells you which vendor is active. The other usage placeholders (`{session_pct}` for Anthropic, `{oai_session_pct}` for OpenAI, etc.) are vendor-specific. If you want one format string for every cycled vendor, prefer the generic aliases: `{session_pct}`, `{session_reset}`, `{weekly_pct}`, and `{weekly_reset}` are implemented by all six vendors (Anthropic, OpenAI, Z.AI, OpenRouter, DeepSeek, and Kimi; OpenRouter and DeepSeek use `0` / `—` for the windows they don't expose). Anthropic and OpenAI add `*_elapsed`, `*_pace`, and `*_bar` families; each vendor also exposes its own `{oai_*}` / `{zai_*}` / `{or_*}` / `{ds_*}` / `{kimi_*}` families, which expand to empty strings for vendors that don't define them.
+The `{vendor_short}` placeholder always expands to a 3-letter vendor ID (`cld` / `gpt` / `zai` / `opr` / `dsk` / `kmi` / `agy`), so the bar text tells you which vendor is active. The other usage placeholders (`{session_pct}` for Anthropic, `{oai_session_pct}` for OpenAI, etc.) are vendor-specific. If you want one format string for every cycled vendor, prefer the generic aliases: `{session_pct}`, `{session_reset}`, `{weekly_pct}`, and `{weekly_reset}` are implemented by all seven usage vendors (Anthropic, OpenAI, Z.AI, OpenRouter, DeepSeek, Kimi, and Antigravity; OpenRouter and DeepSeek use `0` / `—` for the windows they don't expose). Anthropic and OpenAI add `*_elapsed`, `*_pace`, and `*_bar` families; Antigravity adds `*_elapsed` for all four of its windows, plus `{session_model}` / `{weekly_model}` / `{scoped_model}` / `{extra_model}`, which name the model group each row belongs to (vendors with a single quota pool leave them empty). The established API-backed vendors also expose their own `{oai_*}` / `{zai_*}` / `{or_*}` / `{ds_*}` / `{kimi_*}` families, which expand to empty strings for vendors that don't define them.
 
 `signal: 13` lets the scroll-cycle commands refresh the bar instantly (via `SIGRTMIN+13`) instead of waiting for the next 300s interval.
 
@@ -365,14 +449,19 @@ Then `hyprctl reload` (no logout needed).
 
 ## Vendor support matrix
 
-| Vendor | Endpoint | What you see |
-|---|---|---|
-| **Anthropic** | `api.anthropic.com/api/oauth/usage` (undocumented) | Session (5h), Weekly (7d), Sonnet (7d), model-scoped weekly (e.g. Fable), Extra usage $ |
-| **OpenAI** | `chatgpt.com/backend-api/wham/usage` (undocumented; used by official `codex` CLI) | Codex 5h, Codex weekly, Code-review weekly, Credits |
-| **Z.AI** | `api.z.ai/api/monitor/usage/quota/limit` (undocumented) | Session 5h, Weekly 7d, MCP tools monthly |
-| **OpenRouter** | `openrouter.ai/api/v1/{credits,key}` (documented) | Balance, today/week/month spend, free vs paid tier |
-| **DeepSeek** | `api.deepseek.com/user/balance` (documented) | Balance, granted, topped-up credits |
-| **Kimi** | `api.kimi.com/coding/v1/usages` (undocumented; community-confirmed) | Weekly subscription quota + 5h rolling rate-limit window |
+| Vendor | Endpoint | What you see | Native desktop selector (v0.13) |
+|---|---|---|---|
+| **Anthropic** | `api.anthropic.com/api/oauth/usage` (undocumented) | Session (5h), Weekly (7d), model-scoped weekly (e.g. Fable), Extra usage $ | Yes |
+| **OpenAI** | `chatgpt.com/backend-api/wham/usage` (undocumented; used by official `codex` CLI) | Codex 5h, Codex weekly, Code-review weekly, Credits | Yes |
+| **Z.AI** | `api.z.ai/api/monitor/usage/quota/limit` (undocumented) | Session 5h, Weekly 7d, MCP tools monthly | Yes |
+| **OpenRouter** | `openrouter.ai/api/v1/{credits,key}` (documented) | Balance, today/week/month spend, free vs paid tier | Yes |
+| **DeepSeek** | `api.deepseek.com/user/balance` (documented) | Balance, granted, topped-up credits | Yes |
+| **Kimi** | `api.kimi.com/coding/v1/usages` (undocumented; community-confirmed) | Weekly subscription quota + 5h rolling rate-limit window | No — widget/TUI only; desktop protocol and marker parity are future work |
+| **Kilo** | `api.kilo.ai/api/profile/balance` (undocumented; extension-internal) | Remaining credit balance ($) | No — widget/TUI only |
+| **Novita** | `api.novita.ai/openapi/v1/billing/balance/detail` (documented) | Remaining credit balance ($) | No — widget/TUI only |
+| **Moonshot** | `api.moonshot.ai\|.cn/v1/users/me/balance` (documented) | Account balance ($ on `.ai`, ¥ on `.cn`) | No — widget/TUI only |
+| **Grok (xAI)** | `management-api.x.ai/v1/billing/teams/{team}/prepaid/balance` (Management API; documented) | Prepaid credit balance ($) | No — widget/TUI only |
+| **Anthropic (API)** | `api.anthropic.com/v1/organizations/cost_report` (Admin API; documented) | Month-to-date spend ($, excludes Priority Tier), optional spend-vs-limit % | No — widget/TUI only |
 
 ### Endpoint stability
 
@@ -414,6 +503,28 @@ When an endpoint drifts, **run `make smoke`**. It runs all ignored vendor tests,
 
 `{kimi_plan}`, `{kimi_weekly_pct}`, `{kimi_weekly_used}`, `{kimi_weekly_limit}`, `{kimi_weekly_remaining}`, `{kimi_weekly_reset}`, `{kimi_window_pct}`, `{kimi_window_used}`, `{kimi_window_limit}`, `{kimi_window_remaining}`, `{kimi_window_reset}` — subscription quota + rolling rate-limit window from `api.kimi.com/coding/v1/usages`. Generic aliases `{plan}` (plan), `{weekly_pct}` (weekly usage), and `{session_pct}` (5h window usage) are also available.
 
+### Kilo
+
+`{kilo_balance}` — remaining credit balance (USD) from `api.kilo.ai/api/profile/balance`.
+
+### Novita
+
+`{nv_balance}`, `{nv_cash}`, `{nv_credit_limit}`, `{nv_owed}` — account balance and breakdown (USD) from `api.novita.ai/openapi/v1/billing/balance/detail`.
+
+### Moonshot
+
+`{km_balance}`, `{km_voucher}`, `{km_cash}`, `{currency}` — account balance from `api.moonshot.ai|.cn/v1/users/me/balance` (USD on `.ai`, CNY on `.cn`).
+
+### Grok
+
+`{grok_balance}` — prepaid credit balance (USD) from the xAI Management API (`management-api.x.ai`).
+
+### Anthropic (API)
+
+`{aapi_headline}`, `{aapi_spent}`, `{aapi_limit}`, `{aapi_pct}` — month-to-date spend for the API/Console account from the Admin API `cost_report`. The headline is `$1.34 / $1000 · 0%` when a positive, finite `monthly_limit` is set in config, `$1.34/mo` otherwise. Generic aliases `{plan}`, `{session_pct}`, and `{weekly_pct}` are also available (the last two both map to the spend-vs-limit %).
+
+> **Two things this figure is not.** It is **spend**, not remaining credit — Anthropic exposes no API for the prepaid balance, which is visible only on the Console dashboard. And per the [Cost API docs](https://platform.claude.com/docs/en/manage-claude/usage-cost-api) it **omits Priority Tier costs**, so an organization on Priority Tier is seeing less than its true total spend.
+
 ## Local development
 
 ```bash
@@ -435,11 +546,50 @@ make clippy                                        # cargo clippy -D warnings
 - `r` — refresh active tab
 - `R` — refresh all tabs
 - `s` — open Settings overlay (primary vendor + API keys)
+- `c` — open local Claude context sessions (only when `[context] enabled = true`); `v` cycles its layout
 - `q` / `Esc` / `Ctrl-C` — quit
 
 Auto-refresh runs every 60 seconds in the background. Vendors use the same layout. Here's OpenRouter showing the credit balance gauge (red because 98% is consumed), usage-by-period totals, and tier:
 
 ![ai-usagebar-tui showing the OpenRouter tab — Credit balance gauge at 98% in red ($13.67 left of $900), Usage by period with today/week/month, paid tier](screenshots/tui-openrouter.png)
+
+### Local context overlay
+
+The optional context overlay answers a different local question from the
+vendor tabs: how much input context was present in recent Claude Code sessions.
+Enable it by hand, restart the TUI, and press `c`:
+
+```toml
+[context]
+enabled = true
+layout = "full"                          # full | split | bottom  (`v` cycles)
+# projects_path = "~/.claude/projects"  # this is the default
+# context_window_tokens = 200000         # optional fallback
+
+# Exact model ids override the fallback when 200K and 1M sessions coexist.
+[context.model_context_window_tokens]
+"claude-opus-4-6" = 1000000
+```
+
+By default the overlay takes the whole dashboard body — its own screen, not a
+popup with the vendor panel bleeding around it. `v` cycles where it sits:
+`full` → `split` (beside the vendor panel) → `bottom`.
+
+Use `↑`/`↓` or `j`/`k` to select a session, `Enter` for its detail gauge,
+`Esc` to return, and `r` to rescan. The percentage follows
+[Claude Code's status-line definition](https://code.claude.com/docs/en/statusline):
+`input_tokens + cache_creation_input_tokens + cache_read_input_tokens`. If no
+trustworthy window size is configured for a model, the overlay shows the raw
+token count rather than guessing a percentage. After compaction it shows a
+waiting state until the next assistant response establishes the new context.
+
+This is a best-effort reader for Claude Code's undocumented local JSONL format,
+not an API. It reads only bounded tails from the 100 most recently modified
+top-level sessions, ignores unknown or corrupt lines, skips `subagents`
+sidechains, never follows discovered symlinks, and does the filesystem work on
+the blocking pool so the TUI remains responsive. Nothing under
+`~/.claude/projects` is read while the feature is disabled. Context controls
+stay in TOML rather than expanding the already-full Settings modal.
 
 ### Settings overlay
 

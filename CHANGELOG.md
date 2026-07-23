@@ -9,6 +9,310 @@ Each release is also published at
 
 ## [Unreleased]
 
+## [0.16.0] — 2026-07-22
+
+### Added
+
+- **Google Antigravity vendor.** Reports the four real quota windows — a 5-hour
+  and a weekly limit for each of the two independent model pools (Gemini, and
+  Claude & GPT OSS) — from `RetrieveUserQuotaSummary` on whichever Antigravity
+  product is running locally. Antigravity 2.0, the Antigravity IDE and an
+  interactive `agy` session all share one account-wide quota, so any of them
+  serves it; the local server's port is assigned dynamically and is discovered
+  rather than assumed. No credentials to configure: enable `[antigravity]` in
+  `config.toml`. Percentages are *consumed*, matching every other vendor — the
+  Antigravity UI shows the inverse (what remains).
+
+  Quota and cached values are parsed strictly: malformed, out-of-range,
+  duplicate or missing required buckets trigger a refetch rather than a
+  confident bar. Response bodies are bounded on success and error paths. The
+  cache fingerprints the signed-in account, so switching Google accounts
+  cannot show the previous account's figures, and a window whose reset has
+  passed is refused rather than served as current. When a fetch fails with
+  nothing usable cached, the original actionable error is preserved.
+
+- **Two-pool support in the GNOME extension.** The dropdown groups Antigravity's
+  four windows under `Session` and `Weekly` headings, one bar per pool. The new
+  `Panel pools` preference draws both pools (default), either alone, or `auto`,
+  which falls back to an available other pool once the shown one reaches
+  `Auto threshold`.
+  Pace markers are rendered for all four windows. The grouped layout is opted
+  into by the data — a vendor naming its primary rows — so single-pool vendors
+  are unaffected, and a binary predating the new placeholders keeps the flat
+  four-row layout.
+
+### Changed
+
+- The GNOME extension supports GNOME Shell 45–50 (was 45–48).
+
+### Fixed
+
+- Bordered tooltips no longer ragged-edge on rows containing an escaped
+  character: `visible_width` counted `&amp;` as five glyphs instead of one, so
+  every such row stopped short of the right border. Affects any vendor whose
+  API-supplied labels contain `&`, `<` or `>`.
+
+## [0.15.0] — 2026-07-22
+
+### Added
+
+- The local Claude context monitor docks into the dashboard body instead of
+  floating: `v` cycles `full` (its own screen) → `split` (beside the vendor
+  panel) → `bottom`. `[context] layout` sets the one it opens with.
+
+### Fixed
+
+- **Credit spend is no longer hidden on plans without a spending cap** (#30).
+  The usage endpoint sends `extra_usage.monthly_limit: null` for uncapped
+  plans (e.g. Claude Pro); the whole block was discarded, hiding genuine
+  `used_credits`. A null limit is semantic — "no cap" — not schema drift, so
+  `ExtraUsage.limit` is now optional: the spend renders on every surface, the
+  tooltip says `Limit: none reported` (stating the wire fact rather than
+  inferring a plan tier), the TUI shows the amount without a denominator, and
+  `{extra_limit}` expands to `—` (deliberately non-empty: GNOME and the macOS
+  menu bar hide the whole extra row on an empty limit).
+  The block is still dropped when `used_credits` itself is missing — without
+  the spend there is nothing truthful to show — and no percentage is invented
+  when there is no denominator.
+
+- **Extra usage renders in its own currency.** The block's `currency` and
+  `decimal_places` fields were ignored and every amount was formatted as `$`
+  with a hard-coded cent scale — the #30 reporter's R$ 141.57 would have shown
+  as "$141.57", a claim about the wrong currency. Known codes get their symbol
+  (`R$`, `€`, `£`, `¥`), unknown ones render as `AMOUNT CODE`, and an explicit
+  exponent is honored exactly, including zero- and three-decimal currencies.
+  If a currency is present but its exponent is absent, the raw value renders as
+  `N minor units CODE` rather than guessing and silently corrupting the amount;
+  payloads with neither field keep the historical `$`/cents behaviour. Both
+  new fields are gated at the parse boundary: `decimal_places` outside 0..=6 is
+  schema drift (integral floats are tolerated, since this endpoint floats its
+  numbers), and `currency` must be a three-letter ISO alpha code — the value is
+  embedded in Pango markup and the desktop `;;` protocol, so an arbitrary
+  string would be an injection vector besides being drift.
+
+## [0.14.0] — 2026-07-20
+
+### Added
+
+- **Opt-in local Claude Code context monitor in the TUI.** Press `c` to list
+  the 100 most recently modified top-level sessions from
+  `~/.claude/projects`, then `Enter` for a detail gauge. The percentage uses
+  Claude Code's input-only formula (fresh input + cache creation + cache
+  reads); mixed 200K/1M histories can supply exact per-model window sizes, and
+  an unknown denominator stays a raw token count instead of becoming a false
+  percentage. The scanner runs off the async runtime, reads only bounded JSONL
+  tails, skips subagent transcripts and symlinks, tolerates corrupt/unknown
+  records, sanitizes display text, and invalidates a pre-compaction reading
+  until the next assistant response. The feature is disabled by default and
+  performs no filesystem scan until explicitly enabled.
+
+- **Four account-balance vendors** that read remaining credit via each
+  provider's API and render it as money, alongside the existing usage vendors:
+  - **Kilo** — `GET api.kilo.ai/api/profile/balance` (USD; optional org id).
+  - **Novita** — `GET api.novita.ai/openapi/v1/billing/balance/detail`
+    (amounts are in 1/10000 USD).
+  - **Moonshot** — `GET api.moonshot.ai|.cn/v1/users/me/balance`
+    (USD on `.ai`, CNY on `.cn`).
+  - **Grok (xAI)** — `GET management-api.x.ai/v1/billing/teams/{team}/prepaid/balance`
+    via a **Management key** (distinct from the inference key); the team is
+    auto-resolved from the key, and the inverted-ledger `total.val` (USD cents)
+    is converted to dollars.
+
+  All four are opt-in (disabled until a key is configured) and wired into the
+  Waybar widget, the TUI panels, and the settings overlay.
+
+  Money is parsed **strictly**: every documented monetary field is required, and
+  a malformed or error-carrying 200 response is a schema error rather than a
+  fresh "$0.00" snapshot. Moonshot's in-band `code`/`status` failure indicators
+  are honored. Each cache records the target it was fetched for (Kilo
+  organization, Moonshot region/currency, Grok team or key), so changing the
+  target refetches instead of showing the previous account's figure. When a
+  fetch fails with nothing usable cached, the original error is surfaced instead
+  of a generic "no usable cache".
+
+  For Grok, `scopeId` is only treated as a team id when the management key is
+  **team-scoped**. An organization-scoped key reports an actionable error asking
+  for `[grok] team_id` rather than querying a URL built from an organization id.
+
+- **Anthropic (API) vendor** — month-to-date **spend** for the API/Console
+  account, separate from the Claude Code OAuth account the existing `anthropic`
+  vendor covers. Sums the current calendar month's daily buckets from
+  `GET api.anthropic.com/v1/organizations/cost_report` (Admin API, paginated via
+  `has_more`/`next_page`), converting the `amount` field from cents to dollars.
+  Renders `$1.34 / $1000 · 0%` when `monthly_limit` is configured, `$1.34/mo`
+  otherwise — the limit is a config value, since the API exposes neither it nor
+  the remaining prepaid balance (Console dashboard only). Opt-in; requires a
+  Console **Admin key** (`sk-ant-admin01-…`), which is only available to
+  **organization** accounts.
+
+  The cost API omits **Priority Tier** costs, so for an affected organization
+  this figure is below its real total spend; the tooltip, TUI panel, README, and
+  `config.example.toml` all say so rather than implying it is complete.
+
+  Parsing is strict — the documented envelope fields are required, so a 200
+  error envelope or a drifted shape is a schema error instead of a fabricated
+  "$0.00 this month"; a genuine `data: []` is still a real zero. Incomplete
+  pagination (`has_more` with no `next_page`, a repeated cursor, or exceeding
+  the page cap) fails rather than caching a partial month. The cache records the
+  UTC month it covers, so a rollover — including during an outage — refetches
+  instead of showing last month as the current one. When a fetch fails with
+  nothing usable cached, the original error is surfaced so the Admin-key
+  guidance reaches the user.
+
+  The cache also fingerprints the Admin key, preventing a key switch to another
+  organization from reusing the previous organization's spend. Cost records
+  must carry the documented `USD` currency before they are summed, configured
+  limits must be positive and finite, response bodies are bounded, and fallback
+  data older than seven days is refused.
+
+### Changed
+
+- **PRs are now gated on Linux — the platform the widget actually ships on.**
+  Only Windows ran on pull requests; Linux was first exercised *after* a tag
+  was pushed, by which point the tag is immutable and any failure costs a new
+  patch release. The Linux job also runs `cargo fmt --check`, `cargo clippy
+  --all-targets -- -D warnings` and `cargo machete`, none of which ran in CI at
+  all. A macOS job runs the test suite and compiles the menu bar app, whose
+  700+ lines of Swift nothing verified.
+
+- **A release can no longer publish artifacts that disagree with its tag.** A
+  new `verify-version` job — which every downstream job depends on — requires
+  the tag to be an existing `vX.Y.Z`, and `Cargo.toml`, both PKGBUILDs, both
+  `.SRCINFO`s and a `CHANGELOG.md` section to match it. This is not
+  hypothetical: at the v0.13.0 tag both `.SRCINFO` files still declared
+  `0.8.0`, and the release shipped anyway. `workflow_dispatch` also stops
+  accepting an arbitrary commit — it must name a tag that exists — and
+  `contents: write` is now scoped to the single job that publishes rather than
+  granted to the whole workflow.
+
+### Changed
+
+- **A misspelled config *section* is now an error instead of being ignored.**
+  `[openrouer]` used to parse cleanly, leave OpenRouter on its defaults, and
+  give no hint that the section had been dropped. `Config` denies unknown
+  top-level keys. This is deliberately section-level only: the set of sections
+  is small and stable, whereas denying unknown keys inside every section would
+  hard-fail configs carrying a field from a future or removed version.
+
+### Fixed
+
+- **Switching vendors no longer leaves the previous vendor's numbers on the
+  desktop bars.** GNOME dropped any refresh requested while one was in flight,
+  so a vendor change during a fetch never started one for the new vendor: the
+  old vendor's result was applied and stayed until the next timer tick. The
+  request is now queued and run when the current attempt settles, and a result
+  is discarded if it has been superseded or if the selection changed while it
+  ran. The macOS menu bar had no such protection at all — the timer, the
+  Preferences window and a vendor change could each start a subprocess, and
+  whichever finished last won. It now runs at most one at a time, tags each
+  attempt with a generation, and ignores stale results. macOS also gains a
+  45-second watchdog: the subprocess can block on the cache lock and then
+  refresh OAuth, and without a bound a hung run left the panel frozen with no
+  explanation.
+
+- **The config file is found at one agreed location on every platform.** The
+  binary resolved it through `directories::ProjectDirs` (macOS:
+  `~/Library/Application Support/ai-usagebar/`), while the README, the shipped
+  example, `--help`, the GNOME preferences and the macOS menu bar all used
+  `~/.config/ai-usagebar/`. The two never had to be the same file, so the
+  desktop integrations could report "no key configured" for a key the binary
+  was using. The platform path stays canonical; the legacy Unix path is honored
+  when the canonical file does not exist, and both desktop surfaces now check
+  the same pair. Nothing is moved or rewritten — the file can hold API keys,
+  and relocating a secret behind the user's back is not this tool's business.
+  GNOME additionally honors `$XDG_CONFIG_HOME` instead of hard-coding
+  `~/.config`.
+
+- **`~` in configured paths is expanded.** `credentials_path = "~/..."` — the
+  form the README documents — was kept literally by `PathBuf` and resolved to a
+  directory named `~` relative to the working directory. Applies to
+  `[anthropic] credentials_path`, `[openai] codex_auth_path` and every
+  `[[anthropic.accounts]]` entry. `~user` is left untouched.
+
+- **macOS: a locked Keychain is no longer reported as "not logged in".**
+  `keychain::read_raw` mapped *every* `security(1)` failure to "no item",
+  so a locked login Keychain, a denied ACL, or an operational error all
+  produced the friendly "run `claude` to authenticate" message while the
+  credentials sat there intact. Only `errSecItemNotFound` (44) now means
+  absent; anything else surfaces with the exit code, `security`'s own stderr,
+  and what to do about it — and it takes precedence over the file's error,
+  since it is the more actionable one.
+
+- **macOS: a refresh can no longer create a second, unreadable Keychain item.**
+  With `$USER` unset the read selected by service alone while the write passed
+  `-a ""`, so the two no longer addressed the same item. Both now use the same
+  selection.
+
+- **The TUI no longer freezes while a cache lock is contended.** `acquire_lock`
+  parks the thread in a sleep loop for up to 15–45s, and the TUI runs on a
+  current-thread runtime — so a lock held by a concurrent widget invocation
+  stalled keyboard input, the refresh timer and every other vendor's request at
+  once. Adds `Cache::acquire_lock_async`, which waits on the blocking pool, and
+  routes every vendor through it.
+
+- **The TUI no longer leaks a blocking task per event-loop iteration.** A fresh
+  `spawn_blocking(event::poll)` was created on every `select!`; whenever another
+  branch won, the previous one kept running, so several orphaned pollers raced
+  on `event::read()` and could swallow keypresses. A single reader thread now
+  feeds keys through a channel.
+
+- **The terminal is restored even when the TUI exits through an error or a
+  panic.** Raw mode, the alternate screen and the cursor are now owned by an
+  RAII guard rather than undone by straight-line code after the event loop,
+  which was skipped entirely on any early return.
+
+- **A rotated OAuth refresh token is no longer lost silently.** Both Anthropic
+  and OpenAI persisted refreshed credentials with `let _ = write_back(...)`.
+  When the server rotates the refresh token and that write fails, the old token
+  on disk is already spent: the current run works, and the *next* one cannot
+  refresh, so the user appears to be logged out for no visible reason. A failed
+  write-back after a rotation is now reported and treated as an auth failure.
+  A failed write that only carried a new *access* token is still ignored —
+  nothing is lost there, the next run simply refreshes again.
+
+- **OpenAI no longer re-refreshes on every run after an id_token-less refresh.**
+  Expiry was read exclusively from the `id_token` exp claim, and the explicit
+  `expires_at` field in `auth.json` was ignored. A refresh response without a
+  new `id_token` therefore left the old, expired claim in place. `expires_at`
+  is now used as the fallback source and is written from the response's
+  `expires_in`.
+
+- **An invalid config is no longer silently replaced by the defaults.** Every
+  caller used `Config::load().unwrap_or_default()`, so a TOML syntax error, a
+  permission problem, or a failed validation produced the default vendor set
+  with no diagnostic — the user saw the wrong tabs and credentials and had
+  nothing to go on. The widget now reports it through the existing `⚠` fallback
+  (still exiting 0, as Waybar requires), the TUI prints the path and the parse
+  error *before* entering raw mode, in-session reloads keep the last good
+  config instead of reverting to defaults, and `--cycle-next/--cycle-prev` does
+  nothing rather than persisting a selection derived from the wrong vendor set.
+  A missing file remains the legitimate "use defaults" case.
+
+- **Cached data is no longer served forever after a failure.** `MAX_STALE`
+  (7 days) was declared but never referenced, so every vendor's fallback path
+  called `maybe_payload()` with no age limit: after weeks without network or
+  credentials the bar kept showing historical numbers as if they were current,
+  distinguished only by a `⏸` and an old timestamp. Failure paths now use the
+  new `Cache::fallback_payload(MAX_STALE)` and surface the real error once the
+  last good value ages out.
+
+- **A corrupt or incompatible *fresh* cache no longer renders as a zeroed
+  snapshot.** Anthropic, OpenAI, Z.AI, OpenRouter and DeepSeek turned an
+  unparseable payload into "$0.00" / "0%" / "Unknown plan" and displayed it as
+  current data; they now fall through to a live fetch, matching what Kimi
+  already did. Cached monetary fields are required rather than
+  `unwrap_or(0.0)`, so a truncated write is refetched instead of shown as an
+  empty balance.
+
+- **Z.AI no longer accepts an in-band failure as valid usage.** The API signals
+  errors inside HTTP 200 (`success: false`, non-200 `code`, `data: null`).
+  That body deserialized cleanly, was written to the cache — clearing the
+  previously recorded error — and rendered as an unknown plan with empty
+  windows, indistinguishable from an account with no usage. The envelope is now
+  validated before anything is cached, so a failure keeps the last good payload
+  and reports the error.
+## [0.13.0] — 2026-07-17
+
 ### Added
 
 - **Kimi vendor** (`--vendor kimi`): fetches weekly subscription quota and a
@@ -541,7 +845,11 @@ vendors. Highlights:
 - Live API smoke test suite (`make smoke`) that exercises the real
   undocumented endpoints to detect schema drift before users do.
 
-[Unreleased]: https://github.com/akitaonrails/ai-usagebar/compare/v0.12.0...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-usagebar/compare/v0.16.0...HEAD
+[0.16.0]: https://github.com/akitaonrails/ai-usagebar/compare/v0.15.0...v0.16.0
+[0.15.0]: https://github.com/akitaonrails/ai-usagebar/compare/v0.14.0...v0.15.0
+[0.14.0]: https://github.com/akitaonrails/ai-usagebar/compare/v0.13.0...v0.14.0
+[0.13.0]: https://github.com/akitaonrails/ai-usagebar/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/akitaonrails/ai-usagebar/releases/tag/v0.12.0
 [0.11.0]: https://github.com/akitaonrails/ai-usagebar/releases/tag/v0.11.0
 [0.10.0]: https://github.com/akitaonrails/ai-usagebar/releases/tag/v0.10.0

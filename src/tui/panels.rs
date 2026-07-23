@@ -84,11 +84,12 @@ pub fn sections_for(tab: &TabState, now: DateTime<Utc>, pace_tolerance: u32) -> 
                 VendorSnapshot::Openrouter(s) => openrouter_sections(s),
                 VendorSnapshot::Deepseek(s) => deepseek_sections(s),
                 VendorSnapshot::Kimi(s) => kimi_sections(s, now, pace_tolerance),
-                VendorSnapshot::Shvia(s) => shvia_sections(s, now),
                 VendorSnapshot::Kilo(s) => kilo_sections(s),
                 VendorSnapshot::Novita(s) => novita_sections(s),
                 VendorSnapshot::Moonshot(s) => moonshot_sections(s),
                 VendorSnapshot::Grok(s) => grok_sections(s),
+                VendorSnapshot::Antigravity(s) => antigravity_sections(s, now),
+                VendorSnapshot::Shvia(s) => shvia_sections(s, now),
             };
             // Inject the (already-absolute) fetched-at instant into the title
             // row, right-aligned. Pre-snapshotted in app::refresh_one so it
@@ -101,29 +102,46 @@ pub fn sections_for(tab: &TabState, now: DateTime<Utc>, pace_tolerance: u32) -> 
                 *right = Some(updated);
             }
             // Error footer (when present) still lives in the body.
-            if let Some((code, msg)) = last_error
-                && *code != 0
-            {
+            if let Some((label, msg)) = warning_label(snapshot, last_error) {
                 sections.push(Section::Spacer);
-                if crate::anthropic::is_reauth_error(msg) {
-                    // The widget can't mint a token itself — only an interactive
-                    // login (Claude Code) can. Surface it prominently instead of
-                    // the muted "HTTP 400" line users overlook; it auto-recovers
-                    // on the next refresh once the shared credentials are renewed.
-                    sections.push(Section::Text {
-                        label: "Reauth".into(),
-                        value: "Sign-in expired — run `claude` or re-login in your IDE; refreshes automatically once you do".into(),
-                    });
-                } else {
-                    sections.push(Section::Text {
-                        label: format!("HTTP {code}"),
-                        value: msg.clone(),
-                    });
-                }
+                sections.push(Section::Text { label, value: msg });
             }
             sections
         }
     }
+}
+
+/// Translate cache diagnostics at the presentation boundary. Cache files keep
+/// their established `(u16, String)` form: only non-zero codes are HTTP, while
+/// Kimi's stable schema marker identifies its code-zero schema warning.
+fn warning_label(
+    snapshot: &VendorSnapshot,
+    last_error: &Option<(u16, String)>,
+) -> Option<(String, String)> {
+    let (code, message) = last_error.as_ref()?;
+    if *code != 0 {
+        return Some((format!("HTTP {code}"), message.clone()));
+    }
+    if message.is_empty() {
+        return None;
+    }
+    let label = if matches!(snapshot, VendorSnapshot::Kimi(_))
+        && matches!(
+            crate::kimi::vendor::warning_kind(*code, message),
+            crate::kimi::vendor::WarningKind::SchemaDrift
+        ) {
+        "Kimi API schema drift"
+    } else {
+        "Warning"
+    };
+    // The stable marker is already the schema-warning label. Keep the label
+    // visible but do not repeat that sentinel as a redundant body value.
+    let value = if label == message {
+        String::new()
+    } else {
+        message.clone()
+    };
+    Some((label.into(), value))
 }
 
 fn anthropic_api_sections(s: &crate::usage::AnthropicApiSnapshot) -> Vec<Section> {
@@ -158,6 +176,10 @@ fn anthropic_api_sections(s: &crate::usage::AnthropicApiSnapshot) -> Vec<Section
         label: "".into(),
         value: "Prepaid credit balance is Console-only (no API).".into(),
     });
+    v.push(Section::Text {
+        label: "".into(),
+        value: "Excludes Priority Tier cost (not reported by this API).".into(),
+    });
     v
 }
 
@@ -189,12 +211,22 @@ fn anthropic_sections(
     if let Some(e) = &s.extra {
         v.push(Section::Spacer);
         let pct = e.percent().clamp(0, 100) as u16;
+        // An uncapped plan (`monthly_limit: null`) has spend but no
+        // denominator: show the amount alone rather than "of $0.00" or a
+        // percentage nobody can vouch for (#30).
+        let (value_label, footnote) = match e.fmt_limit() {
+            Some(l) => (
+                format!("{} of {}", e.fmt_spent(), l),
+                format!("{pct}% of monthly limit consumed"),
+            ),
+            None => (e.fmt_spent(), "no monthly limit reported".to_string()),
+        };
         v.push(Section::Metric {
             label: "Extra usage".into(),
             pct,
             severity: severity_for(pct as i32),
-            value_label: format!("{} of {}", e.spent.fmt_dollars(), e.limit.fmt_dollars()),
-            footnote: format!("{}% of monthly limit consumed", pct),
+            value_label,
+            footnote,
         });
     }
     v
@@ -376,6 +408,33 @@ fn openrouter_sections(s: &crate::usage::OpenRouterSnapshot) -> Vec<Section> {
             "paid tier".into()
         }],
     });
+    v
+}
+
+/// Antigravity holds two independent pools (Gemini, Claude & GPT OSS), each
+/// with a 5-hour and a weekly window. Grouped by window type so the two pools
+/// sit side by side, matching the GNOME dropdown.
+fn antigravity_sections(s: &crate::usage::AntigravitySnapshot, now: DateTime<Utc>) -> Vec<Section> {
+    use crate::antigravity::vendor::{GROUP_PRIMARY, GROUP_THIRD_PARTY};
+
+    let mut v = vec![Section::Title {
+        left: s.plan.clone(),
+        right: None,
+    }];
+    for (heading, primary, third_party) in [
+        ("Session", &s.session, s.third_party_session.as_ref()),
+        ("Weekly", &s.weekly, s.third_party_weekly.as_ref()),
+    ] {
+        v.push(Section::Spacer);
+        v.push(Section::Text {
+            label: heading.into(),
+            value: String::new(),
+        });
+        push_window(&mut v, GROUP_PRIMARY, primary, now, 5, false);
+        if let Some(w) = third_party {
+            push_window(&mut v, GROUP_THIRD_PARTY, w, now, 5, false);
+        }
+    }
     v
 }
 
@@ -673,19 +732,6 @@ fn render_section(f: &mut Frame, area: Rect, theme: &Theme, bubble: &BubbleTheme
                 f.render_widget(Paragraph::new(line), area);
                 return;
             }
-            if label == "Reauth" {
-                // Warning-colored + bold (action needed), not the error ✗ (crash).
-                let style = bubble
-                    .text
-                    .fg(bubble.palette.warning)
-                    .add_modifier(Modifier::BOLD);
-                let line = Line::from(vec![
-                    Span::styled(format!("  {} ", bubble.symbols.selected), style),
-                    Span::styled(value.clone(), style),
-                ]);
-                f.render_widget(Paragraph::new(line), area);
-                return;
-            }
             let mut spans = Vec::new();
             if !label.is_empty() {
                 spans.push(Span::styled(
@@ -810,63 +856,6 @@ mod tests {
         }))
     }
 
-    fn ready_with_error(code: u16, msg: &str) -> TabState {
-        TabState::Ready(Box::new(crate::tui::app::ReadyTab {
-            snapshot: VendorSnapshot::Anthropic(AnthropicSnapshot {
-                plan: "Max 20x".into(),
-                session: UsageWindow {
-                    utilization_pct: 2,
-                    resets_at: Some(now() + chrono::Duration::hours(1)),
-                    window_duration: chrono::Duration::hours(5),
-                },
-                weekly: UsageWindow {
-                    utilization_pct: 5,
-                    resets_at: Some(now() + chrono::Duration::days(6)),
-                    window_duration: chrono::Duration::days(7),
-                },
-                sonnet: None,
-                scoped: vec![],
-                extra: None,
-            }),
-            stale: true,
-            last_error: Some((code, msg.to_string())),
-            fetched_at: Some(now() - chrono::Duration::seconds(15)),
-        }))
-    }
-
-    #[test]
-    fn reauth_error_renders_prominent_prompt_not_http_line() {
-        let sections = sections_for(
-            &ready_with_error(400, "Refresh token not found or invalid"),
-            now(),
-            5,
-        );
-        // A prominent "Reauth" prompt is emitted…
-        assert!(sections.iter().any(|s| matches!(
-            s,
-            Section::Text { label, value }
-                if label == "Reauth" && value.contains("Sign-in expired")
-        )));
-        // …and the muted "HTTP 400" line is suppressed.
-        assert!(!sections.iter().any(|s| matches!(
-            s,
-            Section::Text { label, .. } if label.starts_with("HTTP")
-        )));
-    }
-
-    #[test]
-    fn non_reauth_http_error_still_renders_http_line() {
-        let sections = sections_for(&ready_with_error(429, "slow down"), now(), 5);
-        assert!(sections.iter().any(|s| matches!(
-            s,
-            Section::Text { label, value } if label == "HTTP 429" && value == "slow down"
-        )));
-        assert!(!sections.iter().any(|s| matches!(
-            s,
-            Section::Text { label, .. } if label == "Reauth"
-        )));
-    }
-
     #[test]
     fn anthropic_sections_include_all_three_windows_when_present() {
         let snap = AnthropicSnapshot {
@@ -888,8 +877,10 @@ mod tests {
             }),
             scoped: vec![],
             extra: Some(ExtraUsage {
-                limit: Cents(5000),
+                limit: Some(Cents(5000)),
                 spent: Cents(250),
+                currency: None,
+                decimal_places: Some(2),
             }),
         };
         let sections = sections_for(&ready(VendorSnapshot::Anthropic(snap)), now(), 5);
@@ -908,6 +899,56 @@ mod tests {
             .filter(|s| matches!(s, Section::Metric { .. }))
             .count();
         assert_eq!(metric_count, 4);
+    }
+
+    #[test]
+    fn anthropic_uncapped_extra_shows_spend_without_a_denominator() {
+        // The #30 shape: `monthly_limit: null` (Pro). The panel must show the
+        // spend alone — not "of $0.00", not an invented percentage.
+        let snap = AnthropicSnapshot {
+            plan: "Pro".into(),
+            session: UsageWindow {
+                utilization_pct: 10,
+                resets_at: None,
+                window_duration: chrono::Duration::hours(5),
+            },
+            weekly: UsageWindow {
+                utilization_pct: 20,
+                resets_at: None,
+                window_duration: chrono::Duration::days(7),
+            },
+            sonnet: None,
+            scoped: vec![],
+            extra: Some(ExtraUsage {
+                limit: None,
+                spent: Cents(14157),
+                currency: Some("BRL".into()),
+                decimal_places: Some(2),
+            }),
+        };
+        let sections = sections_for(&ready(VendorSnapshot::Anthropic(snap)), now(), 5);
+        let extra = sections
+            .iter()
+            .find_map(|s| match s {
+                Section::Metric {
+                    label,
+                    pct,
+                    value_label,
+                    footnote,
+                    ..
+                } if label == "Extra usage" => Some((*pct, value_label.clone(), footnote.clone())),
+                _ => None,
+            })
+            .expect("uncapped extra usage must still render a section");
+        assert_eq!(extra.0, 0);
+        // Non-vacuous currency pin: fmt_dollars would say "$141.57" here.
+        assert_eq!(extra.1, "R$141.57");
+        assert!(
+            !extra.1.contains(" of "),
+            "no denominator to show: {}",
+            extra.1
+        );
+        assert_eq!(extra.2, "no monthly limit reported");
     }
 
     #[test]
@@ -1114,5 +1155,64 @@ mod tests {
             .filter(|s| matches!(s, Section::Metric { .. }))
             .count();
         assert_eq!(metric_count, 1);
+    }
+
+    #[test]
+    fn schema_drift_and_generic_code_zero_diagnostics_are_visible_without_http_labels() {
+        let snap = KimiSnapshot {
+            plan: None,
+            weekly_limit: 100,
+            weekly_used: 10,
+            weekly_remaining: 90,
+            weekly_reset_at: None,
+            window_limit: 0,
+            window_used: 0,
+            window_remaining: 0,
+            window_reset_at: None,
+        };
+        let mut schema = ready(VendorSnapshot::Kimi(snap.clone()));
+        let TabState::Ready(tab) = &mut schema else {
+            unreachable!()
+        };
+        tab.last_error = Some((0, crate::kimi::fetch::SCHEMA_DRIFT_MESSAGE.into()));
+        let schema_sections = sections_for(&schema, now(), 5);
+        assert!(schema_sections.iter().any(|section| matches!(
+            section,
+            Section::Text { label, value } if label == "Kimi API schema drift" && value.is_empty()
+        )));
+
+        let mut generic = ready(VendorSnapshot::Kimi(snap));
+        let TabState::Ready(tab) = &mut generic else {
+            unreachable!()
+        };
+        tab.last_error = Some((0, "cache lock unavailable".into()));
+        let generic_sections = sections_for(&generic, now(), 5);
+        assert!(generic_sections.iter().any(|section| matches!(
+            section,
+            Section::Text { label, value } if label == "Warning" && value == "cache lock unavailable"
+        )));
+        assert!(!generic_sections.iter().any(|section| matches!(
+            section,
+            Section::Text { label, .. } if label.starts_with("HTTP")
+        )));
+
+        let http = warning_label(
+            &VendorSnapshot::Kimi(KimiSnapshot {
+                plan: None,
+                weekly_limit: 0,
+                weekly_used: 0,
+                weekly_remaining: 0,
+                weekly_reset_at: None,
+                window_limit: 0,
+                window_used: 0,
+                window_remaining: 0,
+                window_reset_at: None,
+            }),
+            &Some((503, "service unavailable".into())),
+        );
+        assert_eq!(
+            http,
+            Some(("HTTP 503".into(), "service unavailable".into()))
+        );
     }
 }

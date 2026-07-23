@@ -27,7 +27,12 @@ fn money(v: f64) -> String {
 /// just the month-to-date spend.
 fn headline(snap: &AnthropicApiSnapshot) -> String {
     match snap.limit {
-        Some(l) if l > 0.0 => format!("{} / ${:.0} · {}%", money(snap.spent), l, snap.pct().unwrap_or(0)),
+        Some(l) if l > 0.0 => format!(
+            "{} / ${:.0} · {}%",
+            money(snap.spent),
+            l,
+            snap.pct().unwrap_or(0)
+        ),
         _ => format!("{}/mo", money(snap.spent)),
     }
 }
@@ -47,7 +52,9 @@ pub fn build_placeholders(snap: &AnthropicApiSnapshot) -> HashMap<&'static str, 
         ("aapi_spent", money(snap.spent)),
         (
             "aapi_limit",
-            snap.limit.map(|l| format!("${l:.0}")).unwrap_or_else(|| "—".into()),
+            snap.limit
+                .map(|l| format!("${l:.0}"))
+                .unwrap_or_else(|| "—".into()),
         ),
         ("aapi_pct", pct.to_string()),
     ])
@@ -146,6 +153,12 @@ fn render_tooltip(
     lines.push(TooltipLine::Body(format!(
         " <span foreground='{dim}'>     remaining credit is Console-only (no API)</span>"
     )));
+    lines.push(TooltipLine::Body(format!(
+        " <span foreground='{dim}'>  󰋼  excludes Priority Tier cost, which the</span>"
+    )));
+    lines.push(TooltipLine::Body(format!(
+        " <span foreground='{dim}'>     cost API does not report</span>"
+    )));
 
     if let Some((code, msg)) = outcome.last_error.as_ref() {
         // code 0 = a non-HTTP failure (schema drift, transport). Show it under a
@@ -242,8 +255,26 @@ mod tests {
 
     #[test]
     fn severity_scales_with_spend_pct() {
-        assert_eq!(severity(&AnthropicApiSnapshot { spent: 950.0, limit: Some(1000.0) }), PaceSeverity::Critical);
-        assert_eq!(severity(&AnthropicApiSnapshot { spent: 1.0, limit: Some(1000.0) }), PaceSeverity::Low);
-        assert_eq!(severity(&AnthropicApiSnapshot { spent: 500.0, limit: None }), PaceSeverity::Low);
+        assert_eq!(
+            severity(&AnthropicApiSnapshot {
+                spent: 950.0,
+                limit: Some(1000.0)
+            }),
+            PaceSeverity::Critical
+        );
+        assert_eq!(
+            severity(&AnthropicApiSnapshot {
+                spent: 1.0,
+                limit: Some(1000.0)
+            }),
+            PaceSeverity::Low
+        );
+        assert_eq!(
+            severity(&AnthropicApiSnapshot {
+                spent: 500.0,
+                limit: None
+            }),
+            PaceSeverity::Low
+        );
     }
 }

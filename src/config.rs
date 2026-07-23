@@ -14,6 +14,7 @@
 //! treated as "use defaults". API keys are read from env vars (the relevant
 //! `*_api_key_env` field lets the user override which env var name).
 
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -23,10 +24,17 @@ use crate::cache::Cache;
 use crate::error::{AppError, Result};
 use crate::vendor::VendorId;
 
+/// A misspelled section name is silently ignored without this: `[openrouer]`
+/// leaves OpenRouter on its defaults and the user sees the wrong vendor set
+/// with no diagnostic. Denying unknown keys is deliberately applied at the
+/// *section* level only — the set of sections is small and stable, whereas
+/// denying unknown keys inside every section would hard-fail configs that
+/// carry a field from a future or removed version.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub ui: UiConfig,
+    pub context: ContextConfig,
     pub anthropic: AnthropicConfig,
     pub anthropic_api: AnthropicApiConfig,
     pub openai: OpenAiConfig,
@@ -34,11 +42,12 @@ pub struct Config {
     pub openrouter: OpenRouterConfig,
     pub deepseek: DeepseekConfig,
     pub kimi: KimiConfig,
-    pub shvia: ShviaConfig,
     pub kilo: KiloConfig,
     pub novita: NovitaConfig,
     pub moonshot: MoonshotConfig,
     pub grok: GrokConfig,
+    pub antigravity: AntigravityConfig,
+    pub shvia: ShviaConfig,
 }
 
 /// UI / dispatch preferences. Currently just `primary` — which vendor the
@@ -49,6 +58,69 @@ pub struct Config {
 pub struct UiConfig {
     /// `None` → fall back to anthropic for backward compatibility.
     pub primary: Option<VendorId>,
+}
+
+/// Where the context view docks in the dashboard body. `v` cycles it while the
+/// overlay is open; the config value is what it opens with.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ContextLayout {
+    /// Takes the whole body, the way a vendor panel does.
+    #[default]
+    Full,
+    /// Beside the dashboard.
+    Split,
+    /// Below the dashboard.
+    Bottom,
+}
+
+impl ContextLayout {
+    pub fn next(self) -> Self {
+        match self {
+            ContextLayout::Full => ContextLayout::Split,
+            ContextLayout::Split => ContextLayout::Bottom,
+            ContextLayout::Bottom => ContextLayout::Full,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ContextLayout::Full => "full",
+            ContextLayout::Split => "split",
+            ContextLayout::Bottom => "bottom",
+        }
+    }
+}
+
+/// Optional local Claude Code context-window monitor. This is deliberately
+/// separate from vendors: sessions are discovered from local transcripts and
+/// change while the TUI is running, whereas vendor tabs are config-declared
+/// account identities.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ContextConfig {
+    /// Keep the filesystem scanner completely dormant unless explicitly
+    /// enabled. The `c` key and its footer hint are hidden while disabled.
+    pub enabled: bool,
+    /// Override Claude Code's normal `~/.claude/projects` transcript root.
+    pub projects_path: Option<PathBuf>,
+    /// Optional fallback denominator. When absent, sessions without an exact
+    /// model override show their input-token count without inventing a %.
+    pub context_window_tokens: Option<u64>,
+    /// Exact Claude model id -> context-window size. This takes precedence
+    /// over `context_window_tokens`, which keeps mixed 200K/1M histories safe.
+    pub model_context_window_tokens: BTreeMap<String, u64>,
+    /// Where the view opens: full | split | bottom.
+    pub layout: ContextLayout,
+}
+
+impl ContextConfig {
+    pub fn window_tokens_for(&self, model: Option<&str>) -> Option<u64> {
+        model
+            .and_then(|model| self.model_context_window_tokens.get(model).copied())
+            .filter(|tokens| *tokens > 0)
+            .or_else(|| self.context_window_tokens.filter(|tokens| *tokens > 0))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -152,7 +224,13 @@ pub struct OpenAiConfig {
     pub enabled: bool,
     /// Override the Codex auth file path (defaults to `~/.codex/auth.json`).
     pub codex_auth_path: Option<PathBuf>,
-    /// Optional admin key env var name for the API-key-only fallback path.
+    /// Reserved, and inert: names the env var an API-key-only path *would*
+    /// read (admin key → `/v1/organization/costs`). Nothing consumes it —
+    /// OpenAI usage comes solely from Codex OAuth. Kept because that path is
+    /// still intended, not for back-compat: `[openai]` doesn't deny unknown
+    /// fields, so an existing `admin_key_env` would load either way. See
+    /// `config.example.toml`, which ships it commented out so nobody sets it
+    /// expecting an effect.
     pub admin_key_env: String,
 }
 
@@ -289,34 +367,6 @@ impl Default for NovitaConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
-pub struct ShviaConfig {
-    pub enabled: bool,
-    /// Env var name to read the key from (env wins over `api_key`).
-    pub api_key_env: String,
-    /// Inline key (fallback when the env var is unset). Chmod 600 your
-    /// config file if you put a real key here.
-    pub api_key: Option<String>,
-    /// Base URL of the self-hosted gateway (no trailing path). The usage
-    /// endpoint `/api/v1/usage` is appended automatically.
-    pub base_url: Option<String>,
-    /// Optional plan / gateway label — display-only (tooltip header).
-    pub plan: Option<String>,
-}
-
-impl Default for ShviaConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            api_key_env: "SHVIA_API_KEY".to_string(),
-            api_key: None,
-            base_url: None,
-            plan: None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default)]
 pub struct MoonshotConfig {
     pub enabled: bool,
     pub api_key_env: String,
@@ -357,6 +407,42 @@ impl Default for GrokConfig {
             api_key_env: "XAI_MANAGEMENT_KEY".to_string(),
             api_key: None,
             team_id: None,
+        }
+    }
+}
+
+/// Antigravity reads its quota from whichever local Antigravity product is
+/// running, so it needs no credentials — only an on/off switch.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct AntigravityConfig {
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ShviaConfig {
+    pub enabled: bool,
+    /// Env var name to read the key from (env wins over `api_key`).
+    pub api_key_env: String,
+    /// Inline key (fallback when the env var is unset). Chmod 600 your
+    /// config file if you put a real key here.
+    pub api_key: Option<String>,
+    /// Base URL of the self-hosted gateway (no trailing path). The usage
+    /// endpoint `/api/v1/usage` is appended automatically.
+    pub base_url: Option<String>,
+    /// Optional plan / gateway label — display-only (tooltip header).
+    pub plan: Option<String>,
+}
+
+impl Default for ShviaConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            api_key_env: "SHVIA_API_KEY".to_string(),
+            api_key: None,
+            base_url: None,
+            plan: None,
         }
     }
 }
@@ -430,7 +516,7 @@ impl Config {
     /// Load from `~/.config/ai-usagebar/config.toml`. Returns defaults if the
     /// file doesn't exist; errors only on actual parse failures.
     pub fn load() -> Result<Self> {
-        let Some(path) = default_path() else {
+        let Some(path) = resolved_path() else {
             return Ok(Self::default());
         };
         Self::load_from(&path)
@@ -438,9 +524,26 @@ impl Config {
 
     pub fn load_from(path: &std::path::Path) -> Result<Self> {
         match std::fs::read_to_string(path) {
-            Ok(s) => Ok(toml::from_str(&s)?),
+            Ok(s) => {
+                let mut config: Self = toml::from_str(&s)?;
+                // `~` is shell syntax, not path syntax: `PathBuf` keeps it
+                // literally, so a documented `credentials_path = "~/..."`
+                // silently pointed at a directory named `~`.
+                config.expand_paths();
+                config.validate()?;
+                Ok(config)
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(AppError::io_at(path, e)),
+        }
+    }
+
+    fn expand_paths(&mut self) {
+        expand_tilde_opt(&mut self.context.projects_path);
+        expand_tilde_opt(&mut self.anthropic.credentials_path);
+        expand_tilde_opt(&mut self.openai.codex_auth_path);
+        for account in &mut self.anthropic.accounts {
+            account.credentials_path = expand_tilde(&account.credentials_path);
         }
     }
 
@@ -453,11 +556,12 @@ impl Config {
             VendorId::Openrouter => self.openrouter.enabled,
             VendorId::Deepseek => self.deepseek.enabled,
             VendorId::Kimi => self.kimi.enabled,
-            VendorId::Shvia => self.shvia.enabled,
             VendorId::Kilo => self.kilo.enabled,
             VendorId::Novita => self.novita.enabled,
             VendorId::Moonshot => self.moonshot.enabled,
             VendorId::Grok => self.grok.enabled,
+            VendorId::Antigravity => self.antigravity.enabled,
+            VendorId::Shvia => self.shvia.enabled,
         }
     }
 
@@ -468,6 +572,49 @@ impl Config {
             .filter(|id| self.is_enabled(*id))
             .collect()
     }
+
+    /// Validate cross-entry constraints that serde cannot express. Account
+    /// labels are both CLI selectors and TUI tab identities, so duplicates
+    /// would make either destination ambiguous.
+    pub fn validate(&self) -> Result<()> {
+        if self.context.context_window_tokens == Some(0) {
+            return Err(AppError::Other(
+                "[context] context_window_tokens must be greater than zero".into(),
+            ));
+        }
+        for (model, tokens) in &self.context.model_context_window_tokens {
+            if model.trim().is_empty() {
+                return Err(AppError::Other(
+                    "[context] model_context_window_tokens keys must not be empty".into(),
+                ));
+            }
+            if *tokens == 0 {
+                return Err(AppError::Other(format!(
+                    "[context] model_context_window_tokens entry {model:?} must be greater than zero"
+                )));
+            }
+        }
+        if let Some(limit) = self.anthropic_api.monthly_limit
+            && (!limit.is_finite() || limit <= 0.0)
+        {
+            return Err(AppError::Other(
+                "[anthropic_api] monthly_limit must be finite and greater than zero; \
+                 remove it to show spend without a limit"
+                    .into(),
+            ));
+        }
+        let mut labels = HashSet::new();
+        for account in &self.anthropic.accounts {
+            validate_account_label(&account.label)?;
+            if !labels.insert(&account.label) {
+                return Err(AppError::Credentials(format!(
+                    "duplicate anthropic account label {:?}",
+                    account.label
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 pub fn default_path() -> Option<PathBuf> {
@@ -475,12 +622,70 @@ pub fn default_path() -> Option<PathBuf> {
     Some(proj.config_dir().join("config.toml"))
 }
 
+/// The Unix-conventional location, which is what every doc, the config
+/// example, and both desktop integrations have always pointed at. On Linux it
+/// *is* [`default_path`]; on macOS `ProjectDirs` resolves to
+/// `~/Library/Application Support/…` instead, so the two diverge.
+fn legacy_xdg_path() -> Option<PathBuf> {
+    let home = crate::cache::home_dir().ok()?;
+    Some(home.join(".config").join("ai-usagebar").join("config.toml"))
+}
+
+/// The config file actually in effect.
+///
+/// [`default_path`] stays canonical, but on macOS a file at the documented
+/// `~/.config/ai-usagebar/config.toml` is honored when the canonical one does
+/// not exist — otherwise everyone who followed the README (and both desktop
+/// integrations, which read that path) silently got defaults. The legacy file
+/// is never moved or rewritten: it may hold API keys, and relocating a secret
+/// behind the user's back is not this tool's business.
+pub fn resolved_path() -> Option<PathBuf> {
+    let canonical = default_path();
+    if let Some(p) = &canonical
+        && p.exists()
+    {
+        return canonical;
+    }
+    if let Some(legacy) = legacy_xdg_path()
+        && legacy.exists()
+    {
+        return Some(legacy);
+    }
+    canonical
+}
+
+/// Expand a leading `~` (or `~/`) against the user's home directory. Anything
+/// else — including `~user` — is left untouched.
+fn expand_tilde(p: &std::path::Path) -> PathBuf {
+    let Some(s) = p.to_str() else {
+        return p.to_path_buf();
+    };
+    let rest = if s == "~" {
+        ""
+    } else if let Some(r) = s.strip_prefix("~/") {
+        r
+    } else {
+        return p.to_path_buf();
+    };
+    match crate::cache::home_dir() {
+        Ok(home) if rest.is_empty() => home,
+        Ok(home) => home.join(rest),
+        Err(_) => p.to_path_buf(),
+    }
+}
+
+fn expand_tilde_opt(p: &mut Option<PathBuf>) {
+    if let Some(inner) = p.as_ref() {
+        *p = Some(expand_tilde(inner));
+    }
+}
+
 /// Resolved `config.toml` path as a string for user-facing messages. Uses the
 /// platform's config dir (`directories::ProjectDirs`), so it reads correctly on
 /// Linux, macOS, and Windows instead of hard-coding the Unix `~/.config` path.
 /// Falls back to the bare filename if the path can't be resolved.
 pub fn config_path_hint() -> String {
-    default_path()
+    resolved_path()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "config.toml".to_string())
 }
@@ -499,7 +704,7 @@ mod tests {
     }
 
     #[test]
-    fn defaults_enable_core_vendors_deepseek_and_kimi_default_off() {
+    fn defaults_enable_only_the_four_core_vendors() {
         let c = Config::default();
         assert!(c.is_enabled(VendorId::Anthropic));
         assert!(c.is_enabled(VendorId::Openai));
@@ -507,10 +712,18 @@ mod tests {
         assert!(c.is_enabled(VendorId::Openrouter));
         // ShvIA points at a self-hosted gateway and is enabled by default.
         assert!(c.is_enabled(VendorId::Shvia));
-        // DeepSeek and Kimi require explicit API keys, so they default to disabled.
-        assert!(!c.is_enabled(VendorId::Deepseek));
-        assert!(!c.is_enabled(VendorId::Kimi));
-        // anthropic + openai + zai + openrouter + shvia = 5 (deepseek + kimi off).
+        for opt_in in [
+            VendorId::AnthropicApi,
+            VendorId::Deepseek,
+            VendorId::Kimi,
+            VendorId::Kilo,
+            VendorId::Novita,
+            VendorId::Moonshot,
+            VendorId::Grok,
+        ] {
+            assert!(!c.is_enabled(opt_in), "{opt_in:?}");
+        }
+        // anthropic + openai + zai + openrouter + shvia = 5 (others opt-in).
         assert_eq!(c.enabled_vendors().len(), 5);
     }
 
@@ -569,6 +782,91 @@ enabled = false
     fn malformed_toml_returns_error() {
         let f = write_toml("this is not = = valid");
         assert!(Config::load_from(f.path()).is_err());
+    }
+
+    #[test]
+    fn anthropic_api_monthly_limit_must_be_positive_and_finite() {
+        for value in ["0", "-1", "inf", "nan"] {
+            let file = write_toml(&format!("[anthropic_api]\nmonthly_limit = {value}\n"));
+            let error = Config::load_from(file.path()).unwrap_err().to_string();
+            assert!(error.contains("monthly_limit"), "value {value}: {error}");
+        }
+
+        let file = write_toml("[anthropic_api]\nmonthly_limit = 1000\n");
+        assert_eq!(
+            Config::load_from(file.path())
+                .unwrap()
+                .anthropic_api
+                .monthly_limit,
+            Some(1000.0)
+        );
+    }
+
+    #[test]
+    fn context_monitor_is_opt_in_and_window_sizes_are_explicit() {
+        let defaults = Config::default();
+        assert!(!defaults.context.enabled);
+        assert_eq!(
+            defaults.context.window_tokens_for(Some("claude-test")),
+            None
+        );
+
+        let file = write_toml(
+            r#"
+            [context]
+            enabled = true
+            context_window_tokens = 200000
+
+            [context.model_context_window_tokens]
+            claude-opus-1m = 1000000
+            "claude exact id" = 300000
+            "#,
+        );
+        let config = Config::load_from(file.path()).unwrap();
+        assert!(config.context.enabled);
+        assert_eq!(
+            config.context.window_tokens_for(Some("claude-opus-1m")),
+            Some(1_000_000)
+        );
+        assert_eq!(
+            config.context.window_tokens_for(Some("claude exact id")),
+            Some(300_000)
+        );
+        assert_eq!(
+            config.context.window_tokens_for(Some("another-model")),
+            Some(200_000)
+        );
+    }
+
+    #[test]
+    fn context_layout_defaults_to_full_and_parses_each_variant() {
+        assert_eq!(Config::default().context.layout, ContextLayout::Full);
+        for (text, want) in [
+            ("full", ContextLayout::Full),
+            ("split", ContextLayout::Split),
+            ("bottom", ContextLayout::Bottom),
+        ] {
+            let file = write_toml(&format!("[context]\nlayout = \"{text}\"\n"));
+            assert_eq!(Config::load_from(file.path()).unwrap().context.layout, want);
+        }
+        let file = write_toml("[context]\nlayout = \"floating\"\n");
+        assert!(
+            Config::load_from(file.path()).is_err(),
+            "an unknown layout must be rejected, not silently defaulted"
+        );
+    }
+
+    #[test]
+    fn context_window_sizes_must_be_nonzero_and_model_ids_nonempty() {
+        for source in [
+            "[context]\ncontext_window_tokens = 0\n",
+            "[context.model_context_window_tokens]\nclaude = 0\n",
+            "[context.model_context_window_tokens]\n\" \" = 200000\n",
+        ] {
+            let file = write_toml(source);
+            let error = Config::load_from(file.path()).unwrap_err().to_string();
+            assert!(error.contains("context"), "{error}");
+        }
     }
 
     // serial guard for env-var manipulation tests so they don't race
@@ -746,31 +1044,111 @@ enabled = false
     }
 
     #[test]
-    fn shvia_defaults_and_inline_config() {
-        // Defaults: enabled, SHVIA_API_KEY, no inline key, default base_url.
-        let c = Config::default();
-        assert!(c.shvia.enabled);
-        assert_eq!(c.shvia.api_key_env, "SHVIA_API_KEY");
-        assert!(c.shvia.api_key.is_none());
-        assert!(c.shvia.base_url.is_none());
-
-        // Inline overrides parse correctly, mirroring [zai].
+    fn tilde_paths_are_expanded_on_load() {
+        // `PathBuf` keeps `~` literally, so the documented
+        // `credentials_path = "~/..."` used to resolve to a directory named
+        // `~` relative to the process's cwd.
         let f = write_toml(
             r#"
-            [shvia]
-            enabled = true
-            api_key_env = "MY_SHVIA"
-            api_key = "sk-shvia-inline"
-            base_url = "https://ia.example.test"
-            plan = "Gateway"
+            [context]
+            projects_path = "~/.claude/projects"
+
+            [anthropic]
+            credentials_path = "~/.claude/.credentials.json"
+
+            [[anthropic.accounts]]
+            label = "work"
+            credentials_path = "~/work.json"
             "#,
         );
         let c = Config::load_from(f.path()).unwrap();
-        assert!(c.is_enabled(VendorId::Shvia));
-        assert_eq!(c.shvia.api_key_env, "MY_SHVIA");
-        assert_eq!(c.shvia.api_key.as_deref(), Some("sk-shvia-inline"));
-        assert_eq!(c.shvia.base_url.as_deref(), Some("https://ia.example.test"));
-        assert_eq!(c.shvia.plan.as_deref(), Some("Gateway"));
+        let home = crate::cache::home_dir().unwrap();
+
+        assert_eq!(c.context.projects_path, Some(home.join(".claude/projects")));
+        let got = c.anthropic.credentials_path.unwrap();
+        assert_eq!(got, home.join(".claude/.credentials.json"));
+        assert!(!got.to_string_lossy().contains('~'));
+        assert_eq!(
+            c.anthropic.accounts[0].credentials_path,
+            home.join("work.json")
+        );
+    }
+
+    #[test]
+    fn absolute_and_relative_paths_are_left_alone() {
+        let f = write_toml(
+            r#"
+            [anthropic]
+            credentials_path = "/etc/creds.json"
+            "#,
+        );
+        let c = Config::load_from(f.path()).unwrap();
+        assert_eq!(
+            c.anthropic.credentials_path.unwrap(),
+            std::path::Path::new("/etc/creds.json")
+        );
+
+        // `~user` is not ours to interpret.
+        let f2 = write_toml(
+            r#"
+            [anthropic]
+            credentials_path = "~someone/creds.json"
+            "#,
+        );
+        let c2 = Config::load_from(f2.path()).unwrap();
+        assert_eq!(
+            c2.anthropic.credentials_path.unwrap(),
+            std::path::Path::new("~someone/creds.json")
+        );
+    }
+
+    #[test]
+    fn resolved_path_is_the_canonical_one_and_names_the_config_file() {
+        // Hermetic: only asserts the shape, never which file happens to exist
+        // on the machine running the tests.
+        let p = resolved_path().expect("a config path must resolve");
+        assert!(p.ends_with("config.toml"));
+        let canonical = default_path().unwrap();
+        let legacy = legacy_xdg_path().unwrap();
+        assert!(
+            p == canonical || p == legacy,
+            "resolved to an unexpected location: {}",
+            p.display()
+        );
+    }
+
+    #[test]
+    fn misspelled_section_is_rejected_not_ignored() {
+        // The regression this guards: `[openrouer]` used to parse fine, leave
+        // OpenRouter on its defaults, and give the user no hint at all.
+        let f = write_toml(
+            r#"
+            [openrouer]
+            enabled = true
+            api_key = "sk-or-v1-typo"
+            "#,
+        );
+        let err = Config::load_from(f.path()).unwrap_err().to_string();
+        assert!(
+            err.contains("openrouer"),
+            "error should name the typo: {err}"
+        );
+    }
+
+    #[test]
+    fn invalid_toml_is_an_error_not_silent_defaults() {
+        let f = write_toml("[zai\nenabled = true\n");
+        assert!(Config::load_from(f.path()).is_err());
+    }
+
+    #[test]
+    fn a_missing_file_is_still_just_defaults() {
+        // Absence stays the legitimate "use defaults" case — only real parse
+        // and I/O failures are errors.
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nope").join("config.toml");
+        let c = Config::load_from(&missing).unwrap();
+        assert!(c.is_enabled(VendorId::Anthropic));
     }
 
     #[test]
@@ -802,6 +1180,8 @@ enabled = false
             "#,
         );
         let c = Config::load_from(f.path()).unwrap();
+        // ShvIA is enabled by default (like Z.AI), so it also appears — after
+        // Kimi in canonical `VendorId::all()` order.
         assert_eq!(
             c.enabled_vendors(),
             vec![
@@ -811,7 +1191,6 @@ enabled = false
                 VendorId::Openrouter,
                 VendorId::Deepseek,
                 VendorId::Kimi,
-                // Fork: ShvIA is enabled by default, so it trails the canonical list.
                 VendorId::Shvia,
             ]
         );
@@ -843,6 +1222,26 @@ enabled = false
     }
 
     #[test]
+    fn duplicate_anthropic_account_labels_are_rejected_on_load() {
+        let f = write_toml(
+            r#"
+            [[anthropic.accounts]]
+            label = "work"
+            credentials_path = "/creds/work-one.json"
+
+            [[anthropic.accounts]]
+            label = "work"
+            credentials_path = "/creds/work-two.json"
+            "#,
+        );
+        let err = Config::load_from(f.path()).unwrap_err().to_string();
+        assert!(
+            err.contains("duplicate anthropic account label \"work\""),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn account_label_rejects_path_like_names() {
         let cfg = AnthropicConfig::default();
         for bad in ["", ".", "..", "a/b", r"a\b", "usage.json"] {
@@ -859,5 +1258,126 @@ enabled = false
         // No [[anthropic.accounts]] → the single default account, empty list,
         // nothing to migrate (issue #14, back-compat rule 1).
         assert!(Config::default().anthropic.accounts.is_empty());
+    }
+
+    /// The shipped example, which `make install` puts in
+    /// `share/ai-usagebar/config.example.toml`. Repo-relative, so this stays
+    /// hermetic — it never touches the user's real config.
+    fn config_example() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config.example.toml")
+    }
+
+    #[test]
+    fn shipped_example_parses_as_a_real_config() {
+        // The example is documentation users copy verbatim, but nothing used
+        // to parse it — so a renamed section or field could rot there
+        // unnoticed, and `deny_unknown_fields` would reject the copy on the
+        // user's machine instead of in CI.
+        let c = Config::load_from(&config_example()).unwrap();
+        assert!(!c.context.enabled);
+        assert!(c.is_enabled(VendorId::Anthropic));
+        assert!(c.is_enabled(VendorId::Openai));
+        assert!(!c.is_enabled(VendorId::AnthropicApi));
+        assert!(!c.is_enabled(VendorId::Deepseek));
+        assert!(!c.is_enabled(VendorId::Kimi));
+        assert!(!c.is_enabled(VendorId::Kilo));
+        assert!(!c.is_enabled(VendorId::Novita));
+        assert!(!c.is_enabled(VendorId::Moonshot));
+        assert!(!c.is_enabled(VendorId::Grok));
+    }
+
+    #[test]
+    fn shipped_example_does_not_advertise_admin_key_env_as_working() {
+        // The regression: the example shipped an *uncommented*
+        // `admin_key_env = "OPENAI_ADMIN_KEY"`, indistinguishable from a live
+        // setting. Nothing reads it, so a user could set it, skip
+        // `codex login`, and wait for usage that never arrives.
+        let text = std::fs::read_to_string(config_example()).unwrap();
+        let live: Vec<&str> = text
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.contains("admin_key_env") && !l.starts_with('#'))
+            .collect();
+        assert!(
+            live.is_empty(),
+            "admin_key_env must stay commented out while it is inert: {live:?}"
+        );
+        // Still documented, though — silently dropping it would leave users
+        // who already set it with no explanation of why it does nothing.
+        assert!(
+            text.contains("admin_key_env") && text.contains("RESERVED"),
+            "the example should keep describing admin_key_env as reserved"
+        );
+    }
+
+    #[test]
+    fn admin_key_env_is_accepted_but_changes_nothing() {
+        // The field survives because the API-key-only path is still intended.
+        // What has to hold today is narrower: setting it loads without error
+        // and moves nothing the code actually acts on.
+        let f = write_toml(
+            r#"
+            [openai]
+            admin_key_env = "SOME_ADMIN_KEY"
+            "#,
+        );
+        let c = Config::load_from(f.path()).unwrap();
+        assert_eq!(c.openai.admin_key_env, "SOME_ADMIN_KEY");
+        // Nothing else moved: OpenAI still resolves through Codex OAuth only.
+        let default = OpenAiConfig::default();
+        assert_eq!(c.openai.enabled, default.enabled);
+        assert_eq!(c.openai.codex_auth_path, default.codex_auth_path);
+        assert_eq!(c.enabled_vendors(), Config::default().enabled_vendors());
+    }
+
+    #[test]
+    fn config_example_documents_every_vendor_without_secrets() {
+        let raw = std::fs::read_to_string(config_example()).unwrap();
+        let cfg = Config::load_from(&config_example()).unwrap();
+        // Every vendor the binary can dispatch needs a documented section, or
+        // users have no way to discover how to turn it on.
+        for id in VendorId::all() {
+            let section = id.slug();
+            assert!(
+                raw.contains(&format!("[{section}]")),
+                "config.example.toml has no [{section}] section"
+            );
+        }
+
+        // The example must not ship anything enabled-by-key-only, and must not
+        // carry a real secret.
+        assert!(!cfg.anthropic_api.enabled && cfg.anthropic_api.api_key.is_none());
+        assert!(!cfg.kilo.enabled && cfg.kilo.api_key.is_none());
+        assert!(!cfg.novita.enabled && cfg.novita.api_key.is_none());
+        assert!(!cfg.moonshot.enabled && cfg.moonshot.api_key.is_none());
+        assert!(!cfg.grok.enabled && cfg.grok.api_key.is_none());
+    }
+
+    #[test]
+    fn shvia_defaults_and_inline_config() {
+        // Defaults: enabled, SHVIA_API_KEY, no inline key, default base_url.
+        let c = Config::default();
+        assert!(c.shvia.enabled);
+        assert_eq!(c.shvia.api_key_env, "SHVIA_API_KEY");
+        assert!(c.shvia.api_key.is_none());
+        assert!(c.shvia.base_url.is_none());
+
+        // Inline overrides parse correctly, mirroring [zai].
+        let f = write_toml(
+            r#"
+            [shvia]
+            enabled = true
+            api_key_env = "MY_SHVIA"
+            api_key = "sk-shvia-inline"
+            base_url = "https://ia.example.test"
+            plan = "Gateway"
+            "#,
+        );
+        let c = Config::load_from(f.path()).unwrap();
+        assert!(c.is_enabled(VendorId::Shvia));
+        assert_eq!(c.shvia.api_key_env, "MY_SHVIA");
+        assert_eq!(c.shvia.api_key.as_deref(), Some("sk-shvia-inline"));
+        assert_eq!(c.shvia.base_url.as_deref(), Some("https://ia.example.test"));
+        assert_eq!(c.shvia.plan.as_deref(), Some("Gateway"));
     }
 }

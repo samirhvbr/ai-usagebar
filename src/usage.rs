@@ -14,6 +14,35 @@
 
 use chrono::{DateTime, Utc};
 
+use crate::error::{AppError, Result};
+
+/// Reject a non-finite monetary value. A NaN or infinity reaching a balance
+/// field means the payload was not what we think it is; displaying it as money
+/// (or caching it as authoritative) is worse than failing loudly.
+pub fn finite_amount(vendor: &str, field: &str, v: f64) -> Result<f64> {
+    if v.is_finite() {
+        Ok(v)
+    } else {
+        Err(AppError::Schema(format!(
+            "{vendor}: `{field}` is not a finite number"
+        )))
+    }
+}
+
+/// Parse a monetary field that the wire encodes as a string. A malformed or
+/// empty value is a schema error, **not** a zero balance — silently reporting
+/// $0.00 for an error envelope is the failure mode this guards against.
+pub fn parse_amount(vendor: &str, field: &str, s: &str) -> Result<f64> {
+    let t = s.trim();
+    if t.is_empty() {
+        return Err(AppError::Schema(format!("{vendor}: `{field}` is empty")));
+    }
+    let v: f64 = t
+        .parse()
+        .map_err(|_| AppError::Schema(format!("{vendor}: `{field}` is not numeric (got {t:?})")))?;
+    finite_amount(vendor, field, v)
+}
+
 /// A single usage window — generic enough that every vendor with a notion of
 /// "% used vs. when does it reset" can express itself with it.
 ///
@@ -27,7 +56,8 @@ pub struct UsageWindow {
     pub window_duration: chrono::Duration,
 }
 
-/// Money expressed in cents to dodge float roundoff.
+/// Money in minor currency units (historically always cents; see
+/// `ExtraUsage::decimal_places` for the actual scale) to dodge float roundoff.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Cents(pub i64);
 
@@ -73,21 +103,94 @@ pub struct ScopedWindow {
 }
 
 /// "Extra usage" pay-as-you-go block (claudebar's `extra_usage`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtraUsage {
-    pub limit: Cents,
+    /// `None` when the payload carries no usable `monthly_limit` — an
+    /// explicit null (observed for plans without a spending cap, e.g. Claude
+    /// Pro, #30) or an absent field. Either way the spend is real and stays
+    /// visible; only the limit is unreported, and the renderers say exactly
+    /// that rather than inferring a plan tier from it.
+    pub limit: Option<Cents>,
     pub spent: Cents,
+    /// ISO code from the block (`"BRL"`, `"USD"`, …). `None` on older payloads
+    /// that predate the field — formatted as `$` for back-compat, which was
+    /// the only behaviour before the field existed.
+    pub currency: Option<String>,
+    /// Minor-unit digits from the block's `decimal_places` (BRL/USD = 2,
+    /// JPY/KRW = 0). `None` means the wire did not report the scale. We keep
+    /// that absence instead of guessing from an incomplete currency table.
+    pub decimal_places: Option<u32>,
 }
 
 impl ExtraUsage {
     /// Integer percentage of the monthly limit consumed (0..=100, saturating
     /// at 0 when limit is non-positive — matches claudebar:540-542).
-    pub fn percent(self) -> i32 {
-        if self.limit.0 <= 0 {
-            0
-        } else {
-            ((self.spent.0 * 100) / self.limit.0) as i32
+    ///
+    /// With no cap there is no denominator, so no meaningful percentage
+    /// exists; 0 keeps the bar and severity calm rather than inventing one.
+    pub fn percent(&self) -> i32 {
+        match self.limit {
+            Some(l) if l.0 > 0 => ((self.spent.0 * 100) / l.0) as i32,
+            _ => 0,
         }
+    }
+
+    pub fn fmt_spent(&self) -> String {
+        self.fmt_amount(self.spent)
+    }
+
+    pub fn fmt_limit(&self) -> Option<String> {
+        self.limit.map(|l| self.fmt_amount(l))
+    }
+
+    fn fmt_amount(&self, amount: Cents) -> String {
+        match (self.decimal_places, self.currency.as_deref()) {
+            (Some(decimal_places), currency) => fmt_minor(amount.0, decimal_places, currency),
+            // Legacy payloads predate both fields and were always cents/USD.
+            // Preserve that established behaviour only when neither field can
+            // tell us otherwise.
+            (None, None) => fmt_minor(amount.0, 2, None),
+            // A currency code alone does not determine its ISO minor-unit
+            // exponent. Keep the amount truthful instead of silently dividing
+            // zero-, three-, or four-decimal currencies by the wrong scale.
+            (None, Some(currency)) => fmt_minor_units(amount.0, currency),
+        }
+    }
+}
+
+fn fmt_minor_units(minor: i64, currency: &str) -> String {
+    let sign = if minor < 0 { "-" } else { "" };
+    format!("{sign}{} minor units {currency}", minor.unsigned_abs())
+}
+
+/// Format an amount in minor units with its own currency and scale. Rendering
+/// R$ 141.57 as "$141.57" is a claim about the wrong currency — the same class
+/// of defect as a fabricated number. Known codes get their symbol (mirroring
+/// `deepseek::format_money`); anything else renders as `AMOUNT CODE`, which is
+/// still truthful.
+pub fn fmt_minor(minor: i64, decimal_places: u32, currency: Option<&str>) -> String {
+    let scale = 10_u64.pow(decimal_places);
+    // `unsigned_abs`, not negation: `-i64::MIN` overflows. Unreachable from
+    // the wire (the parse gate rejects negatives) but this is a pub fn.
+    let sign = if minor < 0 { "-" } else { "" };
+    let abs = minor.unsigned_abs();
+    let number = if decimal_places == 0 {
+        format!("{abs}")
+    } else {
+        format!(
+            "{}.{:0width$}",
+            abs / scale,
+            abs % scale,
+            width = decimal_places as usize
+        )
+    };
+    match currency {
+        None | Some("USD") => format!("{sign}${number}"),
+        Some("BRL") => format!("{sign}R${number}"),
+        Some("EUR") => format!("{sign}€{number}"),
+        Some("GBP") => format!("{sign}£{number}"),
+        Some("JPY") | Some("CNY") => format!("{sign}¥{number}"),
+        Some(other) => format!("{sign}{number} {other}"),
     }
 }
 
@@ -101,7 +204,7 @@ pub struct DeepseekSnapshot {
     pub granted: f64,
     /// Topped-up (purchased) credits component.
     pub topped_up: f64,
-    /// The currency of the above amounts ("USD", "CNY", etc.).
+    /// The currency of the above amounts (currently "USD" or "CNY").
     pub currency: String,
 }
 
@@ -167,13 +270,35 @@ pub enum VendorSnapshot {
     Openrouter(OpenRouterSnapshot),
     Deepseek(DeepseekSnapshot),
     Kimi(KimiSnapshot),
-    Shvia(ShviaSnapshot),
     Kilo(KiloSnapshot),
     Novita(NovitaSnapshot),
     Moonshot(MoonshotSnapshot),
     Grok(GrokSnapshot),
     AnthropicApi(AnthropicApiSnapshot),
+    Antigravity(AntigravitySnapshot),
+    Shvia(ShviaSnapshot),
 }
+
+/// Google Antigravity 2.0 / CLI snapshot. The API groups models into Gemini
+/// and third-party (Claude/GPT) buckets, and each group carries its own 5-hour
+/// and weekly window — four independent windows in total.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AntigravitySnapshot {
+    pub plan: String,
+    /// Fingerprint of the signed-in account. Never displayed — it exists so a
+    /// cache written for one Google account is not served for another.
+    pub account: String,
+    /// Gemini group, 5-hour window.
+    pub session: UsageWindow,
+    /// Gemini group, weekly window.
+    pub weekly: UsageWindow,
+    /// Claude/GPT group, 5-hour window.
+    pub third_party_session: Option<UsageWindow>,
+    /// Claude/GPT group, weekly window.
+    pub third_party_weekly: Option<UsageWindow>,
+}
+
+impl Eq for AntigravitySnapshot {}
 
 /// Anthropic Admin API — month-to-date spend (USD) from the cost report. The
 /// monthly `limit` is supplied from config (the API exposes neither the limit
@@ -191,7 +316,7 @@ impl AnthropicApiSnapshot {
     /// positive limit is set.
     pub fn pct(&self) -> Option<i32> {
         self.limit
-            .filter(|l| *l > 0.0)
+            .filter(|l| l.is_finite() && *l > 0.0)
             .map(|l| ((self.spent / l) * 100.0).round().clamp(0.0, 9999.0) as i32)
     }
 }
@@ -403,7 +528,7 @@ pub fn anthropic_severity(snap: &AnthropicSnapshot) -> crate::pacing::PaceSeveri
             .as_ref()
             .is_some_and(|s| s.utilization_pct >= 100)
         || snap.scoped.iter().any(|s| s.window.utilization_pct >= 100);
-    if any_at_cap && let Some(extra) = snap.extra {
+    if any_at_cap && let Some(extra) = snap.extra.as_ref() {
         let p = extra.percent();
         if p > max {
             max = p;
@@ -434,10 +559,48 @@ mod tests {
             sonnet: sonnet.map(w),
             scoped: vec![],
             extra: extra.map(|(limit, spent)| ExtraUsage {
-                limit: Cents(limit),
+                limit: Some(Cents(limit)),
                 spent: Cents(spent),
+                currency: None,
+                decimal_places: Some(2),
             }),
         }
+    }
+
+    #[test]
+    fn fmt_minor_honors_currency_and_scale() {
+        // No currency (older payloads) keeps the historical `$`.
+        assert_eq!(fmt_minor(250, 2, None), "$2.50");
+        // The #30 reporter's actual figures: BRL must not be claimed as `$`.
+        assert_eq!(fmt_minor(14157, 2, Some("BRL")), "R$141.57");
+        assert_eq!(fmt_minor(14157, 2, Some("USD")), "$141.57");
+        // Zero-exponent currency: no decimal point, no /100.
+        assert_eq!(fmt_minor(500, 0, Some("JPY")), "¥500");
+        // Sign precedes the symbol, matching `fmt_dollars`.
+        assert_eq!(fmt_minor(-150, 2, Some("BRL")), "-R$1.50");
+        // Unknown code stays truthful as a suffix rather than guessing a symbol.
+        assert_eq!(fmt_minor(1234, 2, Some("CHF")), "12.34 CHF");
+    }
+
+    #[test]
+    fn extra_usage_formats_in_its_own_currency() {
+        let e = ExtraUsage {
+            limit: None,
+            spent: Cents(14157),
+            currency: Some("BRL".into()),
+            decimal_places: Some(2),
+        };
+        assert_eq!(e.fmt_spent(), "R$141.57");
+        assert_eq!(e.fmt_limit(), None);
+
+        let capped = ExtraUsage {
+            limit: Some(Cents(5000)),
+            spent: Cents(250),
+            currency: None,
+            decimal_places: Some(2),
+        };
+        assert_eq!(capped.fmt_spent(), "$2.50");
+        assert_eq!(capped.fmt_limit().as_deref(), Some("$50.00"));
     }
 
     #[test]
@@ -459,8 +622,10 @@ mod tests {
     fn extra_percent_with_zero_limit_is_zero() {
         assert_eq!(
             ExtraUsage {
-                limit: Cents(0),
-                spent: Cents(100)
+                limit: Some(Cents(0)),
+                spent: Cents(100),
+                currency: None,
+                decimal_places: Some(2),
             }
             .percent(),
             0
@@ -472,8 +637,10 @@ mod tests {
         // Bash integer division — 33/100 -> 33%, 50/100 -> 50%.
         assert_eq!(
             ExtraUsage {
-                limit: Cents(10000),
-                spent: Cents(3333)
+                limit: Some(Cents(10000)),
+                spent: Cents(3333),
+                currency: None,
+                decimal_places: Some(2),
             }
             .percent(),
             33
@@ -504,38 +671,6 @@ mod tests {
         // session = 100, weekly = 50, extra = 100% → max should be 100.
         let s = snap(100, 50, None, Some((10000, 10000)));
         assert_eq!(anthropic_severity(&s), PaceSeverity::Critical);
-    }
-
-    #[test]
-    fn shvia_window_utilization_rounds_and_clamps() {
-        let limited = ShviaWindow {
-            used: 427,
-            limit: 1000,
-            remaining: Some(573),
-            resets_at: None,
-        };
-        assert!(!limited.is_unlimited());
-        assert_eq!(limited.utilization_pct(), 43); // 42.7 rounds to 43
-
-        let over = ShviaWindow {
-            used: 1500,
-            limit: 1000,
-            remaining: Some(0),
-            resets_at: None,
-        };
-        assert_eq!(over.utilization_pct(), 100); // clamps
-    }
-
-    #[test]
-    fn shvia_window_unlimited_has_zero_pct() {
-        let unlimited = ShviaWindow {
-            used: 12_345,
-            limit: -1,
-            remaining: None,
-            resets_at: None,
-        };
-        assert!(unlimited.is_unlimited());
-        assert_eq!(unlimited.utilization_pct(), 0);
     }
 
     fn with_scoped(mut s: AnthropicSnapshot, pct: i32) -> AnthropicSnapshot {
@@ -577,5 +712,37 @@ mod tests {
         };
         assert_eq!(snap.weekly_pct(), 50);
         assert_eq!(snap.window_pct(), 100);
+    }
+
+    #[test]
+    fn shvia_window_utilization_rounds_and_clamps() {
+        let limited = ShviaWindow {
+            used: 427,
+            limit: 1000,
+            remaining: Some(573),
+            resets_at: None,
+        };
+        assert!(!limited.is_unlimited());
+        assert_eq!(limited.utilization_pct(), 43); // 42.7 rounds to 43
+
+        let over = ShviaWindow {
+            used: 1500,
+            limit: 1000,
+            remaining: Some(0),
+            resets_at: None,
+        };
+        assert_eq!(over.utilization_pct(), 100); // clamps
+    }
+
+    #[test]
+    fn shvia_window_unlimited_has_zero_pct() {
+        let unlimited = ShviaWindow {
+            used: 12_345,
+            limit: -1,
+            remaining: None,
+            resets_at: None,
+        };
+        assert!(unlimited.is_unlimited());
+        assert_eq!(unlimited.utilization_pct(), 0);
     }
 }

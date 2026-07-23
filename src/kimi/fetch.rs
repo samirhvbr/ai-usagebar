@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 
-use crate::cache::{Cache, acquire_lock};
+use crate::cache::{Cache, MAX_STALE, acquire_lock_async};
 use crate::error::{AppError, Result};
 use crate::usage::KimiSnapshot;
 
@@ -46,7 +46,7 @@ pub async fn fetch_snapshot(
     cache_ttl: Duration,
 ) -> Result<FetchOutcome> {
     cache.ensure_dir()?;
-    let _lock = acquire_lock(&cache.lock_path(), LOCK_TIMEOUT)?;
+    let _lock = acquire_lock_async(&cache.lock_path(), LOCK_TIMEOUT).await?;
 
     if let Some(bytes) = cache.fresh_payload(cache_ttl)?
         && let Ok(outcome) = reuse_cache(bytes, cache, false)
@@ -58,7 +58,7 @@ pub async fn fetch_snapshot(
 
     match fetch_live(client, &endpoints.usages, api_key).await {
         Ok(snap) => {
-            let bytes = serde_json::to_vec(&snap_to_json(&snap)).unwrap_or_default();
+            let bytes = serde_json::to_vec(&snap_to_json(&snap))?;
             cache.write_payload(&bytes)?;
             Ok(FetchOutcome {
                 snapshot: snap,
@@ -79,7 +79,7 @@ pub async fn fetch_snapshot(
 }
 
 fn fallback_silent(cache: &Cache, original: AppError) -> Result<FetchOutcome> {
-    let Some(bytes) = cache.maybe_payload()? else {
+    let Some(bytes) = cache.fallback_payload(MAX_STALE)? else {
         return Err(original);
     };
     match reuse_cache(bytes, cache, true) {
@@ -89,7 +89,7 @@ fn fallback_silent(cache: &Cache, original: AppError) -> Result<FetchOutcome> {
 }
 
 fn fallback_with_error(cache: &Cache, original: AppError) -> Result<FetchOutcome> {
-    let Some(bytes) = cache.maybe_payload()? else {
+    let Some(bytes) = cache.fallback_payload(MAX_STALE)? else {
         return Err(original);
     };
     match reuse_cache(bytes, cache, true) {
@@ -194,7 +194,7 @@ async fn fetch_live(client: &reqwest::Client, url: &str, api_key: &str) -> Resul
         });
     }
 
-    let bytes = resp.bytes().await?;
+    let bytes = crate::vendor::read_body_capped(resp, crate::vendor::MAX_BODY_BYTES).await?;
     let r: UsagesResponse = serde_json::from_slice(&bytes)
         .map_err(|e| AppError::Schema(format!("kimi usages response: {e}")))?;
     r.into_snapshot()

@@ -28,12 +28,43 @@ pub fn draw(f: &mut Frame, app: &App) {
         .split(f.area());
 
     draw_header(f, app, chunks[0]);
-    draw_main(f, app, chunks[1]);
+    draw_body(f, app, chunks[1]);
     draw_footer(f, app, chunks[2]);
 
-    // Settings overlay sits on top — rendered last so it covers everything.
+    // Settings still floats on top of everything.
     if let Some(s) = &app.settings {
         crate::tui::settings::render(f, f.area(), s, &app.theme);
+    }
+}
+
+/// The dashboard body, plus the context view docked into it when open: `full`
+/// takes it over, `split` sits beside it, `bottom` sits below it.
+fn draw_body(f: &mut Frame, app: &App, area: Rect) {
+    use crate::config::ContextLayout;
+    use crate::tui::context;
+
+    let Some(state) = &app.context else {
+        draw_main(f, app, area);
+        return;
+    };
+    match state.layout {
+        ContextLayout::Full => context::render(f, area, state, &app.theme),
+        ContextLayout::Split => {
+            let cols = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .split(area);
+            draw_main(f, app, cols[0]);
+            context::render(f, cols[1], state, &app.theme);
+        }
+        ContextLayout::Bottom => {
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .split(area);
+            draw_main(f, app, rows[0]);
+            context::render(f, rows[1], state, &app.theme);
+        }
     }
 }
 
@@ -46,11 +77,12 @@ fn vendor_label(id: VendorId) -> &'static str {
         VendorId::Openrouter => "OpenRouter",
         VendorId::Deepseek => "DeepSeek",
         VendorId::Kimi => "Kimi",
-        VendorId::Shvia => "ShvIA",
         VendorId::Kilo => "Kilo",
         VendorId::Novita => "Novita",
         VendorId::Moonshot => "Moonshot",
         VendorId::Grok => "Grok",
+        VendorId::Antigravity => "Antigravity",
+        VendorId::Shvia => "ShvIA",
     }
 }
 
@@ -63,11 +95,12 @@ fn compact_vendor_label(id: VendorId) -> &'static str {
         VendorId::Openrouter => "OpenRouter",
         VendorId::Deepseek => "DeepSeek",
         VendorId::Kimi => "Kimi",
-        VendorId::Shvia => "ShvIA",
         VendorId::Kilo => "Kilo",
         VendorId::Novita => "Novita",
         VendorId::Moonshot => "Moonshot",
         VendorId::Grok => "Grok",
+        VendorId::Antigravity => "Antigravity",
+        VendorId::Shvia => "ShvIA",
     }
 }
 
@@ -106,9 +139,27 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         theme.muted(" · "),
         theme.span(format!("active {active}")),
         theme.muted(" · "),
-        theme.muted(format!("last refresh {}", local_time_hms(app.last_refresh))),
+        theme.muted(header_refresh_text(app)),
     ]);
     f.render_widget(Paragraph::new(line), inner);
+}
+
+/// The header's refresh stamp, read from the ACTIVE tab's own `fetched_at`.
+///
+/// This used to be a single `App::last_refresh` bumped by whichever vendor
+/// finished last, so a tab that was still loading — or had failed minutes ago —
+/// advertised a sibling's success as its own. A tab with no landed response has
+/// no time to show, so it gets the same `—` the panels use for an unknown
+/// fetched-at rather than a borrowed or invented one.
+fn header_refresh_text(app: &App) -> String {
+    let fetched_at = match app.tabs.get(app.active) {
+        Some(TabState::Ready(ready)) => ready.fetched_at,
+        _ => None,
+    };
+    match fetched_at {
+        Some(at) => format!("last refresh {}", local_time_hms(at)),
+        None => "last refresh —".to_string(),
+    }
 }
 
 fn draw_main(f: &mut Frame, app: &App, area: Rect) {
@@ -198,18 +249,7 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
 fn tab_status(tab: Option<&TabState>) -> &'static str {
     match tab {
         Some(TabState::Loading) => "fetching",
-        // A re-auth failure outranks the generic "error"/"stale" labels: it's
-        // the one state the user must act on (login), so name it explicitly.
-        Some(TabState::Error(e)) if crate::anthropic::is_reauth_error(e) => "sign-in expired",
         Some(TabState::Error(_)) => "error",
-        Some(TabState::Ready(ready))
-            if ready
-                .last_error
-                .as_ref()
-                .is_some_and(|(_, msg)| crate::anthropic::is_reauth_error(msg)) =>
-        {
-            "sign-in expired"
-        }
         Some(TabState::Ready(ready)) if ready.stale => "stale cache",
         Some(TabState::Ready(ready))
             if ready
@@ -230,13 +270,172 @@ fn draw_footer(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     // title row of every panel, and (b) prone to getting cropped on narrow
     // 875x600 windows. Keep the footer to just the keybinding hints.
     let theme = bubble_theme(&app.theme);
-    let help = Help::new([
+    let mut bindings = vec![
         KeyBinding::with_keys(["tab", "h/l"], "switch"),
         KeyBinding::new("r", "refresh"),
         KeyBinding::new("R", "refresh all"),
         KeyBinding::new("s", "settings"),
-        KeyBinding::with_keys(["q", "esc"], "quit"),
-    ])
-    .theme(theme);
+    ];
+    if app.context_enabled {
+        bindings.push(KeyBinding::new("c", "context"));
+    }
+    bindings.push(KeyBinding::with_keys(["q", "esc"], "quit"));
+    let help = Help::new(bindings).theme(theme);
     f.render_widget(&help, area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::theme::Theme;
+    use crate::tui::app::ReadyTab;
+    use crate::usage::{OpenRouterSnapshot, VendorSnapshot};
+    use chrono::{DateTime, TimeZone, Utc};
+
+    fn ready_at(fetched_at: Option<DateTime<Utc>>) -> TabState {
+        TabState::Ready(Box::new(ReadyTab {
+            snapshot: VendorSnapshot::Openrouter(OpenRouterSnapshot {
+                label: "test".into(),
+                total_credits: 0.0,
+                total_usage: 0.0,
+                usage_daily: 0.0,
+                usage_weekly: 0.0,
+                usage_monthly: 0.0,
+                is_free_tier: false,
+                limit: None,
+                limit_remaining: None,
+            }),
+            stale: false,
+            last_error: None,
+            fetched_at,
+        }))
+    }
+
+    // `App::with_theme(.., Theme::default())` rather than `App::new`, which
+    // would read the real Omarchy theme file + `$HOME`. The header stamp under
+    // test is theme-agnostic.
+    fn app_with(tabs: Vec<TabState>) -> App {
+        let mut app = App::with_theme(
+            vec![
+                TabId::vendor(VendorId::Anthropic),
+                TabId::vendor(VendorId::Openrouter),
+            ],
+            Theme::default(),
+        );
+        app.tabs = tabs;
+        app
+    }
+
+    #[test]
+    fn header_refresh_follows_the_active_tab() {
+        let anthropic_at = Utc.with_ymd_and_hms(2026, 5, 23, 12, 0, 0).unwrap();
+        let openrouter_at = Utc.with_ymd_and_hms(2026, 5, 23, 9, 30, 0).unwrap();
+        let mut app = app_with(vec![
+            ready_at(Some(anthropic_at)),
+            ready_at(Some(openrouter_at)),
+        ]);
+
+        // Compare against the formatting helper, not a literal, so the test
+        // doesn't depend on the machine's timezone.
+        let anthropic_header = format!("last refresh {}", local_time_hms(anthropic_at));
+        let openrouter_header = format!("last refresh {}", local_time_hms(openrouter_at));
+        assert_ne!(anthropic_header, openrouter_header);
+
+        assert_eq!(header_refresh_text(&app), anthropic_header);
+        app.next_tab();
+        assert_eq!(header_refresh_text(&app), openrouter_header);
+    }
+
+    #[test]
+    fn header_refresh_is_dash_when_active_tab_never_fetched() {
+        // The sibling's successful fetch is exactly what the old global clock
+        // would have displayed here.
+        let sibling = ready_at(Some(Utc.with_ymd_and_hms(2026, 5, 23, 12, 0, 0).unwrap()));
+        let mut app = app_with(vec![TabState::Loading, sibling]);
+        assert_eq!(header_refresh_text(&app), "last refresh —");
+
+        app.tabs[0] = TabState::Error("401 Unauthorized".into());
+        assert_eq!(header_refresh_text(&app), "last refresh —");
+    }
+
+    #[test]
+    fn header_refresh_is_dash_when_ready_tab_has_no_fetched_at() {
+        // Ready but the cache never reported an age — show nothing rather than
+        // passing off "now" as a response time.
+        let app = app_with(vec![ready_at(None), TabState::Loading]);
+        assert_eq!(header_refresh_text(&app), "last refresh —");
+    }
+
+    fn app_with_context(layout: crate::config::ContextLayout) -> App {
+        let mut app = app_with(vec![TabState::Loading, TabState::Loading]);
+        app.context_enabled = true;
+        app.context = Some({
+            let mut state = crate::tui::context::ContextState::new(layout);
+            state.apply_scan(0, Err("scan error".into()));
+            state
+        });
+        app
+    }
+
+    fn body_text(app: &App) -> String {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<Vec<_>>()
+            .concat()
+    }
+
+    #[test]
+    fn full_layout_takes_the_body_and_hides_the_vendor_sidebar() {
+        use crate::config::ContextLayout;
+        let out = body_text(&app_with_context(ContextLayout::Full));
+        assert!(out.contains("Claude context"), "{out}");
+        assert!(
+            !out.contains("vendors"),
+            "full layout must not leave the dashboard around it"
+        );
+    }
+
+    #[test]
+    fn split_and_bottom_layouts_keep_the_dashboard_visible() {
+        use crate::config::ContextLayout;
+        for layout in [ContextLayout::Split, ContextLayout::Bottom] {
+            let out = body_text(&app_with_context(layout));
+            assert!(out.contains("Claude context"), "{layout:?}: {out}");
+            assert!(out.contains("vendors"), "{layout:?}: {out}");
+        }
+    }
+
+    #[test]
+    fn context_footer_hint_is_visible_only_when_the_feature_is_enabled() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        fn rendered(mut app: App, enabled: bool) -> String {
+            app.context_enabled = enabled;
+            let mut terminal = Terminal::new(TestBackend::new(160, 24)).unwrap();
+            terminal.draw(|frame| draw(frame, &app)).unwrap();
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<Vec<_>>()
+                .concat()
+        }
+
+        let disabled = rendered(app_with(vec![TabState::Loading, TabState::Loading]), false);
+        assert!(!disabled.contains("context"));
+
+        let enabled = rendered(app_with(vec![TabState::Loading, TabState::Loading]), true);
+        assert!(enabled.contains("context"));
+    }
 }

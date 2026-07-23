@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use crate::cache::{Cache, acquire_lock};
+use crate::cache::{Cache, MAX_STALE, acquire_lock_async};
 use crate::error::{AppError, Result};
 use crate::usage::OpenRouterSnapshot;
 
@@ -46,11 +46,15 @@ pub async fn fetch_snapshot(
     cache_ttl: Duration,
 ) -> Result<FetchOutcome> {
     cache.ensure_dir()?;
-    let _lock = acquire_lock(&cache.lock_path(), LOCK_TIMEOUT)?;
+    let _lock = acquire_lock_async(&cache.lock_path(), LOCK_TIMEOUT).await?;
 
-    if let Some(bytes) = cache.fresh_payload(cache_ttl)? {
-        return Ok(reuse_cache(bytes, cache, false));
+    if let Some(bytes) = cache.fresh_payload(cache_ttl)?
+        && let Ok(outcome) = reuse_cache(bytes, cache, false)
+    {
+        return Ok(outcome);
     }
+    // Corrupt fresh cache: fall through to live fetch rather than return a
+    // fabricated zero-credit snapshot.
 
     match fetch_live(client, endpoints, api_key).await {
         Ok((credits, key)) => {
@@ -59,7 +63,7 @@ pub async fn fetch_snapshot(
             let cache_repr = serde_json::json!({
                 "snapshot": serde_repr(&snap),
             });
-            let bytes = serde_json::to_vec(&cache_repr).unwrap_or_default();
+            let bytes = serde_json::to_vec(&cache_repr)?;
             cache.write_payload(&bytes)?;
             Ok(FetchOutcome {
                 snapshot: snap,
@@ -83,58 +87,87 @@ pub async fn fetch_snapshot(
 }
 
 fn fallback_silent(cache: &Cache) -> Result<FetchOutcome> {
-    let Some(bytes) = cache.maybe_payload()? else {
+    let Some(bytes) = cache.fallback_payload(MAX_STALE)? else {
         return Err(AppError::Transport(
             "openrouter: no cache and network unreachable".into(),
         ));
     };
-    Ok(reuse_cache(bytes, cache, true))
+    reuse_cache(bytes, cache, true)
 }
 
 fn fallback_with_error(cache: &Cache, last_error: Option<(u16, String)>) -> Result<FetchOutcome> {
-    let Some(bytes) = cache.maybe_payload()? else {
+    let Some(bytes) = cache.fallback_payload(MAX_STALE)? else {
         return Err(AppError::Other("openrouter: no usable cache".into()));
     };
-    let mut outcome = reuse_cache(bytes, cache, true);
+    let mut outcome = reuse_cache(bytes, cache, true)?;
     outcome.last_error = last_error;
     Ok(outcome)
 }
 
-fn reuse_cache(bytes: Vec<u8>, cache: &Cache, stale: bool) -> FetchOutcome {
-    let snap = parse_cache(&bytes).unwrap_or_else(|_| OpenRouterSnapshot {
-        label: "OpenRouter".into(),
-        total_credits: 0.0,
-        total_usage: 0.0,
-        usage_daily: 0.0,
-        usage_weekly: 0.0,
-        usage_monthly: 0.0,
-        is_free_tier: true,
-        limit: None,
-        limit_remaining: None,
-    });
-    FetchOutcome {
+fn reuse_cache(bytes: Vec<u8>, cache: &Cache, stale: bool) -> Result<FetchOutcome> {
+    let snap = parse_cache(&bytes)?;
+    Ok(FetchOutcome {
         snapshot: snap,
         stale,
         last_error: cache.read_last_error(),
         cache_age: cache.payload_age(),
-    }
+    })
 }
 
+/// Cached money is required, not optional: a truncated or half-written payload
+/// must be refetched rather than rendered as $0.00 with a free-tier badge.
+/// `limit`/`limit_remaining` stay optional — the API itself returns them null.
 fn parse_cache(bytes: &[u8]) -> Result<OpenRouterSnapshot> {
     let v: serde_json::Value = serde_json::from_slice(bytes)?;
     let s = v
         .get("snapshot")
         .ok_or_else(|| AppError::Schema("openrouter cache missing 'snapshot' field".into()))?;
+    let money = |name: &str| -> Result<f64> {
+        let n = s
+            .get(name)
+            .and_then(serde_json::Value::as_f64)
+            .ok_or_else(|| AppError::Schema(format!("openrouter cache missing '{name}'")))?;
+        if n.is_finite() && n >= 0.0 {
+            Ok(n)
+        } else {
+            Err(AppError::Schema(format!(
+                "openrouter cache '{name}' is not finite and non-negative"
+            )))
+        }
+    };
+    let optional_money = |name: &str, nonnegative: bool| -> Result<Option<f64>> {
+        match s.get(name) {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(value) => {
+                let number = value.as_f64().ok_or_else(|| {
+                    AppError::Schema(format!("openrouter cache '{name}' is not numeric or null"))
+                })?;
+                if number.is_finite() && (!nonnegative || number >= 0.0) {
+                    Ok(Some(number))
+                } else {
+                    Err(AppError::Schema(format!(
+                        "openrouter cache '{name}' is outside its valid range"
+                    )))
+                }
+            }
+        }
+    };
     Ok(OpenRouterSnapshot {
-        label: s["label"].as_str().unwrap_or("OpenRouter").to_string(),
-        total_credits: s["total_credits"].as_f64().unwrap_or(0.0),
-        total_usage: s["total_usage"].as_f64().unwrap_or(0.0),
-        usage_daily: s["usage_daily"].as_f64().unwrap_or(0.0),
-        usage_weekly: s["usage_weekly"].as_f64().unwrap_or(0.0),
-        usage_monthly: s["usage_monthly"].as_f64().unwrap_or(0.0),
-        is_free_tier: s["is_free_tier"].as_bool().unwrap_or(false),
-        limit: s["limit"].as_f64(),
-        limit_remaining: s["limit_remaining"].as_f64(),
+        label: s
+            .get("label")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| AppError::Schema("openrouter cache missing 'label'".into()))?
+            .to_string(),
+        total_credits: money("total_credits")?,
+        total_usage: money("total_usage")?,
+        usage_daily: money("usage_daily")?,
+        usage_weekly: money("usage_weekly")?,
+        usage_monthly: money("usage_monthly")?,
+        is_free_tier: s["is_free_tier"]
+            .as_bool()
+            .ok_or_else(|| AppError::Schema("openrouter cache missing 'is_free_tier'".into()))?,
+        limit: optional_money("limit", true)?,
+        limit_remaining: optional_money("limit_remaining", false)?,
     })
 }
 
@@ -180,7 +213,7 @@ async fn fetch_one<T: for<'de> serde::Deserialize<'de>>(
     .map_err(|_| AppError::Transport(format!("openrouter timeout: {url}")))??;
 
     let status = resp.status();
-    let bytes = resp.bytes().await?;
+    let bytes = crate::vendor::read_body_capped(resp, crate::vendor::MAX_BODY_BYTES).await?;
 
     if !status.is_success() {
         let body = String::from_utf8_lossy(&bytes).chars().take(200).collect();
