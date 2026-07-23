@@ -290,6 +290,10 @@ let VENDOR_AUTH: [VendorAuth] = [
     VendorAuth(id: "zai", name: "Z.AI (GLM)", kind: "apikey", cli: "", login: "", pkg: "", env: "ZAI_API_KEY"),
     VendorAuth(id: "openrouter", name: "OpenRouter", kind: "apikey", cli: "", login: "", pkg: "", env: "OPENROUTER_API_KEY"),
     VendorAuth(id: "deepseek", name: "DeepSeek", kind: "apikey", cli: "", login: "", pkg: "", env: "DEEPSEEK_API_KEY"),
+    VendorAuth(id: "kilo", name: "Kilo", kind: "apikey", cli: "", login: "", pkg: "", env: "KILO_API_KEY"),
+    VendorAuth(id: "novita", name: "Novita", kind: "apikey", cli: "", login: "", pkg: "", env: "NOVITA_API_KEY"),
+    VendorAuth(id: "moonshot", name: "Kimi (Moonshot)", kind: "apikey", cli: "", login: "", pkg: "", env: "MOONSHOT_API_KEY"),
+    VendorAuth(id: "grok", name: "Grok (xAI)", kind: "apikey", cli: "", login: "", pkg: "", env: "XAI_MANAGEMENT_KEY"),
 ]
 
 // The config file the Rust binary would actually read. On macOS
@@ -301,6 +305,16 @@ func configPathTOML() -> String {
     let appSupport = "\(NSHomeDirectory())/Library/Application Support/ai-usagebar/config.toml"
     if FileManager.default.fileExists(atPath: appSupport) { return appSupport }
     return "\(NSHomeDirectory())/.config/ai-usagebar/config.toml"
+}
+
+// A TOML section header may carry a trailing inline comment ("[zai] # note")
+// and surrounding whitespace — the real TOML parser the binary uses accepts
+// those, so compare only the header token, not the whole line.
+func tomlHeaderIs(_ line: String, _ section: String) -> Bool {
+    guard line.hasPrefix("[") else { return false }
+    let head = line.split(separator: "#", maxSplits: 1, omittingEmptySubsequences: false)
+        .first.map(String.init) ?? line
+    return head.trimmingCharacters(in: .whitespaces) == "[\(section)]"
 }
 
 func configHasApiKeyTOML(_ section: String) -> Bool {
@@ -339,6 +353,162 @@ func vendorConfigured(_ v: VendorAuth) -> Bool {
     }
     if let e = ProcessInfo.processInfo.environment[v.env], !e.isEmpty { return true }
     return configHasApiKeyTOML(v.id)
+}
+
+// ─── API status helpers (menu "Status das APIs") ─────────────────────────
+// The Rust binary already writes a per-vendor cache; we read it back so the
+// menu shows API health with NO new network calls — it mirrors the last fetch.
+// On macOS `directories::BaseDirs.cache_dir()` resolves to ~/Library/Caches
+// (not ~/.cache, despite the Linux-centric comments in src/cache.rs).
+enum ApiState { case ok, warn, error, off }
+
+func aiubCacheDir(_ vendorId: String) -> String {
+    let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first?.path
+        ?? "\(NSHomeDirectory())/Library/Caches"
+    return "\(base)/ai-usagebar/\(vendorId)"
+}
+
+// `.last_error` is `code\nmessage`; present only when the last fetch failed
+// (a successful cache write removes it). See Cache::write_last_error / _payload.
+func readCacheLastError(_ dir: String) -> (code: Int, msg: String)? {
+    guard let raw = try? String(contentsOfFile: "\(dir)/.last_error", encoding: .utf8) else { return nil }
+    let lines = raw.split(separator: "\n", omittingEmptySubsequences: false)
+    guard let first = lines.first, let code = Int(first.trimmingCharacters(in: .whitespaces)) else { return nil }
+    return (code, lines.count > 1 ? String(lines[1]) : "")
+}
+
+// Age of the cached payload (`usage.json` mtime), or nil if never fetched.
+func cachePayloadAge(_ dir: String) -> TimeInterval? {
+    guard let attrs = try? FileManager.default.attributesOfItem(atPath: "\(dir)/usage.json"),
+          let m = attrs[.modificationDate] as? Date else { return nil }
+    return Date().timeIntervalSince(m)
+}
+
+// Reads the cached `usage.json` and returns a formatted headline VALUE for the
+// balance-style vendors (remaining credit, in the right currency). Returns nil
+// for the quota vendors (anthropic/openai/zai), whose cache is the raw API
+// response — those show usage% from the live snapshot instead. This is pure
+// local disk reading: no network. Field names mirror each vendor's cache repr
+// in src/<vendor>/fetch.rs.
+func cacheBalanceDisplay(_ vendorId: String, _ dir: String) -> String? {
+    guard let data = FileManager.default.contents(atPath: "\(dir)/usage.json"),
+          let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let snap = obj["snapshot"] as? [String: Any] else { return nil }
+    func num(_ any: Any?) -> Double? { (any as? NSNumber)?.doubleValue }
+    func money(_ v: Double, _ cur: String) -> String {
+        cur == "CNY" ? String(format: "¥%.2f", v) : String(format: "$%.2f", v)
+    }
+    switch vendorId {
+    case "kilo", "grok":
+        return num(snap["balance"]).map { money($0, "USD") }
+    case "novita":
+        return num(snap["available"]).map { money($0, "USD") }
+    case "moonshot":
+        return num(snap["available"]).map { money($0, snap["currency"] as? String ?? "USD") }
+    case "deepseek":
+        return num(snap["balance"]).map { money($0, snap["currency"] as? String ?? "USD") }
+    case "openrouter":
+        guard let tc = num(snap["total_credits"]), let tu = num(snap["total_usage"]) else { return nil }
+        return money(max(0, tc - tu), "USD")
+    default:
+        return nil
+    }
+}
+
+// Mirrors the binary's config defaults: every vendor is enabled unless the
+// config's `[vendor] enabled = false`, except DeepSeek, which is opt-in (off).
+func configVendorEnabled(_ id: String) -> Bool {
+    // Opt-in vendors (require an explicit key) default to disabled.
+    let dflt = !["deepseek", "kilo", "novita", "moonshot", "grok"].contains(id)
+    let path = configPathTOML()
+    guard let text = try? String(contentsOfFile: path, encoding: .utf8) else { return dflt }
+    var inSection = false
+    for raw in text.split(separator: "\n", omittingEmptySubsequences: false) {
+        let line = String(raw).trimmingCharacters(in: .whitespaces)
+        if line.hasPrefix("[") { inSection = tomlHeaderIs(line, id); continue }
+        if inSection, line.hasPrefix("enabled"), let eq = line.firstIndex(of: "=") {
+            let val = line[line.index(after: eq)...].trimmingCharacters(in: .whitespaces).lowercased()
+            if val.hasPrefix("true") { return true }
+            if val.hasPrefix("false") { return false }
+        }
+    }
+    return dflt
+}
+
+func fmtAge(_ s: TimeInterval) -> String {
+    let sec = max(0, Int(s))
+    if sec < 60 { return "\(sec)s" }
+    if sec < 3600 { return "\(sec / 60)m" }
+    if sec < 86400 { return "\(sec / 3600)h" }
+    return "\(sec / 86400)d"
+}
+
+// A compact, referenced error for a menu row — never the raw response body
+// (which can be long JSON). The full text stays in the vendor's `.last_error`.
+func shortHttpError(_ code: Int) -> String {
+    switch code {
+    case 401, 403: return "HTTP \(code) · chave inválida"
+    case 404: return "HTTP 404 · não encontrado"
+    case 429: return "HTTP 429 · limite atingido"
+    case 500...599: return "HTTP \(code) · erro do servidor"
+    case 0: return "sem conexão"
+    default: return "HTTP \(code)"
+    }
+}
+
+func apiStateColor(_ s: ApiState) -> NSColor {
+    switch s {
+    case .ok: return hexColor(COLOR_LOW)
+    case .warn: return hexColor(COLOR_MID)
+    case .error: return hexColor(COLOR_CRITICAL)
+    case .off: return .tertiaryLabelColor
+    }
+}
+
+// View-based menu item for the "Status das APIs" header. Because a view item
+// owns its own mouse events, clicking it does NOT dismiss the menu — so it can
+// reveal/hide the vendor rows inline (toggling their `isHidden`) while the menu
+// stays open, which a plain NSMenuItem action can't do.
+final class ApiToggleView: NSView {
+    var expanded = false { didSet { needsDisplay = true } }
+    var onToggle: (() -> Void)?
+    private var hovering = false { didSet { needsDisplay = true } }
+    private var trackingArea: NSTrackingArea?
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        autoresizingMask = [.width]   // stretch to the menu's width
+    }
+    required init?(coder: NSCoder) { super.init(coder: coder) }
+
+    override var isFlipped: Bool { true }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let t = trackingArea { removeTrackingArea(t) }
+        let t = NSTrackingArea(rect: bounds,
+                               options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+                               owner: self)
+        addTrackingArea(t)
+        trackingArea = t
+    }
+    override func mouseEntered(with event: NSEvent) { hovering = true }
+    override func mouseExited(with event: NSEvent) { hovering = false }
+    override func mouseUp(with event: NSEvent) { onToggle?() }
+
+    override func draw(_ dirtyRect: NSRect) {
+        if hovering {
+            NSColor.selectedContentBackgroundColor.setFill()
+            NSBezierPath(roundedRect: bounds.insetBy(dx: 5, dy: 1), xRadius: 4, yRadius: 4).fill()
+        }
+        let color: NSColor = hovering ? .white : .labelColor
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.menuFont(ofSize: 0),
+            .foregroundColor: color,
+        ]
+        let str = NSAttributedString(string: "Status das APIs   \(expanded ? "▾" : "▸")", attributes: attrs)
+        str.draw(at: NSPoint(x: 21, y: (bounds.height - str.size().height) / 2))
+    }
 }
 
 func cliInstalled(_ cli: String) -> Bool {
@@ -535,7 +705,7 @@ struct SettingsView: View {
 }
 
 // ─── App ─────────────────────────────────────────────────────────────────
-class AppDelegate: NSObject, NSApplicationDelegate {
+class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var statusItem: NSStatusItem!
     var timer: Timer?
     var prefsWindow: NSWindow?
@@ -557,6 +727,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var refreshQueued = false
     let headerItem = NSMenuItem()
     var rows: [String: NSMenuItem] = [:]
+    // Collapsible "Status das APIs" section (starts collapsed; the toggle click
+    // dismisses the menu, so the rows appear on the next open).
+    var apiToggleItem: NSMenuItem!
+    var apiToggleView: ApiToggleView?
+    var apiSubheadItem: NSMenuItem!
+    var apiCheckAllItem: NSMenuItem!
+    var apiRows: [(vendor: VendorAuth, item: NSMenuItem)] = []
+    var apiExpanded = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -582,18 +760,169 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         menu.addItem(.separator())
         addAction(menu, "Atualizar agora", #selector(refreshAction), "r")
+
+        // Collapsible "Status das APIs": a toggle, an info subhead, one row per
+        // vendor, and a force-check action. The rows read the binary's on-disk
+        // cache — no network — so they mirror the last fetch (design review).
+        apiToggleItem = NSMenuItem()
+        let toggleView = ApiToggleView(frame: NSRect(x: 0, y: 0, width: 260, height: 20))
+        toggleView.onToggle = { [weak self] in self?.toggleApiStatus() }
+        apiToggleItem.view = toggleView
+        apiToggleView = toggleView
+        menu.addItem(apiToggleItem)
+        apiSubheadItem = NSMenuItem()
+        menu.addItem(apiSubheadItem)
+        for v in VENDOR_AUTH {
+            let it = NSMenuItem()
+            apiRows.append((v, it))
+            menu.addItem(it)
+        }
+        apiCheckAllItem = NSMenuItem(title: "Verificar todas agora", action: #selector(checkAllApis), keyEquivalent: "r")
+        apiCheckAllItem.keyEquivalentModifierMask = [.command, .shift]
+        apiCheckAllItem.target = self
+        menu.addItem(apiCheckAllItem)
+
         addAction(menu, "Abrir TUI", #selector(openTui), "t")
         addAction(menu, "Preferências…", #selector(openPrefs), ",")
         menu.addItem(.separator())
         addAction(menu, "Sair", #selector(quit), "q")
 
+        menu.delegate = self
         statusItem.menu = menu
+        refreshApiSection()
     }
 
     func addAction(_ menu: NSMenu, _ title: String, _ sel: Selector, _ key: String) {
         let it = NSMenuItem(title: title, action: sel, keyEquivalent: key)
         it.target = self
         menu.addItem(it)
+    }
+
+    // ── "Status das APIs" section ────────────────────────────────────────
+    // Refresh visibility + content every time the menu opens (cheap: local
+    // disk reads, no network).
+    func menuWillOpen(_ menu: NSMenu) {
+        refreshApiSection()
+    }
+
+    // The view-based toggle keeps the menu open, so flipping the rows' isHidden
+    // reveals/hides them inline without dismissing.
+    @objc func toggleApiStatus() {
+        apiExpanded.toggle()
+        refreshApiSection()
+    }
+
+    // Visibility + content in one pass. A vendor row shows only when the menu
+    // is expanded AND the vendor is enabled and has a key/creds — the design
+    // rule "só mostrar se tiver key ativa". If nothing is configured, the
+    // section stays empty save for a hint.
+    func refreshApiSection() {
+        apiToggleView?.expanded = apiExpanded
+        // Collapsed: hide everything cheaply — no config/creds/cache work.
+        guard apiExpanded else {
+            apiSubheadItem.isHidden = true
+            apiCheckAllItem.isHidden = true
+            for (_, it) in apiRows { it.isHidden = true }
+            return
+        }
+        // Expanded: vendorConfigured may spawn `security` (Keychain) and we read
+        // the config + each vendor's cache from disk. Do all of that off the
+        // main thread, then apply the rows back on main so opening the menu
+        // never blocks. Capture the active vendor's live snapshot on main first.
+        let vendors = apiRows.map { $0.vendor }
+        let activeVendor = VENDOR
+        let activeSnapshot = lastSnapshot
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            let computed: [(show: Bool, title: NSAttributedString)] = vendors.map { v in
+                let show = configVendorEnabled(v.id) && vendorConfigured(v)
+                let title = show
+                    ? self.apiRowTitle(v, activeVendor: activeVendor, activeSnapshot: activeSnapshot)
+                    : NSAttributedString()
+                return (show, title)
+            }
+            DispatchQueue.main.async {
+                guard self.apiExpanded else { return }
+                var shownAny = false
+                for (i, pair) in self.apiRows.enumerated() {
+                    let c = computed[i]
+                    pair.item.isHidden = !c.show
+                    if c.show {
+                        pair.item.attributedTitle = c.title
+                        shownAny = true
+                    }
+                }
+                self.apiSubheadItem.isHidden = false
+                self.apiCheckAllItem.isHidden = !shownAny
+                self.apiSubheadItem.attributedTitle = run(
+                    shownAny ? "status do cache local — sem novas chamadas" : "nenhuma API configurada",
+                    .secondaryLabelColor, NSFont.systemFont(ofSize: 11))
+            }
+        }
+    }
+
+    func apiRowTitle(_ v: VendorAuth, activeVendor: String, activeSnapshot: Snapshot?) -> NSAttributedString {
+        let st = apiRowStatus(v, activeVendor: activeVendor, activeSnapshot: activeSnapshot)
+        let a = NSMutableAttributedString()
+        a.append(run("●  ", apiStateColor(st.state)))
+        let name = v.name.count < 20 ? v.name.padding(toLength: 20, withPad: " ", startingAt: 0) : v.name
+        a.append(run(name, .labelColor))
+        a.append(run(st.detail, st.state == .error ? hexColor(COLOR_CRITICAL) : .secondaryLabelColor))
+        if !st.age.isEmpty { a.append(run("   há \(st.age)", .tertiaryLabelColor)) }
+        return a
+    }
+
+    // Derives a vendor's live status purely from local state — config, creds,
+    // and the on-disk cache — with no network call. The active vendor's live
+    // snapshot is passed in (captured on the main thread) so this can run off
+    // the main thread without touching `self`'s mutable state.
+    func apiRowStatus(_ v: VendorAuth, activeVendor: String, activeSnapshot: Snapshot?)
+        -> (state: ApiState, detail: String, age: String)
+    {
+        if !configVendorEnabled(v.id) { return (.off, "desativado", "") }
+        if !vendorConfigured(v) {
+            let hint = v.kind == "oauth" ? "não logado — \(v.login)" : "sem API key — \(v.env)"
+            return (.warn, hint, "")
+        }
+        let dir = aiubCacheDir(v.id)
+        if let (code, _) = readCacheLastError(dir) {
+            return (.error, shortHttpError(code), cachePayloadAge(dir).map(fmtAge) ?? "")
+        }
+        if let age = cachePayloadAge(dir) {
+            // Balance vendors → the actual remaining value from the cache.
+            if let bal = cacheBalanceDisplay(v.id, dir) {
+                return (.ok, bal, fmtAge(age))
+            }
+            // Active quota vendor → live usage %.
+            if v.id == activeVendor, let s = activeSnapshot {
+                return (.ok, "5h \(s.session.pct)% · 7d \(s.weekly.pct)%", fmtAge(age))
+            }
+            // Non-active quota vendor (raw cache we don't parse) → just OK.
+            return (.ok, "OK", fmtAge(age))
+        }
+        return (.warn, "sem dados — use “Verificar todas”", "")
+    }
+
+    // The only path that touches the network: run the widget for each enabled +
+    // configured vendor (it still honors its own 60s cache, so this is bounded),
+    // then re-read the caches into the rows.
+    @objc func checkAllApis() {
+        guard let bin = resolveBinary("ai-usagebar") else { return }
+        apiSubheadItem.attributedTitle = run("verificando…", .secondaryLabelColor, NSFont.systemFont(ofSize: 11))
+        let group = DispatchGroup()
+        for (v, _) in apiRows where configVendorEnabled(v.id) && vendorConfigured(v) {
+            group.enter()
+            DispatchQueue.global(qos: .utility).async {
+                let p = Process()
+                p.executableURL = URL(fileURLWithPath: bin)
+                p.arguments = ["--vendor", v.id, "--json"]
+                p.standardOutput = FileHandle.nullDevice
+                p.standardError = FileHandle.nullDevice
+                do { try p.run(); p.waitUntilExit() } catch {}
+                group.leave()
+            }
+        }
+        group.notify(queue: .main) { [weak self] in self?.refreshApiSection() }
     }
 
     @objc func refreshAction() { refresh() }
