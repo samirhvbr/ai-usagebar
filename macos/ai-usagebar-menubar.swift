@@ -285,6 +285,7 @@ struct VendorAuth {
 
 let VENDOR_AUTH: [VendorAuth] = [
     VendorAuth(id: "anthropic", name: "Anthropic (Claude)", kind: "oauth", cli: "claude", login: "claude", pkg: "@anthropic-ai/claude-code", env: ""),
+    VendorAuth(id: "anthropic_api", name: "Anthropic (API)", kind: "apikey", cli: "", login: "", pkg: "", env: "ANTHROPIC_ADMIN_KEY"),
     VendorAuth(id: "openai", name: "OpenAI (Codex)", kind: "oauth", cli: "codex", login: "codex login", pkg: "@openai/codex", env: ""),
     VendorAuth(id: "zai", name: "Z.AI (GLM)", kind: "apikey", cli: "", login: "", pkg: "", env: "ZAI_API_KEY"),
     VendorAuth(id: "openrouter", name: "OpenRouter", kind: "apikey", cli: "", login: "", pkg: "", env: "OPENROUTER_API_KEY"),
@@ -400,6 +401,17 @@ func cacheBalanceDisplay(_ vendorId: String, _ dir: String) -> String? {
         cur == "CNY" ? String(format: "¥%.2f", v) : String(format: "$%.2f", v)
     }
     switch vendorId {
+    case "anthropic_api":
+        // Month-to-date spend, optionally against the configured monthly limit.
+        // The limit is config-authoritative (not in the API), so read it from
+        // config — not the possibly-stale cached payload — and round the % to
+        // match the binary's own pct() (usage.rs).
+        guard let spent = num(snap["spent"]) else { return nil }
+        if let limit = configMonthlyLimit("anthropic_api") ?? num(snap["limit"]), limit > 0 {
+            let pct = Int(((spent / limit) * 100).rounded())
+            return String(format: "$%.2f / $%.0f · %d%%", spent, limit, pct)
+        }
+        return String(format: "$%.2f/mo", spent)
     case "kilo", "grok":
         return num(snap["balance"]).map { money($0, "USD") }
     case "novita":
@@ -420,7 +432,7 @@ func cacheBalanceDisplay(_ vendorId: String, _ dir: String) -> String? {
 // config's `[vendor] enabled = false`, except DeepSeek, which is opt-in (off).
 func configVendorEnabled(_ id: String) -> Bool {
     // Opt-in vendors (require an explicit key) default to disabled.
-    let dflt = !["deepseek", "kilo", "novita", "moonshot", "grok"].contains(id)
+    let dflt = !["anthropic_api", "deepseek", "kilo", "novita", "moonshot", "grok"].contains(id)
     let path = aiubConfigPath()
     guard let text = try? String(contentsOfFile: path, encoding: .utf8) else { return dflt }
     var inSection = false
@@ -434,6 +446,24 @@ func configVendorEnabled(_ id: String) -> Bool {
         }
     }
     return dflt
+}
+
+// The monthly spend limit is config-authoritative (the API never exposes it),
+// so read it from config.toml on every render — mirroring how the binary
+// re-applies it — instead of trusting the value frozen in the cache payload.
+func configMonthlyLimit(_ id: String) -> Double? {
+    guard let text = try? String(contentsOfFile: aiubConfigPath(), encoding: .utf8) else { return nil }
+    var inSection = false
+    for raw in text.split(separator: "\n", omittingEmptySubsequences: false) {
+        let line = String(raw).trimmingCharacters(in: .whitespaces)
+        if line.hasPrefix("[") { inSection = tomlHeaderIs(line, id); continue }
+        if inSection, line.hasPrefix("monthly_limit"), let eq = line.firstIndex(of: "=") {
+            var v = String(line[line.index(after: eq)...])
+            if let hash = v.firstIndex(of: "#") { v = String(v[..<hash]) }  // strip inline comment
+            return Double(v.trimmingCharacters(in: .whitespaces))
+        }
+    }
+    return nil
 }
 
 func fmtAge(_ s: TimeInterval) -> String {
