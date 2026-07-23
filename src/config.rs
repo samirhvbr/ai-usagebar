@@ -47,6 +47,7 @@ pub struct Config {
     pub moonshot: MoonshotConfig,
     pub grok: GrokConfig,
     pub antigravity: AntigravityConfig,
+    pub shvia: ShviaConfig,
 }
 
 /// UI / dispatch preferences. Currently just `primary` — which vendor the
@@ -420,6 +421,34 @@ pub struct AntigravityConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
+pub struct ShviaConfig {
+    pub enabled: bool,
+    /// Env var name to read the key from (env wins over `api_key`).
+    pub api_key_env: String,
+    /// Inline key (fallback when the env var is unset). Chmod 600 your
+    /// config file if you put a real key here.
+    pub api_key: Option<String>,
+    /// Base URL of the self-hosted gateway (no trailing path). The usage
+    /// endpoint `/api/v1/usage` is appended automatically.
+    pub base_url: Option<String>,
+    /// Optional plan / gateway label — display-only (tooltip header).
+    pub plan: Option<String>,
+}
+
+impl Default for ShviaConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            api_key_env: "SHVIA_API_KEY".to_string(),
+            api_key: None,
+            base_url: None,
+            plan: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
 pub struct AnthropicApiConfig {
     pub enabled: bool,
     /// Env var for the Console **Admin key** (`sk-ant-admin01-…`), distinct from
@@ -532,6 +561,7 @@ impl Config {
             VendorId::Moonshot => self.moonshot.enabled,
             VendorId::Grok => self.grok.enabled,
             VendorId::Antigravity => self.antigravity.enabled,
+            VendorId::Shvia => self.shvia.enabled,
         }
     }
 
@@ -680,6 +710,8 @@ mod tests {
         assert!(c.is_enabled(VendorId::Openai));
         assert!(c.is_enabled(VendorId::Zai));
         assert!(c.is_enabled(VendorId::Openrouter));
+        // ShvIA points at a self-hosted gateway and is enabled by default.
+        assert!(c.is_enabled(VendorId::Shvia));
         for opt_in in [
             VendorId::AnthropicApi,
             VendorId::Deepseek,
@@ -691,7 +723,8 @@ mod tests {
         ] {
             assert!(!c.is_enabled(opt_in), "{opt_in:?}");
         }
-        assert_eq!(c.enabled_vendors().len(), 4);
+        // anthropic + openai + zai + openrouter + shvia = 5 (others opt-in).
+        assert_eq!(c.enabled_vendors().len(), 5);
     }
 
     #[test]
@@ -990,6 +1023,7 @@ enabled = false
                 VendorId::Openai,
                 VendorId::Zai,
                 VendorId::Openrouter,
+                VendorId::Shvia,
             ]
         );
     }
@@ -1146,6 +1180,8 @@ enabled = false
             "#,
         );
         let c = Config::load_from(f.path()).unwrap();
+        // ShvIA is enabled by default (like Z.AI), so it also appears — after
+        // Kimi in canonical `VendorId::all()` order.
         assert_eq!(
             c.enabled_vendors(),
             vec![
@@ -1155,6 +1191,7 @@ enabled = false
                 VendorId::Openrouter,
                 VendorId::Deepseek,
                 VendorId::Kimi,
+                VendorId::Shvia,
             ]
         );
     }
@@ -1314,5 +1351,33 @@ enabled = false
         assert!(!cfg.novita.enabled && cfg.novita.api_key.is_none());
         assert!(!cfg.moonshot.enabled && cfg.moonshot.api_key.is_none());
         assert!(!cfg.grok.enabled && cfg.grok.api_key.is_none());
+    }
+
+    #[test]
+    fn shvia_defaults_and_inline_config() {
+        // Defaults: enabled, SHVIA_API_KEY, no inline key, default base_url.
+        let c = Config::default();
+        assert!(c.shvia.enabled);
+        assert_eq!(c.shvia.api_key_env, "SHVIA_API_KEY");
+        assert!(c.shvia.api_key.is_none());
+        assert!(c.shvia.base_url.is_none());
+
+        // Inline overrides parse correctly, mirroring [zai].
+        let f = write_toml(
+            r#"
+            [shvia]
+            enabled = true
+            api_key_env = "MY_SHVIA"
+            api_key = "sk-shvia-inline"
+            base_url = "https://ia.example.test"
+            plan = "Gateway"
+            "#,
+        );
+        let c = Config::load_from(f.path()).unwrap();
+        assert!(c.is_enabled(VendorId::Shvia));
+        assert_eq!(c.shvia.api_key_env, "MY_SHVIA");
+        assert_eq!(c.shvia.api_key.as_deref(), Some("sk-shvia-inline"));
+        assert_eq!(c.shvia.base_url.as_deref(), Some("https://ia.example.test"));
+        assert_eq!(c.shvia.plan.as_deref(), Some("Gateway"));
     }
 }

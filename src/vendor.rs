@@ -70,6 +70,7 @@ pub enum VendorId {
     Moonshot,
     Grok,
     Antigravity,
+    Shvia,
 }
 
 impl VendorId {
@@ -87,6 +88,7 @@ impl VendorId {
             VendorId::Moonshot => "moonshot",
             VendorId::Grok => "grok",
             VendorId::Antigravity => "antigravity",
+            VendorId::Shvia => "shvia",
         }
     }
 
@@ -104,6 +106,7 @@ impl VendorId {
             VendorId::Moonshot,
             VendorId::Grok,
             VendorId::Antigravity,
+            VendorId::Shvia,
         ]
     }
 }
