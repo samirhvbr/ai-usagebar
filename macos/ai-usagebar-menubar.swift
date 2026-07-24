@@ -632,8 +632,12 @@ final class UsageRowView: NSView {
     }
 }
 
-// One API vendor: a state dot, the name, and its status on a second line —
-// the same two-line shape the Preferences pane's Vendors list already uses.
+// One API vendor on a single line: state dot, name, then the value and the
+// age in right-aligned columns. Stacking the value under the name reads as a
+// wall once every vendor is configured, and padding the name to a fixed
+// character count (the old attributedTitle rows) only lines up in a
+// monospaced font — drawing to a reserved column lines up in any font.
+let AGE_COL_W: CGFloat = 52
 final class ApiRowView: NSView {
     private var dotColor: NSColor = .clear
     private var name = ""
@@ -659,23 +663,34 @@ final class ApiRowView: NSView {
     }
 
     override func draw(_ dirtyRect: NSRect) {
-        dotColor.setFill()
-        NSBezierPath(ovalIn: NSRect(x: ROW_INSET_L, y: 8, width: 8, height: 8)).fill()
+        // Each string is centered on its own height so the differing font
+        // sizes share one baseline-ish line rather than sitting at a fixed y.
+        func centered(_ s: NSAttributedString) -> CGFloat {
+            (bounds.height - s.size().height) / 2
+        }
 
-        let textX = ROW_INSET_L + 16
+        dotColor.setFill()
+        NSBezierPath(ovalIn: NSRect(x: ROW_INSET_L, y: (bounds.height - 8) / 2,
+                                    width: 8, height: 8)).fill()
+
         let nameStr = NSAttributedString(string: name, attributes: [
             .font: NSFont.systemFont(ofSize: 13), .foregroundColor: NSColor.labelColor])
-        nameStr.draw(at: NSPoint(x: textX, y: 4))
+        nameStr.draw(at: NSPoint(x: ROW_INSET_L + 16, y: centered(nameStr)))
 
         let ageStr = NSAttributedString(string: age, attributes: [
             .font: NSFont.systemFont(ofSize: 11), .foregroundColor: NSColor.tertiaryLabelColor])
         if !age.isEmpty {
-            ageStr.draw(at: NSPoint(x: bounds.width - ROW_INSET_R - ageStr.size().width, y: 6))
+            ageStr.draw(at: NSPoint(x: bounds.width - ROW_INSET_R - ageStr.size().width,
+                                    y: centered(ageStr)))
         }
 
-        NSAttributedString(string: detail, attributes: [
-            .font: NSFont.systemFont(ofSize: 11), .foregroundColor: detailColor,
-        ]).draw(at: NSPoint(x: textX, y: 4 + nameStr.size().height + 1))
+        // Right-align the value against a reserved age column, so the values
+        // line up with each other even on the rows that carry no age.
+        let detailStr = NSAttributedString(string: detail, attributes: [
+            .font: NSFont.systemFont(ofSize: 11), .foregroundColor: detailColor])
+        detailStr.draw(at: NSPoint(
+            x: bounds.width - ROW_INSET_R - AGE_COL_W - detailStr.size().width,
+            y: centered(detailStr)))
     }
 }
 
@@ -946,7 +961,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(apiSubheadItem)
         for v in VENDOR_AUTH {
             let it = NSMenuItem()
-            let rv = ApiRowView(frame: NSRect(x: 0, y: 0, width: ROW_WIDTH, height: 38))
+            let rv = ApiRowView(frame: NSRect(x: 0, y: 0, width: ROW_WIDTH, height: 22))
             it.view = rv
             apiRows.append((v, it, rv))
             menu.addItem(it)

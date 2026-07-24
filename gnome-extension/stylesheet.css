@@ -46,10 +46,12 @@
     color: #5c6370;
 }
 
-/* "Status das APIs" rows — two lines (name over its status) with a state dot. */
+/* "Status das APIs" rows — a state dot, the name, then the value and the age
+   in right-aligned columns (the age's min-width is what keeps the value
+   column straight across rows). */
 .aiub-api-row {
     spacing: 9px;
-    padding: 5px 16px;
+    padding: 4px 16px;
     min-width: 360px;
 }
 
@@ -57,7 +59,6 @@
     width: 8px;
     height: 8px;
     border-radius: 8px;
-    margin-top: 5px;
 }
 
 .aiub-api-name {
@@ -71,5 +72,5 @@
 .aiub-api-age {
     font-size: 0.8em;
     color: #5c6370;
-    margin-top: 2px;
+    min-width: 46px;
 }

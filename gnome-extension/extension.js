@@ -174,19 +174,21 @@ class AiUsageBarIndicator extends PanelMenu.Button {
         this._apiRows = [];
         for (const vendor of API_VENDORS) {
             const item = new PopupMenu.PopupBaseMenuItem({reactive: false, can_focus: false});
+            // One line: dot, name, then value and age in right-aligned columns.
+            // The age label carries a min-width so the values line up across
+            // rows whose ages differ in length ("há 1m" vs "há 19h").
             const box = new St.BoxLayout({x_expand: true, style_class: 'aiub-api-row'});
             const dot = new St.Widget({style_class: 'aiub-api-dot',
-                y_align: Clutter.ActorAlign.START});
-            const textbox = new St.BoxLayout({
-                orientation: Clutter.Orientation.VERTICAL, x_expand: true});
-            const nameL = new St.Label({text: vendor.name, style_class: 'aiub-api-name'});
-            const detailL = new St.Label({style_class: 'aiub-api-detail'});
-            textbox.add_child(nameL);
-            textbox.add_child(detailL);
+                y_align: Clutter.ActorAlign.CENTER});
+            const nameL = new St.Label({text: vendor.name, x_expand: true,
+                style_class: 'aiub-api-name', y_align: Clutter.ActorAlign.CENTER});
+            const detailL = new St.Label({style_class: 'aiub-api-detail',
+                y_align: Clutter.ActorAlign.CENTER});
             const ageL = new St.Label({style_class: 'aiub-api-age',
-                y_align: Clutter.ActorAlign.START});
+                x_align: Clutter.ActorAlign.END, y_align: Clutter.ActorAlign.CENTER});
             box.add_child(dot);
-            box.add_child(textbox);
+            box.add_child(nameL);
+            box.add_child(detailL);
             box.add_child(ageL);
             item.add_child(box);
             this._apiSection.menu.addMenuItem(item);
