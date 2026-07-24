@@ -20,6 +20,8 @@ import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 import {barMarkup, colorForPct, disambiguateTags, field, FIELD, FORMAT, hasUsageWindows, integer,
     isGrouped, markerElapsed, plainTextFromPango, selectPools,
     splitFormatOutput} from './marker-logic.js';
+import {API_VENDORS, configApiKeyEnv, configHasApiKey, configVendorEnabled,
+    extractSnapshot, parseLastError, rowStatus} from './api-status-logic.js';
 
 const ROLE = 'ai-usagebar';
 
@@ -67,6 +69,7 @@ class AiUsageBarIndicator extends PanelMenu.Button {
         this._refreshCancellable = null;
         this._refreshProc = null;
         this._refreshToken = 0;
+        this._apiCheckToken = 0;
         this._rows = {};
 
         // Panel: one markup label holds tags + percentages + bars.
@@ -140,6 +143,11 @@ class AiUsageBarIndicator extends PanelMenu.Button {
         refreshItem.connect('activate', () => this._refresh());
         this.menu.addMenuItem(refreshItem);
 
+        // Collapsible "Status das APIs": one row per configured vendor with a
+        // health state derived from the binary's on-disk cache — no network
+        // calls; it mirrors the last fetch (port of the macOS menu bar section).
+        this._buildApiSection();
+
         const tuiItem = new PopupMenu.PopupMenuItem('Abrir TUI');
         tuiItem.connect('activate', () => this._openTui());
         this.menu.addMenuItem(tuiItem);
@@ -147,6 +155,183 @@ class AiUsageBarIndicator extends PanelMenu.Button {
         const prefsItem = new PopupMenu.PopupMenuItem('Configurações');
         prefsItem.connect('activate', () => this._openPrefs());
         this.menu.addMenuItem(prefsItem);
+    }
+
+    // ── "Status das APIs" (port of the macOS menu bar section) ──────────
+    // A native collapsible submenu; each visible row reads the vendor's
+    // on-disk cache (usage.json age + .last_error) and the config — pure
+    // local disk, no network. The only network path is "Verificar todas".
+    _buildApiSection() {
+        this._apiSection = new PopupMenu.PopupSubMenuMenuItem('Status das APIs', false);
+
+        const subhead = new PopupMenu.PopupBaseMenuItem({reactive: false, can_focus: false});
+        this._apiSubhead = new St.Label({x_expand: true, style_class: 'aiub-row-reset'});
+        subhead.add_child(this._apiSubhead);
+        this._apiSection.menu.addMenuItem(subhead);
+
+        this._apiRows = [];
+        for (const vendor of API_VENDORS) {
+            const item = new PopupMenu.PopupBaseMenuItem({reactive: false, can_focus: false});
+            const box = new St.BoxLayout({x_expand: true});
+            const dotL = new St.Label({style_class: 'aiub-row-name'});
+            const nameL = new St.Label({text: vendor.name, x_expand: true, style_class: 'aiub-row-name'});
+            const detailL = new St.Label({style_class: 'aiub-row-val'});
+            const ageL = new St.Label({style_class: 'aiub-row-reset'});
+            box.add_child(dotL);
+            box.add_child(nameL);
+            box.add_child(detailL);
+            box.add_child(ageL);
+            item.add_child(box);
+            this._apiSection.menu.addMenuItem(item);
+            this._apiRows.push({vendor, item, dotL, detailL, ageL});
+        }
+
+        this._apiCheckItem = new PopupMenu.PopupMenuItem('Verificar todas agora');
+        this._apiCheckItem.connect('activate', () => this._checkAllApis());
+        this._apiSection.menu.addMenuItem(this._apiCheckItem);
+
+        this.menu.addMenuItem(this._apiSection);
+        // Populate lazily: reading ~11 tiny local files is cheap, but there is
+        // no reason to do it before the section is first expanded.
+        this._apiSection.menu.connect('open-state-changed', (_m, open) => {
+            if (open)
+                this._refreshApiSection();
+        });
+    }
+
+    _readFileText(path) {
+        try {
+            const [ok, bytes] = GLib.file_get_contents(path);
+            if (!ok)
+                return null;
+            return new TextDecoder().decode(bytes);
+        } catch (e) {
+            return null; // missing file — the common case, not an error
+        }
+    }
+
+    _fileAgeSecs(path) {
+        try {
+            const info = Gio.File.new_for_path(path)
+                .query_info('time::modified', Gio.FileQueryInfoFlags.NONE, null);
+            const mtime = info.get_attribute_uint64('time::modified');
+            if (!mtime)
+                return null;
+            return Math.max(0, Math.trunc(GLib.get_real_time() / 1e6) - mtime);
+        } catch (e) {
+            return null; // no cache yet
+        }
+    }
+
+    // The effective API-key env var: the config's per-vendor `api_key_env`
+    // override wins (resolve_api_key in the binary checks it first), else the
+    // vendor's default. Used for both the configured check and the row hint.
+    _vendorEnvName(vendor, configText) {
+        return configApiKeyEnv(configText, vendor.id) ?? vendor.env;
+    }
+
+    _vendorConfigured(vendor, configText) {
+        if (vendor.kind === 'oauth')
+            return GLib.file_test(`${GLib.get_home_dir()}/${vendor.creds}`, GLib.FileTest.EXISTS);
+        const envName = this._vendorEnvName(vendor, configText);
+        const env = envName ? GLib.getenv(envName) : null;
+        if (env && env.trim())
+            return true;
+        return configHasApiKey(configText, vendor.id);
+    }
+
+    _refreshApiSection() {
+        if (!this._apiRows)
+            return;
+        const configText = this._readFileText(
+            `${GLib.get_user_config_dir()}/ai-usagebar/config.toml`);
+        const cacheBase = `${GLib.get_user_cache_dir()}/ai-usagebar`;
+        const colors = this._colors();
+        const stateColor = {low: colors.low, ok: colors.low, warn: colors.mid,
+            error: colors.critical, off: DIM};
+        const activeVendor = this._settings.get_string('vendor') || 'anthropic';
+
+        let shownAny = false;
+        for (const row of this._apiRows) {
+            const v = row.vendor;
+            const enabled = configVendorEnabled(configText, v.id);
+            const configured = this._vendorConfigured(v, configText);
+            // Only vendors that are enabled AND have credentials get a row —
+            // the panel is a health view, not a catalog (macOS parity).
+            const show = enabled && configured;
+            row.item.visible = show;
+            if (!show)
+                continue;
+            shownAny = true;
+
+            const dir = `${cacheBase}/${v.id}`;
+            const lastError = parseLastError(this._readFileText(`${dir}/.last_error`));
+            const ageSecs = this._fileAgeSecs(`${dir}/usage.json`);
+            let snap = null;
+            if (ageSecs != null) {
+                try {
+                    snap = extractSnapshot(v.id,
+                        JSON.parse(this._readFileText(`${dir}/usage.json`) ?? ''));
+                } catch (e) {
+                    // corrupt cache → no headline; the state ladder still works
+                }
+            }
+            const activePcts = v.id === activeVendor && this._data?.hasUsageWindows
+                ? {session: this._data.session.pct, weekly: this._data.weekly.pct}
+                : null;
+
+            // Row hints must name the EFFECTIVE env var (api_key_env override).
+            const vEff = v.kind === 'oauth' ? v : {...v, env: this._vendorEnvName(v, configText)};
+            const st = rowStatus(vEff, {enabled, configured, lastError, ageSecs,
+                snap, configText, activePcts});
+            row.dotL.clutter_text.set_markup(
+                `<span foreground="${stateColor[st.state]}">●</span>  `);
+            row.detailL.clutter_text.set_markup(`<span foreground="${
+                st.state === 'error' ? colors.critical : FG}">${esc(st.detail)}</span>`);
+            row.ageL.clutter_text.set_markup(st.age
+                ? `<span foreground="${DIM}">  há ${esc(st.age)}</span>` : '');
+        }
+        this._apiCheckItem.visible = shownAny;
+        this._apiSubhead.clutter_text.set_markup(`<span foreground="${DIM}">${
+            shownAny ? 'status do cache local — sem novas chamadas' : 'nenhuma API configurada'}</span>`);
+    }
+
+    // The only path that touches the network: run the binary once per enabled
+    // + configured vendor (each run still honors the binary's own cache TTL,
+    // so this is bounded), then re-read the caches into the rows.
+    _checkAllApis() {
+        if (!this._apiRows)
+            return;
+        const configText = this._readFileText(
+            `${GLib.get_user_config_dir()}/ai-usagebar/config.toml`);
+        const bin = resolveBinary(this._settings);
+        const targets = this._apiRows
+            .map(r => r.vendor)
+            .filter(v => configVendorEnabled(configText, v.id) &&
+                this._vendorConfigured(v, configText));
+        if (!targets.length)
+            return;
+        const token = ++this._apiCheckToken;
+        this._apiSubhead.clutter_text.set_markup(
+            `<span foreground="${DIM}">verificando…</span>`);
+        let pending = targets.length;
+        for (const v of targets) {
+            let proc;
+            try {
+                proc = Gio.Subprocess.new([bin, '--vendor', v.id, '--json'],
+                    Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE);
+            } catch (e) {
+                pending -= 1;
+                continue;
+            }
+            proc.wait_async(null, () => {
+                pending -= 1;
+                if (pending === 0 && this._apiCheckToken === token && this._apiRows)
+                    this._refreshApiSection();
+            });
+        }
+        if (pending === 0)
+            this._refreshApiSection();
     }
 
     // Group subtitle sitting above the rows that belong to it.
@@ -546,6 +731,10 @@ class AiUsageBarIndicator extends PanelMenu.Button {
             this._settings.disconnect(this._intervalId);
         this._viewIds = this._sourceIds = null;
         this._intervalId = 0;
+        // Orphan any in-flight "Verificar todas" callbacks: they check
+        // _apiRows before touching destroyed actors.
+        this._apiRows = null;
+        this._apiCheckToken += 1;
         super.destroy();
     }
 });
