@@ -8,24 +8,68 @@
 /* Dropdown rows — native St layout, font-independent alignment. */
 .aiub-header {
     font-weight: bold;
-    padding: 4px 12px 2px 12px;
+    padding: 6px 16px 2px 16px;
 }
 
 .aiub-row {
     spacing: 2px;
-    padding: 3px 12px;
-    min-width: 240px;
+    padding: 7px 16px;
+    min-width: 360px;
 }
 
 .aiub-row-name {
     font-weight: bold;
 }
 
-.aiub-row-bar {
-    font-family: monospace;
+.aiub-row-val {
+    font-feature-settings: "tnum";
+}
+
+/* Drawn usage bar: rounded track + fill + pace marker.
+   Widths, colors and margins are set per-render in extension.js (_drawBar);
+   the track width here MUST match the W constant in that method. */
+.aiub-bar-track {
+    width: 320px;
+    height: 7px;
+    border-radius: 4px;
+    margin: 6px 0 5px 0;
+}
+
+.aiub-bar-fill,
+.aiub-bar-over,
+.aiub-bar-marker {
+    height: 7px;
 }
 
 .aiub-row-reset {
     font-size: 0.85em;
-    color: #888888;
+    color: #5c6370;
+}
+
+/* "Status das APIs" rows — two lines (name over its status) with a state dot. */
+.aiub-api-row {
+    spacing: 9px;
+    padding: 5px 16px;
+    min-width: 360px;
+}
+
+.aiub-api-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 8px;
+    margin-top: 5px;
+}
+
+.aiub-api-name {
+    font-weight: bold;
+}
+
+.aiub-api-detail {
+    font-size: 0.85em;
+}
+
+.aiub-api-age {
+    font-size: 0.8em;
+    color: #5c6370;
+    margin-top: 2px;
 }

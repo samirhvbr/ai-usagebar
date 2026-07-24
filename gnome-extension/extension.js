@@ -17,8 +17,8 @@ import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
-import {barMarkup, colorForPct, disambiguateTags, field, FIELD, FORMAT, hasUsageWindows, integer,
-    isGrouped, markerElapsed, plainTextFromPango, selectPools,
+import {barMarkup, colorForDelta, colorForPct, disambiguateTags, field, FIELD, FORMAT, hasUsageWindows,
+    integer, isGrouped, MARKER, markerElapsed, plainTextFromPango, selectPools,
     splitFormatOutput} from './marker-logic.js';
 import {API_VENDORS, configApiKeyEnv, configHasApiKey, configVendorEnabled,
     extractSnapshot, parseLastError, rowStatus} from './api-status-logic.js';
@@ -29,6 +29,8 @@ const ROLE = 'ai-usagebar';
 const DIM = '#5c6370';
 const FG = '#abb2bf';
 const RED = '#e06c75';
+// Muted secondary text (the API rows' status line): between DIM and FG.
+const MUTED = '#8b93a1';
 // FORMAT's final ignored literal sentinel receives a stale suffix, keeping the
 // preceding elapsed fields numeric. It and its field indexes live in marker-logic.
 const REFRESH_TIMEOUT_SECS = 60;
@@ -172,18 +174,23 @@ class AiUsageBarIndicator extends PanelMenu.Button {
         this._apiRows = [];
         for (const vendor of API_VENDORS) {
             const item = new PopupMenu.PopupBaseMenuItem({reactive: false, can_focus: false});
-            const box = new St.BoxLayout({x_expand: true});
-            const dotL = new St.Label({style_class: 'aiub-row-name'});
-            const nameL = new St.Label({text: vendor.name, x_expand: true, style_class: 'aiub-row-name'});
-            const detailL = new St.Label({style_class: 'aiub-row-val'});
-            const ageL = new St.Label({style_class: 'aiub-row-reset'});
-            box.add_child(dotL);
-            box.add_child(nameL);
-            box.add_child(detailL);
+            const box = new St.BoxLayout({x_expand: true, style_class: 'aiub-api-row'});
+            const dot = new St.Widget({style_class: 'aiub-api-dot',
+                y_align: Clutter.ActorAlign.START});
+            const textbox = new St.BoxLayout({
+                orientation: Clutter.Orientation.VERTICAL, x_expand: true});
+            const nameL = new St.Label({text: vendor.name, style_class: 'aiub-api-name'});
+            const detailL = new St.Label({style_class: 'aiub-api-detail'});
+            textbox.add_child(nameL);
+            textbox.add_child(detailL);
+            const ageL = new St.Label({style_class: 'aiub-api-age',
+                y_align: Clutter.ActorAlign.START});
+            box.add_child(dot);
+            box.add_child(textbox);
             box.add_child(ageL);
             item.add_child(box);
             this._apiSection.menu.addMenuItem(item);
-            this._apiRows.push({vendor, item, dotL, detailL, ageL});
+            this._apiRows.push({vendor, item, dot, detailL, ageL});
         }
 
         this._apiCheckItem = new PopupMenu.PopupMenuItem('Verificar todas agora');
@@ -284,12 +291,11 @@ class AiUsageBarIndicator extends PanelMenu.Button {
             const vEff = v.kind === 'oauth' ? v : {...v, env: this._vendorEnvName(v, configText)};
             const st = rowStatus(vEff, {enabled, configured, lastError, ageSecs,
                 snap, configText, activePcts});
-            row.dotL.clutter_text.set_markup(
-                `<span foreground="${stateColor[st.state]}">●</span>  `);
+            row.dot.style = `background-color: ${stateColor[st.state]};`;
             row.detailL.clutter_text.set_markup(`<span foreground="${
-                st.state === 'error' ? colors.critical : FG}">${esc(st.detail)}</span>`);
+                st.state === 'error' ? colors.critical : MUTED}">${esc(st.detail)}</span>`);
             row.ageL.clutter_text.set_markup(st.age
-                ? `<span foreground="${DIM}">  há ${esc(st.age)}</span>` : '');
+                ? `<span foreground="${DIM}">há ${esc(st.age)}</span>` : '');
         }
         this._apiCheckItem.visible = shownAny;
         this._apiSubhead.clutter_text.set_markup(`<span foreground="${DIM}">${
@@ -356,16 +362,77 @@ class AiUsageBarIndicator extends PanelMenu.Button {
         head.add_child(nameL);
         head.add_child(valL);
 
-        const barL = new St.Label({style_class: 'aiub-row-bar'});
+        // Drawn bar: a fixed-width rounded track (BinLayout) holding an overlaid
+        // calm fill, an overshoot fill, and the pace-marker line. Widths/colors
+        // are set per render in _drawBar; the track is styled via CSS.
+        const barTrack = new St.Widget({
+            style_class: 'aiub-bar-track',
+            layout_manager: new Clutter.BinLayout(),
+        });
+        const barFill = new St.Widget({style_class: 'aiub-bar-fill',
+            x_align: Clutter.ActorAlign.START, y_align: Clutter.ActorAlign.FILL});
+        const barOver = new St.Widget({style_class: 'aiub-bar-over',
+            x_align: Clutter.ActorAlign.START, y_align: Clutter.ActorAlign.FILL});
+        const barMark = new St.Widget({style_class: 'aiub-bar-marker',
+            x_align: Clutter.ActorAlign.START, y_align: Clutter.ActorAlign.FILL});
+        barTrack.add_child(barFill);
+        barTrack.add_child(barOver);
+        barTrack.add_child(barMark);
         const resetL = new St.Label({style_class: 'aiub-row-reset'});
 
         vbox.add_child(head);
-        vbox.add_child(barL);
+        vbox.add_child(barTrack);
         vbox.add_child(resetL);
         item.add_child(vbox);
         this.menu.addMenuItem(item);
 
-        this._rows[key] = {item, nameL, valL, barL, resetL};
+        this._rows[key] = {item, nameL, valL, barTrack, barFill, barOver, barMark, resetL};
+    }
+
+    // Paint a row's usage bar. Mirrors barMarkup's semantics: the fill up to the
+    // pace marker is the calm absolute-usage color; only the part that overshoots
+    // the marker is the pace-delta (warning) color. elapsed null = no pace window
+    // (the $-budget extra row), so just a plain fill with no marker.
+    _drawBar(row, pct, elapsed, colors) {
+        const W = 320; // logical px — MUST match .aiub-bar-track width in the CSS
+        const r = 4;   // rounded ends (half of the 7px track height)
+        const p = Math.max(0, Math.min(100, Math.round(pct)));
+        const filledFrac = p / 100;
+        row.barTrack.style = `background-color: ${colors.empty};`;
+
+        if (!Number.isFinite(elapsed)) {
+            const fw = Math.round(filledFrac * W);
+            row.barFill.style = `width: ${fw}px; margin-left: 0; ` +
+                `border-radius: ${r}px; background-color: ${colorForPct(p, colors)};`;
+            row.barFill.visible = fw > 0;
+            row.barOver.visible = false;
+            row.barMark.visible = false;
+            return;
+        }
+
+        const e = Math.max(0, Math.min(100, Math.round(elapsed)));
+        const markerPx = Math.round((e / 100) * W);
+        const calmPx = Math.round(Math.min(filledFrac, e / 100) * W);
+        const over = filledFrac > e / 100;
+
+        row.barFill.style = `width: ${calmPx}px; margin-left: 0; ` +
+            `border-radius: ${over ? `${r}px 0 0 ${r}px` : `${r}px`}; ` +
+            `background-color: ${colorForPct(p, colors)};`;
+        row.barFill.visible = calmPx > 0;
+
+        if (over) {
+            const overW = Math.round((filledFrac - e / 100) * W);
+            row.barOver.style = `width: ${overW}px; margin-left: ${markerPx}px; ` +
+                `border-radius: 0 ${r}px ${r}px 0; ` +
+                `background-color: ${colorForDelta(p - e, colors)};`;
+            row.barOver.visible = overW > 0;
+        } else {
+            row.barOver.visible = false;
+        }
+
+        row.barMark.style = `width: 2px; margin-left: ${Math.max(0, markerPx - 1)}px; ` +
+            `background-color: ${MARKER};`;
+        row.barMark.visible = true;
     }
 
     _colors() {
@@ -646,7 +713,7 @@ class AiUsageBarIndicator extends PanelMenu.Button {
             if (!visible)
                 return;
             r.valL.text = valueText;
-            r.barL.clutter_text.set_markup(barMarkup(pct ?? 0, 18, colors, elapsed));
+            this._drawBar(r, pct ?? 0, elapsed, colors);
             if (reset) {
                 r.resetL.text = `↺ resets in ${reset}`;
                 r.resetL.visible = true;

@@ -47,7 +47,6 @@ var INTERVAL: Double { let v = DEF.double(forKey: "interval"); return v > 0 ? v 
 /// updating with no explanation. Matches the GNOME extension's own timeout.
 let REFRESH_TIMEOUT: Double = 45
 var BAR_WIDTH: Int { max(4, min(20, DEF.integer(forKey: "barWidth"))) }
-let MENU_BAR_W = 14
 var SHOW_SESSION: Bool { DEF.bool(forKey: "showSession") }
 var SHOW_WEEKLY: Bool { DEF.bool(forKey: "showWeekly") }
 var SHOW_EXTRA: Bool { DEF.bool(forKey: "showExtra") }
@@ -541,6 +540,145 @@ final class ApiToggleView: NSView {
     }
 }
 
+// ─── Drawn menu rows ─────────────────────────────────────────────────────
+// The quota and API rows are view-based menu items so the bar can be a real
+// drawn shape — rounded track, fill, and pace marker — instead of a run of
+// █/░ glyphs. The menu-bar title itself stays text: an NSStatusItem button
+// has no view of ours to draw into. Neither view installs a tracking area or
+// handles mouse events, so these rows stay inert exactly like the plain
+// NSMenuItems they replace (only ApiToggleView is clickable).
+let ROW_INSET_L: CGFloat = 21   // matches ApiToggleView's text inset
+let ROW_INSET_R: CGFloat = 14
+let ROW_WIDTH: CGFloat = 360
+let BAR_H: CGFloat = 7
+
+final class UsageRowView: NSView {
+    private var name = ""
+    private var value = ""
+    private var pct = 0
+    private var reset = ""
+    private var elapsed: Int?
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        autoresizingMask = [.width]   // stretch to the menu's width
+    }
+    required init?(coder: NSCoder) { super.init(coder: coder) }
+
+    override var isFlipped: Bool { true }
+
+    func update(name: String, value: String, pct: Int, reset: String?, elapsed: Int?) {
+        self.name = name
+        self.value = value
+        self.pct = pct
+        self.reset = reset ?? ""
+        self.elapsed = elapsed
+        needsDisplay = true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        var y: CGFloat = 5
+
+        let nameStr = NSAttributedString(string: name, attributes: [
+            .font: NSFont.boldSystemFont(ofSize: 13), .foregroundColor: NSColor.labelColor])
+        nameStr.draw(at: NSPoint(x: ROW_INSET_L, y: y))
+        // Tabular figures so a changing percentage never shifts the layout.
+        let valStr = NSAttributedString(string: value, attributes: [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .regular),
+            .foregroundColor: NSColor.labelColor])
+        valStr.draw(at: NSPoint(x: bounds.width - ROW_INSET_R - valStr.size().width, y: y))
+        y += max(nameStr.size().height, valStr.size().height) + 6
+
+        let barW = max(40, bounds.width - ROW_INSET_L - ROW_INSET_R)
+        let track = NSRect(x: ROW_INSET_L, y: y, width: barW, height: BAR_H)
+        let radius = BAR_H / 2
+        let trackPath = NSBezierPath(roundedRect: track, xRadius: radius, yRadius: radius)
+        hexColor(COLOR_EMPTY).setFill()
+        trackPath.fill()
+
+        // Clip the fills to the rounded track: the ends then round themselves,
+        // with no per-corner radius math as the fill grows past the marker.
+        NSGraphicsContext.saveGraphicsState()
+        trackPath.addClip()
+        let p = max(0, min(100, pct))
+        let filled = CGFloat(p) / 100
+        if SHOW_META, let elapsedVal = elapsed {
+            // Same semantics as barAttr: calm up to the marker, and only the
+            // overshoot beyond it in the pace-warning color.
+            let eInt = max(0, min(100, elapsedVal))
+            let e = CGFloat(eInt) / 100
+            colorForPct(p).setFill()
+            NSRect(x: track.minX, y: track.minY, width: min(filled, e) * barW, height: BAR_H).fill()
+            if filled > e {
+                colorForDelta(p - eInt).setFill()
+                NSRect(x: track.minX + e * barW, y: track.minY,
+                       width: (filled - e) * barW, height: BAR_H).fill()
+            }
+            hexColor(COLOR_MARKER).setFill()
+            NSRect(x: track.minX + e * barW - 1, y: track.minY, width: 2, height: BAR_H).fill()
+        } else {
+            colorForPct(p).setFill()
+            NSRect(x: track.minX, y: track.minY, width: filled * barW, height: BAR_H).fill()
+        }
+        NSGraphicsContext.restoreGraphicsState()
+        y += BAR_H + 5
+
+        if !reset.isEmpty {
+            NSAttributedString(string: "↺ \(reset)", attributes: [
+                .font: NSFont.systemFont(ofSize: 11),
+                .foregroundColor: NSColor.secondaryLabelColor,
+            ]).draw(at: NSPoint(x: ROW_INSET_L, y: y))
+        }
+    }
+}
+
+// One API vendor: a state dot, the name, and its status on a second line —
+// the same two-line shape the Preferences pane's Vendors list already uses.
+final class ApiRowView: NSView {
+    private var dotColor: NSColor = .clear
+    private var name = ""
+    private var detail = ""
+    private var detailColor: NSColor = .secondaryLabelColor
+    private var age = ""
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        autoresizingMask = [.width]
+    }
+    required init?(coder: NSCoder) { super.init(coder: coder) }
+
+    override var isFlipped: Bool { true }
+
+    func update(dot: NSColor, name: String, detail: String, detailColor: NSColor, age: String) {
+        self.dotColor = dot
+        self.name = name
+        self.detail = detail
+        self.detailColor = detailColor
+        self.age = age
+        needsDisplay = true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        dotColor.setFill()
+        NSBezierPath(ovalIn: NSRect(x: ROW_INSET_L, y: 8, width: 8, height: 8)).fill()
+
+        let textX = ROW_INSET_L + 16
+        let nameStr = NSAttributedString(string: name, attributes: [
+            .font: NSFont.systemFont(ofSize: 13), .foregroundColor: NSColor.labelColor])
+        nameStr.draw(at: NSPoint(x: textX, y: 4))
+
+        let ageStr = NSAttributedString(string: age, attributes: [
+            .font: NSFont.systemFont(ofSize: 11), .foregroundColor: NSColor.tertiaryLabelColor])
+        if !age.isEmpty {
+            ageStr.draw(at: NSPoint(x: bounds.width - ROW_INSET_R - ageStr.size().width, y: 6))
+        }
+
+        NSAttributedString(string: detail, attributes: [
+            .font: NSFont.systemFont(ofSize: 11), .foregroundColor: detailColor,
+        ]).draw(at: NSPoint(x: textX, y: 4 + nameStr.size().height + 1))
+    }
+}
+
 func cliInstalled(_ cli: String) -> Bool {
     let home = NSHomeDirectory()
     let fm = FileManager.default
@@ -757,13 +895,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var refreshQueued = false
     let headerItem = NSMenuItem()
     var rows: [String: NSMenuItem] = [:]
+    var rowViews: [String: UsageRowView] = [:]
     // Collapsible "Status das APIs" section (starts collapsed; the toggle click
     // dismisses the menu, so the rows appear on the next open).
     var apiToggleItem: NSMenuItem!
     var apiToggleView: ApiToggleView?
     var apiSubheadItem: NSMenuItem!
     var apiCheckAllItem: NSMenuItem!
-    var apiRows: [(vendor: VendorAuth, item: NSMenuItem)] = []
+    var apiRows: [(vendor: VendorAuth, item: NSMenuItem, view: ApiRowView)] = []
     var apiExpanded = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -784,7 +923,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(headerItem)
         for key in ["session", "weekly", "sonnet", "extra"] {
             let it = NSMenuItem()
+            let v = UsageRowView(frame: NSRect(x: 0, y: 0, width: ROW_WIDTH, height: 54))
+            it.view = v
             rows[key] = it
+            rowViews[key] = v
             menu.addItem(it)
         }
 
@@ -804,7 +946,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(apiSubheadItem)
         for v in VENDOR_AUTH {
             let it = NSMenuItem()
-            apiRows.append((v, it))
+            let rv = ApiRowView(frame: NSRect(x: 0, y: 0, width: ROW_WIDTH, height: 38))
+            it.view = rv
+            apiRows.append((v, it, rv))
             menu.addItem(it)
         }
         apiCheckAllItem = NSMenuItem(title: "Verificar todas agora", action: #selector(checkAllApis), keyEquivalent: "r")
@@ -852,7 +996,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard apiExpanded else {
             apiSubheadItem.isHidden = true
             apiCheckAllItem.isHidden = true
-            for (_, it) in apiRows { it.isHidden = true }
+            for r in apiRows { r.item.isHidden = true }
             return
         }
         // Expanded: vendorConfigured may spawn `security` (Keychain) and we read
@@ -864,12 +1008,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let activeSnapshot = lastSnapshot
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
-            let computed: [(show: Bool, title: NSAttributedString)] = vendors.map { v in
+            let computed: [(show: Bool, state: ApiState, detail: String, age: String)] = vendors.map { v in
                 let show = configVendorEnabled(v.id) && vendorConfigured(v)
-                let title = show
-                    ? self.apiRowTitle(v, activeVendor: activeVendor, activeSnapshot: activeSnapshot)
-                    : NSAttributedString()
-                return (show, title)
+                guard show else { return (false, ApiState.off, "", "") }
+                let st = self.apiRowStatus(v, activeVendor: activeVendor, activeSnapshot: activeSnapshot)
+                return (true, st.state, st.detail, st.age)
             }
             DispatchQueue.main.async {
                 guard self.apiExpanded else { return }
@@ -878,7 +1021,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     let c = computed[i]
                     pair.item.isHidden = !c.show
                     if c.show {
-                        pair.item.attributedTitle = c.title
+                        pair.view.update(
+                            dot: apiStateColor(c.state),
+                            name: pair.vendor.name,
+                            detail: c.detail,
+                            detailColor: c.state == .error
+                                ? hexColor(COLOR_CRITICAL) : .secondaryLabelColor,
+                            age: c.age.isEmpty ? "" : "há \(c.age)")
                         shownAny = true
                     }
                 }
@@ -889,17 +1038,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     .secondaryLabelColor, NSFont.systemFont(ofSize: 11))
             }
         }
-    }
-
-    func apiRowTitle(_ v: VendorAuth, activeVendor: String, activeSnapshot: Snapshot?) -> NSAttributedString {
-        let st = apiRowStatus(v, activeVendor: activeVendor, activeSnapshot: activeSnapshot)
-        let a = NSMutableAttributedString()
-        a.append(run("●  ", apiStateColor(st.state)))
-        let name = v.name.count < 20 ? v.name.padding(toLength: 20, withPad: " ", startingAt: 0) : v.name
-        a.append(run(name, .labelColor))
-        a.append(run(st.detail, st.state == .error ? hexColor(COLOR_CRITICAL) : .secondaryLabelColor))
-        if !st.age.isEmpty { a.append(run("   há \(st.age)", .tertiaryLabelColor)) }
-        return a
     }
 
     // Derives a vendor's live status purely from local state — config, creds,
@@ -940,7 +1078,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let bin = resolveBinary("ai-usagebar") else { return }
         apiSubheadItem.attributedTitle = run("verificando…", .secondaryLabelColor, NSFont.systemFont(ofSize: 11))
         let group = DispatchGroup()
-        for (v, _) in apiRows where configVendorEnabled(v.id) && vendorConfigured(v) {
+        for (v, _, _) in apiRows where configVendorEnabled(v.id) && vendorConfigured(v) {
             group.enter()
             DispatchQueue.global(qos: .utility).async {
                 let p = Process()
@@ -1128,17 +1266,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                          .labelColor, NSFont.boldSystemFont(ofSize: 13))
 
         func row(_ key: String, _ name: String, _ pct: Int, _ value: String, _ reset: String?, _ elapsed: Int?) {
-            guard let item = rows[key] else { return }
+            guard let item = rows[key], let view = rowViews[key] else { return }
             item.isHidden = false
-            let a = NSMutableAttributedString()
-            let label = name.count < 12
-                ? name.padding(toLength: 12, withPad: " ", startingAt: 0)
-                : name
-            a.append(run(label, .labelColor))
-            a.append(barAttr(pct: pct, width: MENU_BAR_W, elapsed: elapsed))
-            a.append(run("  \(value)", colorForPct(pct)))
-            if let r = reset, !r.isEmpty { a.append(run("   ↺ \(r)", .secondaryLabelColor)) }
-            item.attributedTitle = a
+            view.update(name: name, value: value, pct: pct, reset: reset, elapsed: elapsed)
         }
         if s.hasUsageWindows {
             row("session", "Session", s.session.pct, "\(s.session.pct)%", s.session.reset, s.session.elapsed)
