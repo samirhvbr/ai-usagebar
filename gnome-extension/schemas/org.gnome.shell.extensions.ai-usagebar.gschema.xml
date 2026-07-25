@@ -9,6 +9,13 @@
       <summary>Refresh interval in seconds</summary>
     </key>
 
+    <key name="api-refresh-interval" type="i">
+      <default>600</default>
+      <range min="0" max="86400"/>
+      <summary>Seconds between background refreshes of every configured vendor's cache (0 = only on demand)</summary>
+      <description>The main interval only fetches the vendor shown in the panel, so every other vendor's "Status das APIs" row ages until something asks for it. This runs the binary once per enabled+configured vendor in the background. Each run still honors the binary's own 60s cache TTL. 0 disables it, leaving "Verificar todas agora" as the only refresh.</description>
+    </key>
+
     <key name="vendor" type="s">
       <default>'anthropic'</default>
       <summary>Vendor to display (anthropic shows the 5h + weekly windows)</summary>

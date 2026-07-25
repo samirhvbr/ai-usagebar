@@ -67,6 +67,7 @@ class AiUsageBarIndicator extends PanelMenu.Button {
         // A refresh asked for while one was in flight, to run once it settles.
         this._refreshPending = false;
         this._timer = 0;
+        this._apiTimer = 0;
         this._refreshTimeoutId = 0;
         this._refreshCancellable = null;
         this._refreshProc = null;
@@ -96,6 +97,8 @@ class AiUsageBarIndicator extends PanelMenu.Button {
 
         this._intervalId = this._settings.connect('changed::refresh-interval',
             () => this._restartTimer());
+        this._apiIntervalId = this._settings.connect('changed::api-refresh-interval',
+            () => this._restartApiTimer());
         this._sourceIds = [
             this._settings.connect('changed::vendor', () => this._refresh()),
             this._settings.connect('changed::binary-path', () => this._refresh()),
@@ -108,6 +111,7 @@ class AiUsageBarIndicator extends PanelMenu.Button {
 
         this._refresh();
         this._restartTimer();
+        this._restartApiTimer();
     }
 
     _buildMenu(grouped = false) {
@@ -307,7 +311,10 @@ class AiUsageBarIndicator extends PanelMenu.Button {
     // The only path that touches the network: run the binary once per enabled
     // + configured vendor (each run still honors the binary's own cache TTL,
     // so this is bounded), then re-read the caches into the rows.
-    _checkAllApis() {
+    // `silent` is the background timer's path: same work, but it leaves the
+    // subhead alone so a closed menu never flashes "verificando…" and an open
+    // one does not shift under the pointer.
+    _checkAllApis(silent = false) {
         if (!this._apiRows)
             return;
         const configText = this._readFileText(
@@ -320,8 +327,10 @@ class AiUsageBarIndicator extends PanelMenu.Button {
         if (!targets.length)
             return;
         const token = ++this._apiCheckToken;
-        this._apiSubhead.clutter_text.set_markup(
-            `<span foreground="${DIM}">verificando…</span>`);
+        if (!silent) {
+            this._apiSubhead.clutter_text.set_markup(
+                `<span foreground="${DIM}">verificando…</span>`);
+        }
         let pending = targets.length;
         for (const v of targets) {
             let proc;
@@ -456,6 +465,24 @@ class AiUsageBarIndicator extends PanelMenu.Button {
         const secs = Math.max(5, this._settings.get_int('refresh-interval'));
         this._timer = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, secs, () => {
             this._refresh();
+            return GLib.SOURCE_CONTINUE;
+        });
+    }
+
+    // The main timer only fetches the vendor on the panel, so every other
+    // vendor's cache — and the row that reads it — ages indefinitely. This
+    // refreshes all of them in the background at a much slower cadence
+    // (LOW priority: it is never what the user is waiting for). 0 = off.
+    _restartApiTimer() {
+        if (this._apiTimer) {
+            GLib.source_remove(this._apiTimer);
+            this._apiTimer = 0;
+        }
+        const secs = this._settings.get_int('api-refresh-interval');
+        if (secs <= 0)
+            return;
+        this._apiTimer = GLib.timeout_add_seconds(GLib.PRIORITY_LOW, secs, () => {
+            this._checkAllApis(true);
             return GLib.SOURCE_CONTINUE;
         });
     }
@@ -780,6 +807,10 @@ class AiUsageBarIndicator extends PanelMenu.Button {
             GLib.source_remove(this._timer);
             this._timer = 0;
         }
+        if (this._apiTimer) {
+            GLib.source_remove(this._apiTimer);
+            this._apiTimer = 0;
+        }
         if (this._refreshTimeoutId) {
             GLib.source_remove(this._refreshTimeoutId);
             this._refreshTimeoutId = 0;
@@ -798,8 +829,11 @@ class AiUsageBarIndicator extends PanelMenu.Button {
             this._settings.disconnect(id);
         if (this._intervalId)
             this._settings.disconnect(this._intervalId);
+        if (this._apiIntervalId)
+            this._settings.disconnect(this._apiIntervalId);
         this._viewIds = this._sourceIds = null;
         this._intervalId = 0;
+        this._apiIntervalId = 0;
         // Orphan any in-flight "Verificar todas" callbacks: they check
         // _apiRows before touching destroyed actors.
         this._apiRows = null;

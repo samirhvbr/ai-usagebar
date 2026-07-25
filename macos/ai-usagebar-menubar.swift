@@ -24,6 +24,7 @@ let DEF = UserDefaults.standard
 let SETTINGS_DEFAULTS: [String: Any] = [
     "vendor": "anthropic",
     "interval": 30.0,
+    "apiInterval": 600.0,
     "barWidth": 8,
     "showSession": true,
     "showWeekly": true,
@@ -41,6 +42,11 @@ let SETTINGS_DEFAULTS: [String: Any] = [
 
 var VENDOR: String { DEF.string(forKey: "vendor") ?? "anthropic" }
 var INTERVAL: Double { let v = DEF.double(forKey: "interval"); return v > 0 ? v : 30 }
+/// Cadence of the background sweep that refreshes EVERY configured vendor's
+/// cache. `INTERVAL` only fetches the vendor shown in the menu bar, so the
+/// other "Status das APIs" rows would otherwise age until asked for. 0 = off,
+/// leaving "Verificar todas agora" as the only refresh.
+var API_INTERVAL: Double { max(0, DEF.double(forKey: "apiInterval")) }
 /// Upper bound on one `ai-usagebar` invocation. It can block on the cache
 /// flock (up to 15s) and then refresh OAuth over the network, so without a
 /// bound a hung run holds a worker indefinitely and the panel simply stops
@@ -823,6 +829,7 @@ struct VendorsSection: View {
 struct SettingsView: View {
     @AppStorage("vendor") private var vendor = "anthropic"
     @AppStorage("interval") private var interval = 30.0
+    @AppStorage("apiInterval") private var apiInterval = 600.0
     @AppStorage("barWidth") private var barWidth = 8
     @AppStorage("showSession") private var showSession = true
     @AppStorage("showWeekly") private var showWeekly = true
@@ -873,6 +880,12 @@ struct SettingsView: View {
                             ForEach(vendors, id: \.self) { Text($0) }
                         }
                         Stepper("Intervalo: \(Int(interval))s", value: $interval, in: 5...3600, step: 5)
+                        Stepper(apiInterval > 0
+                                ? "Status das APIs: a cada \(Int(apiInterval / 60)) min"
+                                : "Status das APIs: só sob demanda",
+                                value: $apiInterval, in: 0...7200, step: 300)
+                        Text("O intervalo acima só busca o vendor exibido. Este atualiza o cache de todos os configurados em segundo plano (0 = desligado).")
+                            .font(.caption).foregroundColor(.secondary)
                         TextField("Caminho do binário (vazio = auto)", text: $binaryPath)
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -891,6 +904,7 @@ struct SettingsView: View {
 class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var statusItem: NSStatusItem!
     var timer: Timer?
+    var apiTimer: Timer?
     var prefsWindow: NSWindow?
     // Keep the SwiftUI host alive while its view is installed directly in the
     // window. This avoids NSHostingController's macOS-13-only sizing API.
@@ -926,6 +940,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         buildMenu()
         refresh()
         restartTimer()
+        restartApiTimer()
         NotificationCenter.default.addObserver(
             self, selector: #selector(settingsChanged),
             name: UserDefaults.didChangeNotification, object: nil)
@@ -1090,8 +1105,19 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // configured vendor (it still honors its own 60s cache, so this is bounded),
     // then re-read the caches into the rows.
     @objc func checkAllApis() {
+        refreshAllVendors(silent: false)
+    }
+
+    /// Runs the binary once per enabled + configured vendor, refreshing each
+    /// one's on-disk cache, then re-reads the rows. Each run still honors the
+    /// binary's own 60s cache TTL, so this is bounded no matter who calls it.
+    /// `silent` is the timer's path: it leaves the subhead alone so a closed
+    /// menu never flashes "verificando…".
+    func refreshAllVendors(silent: Bool) {
         guard let bin = resolveBinary("ai-usagebar") else { return }
-        apiSubheadItem.attributedTitle = run("verificando…", .secondaryLabelColor, NSFont.systemFont(ofSize: 11))
+        if !silent {
+            apiSubheadItem.attributedTitle = run("verificando…", .secondaryLabelColor, NSFont.systemFont(ofSize: 11))
+        }
         let group = DispatchGroup()
         for (v, _, _) in apiRows where configVendorEnabled(v.id) && vendorConfigured(v) {
             group.enter()
@@ -1151,6 +1177,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func settingsChanged() {
         if let s = lastSnapshot { renderPanel(s); renderMenu(s) }
         restartTimer()
+        restartApiTimer()
         pendingRefresh?.cancel()
         let work = DispatchWorkItem { [weak self] in self?.refresh() }
         pendingRefresh = work
@@ -1162,6 +1189,23 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         timer = Timer.scheduledTimer(withTimeInterval: INTERVAL, repeats: true) { [weak self] _ in
             self?.refresh()
         }
+    }
+
+    // Background sweep over every configured vendor, so the API rows are fresh
+    // whenever the menu is opened instead of only after an explicit check.
+    func restartApiTimer() {
+        apiTimer?.invalidate()
+        apiTimer = nil
+        let secs = API_INTERVAL
+        guard secs > 0 else { return }
+        // tolerance lets macOS coalesce this with other timers — it is
+        // background work, so drifting a few seconds costs nothing.
+        let t = Timer(timeInterval: secs, repeats: true) { [weak self] _ in
+            self?.refreshAllVendors(silent: true)
+        }
+        t.tolerance = min(30, secs / 10)
+        RunLoop.main.add(t, forMode: .common)
+        apiTimer = t
     }
 
     func refresh() {

@@ -279,6 +279,14 @@ export default class AiUsageBarPrefs extends ExtensionPreferences {
         settings.bind('refresh-interval', interval, 'value', Gio.SettingsBindFlags.DEFAULT);
         data.add(interval);
 
+        const apiInterval = new Adw.SpinRow({
+            title: _('Atualizar Status das APIs (s)'),
+            subtitle: _('O intervalo acima só busca o vendor exibido; este atualiza o cache de todos os configurados em segundo plano (0 = só sob demanda)'),
+            adjustment: new Gtk.Adjustment({lower: 0, upper: 86400, step_increment: 300, page_increment: 600}),
+        });
+        settings.bind('api-refresh-interval', apiInterval, 'value', Gio.SettingsBindFlags.DEFAULT);
+        data.add(apiInterval);
+
         const vendorList = ['anthropic', 'openai', 'zai', 'openrouter', 'deepseek', 'antigravity'];
         const vendor = new Adw.ComboRow({
             title: _('Vendor'),
