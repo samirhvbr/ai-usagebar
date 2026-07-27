@@ -276,6 +276,7 @@ pub enum VendorSnapshot {
     Grok(GrokSnapshot),
     AnthropicApi(AnthropicApiSnapshot),
     Antigravity(AntigravitySnapshot),
+    Minimax(MinimaxSnapshot),
     Shvia(ShviaSnapshot),
 }
 
@@ -299,6 +300,27 @@ pub struct AntigravitySnapshot {
 }
 
 impl Eq for AntigravitySnapshot {}
+
+/// MiniMax Token Plan — `/v1/token_plan/remains` returns one row per model
+/// bucket (`general` for text/coding, `video`), and each row carries its own
+/// rolling interval window plus a weekly window.
+///
+/// Two things the payload dictates rather than convention: the interval length
+/// is **not fixed** (`general` rolls every 5h, `video` every 24h), so the
+/// duration is derived from the row's own start/end rather than assumed; and
+/// the API reports the percentage **remaining**, which is inverted on the way
+/// in so these windows carry consumed-% like every other vendor's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MinimaxSnapshot {
+    pub plan: String,
+    /// `general` bucket — rolling interval window (5h on the observed plans).
+    pub session: UsageWindow,
+    /// `general` bucket — weekly window.
+    pub weekly: UsageWindow,
+    /// `video` bucket, `None` on plans that carry no video quota.
+    pub video_session: Option<UsageWindow>,
+    pub video_weekly: Option<UsageWindow>,
+}
 
 /// Anthropic Admin API — month-to-date spend (USD) from the cost report. The
 /// monthly `limit` is supplied from config (the API exposes neither the limit

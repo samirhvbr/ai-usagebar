@@ -112,6 +112,7 @@ fn parse_slug(s: &str) -> Option<VendorId> {
         "grok" => Some(VendorId::Grok),
         "antigravity" => Some(VendorId::Antigravity),
         "shvia" => Some(VendorId::Shvia),
+        "minimax" => Some(VendorId::Minimax),
         _ => None,
     }
 }

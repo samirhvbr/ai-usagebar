@@ -18,6 +18,7 @@ use crate::error::{AppError, Result};
 use crate::grok;
 use crate::kilo;
 use crate::kimi;
+use crate::minimax;
 use crate::moonshot;
 use crate::novita;
 use crate::openai;
@@ -151,6 +152,7 @@ async fn build_output(cli: &Cli) -> Result<WaybarOutput> {
         Vendor::Grok => grok_output(cli, &config).await,
         Vendor::Antigravity => antigravity_output(cli, &config).await,
         Vendor::Shvia => shvia_output(cli, &config).await,
+        Vendor::Minimax => minimax_output(cli, &config).await,
     }
 }
 
@@ -251,6 +253,35 @@ async fn moonshot_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
     let vendor_outcome: VendorOutcome = outcome.into();
     let opts = RenderOpts::from_cli(cli);
     Ok(moonshot::vendor::render(
+        &vendor_outcome,
+        &snap,
+        &theme,
+        &opts,
+        chrono::Utc::now(),
+    ))
+}
+
+async fn minimax_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
+    let api_key = crate::config::resolve_api_key(
+        "MiniMax",
+        &config.minimax.api_key_env,
+        config.minimax.api_key.as_deref(),
+    )?;
+    let client = http_client()?;
+    let cache = vendor_cache(cli, "minimax")?;
+    let endpoints = minimax::fetch::Endpoints::for_region(&config.minimax.region);
+    let outcome =
+        match minimax::fetch_snapshot(&client, &api_key, &cache, &endpoints, DEFAULT_TTL).await {
+            Ok(o) => o,
+            Err(e) if e.is_transient() => return Ok(WaybarOutput::loading(cli.icon.as_deref())),
+            Err(e) => return Err(e),
+        };
+
+    let theme = theme_from_cli(cli);
+    let snap = outcome.snapshot.clone();
+    let vendor_outcome: VendorOutcome = outcome.into();
+    let opts = RenderOpts::from_cli(cli);
+    Ok(minimax::vendor::render(
         &vendor_outcome,
         &snap,
         &theme,

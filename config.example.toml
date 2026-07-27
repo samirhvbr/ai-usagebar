@@ -179,3 +179,18 @@ api_key_env = "SHVIA_API_KEY"     # checked first; if set + non-empty, used
 # base_url = "https://ia.blue3.com.br"
 # Display-only label shown in the tooltip header (defaults to "ShvIA").
 # plan = "ShvIA"
+
+[minimax]
+# Disabled by default — enable once you've set a key (env var or inline).
+# Saving a key in the Settings overlay writes the inline fallback AND flips
+# `enabled` to true; clearing the field removes the inline key again.
+# Token Plan subscription quota (rolling 5h window + weekly) from the
+# undocumented /v1/token_plan/remains endpoint. Needs the Token Plan
+# SUBSCRIPTION key — a pay-as-you-go key has no plan quota to report.
+enabled = false
+api_key_env = "MINIMAX_API_KEY"    # checked first; if set + non-empty, used
+# api_key = "..."                  # fallback; chmod 600 the file if you use it
+# Region picks the INSTANCE, and the two issue separate keys — pointing this
+# at the wrong one reads as an invalid key, not an empty plan:
+#   global -> api.minimax.io   |   cn -> api.minimaxi.com
+# region = "global"

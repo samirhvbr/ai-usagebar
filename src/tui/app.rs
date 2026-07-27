@@ -428,6 +428,19 @@ async fn build_outcome(client: &Client, config: &Config, tab: &TabId) -> Result<
             .await?;
             Ok(outcome.into())
         }
+        VendorId::Minimax => {
+            let api_key = crate::config::resolve_api_key(
+                "MiniMax",
+                &config.minimax.api_key_env,
+                config.minimax.api_key.as_deref(),
+            )?;
+            let cache = crate::cache::Cache::for_vendor("minimax")?;
+            let endpoints = crate::minimax::fetch::Endpoints::for_region(&config.minimax.region);
+            let outcome =
+                crate::minimax::fetch_snapshot(client, &api_key, &cache, &endpoints, DEFAULT_TTL)
+                    .await?;
+            Ok(outcome.into())
+        }
         VendorId::Grok => {
             let key = crate::config::resolve_api_key(
                 "Grok",

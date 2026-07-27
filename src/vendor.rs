@@ -71,6 +71,7 @@ pub enum VendorId {
     Grok,
     Antigravity,
     Shvia,
+    Minimax,
 }
 
 impl VendorId {
@@ -89,6 +90,7 @@ impl VendorId {
             VendorId::Grok => "grok",
             VendorId::Antigravity => "antigravity",
             VendorId::Shvia => "shvia",
+            VendorId::Minimax => "minimax",
         }
     }
 
@@ -107,6 +109,7 @@ impl VendorId {
             VendorId::Grok,
             VendorId::Antigravity,
             VendorId::Shvia,
+            VendorId::Minimax,
         ]
     }
 }

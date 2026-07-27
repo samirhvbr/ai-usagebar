@@ -48,6 +48,7 @@ pub struct Config {
     pub grok: GrokConfig,
     pub antigravity: AntigravityConfig,
     pub shvia: ShviaConfig,
+    pub minimax: MinimaxConfig,
 }
 
 /// UI / dispatch preferences. Currently just `primary` — which vendor the
@@ -389,6 +390,32 @@ impl Default for MoonshotConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
+pub struct MinimaxConfig {
+    pub enabled: bool,
+    pub api_key_env: String,
+    pub api_key: Option<String>,
+    /// `"global"` → api.minimax.io; `"cn"` → api.minimaxi.com. Unlike
+    /// Moonshot's, this does not change the unit — MiniMax reports quota as a
+    /// percentage either way. It picks the *instance*: a key issued for one
+    /// host is rejected by the other (`status_code 2049`), so pointing this at
+    /// the wrong region reads as an invalid key rather than an empty plan.
+    pub region: String,
+}
+
+impl Default for MinimaxConfig {
+    fn default() -> Self {
+        // Opt-in like the other API-key vendors: needs an explicit key.
+        Self {
+            enabled: false,
+            api_key_env: "MINIMAX_API_KEY".to_string(),
+            api_key: None,
+            region: "global".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
 pub struct GrokConfig {
     pub enabled: bool,
     /// Env var for the xAI **Management** key (distinct from the inference key).
@@ -562,6 +589,7 @@ impl Config {
             VendorId::Grok => self.grok.enabled,
             VendorId::Antigravity => self.antigravity.enabled,
             VendorId::Shvia => self.shvia.enabled,
+            VendorId::Minimax => self.minimax.enabled,
         }
     }
 
