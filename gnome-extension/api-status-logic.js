@@ -243,6 +243,35 @@ export function balanceDisplay(vendorId, snap, configText) {
     }
 }
 
+// Window label from its length in seconds — `4h`, `5h`, `7d`. MiniMax's short
+// window is not a fixed 5h (it has been observed at both 4h and 5h, and the
+// video pool rolls daily), so the label is derived rather than assumed.
+function windowLabel(secs, fallback) {
+    if (!Number.isFinite(secs) || secs <= 0)
+        return fallback;
+    return secs < 86400
+        ? `${Math.round(secs / 3600)}h`
+        : `${Math.round(secs / 86400)}d`;
+}
+
+// Headline for a QUOTA vendor whose cache we write ourselves and can therefore
+// read back: the two windows' consumed percentages. Without this a configured
+// quota vendor that isn't the active one falls through to a bare "OK", hiding
+// the number the panel exists to show. Returns null for vendors whose cache is
+// the raw upstream response (anthropic/openai/zai), which this does not parse.
+export function quotaDisplay(vendorId, snap) {
+    if (vendorId !== 'minimax' || !snap || typeof snap !== 'object')
+        return null;
+    const win = (w) => (w && typeof w === 'object' && Number.isFinite(w.pct) ? w : null);
+    const session = win(snap.session);
+    const weekly = win(snap.weekly);
+    if (!session || !weekly)
+        return null;
+    const s = windowLabel(session.window_secs, '5h');
+    const w = windowLabel(weekly.window_secs, '7d');
+    return `${s} ${session.pct}% · ${w} ${weekly.pct}%`;
+}
+
 // Derives a vendor's row purely from injected local state — no IO here.
 //   ctx = {
 //     enabled, configured: booleans (config + env/creds checks, done by caller)
@@ -273,6 +302,11 @@ export function rowStatus(vendor, ctx) {
         const bal = balanceDisplay(vendor.id, ctx.snap, ctx.configText);
         if (bal != null)
             return {state: 'ok', detail: bal, age: fmtAge(ctx.ageSecs)};
+        // A quota vendor we can read back from cache shows its windows even
+        // when it is not the selected vendor.
+        const quota = quotaDisplay(vendor.id, ctx.snap);
+        if (quota != null)
+            return {state: 'ok', detail: quota, age: fmtAge(ctx.ageSecs)};
         if (ctx.activePcts)
             return {state: 'ok', detail: `5h ${ctx.activePcts.session}% · 7d ${ctx.activePcts.weekly}%`, age: fmtAge(ctx.ageSecs)};
         return {state: 'ok', detail: 'OK', age: fmtAge(ctx.ageSecs)};

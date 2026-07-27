@@ -12,11 +12,21 @@
    above the background instead of blending into it. The arrow is painted by
    the boxpointer, separately from the content box, so it needs its own key. */
 .aiub-menu {
-    -arrow-background-color: #1c1f24;
+    -arrow-background-color: #16181c;
 }
 
 .aiub-menu .popup-menu-content {
-    background-color: #1c1f24;
+    background-color: #16181c;
+}
+
+/* The expanded "Status das APIs" submenu paints its own, lighter background,
+   which reads as a pale slab floating over the dark menu. Sink it *below* the
+   menu instead, so the section reads as inset — the nesting is then legible
+   from the shade alone, without a border. */
+.aiub-menu .popup-sub-menu {
+    background-color: #101216;
+    box-shadow: none;
+    border: none;
 }
 
 /* Dropdown rows — native St layout, font-independent alignment. */

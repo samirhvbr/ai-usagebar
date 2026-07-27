@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import {API_VENDORS, balanceDisplay, configApiKeyEnv, configHasApiKey,
     configMonthlyLimit, configVendorEnabled, extractSnapshot, fmtAge,
-    parseLastError, rowStatus, shortHttpError,
+    parseLastError, quotaDisplay, rowStatus, shortHttpError,
     tomlHeaderIs} from './api-status-logic.js';
 
 // ── tomlHeaderIs ──────────────────────────────────────────────────────────
@@ -150,5 +150,29 @@ assert.equal(configApiKeyEnv(null, 'deepseek'), null);
 assert.deepEqual(
     rowStatus(kilo, {...base, lastError: {code: 500, msg: ''}, ageSecs: 60, snap: {balance: 9}}),
     {state: 'error', detail: 'HTTP 500 · erro do servidor', age: '1m'});
+
+// ── quotaDisplay (MiniMax) ────────────────────────────────────────────────
+// The window length is read from the payload: MiniMax's short window has been
+// observed at both 4h and 5h, so a hardcoded "5h" label would eventually lie.
+const mmSnap = (sSecs, wSecs) => ({
+    plan: 'MiniMax Token Plan',
+    session: {pct: 12, resets_at: null, window_secs: sSecs},
+    weekly: {pct: 34, resets_at: null, window_secs: wSecs},
+});
+assert.equal(quotaDisplay('minimax', mmSnap(18000, 604800)), '5h 12% · 7d 34%');
+assert.equal(quotaDisplay('minimax', mmSnap(14400, 604800)), '4h 12% · 7d 34%');
+// Degenerate/absent lengths fall back to the conventional labels.
+assert.equal(quotaDisplay('minimax', mmSnap(0, 0)), '5h 12% · 7d 34%');
+// Only vendors whose cache we write ourselves are parsed.
+assert.equal(quotaDisplay('anthropic', mmSnap(18000, 604800)), null);
+assert.equal(quotaDisplay('minimax', null), null);
+assert.equal(quotaDisplay('minimax', {session: {pct: 1}}), null, 'needs both windows');
+
+// A configured MiniMax that is NOT the active vendor shows its windows rather
+// than the bare "OK" the generic branch would produce.
+const minimax = API_VENDORS.find(v => v.id === 'minimax');
+assert.deepEqual(
+    rowStatus(minimax, {...base, ageSecs: 20, snap: mmSnap(14400, 604800), activePcts: null}),
+    {state: 'ok', detail: '4h 12% · 7d 34%', age: '20s'});
 
 console.log('api-status-logic: all assertions passed');
