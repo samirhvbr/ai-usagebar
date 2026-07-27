@@ -25,6 +25,7 @@ export const API_VENDORS = [
     {id: 'moonshot', name: 'Kimi (Moonshot)', kind: 'apikey', creds: '', env: 'MOONSHOT_API_KEY', login: ''},
     {id: 'grok', name: 'Grok (xAI)', kind: 'apikey', creds: '', env: 'XAI_MANAGEMENT_KEY', login: ''},
     {id: 'shvia', name: 'ShvIA', kind: 'apikey', creds: '', env: 'SHVIA_API_KEY', login: ''},
+    {id: 'minimax', name: 'MiniMax', kind: 'apikey', creds: '', env: 'MINIMAX_API_KEY', login: ''},
 ];
 
 // A TOML section header may carry a trailing inline comment ("[zai] # note")
@@ -94,7 +95,8 @@ export function configHasApiKey(text, section) {
 // config's `[vendor] enabled = false`, except the opt-in vendors (explicit
 // key or Admin key required), which default to disabled.
 export function configVendorEnabled(text, id) {
-    const dflt = !['anthropic_api', 'deepseek', 'kilo', 'novita', 'moonshot', 'grok'].includes(id);
+    const dflt = !['anthropic_api', 'deepseek', 'kilo', 'novita', 'moonshot', 'grok', 'minimax']
+        .includes(id);
     if (!text)
         return dflt;
     let inSection = false;
