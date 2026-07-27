@@ -5,6 +5,20 @@
     padding: 0 4px;
 }
 
+/* Dropdown background. The shell's default popup grey is light enough that
+   the bars' empty track (#3e4451) nearly matches it, so the tracks — and the
+   rows sitting on them — read as one flat block. Pin the menu to the One Dark
+   base the bars are already themed against; the track then reads as a step
+   above the background instead of blending into it. The arrow is painted by
+   the boxpointer, separately from the content box, so it needs its own key. */
+.aiub-menu {
+    -arrow-background-color: #1c1f24;
+}
+
+.aiub-menu .popup-menu-content {
+    background-color: #1c1f24;
+}
+
 /* Dropdown rows — native St layout, font-independent alignment. */
 .aiub-header {
     font-weight: bold;

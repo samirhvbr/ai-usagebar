@@ -83,6 +83,11 @@ class AiUsageBarIndicator extends PanelMenu.Button {
         });
         this.add_child(this._label);
 
+        // The shell's default popup grey sits close to the bars' empty track,
+        // which washes the tracks out. Tag the menu so the stylesheet can pin
+        // it to the One Dark base the bars are themed against.
+        this.menu.actor.add_style_class_name('aiub-menu');
+
         this._buildMenu();
 
         // Re-render cached data when any display setting changes (no refetch).
