@@ -17,6 +17,9 @@
 
 .aiub-menu .popup-menu-content {
     background-color: #16181c;
+    /* The shell theme borders the content box in #424247. Left alone it draws
+       a pale hairline around a now-dark menu. */
+    border: 1px solid #262b33;
 }
 
 /* The expanded "Status das APIs" submenu paints its own, lighter background,
@@ -27,6 +30,34 @@
     background-color: #101216;
     box-shadow: none;
     border: none;
+}
+
+/* Item states. The shell derives every one of these from a light grey
+   (`st-lighten(#424247, …)` in the menu, `st-lighten(#56565c, …)` in the
+   submenu), so overriding only the backgrounds left hover, focus and the
+   open-submenu `:checked` state painting pale slabs over the dark menu — the
+   states are what the pointer actually reveals, so they matter more than the
+   resting color. Each is restated against the dark base. */
+.aiub-menu .popup-menu-item:hover,
+.aiub-menu .popup-menu-item:focus,
+.aiub-menu .popup-menu-item:selected {
+    background-color: #232833;
+}
+
+.aiub-menu .popup-menu-item:active,
+.aiub-menu .popup-menu-item:checked {
+    background-color: #2b313d;
+}
+
+.aiub-menu .popup-menu-item:active:hover,
+.aiub-menu .popup-menu-item:checked:hover {
+    background-color: #333a48;
+}
+
+.aiub-menu .popup-sub-menu .popup-menu-item:hover,
+.aiub-menu .popup-sub-menu .popup-menu-item:focus,
+.aiub-menu .popup-sub-menu .popup-menu-item:selected {
+    background-color: #1b2029;
 }
 
 /* Dropdown rows — native St layout, font-independent alignment. */
