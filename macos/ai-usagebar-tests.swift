@@ -780,9 +780,9 @@ func testApiStatus() {
                    pkg: "", env: "XAI_MANAGEMENT_KEY"),
     ]
     func entry(_ id: String, failed: Bool = false, error: String = "", stale: Bool = false,
-               metrics: [ReportMetric] = []) -> UsageReportEntry {
+               metrics: [ReportMetric] = [], texts: [ReportMetric] = []) -> UsageReportEntry {
         UsageReportEntry(id: id, name: id, plan: "", failed: failed, error: error,
-                         stale: stale, metrics: metrics)
+                         stale: stale, metrics: metrics, texts: texts)
     }
     let report: [String: UsageReportEntry] = [
         "shvia": entry("shvia", metrics: [
@@ -866,6 +866,24 @@ func testUsageReportParsing() {
     assertEqual(entries[1].id, "anthropic@work", "account ids match the menu's own shape")
     assertEqual(entries[1].failed, true, "an error status is a failure")
     assertEqual(entries[1].error, "HTTP 401", "with the message")
+
+    // A vendor with no gauge at all still has a headline: ShvIA's windows are
+    // uncapped on some plans, so they report a used count and no ratio.
+    let uncapped = """
+    {"entries":[
+      {"id":"shvia","display_name":"ShvIA","status":"ready","error":null,"stale":false,
+       "metrics":[],
+       "sections":[{"type":"title","left":"ShvIA"},
+                   {"type":"spacer"},
+                   {"type":"text","label":"Today","value":"0 used · unlimited"},
+                   {"type":"text","label":"","value":"resets in 11h"},
+                   {"type":"text","label":"Week","value":"169.2k used · unlimited"}]}
+    ]}
+    """
+    let noGauge = parseUsageReport(Data(uncapped.utf8))
+    assertEqual(noGauge[0].texts.count, 2, "unlabelled continuation rows are not headlines")
+    assertEqual(reportHeadline(noGauge[0]), "0 used · unlimited",
+                "the first labelled text row stands in for a missing gauge")
 
     assertEqual(parseUsageReport(Data("not json".utf8)).count, 0, "garbage yields no entries")
     assertEqual(parseUsageReport(Data()).count, 0, "empty output yields no entries")

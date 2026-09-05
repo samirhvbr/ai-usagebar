@@ -1045,6 +1045,11 @@ struct UsageReportEntry: Equatable {
     let stale: Bool
     /// `(label, percent, value)` per gauge row, in the panel's own order.
     let metrics: [ReportMetric]
+    /// The labelled free-text rows, in the panel's own order. A vendor can
+    /// report figures with no gauge at all — ShvIA's uncapped windows have a
+    /// used count and no ratio — and then this is the only place a headline
+    /// can come from.
+    let texts: [ReportMetric]
 }
 
 struct ReportMetric: Equatable {
@@ -1087,6 +1092,15 @@ func parseUsageReport(_ data: Data) -> [UsageReportEntry] {
                 percent: (metric["percent"] as? NSNumber)?.intValue ?? 0,
                 value: metric["value"] as? String ?? "")
         }
+        // `sections` is the lossless list; `metrics` is a view over its gauge
+        // rows only. The labelled text rows are what is left.
+        let texts = (entry["sections"] as? [[String: Any]] ?? []).compactMap { section -> ReportMetric? in
+            guard section["type"] as? String == "text",
+                  let label = section["label"] as? String, !label.isEmpty,
+                  let value = section["value"] as? String, !value.isEmpty
+            else { return nil }
+            return ReportMetric(label: label, percent: 0, value: value)
+        }
         let error = entry["error"] as? String ?? ""
         return UsageReportEntry(
             id: id,
@@ -1095,7 +1109,8 @@ func parseUsageReport(_ data: Data) -> [UsageReportEntry] {
             failed: !error.isEmpty || (entry["status"] as? String) == "error",
             error: error,
             stale: (entry["stale"] as? Bool) ?? false,
-            metrics: metrics)
+            metrics: metrics,
+            texts: texts)
     }
 }
 
@@ -1104,8 +1119,15 @@ func parseUsageReport(_ data: Data) -> [UsageReportEntry] {
 /// It is each metric's own `value` string, not a percentage assembled here —
 /// that is how a balance vendor's row reads "$12.34" and a quota vendor's
 /// reads "78%" without this side keeping a table of which is which.
+///
+/// With no gauge at all, the first labelled text row stands in. A vendor can
+/// genuinely have figures and no ratio — every ShvIA window on an uncapped
+/// plan — and a blank row beside a green dot says less than the count does.
 func reportHeadline(_ entry: UsageReportEntry) -> String {
-    entry.metrics.max { $0.percent < $1.percent }?.value ?? ""
+    if let worst = entry.metrics.max(by: { $0.percent < $1.percent }) {
+        return worst.value
+    }
+    return entry.texts.first?.value ?? ""
 }
 
 /// What a vendor still needs before it can report anything.

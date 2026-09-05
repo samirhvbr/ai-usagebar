@@ -742,16 +742,19 @@ fn shvia_sections(s: &crate::usage::ShviaSnapshot, now: DateTime<Utc>, tol: u32)
         match w.as_usage_window() {
             Some(uw) => push_window(&mut v, label, &uw, now, tol, true),
             // No ceiling: a gauge would report 0% used, which reads as the
-            // opposite of what an unlimited window means.
+            // opposite of what an unlimited window means. The reset takes its
+            // own row rather than trailing the count, so the labelled row's
+            // value stays short enough to be a headline — which is what a
+            // frontend with one line per vendor reads when there is no metric.
             None => {
                 v.push(Section::Spacer);
                 v.push(Section::Text {
                     label: label.into(),
-                    value: format!(
-                        "{} used · unlimited · resets in {}",
-                        crate::format::compact_count(w.used),
-                        countdown::format(w.resets_at, now)
-                    ),
+                    value: format!("{} used · unlimited", crate::format::compact_count(w.used)),
+                });
+                v.push(Section::Text {
+                    label: String::new(),
+                    value: format!("resets in {}", countdown::format(w.resets_at, now)),
                 });
             }
         }

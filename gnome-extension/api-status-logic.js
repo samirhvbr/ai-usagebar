@@ -143,6 +143,14 @@ export function parseUsageReport(text) {
         if (!entry || typeof entry !== 'object' || typeof entry.id !== 'string')
             continue;
         const metrics = Array.isArray(entry.metrics) ? entry.metrics : [];
+        // `sections` is the lossless list; `metrics` is a view over its gauge
+        // rows only. The labelled text rows are what is left, and are the only
+        // headline a vendor with no ratio has — every ShvIA window on an
+        // uncapped plan reports a used count and no percentage.
+        const sections = Array.isArray(entry.sections) ? entry.sections : [];
+        const texts = sections
+            .filter(sec => sec && sec.type === 'text' && sec.label && sec.value)
+            .map(sec => ({label: String(sec.label), value: String(sec.value)}));
         const error = typeof entry.error === 'string' ? entry.error : '';
         if (out[entry.id] === undefined) {
             out[entry.id] = {
@@ -151,6 +159,7 @@ export function parseUsageReport(text) {
                 failed: error !== '' || entry.status === 'error',
                 error,
                 stale: entry.stale === true,
+                texts,
                 metrics: metrics
                     .filter(m => m && typeof m === 'object')
                     .map(m => ({
@@ -168,11 +177,18 @@ export function parseUsageReport(text) {
 // the metric's own string, not a percentage assembled here — that is how a
 // balance vendor reads "$12.34" and a quota vendor "78%" without this side
 // keeping a table of which is which.
+// With no gauge at all, the first labelled text row stands in: a blank cell
+// beside a green dot says less than the count does.
 export function reportHeadline(entry) {
-    if (!entry || !Array.isArray(entry.metrics) || entry.metrics.length === 0)
+    if (!entry)
         return '';
-    let best = entry.metrics[0];
-    for (const m of entry.metrics) {
+    const metrics = Array.isArray(entry.metrics) ? entry.metrics : [];
+    if (metrics.length === 0) {
+        const texts = Array.isArray(entry.texts) ? entry.texts : [];
+        return texts.length > 0 ? texts[0].value ?? '' : '';
+    }
+    let best = metrics[0];
+    for (const m of metrics) {
         if (m.percent > best.percent)
             best = m;
     }

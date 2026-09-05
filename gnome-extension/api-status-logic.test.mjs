@@ -72,6 +72,27 @@ assert.equal(report.openrouter.stale, true);
 // Account ids keep the report's own `<vendor>@<label>` shape.
 assert.ok(Object.prototype.hasOwnProperty.call(report, 'anthropic@work'));
 
+const shvia = API_VENDORS.find(v => v.id === 'shvia');
+
+// A vendor with no gauge at all still has a headline: ShvIA's windows are
+// uncapped on some plans, so they report a used count and no ratio.
+const uncapped = parseUsageReport(JSON.stringify({
+    entries: [{
+        id: 'shvia', display_name: 'ShvIA', status: 'ready', error: null, stale: false,
+        metrics: [],
+        sections: [
+            {type: 'title', left: 'ShvIA'},
+            {type: 'spacer'},
+            {type: 'text', label: 'Today', value: '0 used · unlimited'},
+            {type: 'text', label: '', value: 'resets in 11h'},
+            {type: 'text', label: 'Week', value: '169.2k used · unlimited'},
+        ],
+    }],
+}));
+assert.equal(uncapped.shvia.texts.length, 2, 'unlabelled continuation rows are not headlines');
+assert.equal(reportHeadline(uncapped.shvia), '0 used · unlimited');
+assert.equal(rowStatus(shvia, {enabled: true, configured: true, entry: uncapped.shvia, reportRan: true}).state, 'ok');
+
 // Garbage never throws — the section degrades, it does not take the menu down.
 assert.deepEqual(parseUsageReport('not json'), {});
 assert.deepEqual(parseUsageReport(''), {});
@@ -82,7 +103,6 @@ assert.equal(oneLine('line one\nline two'), 'line one line two');
 assert.equal(oneLine('x'.repeat(60), 10), `${'x'.repeat(9)}…`);
 
 // ─── The row decision table ──────────────────────────────────────────────
-const shvia = API_VENDORS.find(v => v.id === 'shvia');
 const anthropic = API_VENDORS.find(v => v.id === 'anthropic');
 
 assert.deepEqual(rowStatus(shvia, {enabled: false, configured: true, reportRan: true}),
