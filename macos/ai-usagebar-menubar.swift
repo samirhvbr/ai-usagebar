@@ -39,6 +39,8 @@ let SETTINGS_DEFAULTS: [String: Any] = [
     "colorCritical": "#e06c75",
     "colorEmpty": "#3e4451",
     "binaryPath": "",
+    "apiStatusExpanded": false,
+    "apiStatusInterval": 0.0,
 ]
 
 var VENDOR: String { DEF.string(forKey: "vendor") ?? "anthropic" }
@@ -81,8 +83,12 @@ let POINT_CRITICAL_MIN = 10
 // populated — and the `aapi_*` fields (23-26) carry the Anthropic API headline
 // plus its spend-vs-limit bar. `cursor_total_pct` (27) is followed by the
 // Antigravity-only fourth-window fields (28-30) and the Z.AI MCP-tools pool
-// (31-33), which fills that same fourth-window slot. A final literal sentinel
-// absorbs the widget's stale suffix, preserving these fields.
+// (31-33), which fills that same fourth-window slot. ShvIA's today/month
+// windows (34-39) plus its week headline (40) close the list: it has three
+// rolling windows and no 5h/weekly pair, and the headline strings — not the
+// percentages — say whether a window exists and whether it has a ceiling. A
+// final literal sentinel absorbs the widget's stale suffix, preserving these
+// fields.
 let FORMAT = "{plan};;{session_pct};;{session_reset};;{weekly_pct};;{weekly_reset};;" +
              "{sonnet_pct};;{sonnet_reset};;{extra_pct};;{extra_spent};;{extra_limit};;" +
              "{scoped_model};;{scoped_pct};;{scoped_reset};;" +
@@ -90,7 +96,9 @@ let FORMAT = "{plan};;{session_pct};;{session_reset};;{weekly_pct};;{weekly_rese
              "{ds_balance};;{kilo_balance};;{nv_balance};;{km_balance};;{grok_balance};;" +
              "{aapi_headline};;{aapi_pct};;{aapi_spent};;{aapi_limit};;{cursor_total_pct};;" +
              "{extra_model};;{extra_reset};;{extra_elapsed};;" +
-             "{zai_mcp_pct};;{zai_mcp_reset};;{zai_mcp_elapsed}"
+             "{zai_mcp_pct};;{zai_mcp_reset};;{zai_mcp_elapsed};;" +
+             "{shvia_today};;{shvia_today_reset};;{shvia_today_elapsed};;" +
+             "{shvia_month};;{shvia_month_reset};;{shvia_month_elapsed};;{shvia_week}"
 
 let FORMAT_WITH_SENTINEL = FORMAT + ";;__aiub_end__"
 
@@ -426,6 +434,22 @@ func parse(_ text: String, vendor: String) -> Snapshot? {
             reset: reset,
             elapsed: markerElapsed(reset: reset, elapsed: n(elapsedIndex)))
     }
+    // ShvIA reports a headline string per window rather than a bare percentage:
+    // "42%" for a capped window, a raw used count ("12.3k") for one with no
+    // ceiling, and "—" for a window the gateway did not report. Only the capped
+    // case is a bar — the other two would paint a 0% row that means the
+    // opposite of what they say.
+    func shviaWindow(_ headlineIndex: Int, _ resetIndex: Int, _ elapsedIndex: Int) -> Window? {
+        let headline = t(headlineIndex)
+        guard headline.hasSuffix("%"), let pct = Int(headline.dropLast()),
+              (0...100).contains(pct) else { return nil }
+        let reset = t(resetIndex)
+        return Window(
+            pct: pct,
+            reset: reset,
+            elapsed: markerElapsed(reset: reset, elapsed: n(elapsedIndex)))
+    }
+    let isShvia = vendor == "shvia"
     // Third bar = the per-model weekly window: a non-empty scoped model is the
     // presence signal. Its reset can legitimately be unavailable, so do not
     // mistake a missing reset for an absent scoped window and show Sonnet.
@@ -492,6 +516,11 @@ func parse(_ text: String, vendor: String) -> Snapshot? {
     if isAntigravity, !t(28).isEmpty {
         secondaryWeekly = quotaWindow(7, 29, 30)
         secondaryWeeklyLabel = "\(t(28)) Weekly"
+    } else if isShvia, let month = shviaWindow(37, 38, 39) {
+        // ShvIA's month window rides the same fourth-window slot, when it has a
+        // ceiling to draw.
+        secondaryWeekly = month
+        secondaryWeeklyLabel = "Month (30d)"
     } else if vendor == "zai", isReported(t(32)), let mcp = quotaWindow(31, 32, 33) {
         // Z.AI's monthly MCP-tools pool is a real quota window with its own
         // reset, so it rides the same fourth-window slot Antigravity uses.
@@ -507,17 +536,19 @@ func parse(_ text: String, vendor: String) -> Snapshot? {
     return Snapshot(plan: t(0),
                     hasUsageWindows: !balanceOnly,
                     creditBalance: displayBalance,
-                    session: quotaWindow(1, 2, 13),
-                    weekly: quotaWindow(3, 4, 14),
+                    session: isShvia ? shviaWindow(34, 35, 36) : quotaWindow(1, 2, 13),
+                    weekly: isShvia ? shviaWindow(40, 4, 14) : quotaWindow(3, 4, 14),
                     sonnet: sonnet,
                     sonnetLabel: sonnetLabel,
                     extra: aapiExtra ?? extra,
                     secondaryWeekly: secondaryWeekly,
                     secondaryWeeklyLabel: secondaryWeeklyLabel,
-                    sessionTag: isCursor ? "auto" : "5h",
+                    sessionTag: isCursor ? "auto" : (isShvia ? "24h" : "5h"),
                     weeklyTag: isCursor ? "premium" : "7d",
-                    sessionLabel: isCursor ? "Cursor Models" : (isAntigravity ? "Gemini 5h" : "Session"),
-                    weeklyLabel: isCursor ? "Other Models" : (isAntigravity ? "Gemini Weekly" : "Weekly"),
+                    sessionLabel: isCursor ? "Cursor Models"
+                        : (isAntigravity ? "Gemini 5h" : (isShvia ? "Today" : "Session")),
+                    weeklyLabel: isCursor ? "Other Models"
+                        : (isAntigravity ? "Gemini Weekly" : (isShvia ? "Week" : "Weekly")),
                     cursorTotalPct: isCursor ? n(27) : nil)
 }
 
@@ -572,6 +603,7 @@ let VENDOR_AUTH: [VendorAuth] = [
     // local server is running. `kind: "local"` mirrors Cursor and the GNOME
     // extension (gnome-extension/prefs.js).
     VendorAuth(id: "antigravity", name: "Google Antigravity", kind: "local", cli: "agy", login: "", pkg: "", env: ""),
+    VendorAuth(id: "shvia", name: "ShvIA", kind: "apikey", cli: "", login: "", pkg: "", env: "SHVIA_API_KEY"),
 ]
 
 // The config file the Rust binary would actually read. On macOS
@@ -983,6 +1015,143 @@ func entryDisplayName(_ id: String) -> String {
     return VENDOR_AUTH.first { $0.id == id }?.name ?? id
 }
 
+// ─── "Status das APIs" — every vendor's health in one section ─────────────
+//
+// The dropdown shows one vendor at a time and the Overview shows every
+// *working* one; neither answers "is anything broken, and what do I have to
+// do about it". This section does: a row per vendor the selector knows —
+// including the ones that are off or have no credential — with a health state
+// and its headline figure.
+//
+// The figures come from a single `ai-usagebar usage --json` sweep rather than
+// from reading each vendor's cache file. The binary already walks every
+// configured vendor and account there, and it reports `status`, `error` and
+// `stale` per entry, which the `--format` path throws away. Reading the caches
+// instead means re-implementing each vendor's payload shape in Swift, which is
+// exactly what stopped compiling when the Rust side reorganised them.
+
+enum ApiState: String {
+    case ok, warn, error, off
+}
+
+/// One entry of `ai-usagebar usage --json`. Only the fields this section
+/// shows; the report carries more.
+struct UsageReportEntry: Equatable {
+    let id: String
+    let name: String
+    let plan: String
+    let failed: Bool
+    let error: String
+    let stale: Bool
+    /// `(label, percent, value)` per gauge row, in the panel's own order.
+    let metrics: [ReportMetric]
+}
+
+struct ReportMetric: Equatable {
+    let label: String
+    let percent: Int
+    let value: String
+}
+
+/// One bounded line: an error from a provider can be long and can carry
+/// newlines, and a menu row is neither.
+func oneLine(_ text: String, max limit: Int) -> String {
+    let flat = text
+        .replacingOccurrences(of: "\n", with: " ")
+        .replacingOccurrences(of: "\r", with: " ")
+        .replacingOccurrences(of: "\t", with: " ")
+        .trimmingCharacters(in: .whitespaces)
+    return flat.count > limit ? String(flat.prefix(limit - 1)) + "…" : flat
+}
+
+/// A row of the section, ready to draw.
+struct ApiStatusRow: Equatable {
+    let id: String
+    let name: String
+    let state: ApiState
+    /// The headline figure, or "" when there is nothing to show.
+    let value: String
+    /// Why, when the state is not `.ok`: an error, or what is missing.
+    let detail: String
+}
+
+func parseUsageReport(_ data: Data) -> [UsageReportEntry] {
+    guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let entries = obj["entries"] as? [[String: Any]] else { return [] }
+    return entries.compactMap { entry in
+        guard let id = entry["id"] as? String else { return nil }
+        let metrics = (entry["metrics"] as? [[String: Any]] ?? []).compactMap { metric -> ReportMetric? in
+            guard let label = metric["label"] as? String else { return nil }
+            return ReportMetric(
+                label: label,
+                percent: (metric["percent"] as? NSNumber)?.intValue ?? 0,
+                value: metric["value"] as? String ?? "")
+        }
+        let error = entry["error"] as? String ?? ""
+        return UsageReportEntry(
+            id: id,
+            name: entry["display_name"] as? String ?? entry["name"] as? String ?? id,
+            plan: entry["plan"] as? String ?? "",
+            failed: !error.isEmpty || (entry["status"] as? String) == "error",
+            error: error,
+            stale: (entry["stale"] as? Bool) ?? false,
+            metrics: metrics)
+    }
+}
+
+/// The one figure a row shows: the value of the most-consumed metric.
+///
+/// It is each metric's own `value` string, not a percentage assembled here —
+/// that is how a balance vendor's row reads "$12.34" and a quota vendor's
+/// reads "78%" without this side keeping a table of which is which.
+func reportHeadline(_ entry: UsageReportEntry) -> String {
+    entry.metrics.max { $0.percent < $1.percent }?.value ?? ""
+}
+
+/// What a vendor still needs before it can report anything.
+func missingCredentialHint(_ v: VendorAuth) -> String {
+    if !v.login.isEmpty { return "sem login — rode `\(v.login)`" }
+    if !v.env.isEmpty { return "sem chave (\(v.env))" }
+    return "não configurado"
+}
+
+/// Build the section's rows. Pure: every piece of ambient state — what is
+/// enabled, what is configured, what the report said — is passed in, so the
+/// decision table is testable and the IO stays in the delegate.
+///
+/// `reportRan` distinguishes "the sweep found nothing for this vendor" from
+/// "no sweep has finished yet", which are different things to tell someone.
+func apiStatusRows(vendors: [VendorAuth],
+                   enabled: (VendorAuth) -> Bool,
+                   configured: (VendorAuth) -> Bool,
+                   report: [String: UsageReportEntry],
+                   reportRan: Bool) -> [ApiStatusRow] {
+    vendors.map { v in
+        let row = { (state: ApiState, value: String, detail: String) in
+            ApiStatusRow(id: v.id, name: v.name, state: state, value: value, detail: detail)
+        }
+        guard enabled(v) else { return row(.off, "", "desativado") }
+        guard configured(v) else { return row(.warn, "", missingCredentialHint(v)) }
+        guard let entry = report[v.id] else {
+            return reportRan ? row(.warn, "", "sem dados") : row(.warn, "", "…")
+        }
+        if entry.failed {
+            return row(.error, "", entry.error.isEmpty ? "erro" : entry.error)
+        }
+        let value = reportHeadline(entry)
+        return entry.stale
+            ? row(.warn, value, "cache — a última atualização falhou")
+            : row(.ok, value, "")
+    }
+}
+
+/// How often the section refreshes itself in the background, in seconds.
+/// `0` means only when the menu is opened, which is the default: this sweep
+/// talks to every configured provider, and a background timer doing that is a
+/// choice, not something to switch on for someone.
+var API_STATUS_INTERVAL: Double { max(0, DEF.double(forKey: "apiStatusInterval")) }
+var API_STATUS_EXPANDED: Bool { DEF.bool(forKey: "apiStatusExpanded") }
+
 // MARK: - Which account each surface is signed in as
 //
 // Separate from the vendor entries above: those decide whose usage is *shown*,
@@ -1121,7 +1290,8 @@ func addAccountScript(binary: String, label: String, desktop: Bool) -> String {
 func defaultEnabled(_ id: String) -> Bool {
     switch id {
     case "anthropic", "openai", "zai", "openrouter": return true
-    case "deepseek", "kimi", "kilo", "novita", "moonshot", "grok", "anthropic_api", "cursor", "antigravity": return false
+    case "deepseek", "kimi", "kilo", "novita", "moonshot", "grok", "anthropic_api", "cursor", "antigravity",
+         "shvia": return false
     default: return true
     }
 }
@@ -1347,6 +1517,8 @@ struct SettingsView: View {
     @AppStorage("colorCritical") private var colorCritical = "#e06c75"
     @AppStorage("colorEmpty") private var colorEmpty = "#3e4451"
     @AppStorage("binaryPath") private var binaryPath = ""
+    @AppStorage("apiStatusExpanded") private var apiStatusExpanded = false
+    @AppStorage("apiStatusInterval") private var apiStatusInterval = 0.0
     @State private var launchAtLogin = launchAgentIsInstalled()
     @State private var launchAtLoginError: String?
 
@@ -1420,6 +1592,19 @@ struct SettingsView: View {
                         }
                         Stepper("Intervalo: \(Int(interval))s", value: $interval, in: 5...3600, step: 5)
                         TextField("Caminho do binário (vazio = auto)", text: $binaryPath)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                GroupBox("Status das APIs") {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Toggle("Mostrar a seção no menu", isOn: $apiStatusExpanded)
+                        Stepper(apiStatusInterval > 0
+                                    ? "Atualizar a cada \(Int(apiStatusInterval / 60)) min"
+                                    : "Atualizar só ao abrir o menu",
+                                value: $apiStatusInterval, in: 0...3600, step: 300)
+                        Text("A seção consulta todos os vendors configurados de uma vez. "
+                             + "Sem intervalo ela só faz isso quando você abre o menu.")
+                            .font(.caption).foregroundColor(.secondary)
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
@@ -1657,6 +1842,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let desktopAccountItem = NSMenuItem(title: "Claude Desktop", action: nil, keyEquivalent: "")
     let cliAccountSubmenu = NSMenu()
     let cliAccountItem = NSMenuItem(title: "Claude Code", action: nil, keyEquivalent: "")
+    /// "Status das APIs": a collapsible section listing every vendor the
+    /// selector knows, with its health. Collapsed by default — it is the answer
+    /// to "what is broken", not something to read on every glance.
+    let apiStatusHeaderItem = NSMenuItem(title: "Status das APIs", action: nil, keyEquivalent: "")
+    var apiStatusRowItems: [NSMenuItem] = []
+    /// Last `usage --json` sweep, keyed by entry id. Empty until one finishes,
+    /// which `apiReportRan` distinguishes from a sweep that found nothing.
+    var lastApiReport: [String: UsageReportEntry] = [:]
+    var apiReportRan = false
+    var apiStatusFetchedAt = Date.distantPast
+    var apiStatusInFlight = false
     var lastAccountStatus: AccountStatus?
     var accountStatusFetchedAt = Date.distantPast
     var accountStatusGeneration = 0
@@ -1674,6 +1870,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         lastVendor = VENDOR  // so the first settingsChanged isn't mistaken for a swap
         refresh()
         restartTimer()
+        renderApiStatus()
+        if API_STATUS_EXPANDED { refreshApiStatus() }
         NotificationCenter.default.addObserver(
             self, selector: #selector(settingsChanged),
             name: UserDefaults.didChangeNotification, object: nil)
@@ -1966,6 +2164,20 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(compactItem)
 
         menu.addItem(.separator())
+        apiStatusHeaderItem.action = #selector(toggleApiStatus)
+        apiStatusHeaderItem.target = self
+        menu.addItem(apiStatusHeaderItem)
+        // One slot per known vendor. Unlike the Overview rows this list never
+        // grows: it is per vendor, not per account.
+        for _ in VENDOR_AUTH {
+            let it = NSMenuItem()
+            it.isEnabled = false
+            it.isHidden = true
+            apiStatusRowItems.append(it)
+            menu.addItem(it)
+        }
+
+        menu.addItem(.separator())
         addAction(menu, "Atualizar agora", #selector(refreshAction), "r")
         addAction(menu, "Abrir TUI", #selector(openTui), "t")
         vendorSubmenuItem.submenu = vendorSubmenu
@@ -1988,6 +2200,114 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func menuWillOpen(_ menu: NSMenu) {
         if Date().timeIntervalSince(accountStatusFetchedAt) >= 5 { fetchAccountStatus() }
+        // The section costs a sweep across every provider, so it refreshes when
+        // it is actually on screen — and, if the user asked for a background
+        // interval, on that timer as well.
+        renderApiStatus()
+        if API_STATUS_EXPANDED, Date().timeIntervalSince(apiStatusFetchedAt) >= 30 {
+            refreshApiStatus()
+        }
+    }
+
+    /// Expand/collapse the section. The state is a preference, so it survives a
+    /// restart and the usual `settingsChanged` path repaints it.
+    @objc func toggleApiStatus() {
+        DEF.set(!API_STATUS_EXPANDED, forKey: "apiStatusExpanded")
+        if API_STATUS_EXPANDED { refreshApiStatus() }
+    }
+
+    /// Draw the section from the last sweep plus the local enabled/configured
+    /// state. Cheap and synchronous: no subprocess, no network.
+    func renderApiStatus() {
+        let expanded = API_STATUS_EXPANDED
+        let appearance = statusItem?.button?.effectiveAppearance ?? NSApp.effectiveAppearance
+        apiStatusHeaderItem.attributedTitle = run(
+            "Status das APIs   \(expanded ? "▾" : "▸")",
+            menuBarTextColor(appearance, secondary: true))
+        guard expanded else {
+            for it in apiStatusRowItems { it.isHidden = true }
+            return
+        }
+        let rows = apiStatusRows(
+            vendors: VENDOR_AUTH,
+            enabled: vendorEnabled,
+            configured: vendorConfigured,
+            report: lastApiReport,
+            reportRan: apiReportRan)
+        for (i, row) in rows.enumerated() where i < apiStatusRowItems.count {
+            let item = apiStatusRowItems[i]
+            item.isHidden = false
+            item.attributedTitle = apiStatusRowTitle(row, appearance: appearance)
+        }
+        for i in rows.count..<apiStatusRowItems.count { apiStatusRowItems[i].isHidden = true }
+    }
+
+    /// `<glyph> <name padded> <value>` on the first line, the reason dimmed
+    /// underneath when there is one. Monospaced so the column lines up.
+    func apiStatusRowTitle(_ row: ApiStatusRow, appearance: NSAppearance) -> NSAttributedString {
+        let nameWidth = 18
+        let fitted = row.name.count > nameWidth
+            ? String(row.name.prefix(nameWidth - 1)) + "…"
+            : row.name.padding(toLength: nameWidth, withPad: " ", startingAt: 0)
+        let (glyph, color): (String, NSColor) = {
+            switch row.state {
+            case .ok: return ("●", hexColor(COLOR_LOW))
+            case .warn: return ("●", hexColor(COLOR_MID))
+            case .error: return ("●", hexColor(COLOR_CRITICAL))
+            case .off: return ("○", menuBarTextColor(appearance, secondary: true))
+            }
+        }()
+        let out = NSMutableAttributedString()
+        out.append(run("  \(glyph) ", color))
+        out.append(run(fitted, menuBarTextColor(appearance)))
+        if !row.value.isEmpty {
+            out.append(run(" \(row.value)", color))
+        }
+        if !row.detail.isEmpty {
+            out.append(run("\n      \(oneLine(row.detail, max: 46))",
+                           menuBarTextColor(appearance, secondary: true)))
+        }
+        return out
+    }
+
+    /// Fetch every configured vendor's usage in one sweep. Cache-first in the
+    /// binary, so a repeat inside the TTL costs no network.
+    func refreshApiStatus() {
+        guard !apiStatusInFlight, let bin = resolveBinary("ai-usagebar") else { return }
+        apiStatusInFlight = true
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: bin)
+            p.arguments = ["usage", "--json"]
+            let pipe = Pipe()
+            p.standardOutput = pipe
+            p.standardError = FileHandle.nullDevice
+            let watchdog = DispatchWorkItem { if p.isRunning { p.terminate() } }
+            DispatchQueue.global(qos: .utility)
+                .asyncAfter(deadline: .now() + REFRESH_TIMEOUT, execute: watchdog)
+            var data = Data()
+            do {
+                try p.run()
+                data = pipe.fileHandleForReading.readDataToEndOfFile()
+                p.waitUntilExit()
+            } catch { data = Data() }
+            watchdog.cancel()
+            // `usage` exits non-zero when *every* entry failed, and still
+            // prints them — that is exactly the case this section exists to
+            // show, so the payload is parsed regardless of the exit status.
+            let entries = parseUsageReport(data)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.apiStatusInFlight = false
+                if !entries.isEmpty || !data.isEmpty {
+                    self.lastApiReport = Dictionary(
+                        entries.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+                    self.apiReportRan = true
+                    self.apiStatusFetchedAt = Date()
+                }
+                self.renderApiStatus()
+            }
+        }
     }
 
     func addAction(_ menu: NSMenu, _ title: String, _ sel: Selector, _ key: String) {
@@ -2094,7 +2414,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func restartTimer() {
         timer?.invalidate()
         timer = Timer.scheduledTimer(withTimeInterval: INTERVAL, repeats: true) { [weak self] _ in
-            self?.refresh()
+            guard let self else { return }
+            self.refresh()
+            // Opt-in: with no interval configured the section refreshes when
+            // the menu opens, and nothing sweeps every provider on a timer.
+            let every = API_STATUS_INTERVAL
+            if every > 0, Date().timeIntervalSince(self.apiStatusFetchedAt) >= every {
+                self.refreshApiStatus()
+            }
         }
     }
 
@@ -2333,6 +2660,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func renderOverview(_ items: [(name: String, id: String, snap: Snapshot?)],
                         rebuildSubmenu: Bool = true) {
+        defer { renderApiStatus() }
         lastSnapshot = nil
         lastOverview = items
         let appearance = statusItem.button?.effectiveAppearance ?? NSApp.effectiveAppearance
@@ -2463,6 +2791,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func renderMenu(_ s: Snapshot) {
+        defer { renderApiStatus() }
         let appearance = statusItem.button?.effectiveAppearance ?? NSApp.effectiveAppearance
         for it in overviewRows { it.isHidden = true }
         compactItem.isHidden = true
@@ -2810,6 +3139,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         for it in overviewRows { it.isHidden = true }
         compactItem.isHidden = true
         accountsInfoItem.isHidden = true
+        // The section keeps its rows: a binary that failed for the selected
+        // vendor is exactly when "which APIs are up" is worth reading.
+        renderApiStatus()
     }
 }
 

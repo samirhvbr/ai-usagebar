@@ -198,7 +198,8 @@ func testDefaultEnabled() {
     for id in ["anthropic", "openai", "zai", "openrouter"] {
         assertEqual(defaultEnabled(id), true, "\(id) defaults enabled")
     }
-    for id in ["deepseek", "kimi", "kilo", "novita", "moonshot", "grok", "anthropic_api", "cursor", "antigravity"] {
+    for id in ["deepseek", "kimi", "kilo", "novita", "moonshot", "grok", "anthropic_api", "cursor",
+               "antigravity", "shvia"] {
         assertEqual(defaultEnabled(id), false, "\(id) defaults disabled (opt-in)")
     }
 }
@@ -721,6 +722,160 @@ func testDesktopAccounts() {
                 "OpenRouter accounts use generic report ids")
 }
 
+// ─── ShvIA: three rolling windows, not a 5h/weekly pair ──────────────────
+//
+// The headline strings — not the percentages — decide what is a bar: an
+// uncapped window reports a used count ("12.3k") and an absent one "—", and
+// both would otherwise paint a 0% row that reads as "nothing used".
+func testShviaWindows() {
+    print("ShvIA windows")
+    func fields(_ set: [Int: String]) -> [String] {
+        (0...40).map { set[$0] ?? "" }
+    }
+    // today 42%, week 50%, month uncapped.
+    let s = snapshot(FORMAT, vendor: "shvia", fields: fields([
+        0: "ShvIA",
+        3: "50", 4: "3d",              // {weekly_pct} / {weekly_reset} alias the week
+        34: "42%", 35: "8h",           // shvia_today headline + reset
+        37: "12.3k", 38: "9d",         // shvia_month: uncapped
+        40: "50%",                     // shvia_week headline
+    ]))
+    assertEqual(s?.session?.pct, 42, "today window takes the session slot")
+    assertEqual(s?.sessionLabel, "Today", "session slot is relabelled")
+    assertEqual(s?.sessionTag, "24h", "today is a 24h window, not 5h")
+    assertEqual(s?.weekly?.pct, 50, "week window from the aliased fields")
+    assertEqual(s?.weeklyLabel, "Week", "weekly slot is relabelled")
+    assertNil(s?.secondaryWeekly, "an uncapped month draws no bar")
+    assertEqual(s?.hasUsageWindows, true, "ShvIA is a quota vendor, not balance-only")
+
+    // A capped month fills the fourth-window slot.
+    let capped = snapshot(FORMAT, vendor: "shvia", fields: fields([
+        0: "ShvIA", 3: "50", 4: "3d", 34: "42%", 35: "8h",
+        37: "77%", 38: "9d", 40: "50%",
+    ]))
+    assertEqual(capped?.secondaryWeekly?.pct, 77, "capped month takes the fourth slot")
+    assertEqual(capped?.secondaryWeeklyLabel, "Month (30d)", "fourth slot is labelled")
+
+    // A gateway reporting only the week: the other slots stay empty rather
+    // than showing 0%.
+    let weekOnly = snapshot(FORMAT, vendor: "shvia", fields: fields([
+        0: "ShvIA", 3: "10", 4: "2d", 34: "—", 37: "—", 40: "10%",
+    ]))
+    assertEqual(weekOnly?.weekly?.pct, 10, "week is present")
+    assertNil(weekOnly?.session, "an unreported today draws no bar")
+    assertNil(weekOnly?.secondaryWeekly, "an unreported month draws no bar")
+}
+
+// ─── "Status das APIs": the decision table ───────────────────────────────
+func testApiStatus() {
+    print("API status rows")
+    let vendors = [
+        VendorAuth(id: "anthropic", name: "Claude", kind: "oauth", cli: "claude",
+                   login: "claude", pkg: "", env: ""),
+        VendorAuth(id: "shvia", name: "ShvIA", kind: "apikey", cli: "", login: "",
+                   pkg: "", env: "SHVIA_API_KEY"),
+        VendorAuth(id: "zai", name: "Z.AI", kind: "apikey", cli: "", login: "",
+                   pkg: "", env: "ZAI_API_KEY"),
+        VendorAuth(id: "grok", name: "Grok", kind: "apikey", cli: "", login: "",
+                   pkg: "", env: "XAI_MANAGEMENT_KEY"),
+    ]
+    func entry(_ id: String, failed: Bool = false, error: String = "", stale: Bool = false,
+               metrics: [ReportMetric] = []) -> UsageReportEntry {
+        UsageReportEntry(id: id, name: id, plan: "", failed: failed, error: error,
+                         stale: stale, metrics: metrics)
+    }
+    let report: [String: UsageReportEntry] = [
+        "shvia": entry("shvia", metrics: [
+            ReportMetric(label: "Today", percent: 12, value: "12%"),
+            ReportMetric(label: "Week", percent: 63, value: "63%"),
+        ]),
+        "zai": entry("zai", failed: true, error: "HTTP 401 Authentication failed"),
+        "grok": entry("grok", stale: true, metrics: [
+            ReportMetric(label: "Balance", percent: 0, value: "$9.99"),
+        ]),
+    ]
+    let rows = apiStatusRows(
+        vendors: vendors,
+        enabled: { $0.id != "anthropic" },      // Claude turned off (the #148 workaround)
+        configured: { _ in true },
+        report: report,
+        reportRan: true)
+
+    assertEqual(rows.count, 4, "one row per known vendor, on or off")
+    assertEqual(rows[0].state, ApiState.off, "a disabled vendor is off, not broken")
+    assertEqual(rows[0].detail, "desativado", "and says so")
+    assertEqual(rows[1].state, ApiState.ok, "a healthy vendor is ok")
+    assertEqual(rows[1].value, "63%", "the headline is the most-consumed metric")
+    assertEqual(rows[2].state, ApiState.error, "a failed fetch is an error")
+    assertEqual(rows[2].detail, "HTTP 401 Authentication failed", "with the reason")
+    assertEqual(rows[3].state, ApiState.warn, "a stale entry is a warning")
+    assertEqual(rows[3].value, "$9.99", "and still shows the last known figure")
+
+    // Enabled but with no credential: the row says what is missing, per kind.
+    let missing = apiStatusRows(
+        vendors: vendors,
+        enabled: { _ in true },
+        configured: { _ in false },
+        report: [:],
+        reportRan: true)
+    assertEqual(missing[0].detail, "sem login — rode `claude`", "OAuth vendor names its login")
+    assertEqual(missing[1].detail, "sem chave (SHVIA_API_KEY)", "key vendor names its variable")
+    assertEqual(missing[0].state, ApiState.warn, "unconfigured is a warning, not an error")
+
+    // Before the first sweep, an enabled+configured vendor is pending — not
+    // "no data", which would claim the sweep ran and found nothing.
+    let pending = apiStatusRows(
+        vendors: vendors,
+        enabled: { _ in true },
+        configured: { _ in true },
+        report: [:],
+        reportRan: false)
+    assertEqual(pending[1].detail, "…", "no sweep yet reads as pending")
+    let swept = apiStatusRows(
+        vendors: vendors,
+        enabled: { _ in true },
+        configured: { _ in true },
+        report: [:],
+        reportRan: true)
+    assertEqual(swept[1].detail, "sem dados", "a finished sweep that skipped it says so")
+}
+
+func testUsageReportParsing() {
+    print("usage --json parsing")
+    let json = """
+    {"primary":"shvia","entries":[
+      {"id":"shvia","name":"shvia","display_name":"ShvIA","short_name":"shv",
+       "plan":"ShvIA","status":"ready","error":null,"stale":false,
+       "fetched_at":"2026-09-05T12:00:00Z",
+       "metrics":[{"label":"Today","percent":12,"value":"12%","detail":"Resets in 8h",
+                   "severity":"low","reset_at":null},
+                  {"label":"Week","percent":63,"value":"63%","detail":"Resets in 3d",
+                   "severity":"mid","reset_at":null}],
+       "sections":[]},
+      {"id":"anthropic@work","name":"anthropic · work","display_name":"Claude · work",
+       "short_name":"cld","plan":null,"status":"error","error":"HTTP 401",
+       "stale":false,"fetched_at":null,"metrics":[],"sections":[]}
+    ]}
+    """
+    let entries = parseUsageReport(Data(json.utf8))
+    assertEqual(entries.count, 2, "both entries parsed")
+    assertEqual(entries[0].id, "shvia", "id is the machine id")
+    assertEqual(entries[0].name, "ShvIA", "display_name is preferred")
+    assertEqual(entries[0].failed, false, "a ready entry has not failed")
+    assertEqual(reportHeadline(entries[0]), "63%", "headline is the worst metric's value")
+    assertEqual(entries[1].id, "anthropic@work", "account ids match the menu's own shape")
+    assertEqual(entries[1].failed, true, "an error status is a failure")
+    assertEqual(entries[1].error, "HTTP 401", "with the message")
+
+    assertEqual(parseUsageReport(Data("not json".utf8)).count, 0, "garbage yields no entries")
+    assertEqual(parseUsageReport(Data()).count, 0, "empty output yields no entries")
+
+    // An error can be long and multi-line; a menu row is one bounded line.
+    assertEqual(oneLine("line one\nline two", max: 40), "line one line two", "newlines collapse")
+    assertEqual(oneLine(String(repeating: "x", count: 60), max: 10),
+                String(repeating: "x", count: 9) + "…", "long text is truncated")
+}
+
 @main
 struct TestRunner {
     static func main() {
@@ -737,6 +892,9 @@ struct TestRunner {
         testOverviewProviderToggle()
         testAccountStatus()
         testSystemIntegrations()
+        testShviaWindows()
+        testApiStatus()
+        testUsageReportParsing()
         if failures > 0 {
             print("\n\(failures) test(s) FAILED")
             exit(1)

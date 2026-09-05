@@ -15,11 +15,15 @@ A single Swift file (`NSStatusItem` + `NSAttributedString`); no Xcode project.
 
 ## Vendor scope
 
-The selector supports **thirteen vendors** that ship in the binary:
+The selector supports **fourteen vendors** that ship in the binary:
 
 - **Rate-limit windows (5h / weekly):** Claude, Codex,
   Z.AI (GLM), and Google Antigravity (two independent pools — Gemini, and
   Claude & GPT OSS — each with its own 5h/weekly pair).
+- **Rolling windows (today / week / month):** ShvIA, a self-hosted gateway.
+  Its bars are relabelled accordingly, and a window with no ceiling
+  (`limit = -1`) draws no bar — it has no ratio, and a 0% gauge would say the
+  opposite of what an uncapped window means.
 - **Included-usage pools:** Cursor (Cursor Models and Other Models, both reset
   on the billing cycle).
 - **Balance-only:** OpenRouter, DeepSeek, Kimi, Kilo, Novita, Moonshot, Grok
@@ -29,9 +33,32 @@ The selector supports **thirteen vendors** that ship in the binary:
   bar when a monthly limit is configured.
 
 Only **enabled** vendors appear in the selector. The opt-in vendors (DeepSeek,
-Kimi, Kilo, Novita, Moonshot, Grok, Anthropic API, Cursor, Antigravity) default
-to disabled in the Rust config, matching `src/config.rs`; set
+Kimi, Kilo, Novita, Moonshot, Grok, Anthropic API, Cursor, Antigravity, ShvIA)
+default to disabled in the Rust config, matching `src/config.rs`; set
 `[vendor].enabled = true` (or save an API key via the TUI) to turn one on.
+
+## Status das APIs
+
+A collapsible section at the bottom of the dropdown, listing **every** vendor
+the selector knows — including the ones that are switched off or have no
+credential yet — with a health dot, its headline figure, and, when something is
+wrong, what to do about it:
+
+| Dot | Meaning |
+|---|---|
+| green | fetched fine; the figure beside it is the most-consumed metric |
+| yellow | needs attention — no key, no login, a stale cache, or not fetched yet |
+| red | the last fetch failed; the row carries the error |
+| hollow | `enabled = false` in config |
+
+It is collapsed by default and toggled from its own header row, or from
+**Preferências… → Status das APIs**.
+
+The figures come from one `ai-usagebar usage --json` sweep — the binary already
+walks every configured vendor and account there, and reports each one's status,
+error and staleness. That sweep runs when the menu is opened with the section
+expanded; **Preferências…** can also put it on a background interval, which is
+off by default because it talks to every provider you have configured.
 
 Antigravity has no credential file to check, so the Vendors pane treats it as
 **configured** once it finds any of Antigravity 2.0/IDE/`agy`'s state

@@ -24,6 +24,21 @@ Each release is also published at
   `{shvia_<window>_used|limit|remaining}` rather than spelled out beside a bar
   that already draws them.
 
+- The macOS menu bar shows ShvIA with its own three windows rather than the
+  5h/weekly pair it does not have: today takes the session slot (`24h`), week
+  the weekly slot, and a capped month the fourth-window slot Antigravity and
+  Z.AI already use. An uncapped or unreported window draws no bar — the
+  headline string, not the percentage, is what says which it is.
+
+- **"Status das APIs"** in the macOS dropdown: a collapsible section listing
+  every vendor the selector knows — including the ones switched off or missing
+  a credential — with a health dot, its headline figure, and what to do when
+  something is wrong. The dropdown shows one vendor and the Overview shows the
+  working ones; neither answered "is anything broken". It reads one
+  `ai-usagebar usage --json` sweep rather than each vendor's cache file, so it
+  needs no copy of any vendor's payload shape. Collapsed by default, refreshed
+  when the menu opens, and optionally on an interval set in Preferences.
+
 ## [1.12.0] — 2026-09-06
 
 ### Added
