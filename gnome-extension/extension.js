@@ -20,6 +20,8 @@ import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 import {barMarkup, colorForPct, disambiguateTags, field, FIELD, FORMAT, hasUsageWindows, integer,
     isGrouped, markerElapsed, plainTextFromPango, selectPools,
     splitFormatOutput} from './marker-logic.js';
+import {API_VENDORS, apiStatusRows, configApiKeyEnv, configHasApiKey,
+    configVendorEnabled, parseUsageReport} from './api-status-logic.js';
 
 const ROLE = 'ai-usagebar';
 
@@ -68,6 +70,16 @@ class AiUsageBarIndicator extends PanelMenu.Button {
         this._refreshProc = null;
         this._refreshToken = 0;
         this._rows = {};
+        // "Status das APIs": one `usage --json` sweep, keyed by entry id.
+        // `_apiReportRan` distinguishes "the sweep skipped this vendor" from
+        // "no sweep has finished yet".
+        this._apiReport = {};
+        this._apiReportRan = false;
+        this._apiBusy = false;
+        this._apiFetchedAt = 0;
+        this._apiRows = [];
+        this._apiCancellable = null;
+        this._apiProc = null;
 
         // Panel: one markup label holds tags + percentages + bars.
         this._label = new St.Label({
@@ -97,8 +109,15 @@ class AiUsageBarIndicator extends PanelMenu.Button {
         ];
 
         this.menu.connect('open-state-changed', (_m, open) => {
-            if (open)
-                this._refresh();
+            if (!open)
+                return;
+            this._refresh();
+            // The sweep touches every configured provider, so it runs when the
+            // section is actually on screen rather than on the panel's timer.
+            this._renderApiStatus();
+            if (this._settings.get_boolean('api-status-expanded') &&
+                GLib.get_monotonic_time() / 1000000 - this._apiFetchedAt >= 30)
+                this._refreshApiStatus();
         });
 
         this._refresh();
@@ -134,6 +153,8 @@ class AiUsageBarIndicator extends PanelMenu.Button {
             this._addRow('extra', 'Extra usage');
         }
 
+        this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+        this._addApiStatusSection();
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
 
         const refreshItem = new PopupMenu.PopupMenuItem('Atualizar agora');
@@ -500,6 +521,180 @@ class AiUsageBarIndicator extends PanelMenu.Button {
             r.item.visible = false;
     }
 
+    // ─── "Status das APIs" ───────────────────────────────────────────────
+    //
+    // A row per vendor the extension knows — the ones switched off and the
+    // ones missing a credential included — with a health dot, its headline
+    // figure, and what to do when something is wrong. The dropdown shows one
+    // vendor at a time and never answered "is anything broken".
+    _addApiStatusSection() {
+        const header = new PopupMenu.PopupMenuItem('Status das APIs');
+        header.label.add_style_class_name('aiub-api-header');
+        header.connect('activate', () => {
+            const key = 'api-status-expanded';
+            this._settings.set_boolean(key, !this._settings.get_boolean(key));
+            this._renderApiStatus();
+            if (this._settings.get_boolean(key))
+                this._refreshApiStatus();
+        });
+        this.menu.addMenuItem(header);
+        this._apiHeader = header;
+
+        // One slot per known vendor; the list is per vendor, not per account,
+        // so it never grows.
+        this._apiRows = API_VENDORS.map(() => {
+            const item = new PopupMenu.PopupBaseMenuItem({reactive: false, can_focus: false});
+            const vbox = new St.BoxLayout({
+                orientation: Clutter.Orientation.VERTICAL,
+                x_expand: true,
+                style_class: 'aiub-api-row',
+            });
+            const head = new St.BoxLayout({x_expand: true});
+            const dotL = new St.Label({style_class: 'aiub-api-dot'});
+            const nameL = new St.Label({x_expand: true, style_class: 'aiub-row-name'});
+            const valL = new St.Label({style_class: 'aiub-row-val'});
+            head.add_child(dotL);
+            head.add_child(nameL);
+            head.add_child(valL);
+            const detailL = new St.Label({style_class: 'aiub-api-detail'});
+            vbox.add_child(head);
+            vbox.add_child(detailL);
+            item.add_child(vbox);
+            item.visible = false;
+            this.menu.addMenuItem(item);
+            return {item, dotL, nameL, valL, detailL};
+        });
+        this._renderApiStatus();
+    }
+
+    // Which vendors are on and which have a credential. The report cannot say:
+    // it only lists what the binary actually fetched.
+    _apiLocalState() {
+        // Same resolution prefs.js uses: the platform config dir honors
+        // $XDG_CONFIG_HOME, and hard-coding ~/.config reported "no key" for
+        // keys that were in fact configured. The legacy path stays as the
+        // fallback, which the binary also accepts.
+        const xdg = `${GLib.get_user_config_dir()}/ai-usagebar/config.toml`;
+        const path = GLib.file_test(xdg, GLib.FileTest.EXISTS)
+            ? xdg
+            : `${GLib.get_home_dir()}/.config/ai-usagebar/config.toml`;
+        let text = '';
+        try {
+            const [ok, bytes] = GLib.file_get_contents(path);
+            if (ok)
+                text = new TextDecoder().decode(bytes);
+        } catch (e) {
+            // No config yet: every default applies, which is a valid answer.
+        }
+        const home = GLib.get_home_dir();
+        return {
+            enabled: v => configVendorEnabled(text, v.id),
+            configured: v => {
+                if (v.creds && GLib.file_test(`${home}/${v.creds}`, GLib.FileTest.EXISTS))
+                    return true;
+                const envName = configApiKeyEnv(text, v.id) || v.env;
+                if (envName && (GLib.getenv(envName) ?? '') !== '')
+                    return true;
+                return configHasApiKey(text, v.id);
+            },
+        };
+    }
+
+    _renderApiStatus() {
+        if (!this._apiHeader)
+            return;
+        const expanded = this._settings.get_boolean('api-status-expanded');
+        this._apiHeader.label.text = `Status das APIs   ${expanded ? '▾' : '▸'}`;
+        if (!expanded) {
+            for (const row of this._apiRows)
+                row.item.visible = false;
+            return;
+        }
+        const colors = this._colors();
+        const dotColor = {
+            ok: colors.low,
+            warn: colors.mid,
+            error: colors.critical,
+            off: DIM,
+        };
+        const local = this._apiLocalState();
+        const rows = apiStatusRows({
+            enabled: local.enabled,
+            configured: local.configured,
+            report: this._apiReport,
+            reportRan: this._apiReportRan,
+        });
+        rows.forEach((row, i) => {
+            const ui = this._apiRows[i];
+            if (!ui)
+                return;
+            ui.item.visible = true;
+            ui.dotL.text = row.state === 'off' ? '○ ' : '● ';
+            ui.dotL.set_style(`color: ${dotColor[row.state] ?? DIM};`);
+            ui.nameL.text = row.name;
+            ui.valL.text = row.value;
+            ui.valL.set_style(`color: ${row.value ? dotColor[row.state] ?? FG : FG};`);
+            ui.detailL.text = row.detail;
+            ui.detailL.visible = row.detail !== '';
+        });
+        for (let i = rows.length; i < this._apiRows.length; i++)
+            this._apiRows[i].item.visible = false;
+    }
+
+    // One `ai-usagebar usage --json` sweep. Cache-first in the binary, so a
+    // repeat inside the TTL costs no network.
+    _refreshApiStatus() {
+        if (this._apiBusy)
+            return;
+        this._apiBusy = true;
+        const bin = resolveBinary(this._settings);
+        const cancellable = new Gio.Cancellable();
+        this._apiCancellable = cancellable;
+        let proc;
+        try {
+            proc = new Gio.Subprocess({
+                argv: [bin, 'usage', '--json'],
+                flags: Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE,
+            });
+            proc.init(cancellable);
+        } catch (e) {
+            this._apiBusy = false;
+            this._apiCancellable = null;
+            return;
+        }
+        this._apiProc = proc;
+        const timeoutId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, REFRESH_TIMEOUT_SECS, () => {
+            try {
+                proc.force_exit();
+            } catch (e) {}
+            cancellable.cancel();
+            return GLib.SOURCE_REMOVE;
+        });
+        proc.communicate_utf8_async(null, cancellable, (p, res) => {
+            this._apiBusy = false;
+            GLib.source_remove(timeoutId);
+            if (this._apiCancellable === cancellable)
+                this._apiCancellable = null;
+            if (this._apiProc === proc)
+                this._apiProc = null;
+            try {
+                const [, out] = p.communicate_utf8_finish(res);
+                // `usage` exits non-zero when EVERY entry failed, and still
+                // prints them — which is exactly what this section exists to
+                // show, so the payload is read regardless of the exit status.
+                const report = parseUsageReport(out || '');
+                if (Object.keys(report).length > 0 || (out ?? '').trim() !== '') {
+                    this._apiReport = report;
+                    this._apiReportRan = true;
+                    this._apiFetchedAt = GLib.get_monotonic_time() / 1000000;
+                }
+            } catch (e) {
+                // A cancelled or unreadable sweep leaves the previous rows up.
+            }
+            this._renderApiStatus();
+        });
+    }
+
     _openTui() {
         const tui = GLib.find_program_in_path('ai-usagebar-tui') ||
             `${GLib.get_home_dir()}/.cargo/bin/ai-usagebar-tui`;
@@ -537,6 +732,14 @@ class AiUsageBarIndicator extends PanelMenu.Button {
                 this._refreshProc.force_exit();
             } catch (e) {}
             this._refreshProc = null;
+        }
+        if (this._apiCancellable)
+            this._apiCancellable.cancel();
+        if (this._apiProc) {
+            try {
+                this._apiProc.force_exit();
+            } catch (e) {}
+            this._apiProc = null;
         }
         for (const id of this._viewIds ?? [])
             this._settings.disconnect(id);

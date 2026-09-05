@@ -29,3 +29,25 @@
     font-size: 0.85em;
     color: #888888;
 }
+
+/* "Status das APIs" — the section header and its rows. Dimmer than a quota
+   row: it is a health list, read on purpose, not the numbers on every glance. */
+.aiub-api-header {
+    font-weight: bold;
+    font-size: 0.9em;
+    color: #7f8794;
+}
+
+.aiub-api-row {
+    padding: 1px 0;
+}
+
+.aiub-api-dot {
+    font-size: 0.9em;
+}
+
+.aiub-api-detail {
+    font-size: 0.8em;
+    color: #5c6370;
+    padding-left: 14px;
+}

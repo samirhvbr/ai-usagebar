@@ -14,6 +14,12 @@
       <summary>Vendor to display (anthropic shows the 5h + weekly windows)</summary>
     </key>
 
+    <key name="api-status-expanded" type="b">
+      <default>false</default>
+      <summary>Show the "Status das APIs" section in the dropdown</summary>
+      <description>Collapsed by default: the section sweeps every configured provider, so it is opened deliberately.</description>
+    </key>
+
     <key name="binary-path" type="s">
       <default>''</default>
       <summary>Absolute path to the ai-usagebar binary (empty = auto-detect on PATH / ~/.cargo/bin)</summary>

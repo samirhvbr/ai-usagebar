@@ -52,6 +52,7 @@ test:
 
 desktop-test:
 	node gnome-extension/marker-logic.test.mjs
+	node gnome-extension/api-status-logic.test.mjs
 	node kde-plasmoid/plasmoid-logic.test.mjs
 
 plugin-test:

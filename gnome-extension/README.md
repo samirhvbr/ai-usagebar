@@ -142,3 +142,26 @@ An unavailable pool is omitted; selecting it explicitly falls back to the pool
 that has data instead of leaving the panel blank.
 It composes with the 5h/weekly toggles — turning the weekly bar off leaves two
 segments, one per pool, at the same width as a single-pool vendor.
+
+## Status das APIs
+
+A collapsible section at the bottom of the dropdown listing **every** vendor
+the extension knows — including the ones switched off or missing a credential —
+with a health dot, its headline figure, and what to do when something is wrong:
+
+| Dot | Meaning |
+|---|---|
+| green | fetched fine; the figure beside it is the most-consumed metric |
+| yellow | needs attention — no key, no login, a stale cache, or not fetched yet |
+| red | the last fetch failed; the row carries the error |
+| hollow | `enabled = false` in `config.toml` |
+
+Click its header row to expand or collapse it (the state is the
+`api-status-expanded` setting). The figures come from one
+`ai-usagebar usage --json` sweep, which runs when the dropdown is opened with
+the section expanded — the binary walks every configured vendor and account
+there and reports each one's status, error and staleness, so the extension
+keeps no copy of any vendor's cache layout.
+
+The decision table is pure and lives in `api-status-logic.js`, covered by
+`api-status-logic.test.mjs` (`make desktop-test`).

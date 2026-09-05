@@ -39,6 +39,11 @@ Each release is also published at
   needs no copy of any vendor's payload shape. Collapsed by default, refreshed
   when the menu opens, and optionally on an interval set in Preferences.
 
+- The same **"Status das APIs"** section in the GNOME Shell dropdown, off the
+  same `usage --json` sweep and the same decision table — which is pure and
+  tested under Node in `gnome-extension/api-status-logic.test.mjs`. ShvIA also
+  joins the extension's vendor picker and its Vendors preferences tab.
+
 ## [1.12.0] — 2026-09-06
 
 ### Added

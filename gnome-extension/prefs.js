@@ -19,6 +19,7 @@ const VENDOR_AUTH = [
     {id: 'zai', name: 'Z.AI (GLM)', kind: 'apikey', env: 'ZAI_API_KEY'},
     {id: 'openrouter', name: 'OpenRouter', kind: 'apikey', env: 'OPENROUTER_API_KEY'},
     {id: 'deepseek', name: 'DeepSeek', kind: 'apikey', env: 'DEEPSEEK_API_KEY'},
+    {id: 'shvia', name: 'ShvIA', kind: 'apikey', env: 'SHVIA_API_KEY'},
 ];
 
 // The config file the Rust binary would actually read. It resolves the
@@ -279,7 +280,8 @@ export default class AiUsageBarPrefs extends ExtensionPreferences {
         settings.bind('refresh-interval', interval, 'value', Gio.SettingsBindFlags.DEFAULT);
         data.add(interval);
 
-        const vendorList = ['anthropic', 'openai', 'zai', 'openrouter', 'deepseek', 'antigravity'];
+        const vendorList = ['anthropic', 'openai', 'zai', 'openrouter', 'deepseek', 'antigravity',
+            'shvia'];
         const vendor = new Adw.ComboRow({
             title: _('Vendor'),
             subtitle: _('anthropic e antigravity expõem as janelas de 5h + semanal'),
