@@ -31,6 +31,7 @@ pub(crate) const VENDOR_SECRET_ENV_VARS: &[&str] = &[
     "NOVITA_API_KEY",
     "MINIMAX_API_KEY",
     "MOONSHOT_API_KEY",
+    "SHVIA_API_KEY",
     "XAI_MANAGEMENT_KEY",
     "ANTHROPIC_ADMIN_KEY",
     "XAI_API_KEY",
@@ -135,6 +136,7 @@ pub enum VendorId {
     OpenCodeGo,
     #[serde(rename = "commandcode")]
     CommandCode,
+    Shvia,
 }
 
 impl VendorId {
@@ -160,6 +162,7 @@ impl VendorId {
             VendorId::NousResearch => "nous",
             VendorId::OpenCodeGo => "opencode-go",
             VendorId::CommandCode => "commandcode",
+            VendorId::Shvia => "shvia",
         }
     }
 
@@ -188,6 +191,7 @@ impl VendorId {
             VendorId::NousResearch => "Nous Research",
             VendorId::OpenCodeGo => "OpenCode Go",
             VendorId::CommandCode => "Command Code",
+            VendorId::Shvia => "ShvIA",
         }
     }
 
@@ -217,6 +221,7 @@ impl VendorId {
             VendorId::NousResearch => "nrs",
             VendorId::OpenCodeGo => "ocg",
             VendorId::CommandCode => "cmc",
+            VendorId::Shvia => "shv",
         }
     }
 
@@ -242,6 +247,7 @@ impl VendorId {
             VendorId::NousResearch,
             VendorId::OpenCodeGo,
             VendorId::CommandCode,
+            VendorId::Shvia,
         ]
     }
 }
@@ -340,6 +346,7 @@ mod tests {
             "XAI_MANAGEMENT_KEY",
             "ANTHROPIC_ADMIN_KEY",
             "GITHUB_COPILOT_TOKEN",
+            "SHVIA_API_KEY",
         ];
         for name in configured_defaults {
             assert!(VENDOR_SECRET_ENV_VARS.contains(&name), "missing {name}");

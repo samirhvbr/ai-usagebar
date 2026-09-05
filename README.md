@@ -228,6 +228,7 @@ come from environment variables or `config.toml`.
 | Nous Research | OAuth device flow | Enable `[nous]`, click **Log in with Nous Research** in the Omarchy settings panel, or run `ai-usagebar auth nous login`. Credentials are kept in ai-usagebar's separate platform config directory (`~/.config/ai-usagebar/credentials.json` on Linux). |
 | OpenCode Go | API key (`OPENCODE_GO_API_KEY` env or `[opencode-go] api_key` in config) | Enable `[opencode-go]`, then enter the key in the Omarchy settings panel or set the environment variable. |
 | Command Code | Existing `commandcode` or pi login | Enable `[commandcode]` and sign in to either one once. No key to paste; `COMMANDCODE_API_KEY` overrides if you prefer one. |
+| ShvIA | API key (`SHVIA_API_KEY` env or `[shvia] api_key` in config) | Opt in. A self-hosted gateway, so also set `[shvia] base_url` unless you are on the default deployment. |
 
 ### Nous credits and OpenCode Go
 
@@ -297,7 +298,7 @@ rather than silently querying the wrong URL.
 
 `enabled = true` is what makes a vendor fetch. Anthropic API, GitHub Copilot,
 DeepSeek, Kimi, Kilo, Novita, Moonshot, Grok, SuperGrok, Antigravity, Cursor,
-MiniMax, and Kiro CLI all default to **disabled** so that existing
+MiniMax, Kiro CLI, and ShvIA all default to **disabled** so that existing
 installs are unaffected until you opt in. Use either method:
 
 - Use the gear or `s` in the Omarchy panel, or run

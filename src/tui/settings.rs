@@ -150,6 +150,15 @@ pub const KEY_VENDORS: &[KeyVendor] = &[
         secret_label: "API key",
         note: "usage quota",
     },
+    KeyVendor {
+        id: VendorId::Shvia,
+        label: "ShvIA",
+        env: "SHVIA_API_KEY",
+        section: "shvia",
+        config_key: "api_key",
+        secret_label: "API key",
+        note: "self-hosted gateway",
+    },
 ];
 
 /// Read the inline credential currently in config, so the field opens
@@ -167,6 +176,7 @@ fn config_inline_key<'a>(cfg: &'a Config, vendor: &KeyVendor) -> Option<&'a str>
         "grok" => cfg.grok.api_key.as_deref(),
         "minimax" => cfg.minimax.api_key.as_deref(),
         "opencode-go" => cfg.opencode_go.api_key.as_deref(),
+        "shvia" => cfg.shvia.api_key.as_deref(),
         _ => None,
     }
 }
@@ -690,6 +700,7 @@ fn configured_key_env<'a>(cfg: &'a Config, section: &str, fallback: &'a str) -> 
         "grok" => &cfg.grok.api_key_env,
         "minimax" => &cfg.minimax.api_key_env,
         "opencode-go" => &cfg.opencode_go.api_key_env,
+        "shvia" => &cfg.shvia.api_key_env,
         _ => fallback,
     }
 }

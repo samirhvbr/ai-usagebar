@@ -14,6 +14,7 @@ settings.
 #                         # | zai | openrouter | deepseek | kimi | kilo | novita
 #                         # | moonshot | grok | supergrok | antigravity | cursor
 #                         # | minimax | kiro | nous | opencode-go | commandcode
+#                         # | shvia
 
 [context]
 enabled = false           # opt in, then press c in ai-usagebar-tui
@@ -167,3 +168,28 @@ Create the second login with `CODEX_HOME=~/.codex-work codex login` and point
 `codex_auth_path` at the file it writes. Select it with `--account work`; each
 account caches separately under `~/.cache/ai-usagebar/openai/<label>`. The
 singular `codex_auth_path` remains the default account and needs no migration.
+
+## ShvIA (self-hosted gateway)
+
+ShvIA is the one vendor whose endpoint is not a product: it is a self-hosted,
+OpenAI-compatible gateway, so the deployment's address is configuration rather
+than a constant.
+
+```toml
+[shvia]
+enabled = false
+api_key_env = "SHVIA_API_KEY"   # checked first; if set + non-empty, used
+# api_key = "shvia_..."         # used if SHVIA_API_KEY is unset; chmod 600 the file!
+# base_url = "https://gateway.example.com"  # no trailing path
+# plan = "ShvIA Gateway"        # display-only label in the tooltip header
+```
+
+The key is sent as `Authorization: Bearer <key>` — with the prefix, unlike
+Z.AI's. `base_url` names the gateway only; `/api/v1/usage` is appended, and a
+trailing slash is tolerated. Omit it to use the default deployment compiled
+into `shvia::fetch::DEFAULT_BASE_URL`.
+
+The endpoint answers with three rolling windows — `today`, `week` and `month` —
+each carrying `used`, `limit`, `remaining` and `reset_at`. A `limit` of `-1`
+means the window is uncapped: it renders the used count instead of a bar, and
+contributes no percentage to the vendor's severity.

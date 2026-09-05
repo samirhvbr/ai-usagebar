@@ -342,3 +342,18 @@ enabled = false
 #   ~/.pi/agent/auth.json
 # COMMANDCODE_API_KEY in the environment outranks both.
 # auth_paths = ["~/.commandcode/auth.json"]
+
+# ShvIA — a self-hosted, OpenAI-compatible gateway. Disabled by default, like
+# every other key-authenticated vendor: it needs a key, and unlike the rest it
+# also needs to be told where the gateway is. Three rolling windows (today /
+# week / month) come from {base_url}/api/v1/usage; a window whose limit is -1
+# is unlimited, and shows the raw used count instead of a percentage.
+[shvia]
+enabled = false
+api_key_env = "SHVIA_API_KEY"      # checked first; if set + non-empty, used
+# api_key = "shvia_..."            # fallback; chmod 600 the file if you use it
+# Where the gateway lives, no trailing path. Defaults to the deployment in
+# shvia::fetch::DEFAULT_BASE_URL when omitted.
+# base_url = "https://gateway.example.com"
+# Display-only label for the tooltip header (defaults to "ShvIA").
+# plan = "ShvIA Gateway"

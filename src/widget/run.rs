@@ -27,6 +27,7 @@ use crate::novita;
 use crate::openai;
 use crate::openrouter;
 use crate::pango::escape;
+use crate::shvia;
 use crate::supergrok;
 use crate::theme::Theme;
 use crate::vendor::{HTTP_CLIENT_TIMEOUT, RenderOpts, VendorOutcome};
@@ -163,6 +164,7 @@ async fn build_output(cli: &Cli) -> Result<WaybarOutput> {
         Vendor::NousResearch => nous_output(cli).await,
         Vendor::OpenCodeGo => opencode_go_output(cli, &config).await,
         Vendor::CommandCode => commandcode_output(cli, &config).await,
+        Vendor::Shvia => shvia_output(cli, &config).await,
     }
 }
 
@@ -539,6 +541,46 @@ async fn novita_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
     let vendor_outcome: VendorOutcome = outcome.into();
     let opts = RenderOpts::from_cli(cli);
     Ok(novita::vendor::render(
+        &vendor_outcome,
+        &snap,
+        &theme,
+        &opts,
+        chrono::Utc::now(),
+    ))
+}
+
+async fn shvia_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
+    let api_key = crate::config::resolve_api_key(
+        "ShvIA",
+        &config.shvia.api_key_env,
+        config.shvia.api_key.as_deref(),
+    )?;
+    let client = http_client()?;
+    let cache = vendor_cache(cli, "shvia")?;
+    let endpoints = match config.shvia.base_url.as_deref() {
+        Some(url) if !url.trim().is_empty() => shvia::fetch::Endpoints::from_base_url(url.trim()),
+        _ => shvia::fetch::Endpoints::default(),
+    };
+    let outcome = match shvia::fetch_snapshot(
+        &client,
+        &api_key,
+        &cache,
+        &endpoints,
+        DEFAULT_TTL,
+        config.shvia.plan.as_deref(),
+    )
+    .await
+    {
+        Ok(o) => o,
+        Err(e) if e.is_transient() => return Ok(WaybarOutput::loading(cli.icon.as_deref())),
+        Err(e) => return Err(e),
+    };
+
+    let theme = theme_from_cli(cli);
+    let snap = outcome.snapshot.clone();
+    let vendor_outcome: VendorOutcome = outcome.into();
+    let opts = RenderOpts::from_cli(cli);
+    Ok(shvia::vendor::render(
         &vendor_outcome,
         &snap,
         &theme,

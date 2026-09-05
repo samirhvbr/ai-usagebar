@@ -46,6 +46,7 @@ pub mod pango;
 pub mod report;
 pub mod safe_storage;
 pub mod serde_helpers;
+pub mod shvia;
 pub mod supergrok;
 pub mod theme;
 pub mod tooltip;

@@ -9,6 +9,21 @@ Each release is also published at
 
 ## [Unreleased]
 
+### Added
+
+- **ShvIA** is supported as a vendor, selectable with `--vendor shvia` and
+  enabled with `[shvia]` in config. It reads a self-hosted, OpenAI-compatible
+  gateway's `{base_url}/api/v1/usage` and shows its three rolling windows —
+  today, week and month. It is the first vendor whose endpoint is not a
+  product, so `base_url` is configuration rather than a constant; the key is
+  sent as `Authorization: Bearer <key>`, with the prefix Z.AI's deliberately
+  omits. A window whose `limit` is `-1` is uncapped: it shows the raw used
+  count instead of a bar, contributes no percentage to the vendor's severity,
+  and has no pace value, because pacing compares consumption against a ceiling
+  that does not exist. The raw counters are available as
+  `{shvia_<window>_used|limit|remaining}` rather than spelled out beside a bar
+  that already draws them.
+
 ## [1.12.0] — 2026-09-06
 
 ### Added

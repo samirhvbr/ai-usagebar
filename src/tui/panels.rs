@@ -159,6 +159,31 @@ pub fn compact_cells(snapshot: &VendorSnapshot) -> (String, Vec<(String, PaceSev
             }
             (s.plan.clone(), cells)
         }
+        VendorSnapshot::Shvia(s) => {
+            // An unlimited window has no ratio, so it contributes its raw used
+            // count rather than a percentage a bar would draw as "empty".
+            let cell = |label: &str, w: &crate::usage::ShviaWindow| {
+                if w.is_unlimited() {
+                    (
+                        format!("{label} {}", crate::format::compact_count(w.used)),
+                        PaceSeverity::Low,
+                    )
+                } else {
+                    pct(label, w.utilization_pct())
+                }
+            };
+            let mut cells = Vec::new();
+            if let Some(w) = &s.today {
+                cells.push(cell("T", w));
+            }
+            if let Some(w) = &s.week {
+                cells.push(cell("W", w));
+            }
+            if cells.is_empty() {
+                cells.push(("—".into(), PaceSeverity::Low));
+            }
+            (s.plan.clone(), cells)
+        }
         VendorSnapshot::Openrouter(s) => (String::new(), vec![usd_cell(s.balance())]),
         VendorSnapshot::Deepseek(s) => (String::new(), vec![money_cell(s.balance, &s.currency)]),
         VendorSnapshot::Kimi(s) => (
@@ -261,6 +286,14 @@ pub fn headline_pct(snapshot: &VendorSnapshot) -> Option<i32> {
         .into_iter()
         .flatten()
         .max(),
+        // Only the capped windows can produce a percentage; a gateway whose
+        // windows are all unlimited has no bar to draw, like a balance vendor.
+        VendorSnapshot::Shvia(s) => [&s.today, &s.week, &s.month]
+            .into_iter()
+            .filter_map(|w| w.as_ref())
+            .filter(|w| !w.is_unlimited())
+            .map(|w| w.utilization_pct())
+            .max(),
         VendorSnapshot::Kimi(s) => Some(s.weekly_pct().max(s.window_pct())),
         VendorSnapshot::Antigravity(s) => [
             s.session.as_ref().map(|w| w.utilization_pct),
@@ -364,6 +397,7 @@ pub(crate) fn sections_with_metadata_for(
                 VendorSnapshot::NousResearch(s) => nous_sections(s, now),
                 VendorSnapshot::OpenCodeGo(s) => opencode_go_sections(s, now),
                 VendorSnapshot::CommandCode(s) => commandcode_sections(s, now),
+                VendorSnapshot::Shvia(s) => shvia_sections(s, now, pace_tolerance),
             };
             // Inject the (already-absolute) fetched-at instant into the title
             // row, right-aligned. Pre-snapshotted in app::refresh_one so it
@@ -685,6 +719,44 @@ fn zai_sections(s: &crate::usage::ZaiSnapshot, now: DateTime<Utc>, tol: u32) -> 
         push_window(&mut v, "MCP tools (monthly)", w, now, tol, true);
     }
     if s.session.is_none() && s.weekly.is_none() && s.mcp.is_none() {
+        v.push(Section::Spacer);
+        v.push(Section::Text {
+            label: "".into(),
+            value: "  no usage windows reported".into(),
+        });
+    }
+    v
+}
+
+fn shvia_sections(s: &crate::usage::ShviaSnapshot, now: DateTime<Utc>, tol: u32) -> SectionBuilder {
+    let mut v = SectionBuilder::new(vec![Section::Title {
+        left: s.plan.clone(),
+        right: None,
+    }]);
+    for (label, window) in [
+        ("Today", &s.today),
+        ("Week", &s.week),
+        ("Month (30d)", &s.month),
+    ] {
+        let Some(w) = window.as_ref() else { continue };
+        match w.as_usage_window() {
+            Some(uw) => push_window(&mut v, label, &uw, now, tol, true),
+            // No ceiling: a gauge would report 0% used, which reads as the
+            // opposite of what an unlimited window means.
+            None => {
+                v.push(Section::Spacer);
+                v.push(Section::Text {
+                    label: label.into(),
+                    value: format!(
+                        "{} used · unlimited · resets in {}",
+                        crate::format::compact_count(w.used),
+                        countdown::format(w.resets_at, now)
+                    ),
+                });
+            }
+        }
+    }
+    if s.today.is_none() && s.week.is_none() && s.month.is_none() {
         v.push(Section::Spacer);
         v.push(Section::Text {
             label: "".into(),

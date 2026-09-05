@@ -19,6 +19,7 @@ metrics expand to an empty string unless noted otherwise.
 | Cursor | `cur` | MiniMax | `mmx` |
 | Kiro CLI | `kir` | Nous Research | `nrs` |
 | OpenCode Go | `ocg` | Command Code | `cmc` |
+| ShvIA | `shv` | | |
 
 The same codes ride the `ai-usagebar usage --json` report as each entry's
 `short_name`, so a native frontend can draw a Waybar-style provider tag without
@@ -274,3 +275,22 @@ derived from the credit ledger against the plan pool, and
 ledger refills. A plan the release does not know, or a response without the
 credit ledger, leaves the monthly family and `{cc_credits_reset}` at `—`.
 `{session_pct}` and `{weekly_pct}` alias the 5-hour and weekly windows.
+
+## ShvIA
+
+`{shvia_plan}`, `{shvia_today}`, `{shvia_today_pct}`, `{shvia_today_reset}`,
+`{shvia_today_elapsed}`, `{shvia_today_pace}`,
+`{shvia_today_pace_indicator}`, `{shvia_today_used}`, `{shvia_today_limit}`,
+`{shvia_today_remaining}`, and the same eight for `week` and `month`.
+
+`{shvia_<window>}` is the headline: a percentage for a capped window, the raw
+used count (`12.3k`) for an unlimited one, and `—` when the gateway did not
+report the window at all. `{session_pct}`, `{session_reset}`, `{weekly_pct}`
+and `{weekly_reset}` all alias the **week** window, which is what the default
+format shows.
+
+A window whose `limit` is `-1` is unlimited: its `_pct` is `0`, its `_limit`
+reads `unlimited`, its `_remaining` is empty, and it has no pace or elapsed
+value — pacing compares consumption against a ceiling, and there is none. A
+window the gateway omits reports empty counters rather than `0`, so a custom
+format never claims a figure that was never sent.

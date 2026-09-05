@@ -60,6 +60,7 @@ pub struct Config {
     #[serde(rename = "opencode-go")]
     pub opencode_go: OpenCodeGoConfig,
     pub commandcode: CommandCodeConfig,
+    pub shvia: ShviaConfig,
 }
 
 /// UI / dispatch preferences. Currently just `primary` — which vendor the
@@ -844,6 +845,40 @@ impl Default for MoonshotConfig {
     }
 }
 
+/// ShvIA — a self-hosted OpenAI-compatible gateway. Unlike every other vendor
+/// here the endpoint is not a public product, so `base_url` is part of the
+/// configuration rather than a constant.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ShviaConfig {
+    pub enabled: bool,
+    /// Env var name to read the key from (env wins over `api_key`).
+    pub api_key_env: String,
+    /// Inline key (fallback when the env var is unset). Saving a config that
+    /// carries one chmods the file to 600, like every other inline credential.
+    pub api_key: Option<String>,
+    /// Base URL of the gateway (no trailing path). The usage endpoint
+    /// `/api/v1/usage` is appended automatically; `None` uses the default
+    /// deployment in `shvia::fetch::DEFAULT_BASE_URL`.
+    pub base_url: Option<String>,
+    /// Optional plan / gateway label — display-only (tooltip header).
+    pub plan: Option<String>,
+}
+
+impl Default for ShviaConfig {
+    fn default() -> Self {
+        // Opt-in like every other key-authenticated vendor: a gateway that
+        // rejects an absent key is not a useful default-on panel row.
+        Self {
+            enabled: false,
+            api_key_env: "SHVIA_API_KEY".to_string(),
+            api_key: None,
+            base_url: None,
+            plan: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct GrokConfig {
@@ -1109,6 +1144,7 @@ impl Config {
             self.grok.api_key.as_deref(),
             self.anthropic_api.api_key.as_deref(),
             self.opencode_go.api_key.as_deref(),
+            self.shvia.api_key.as_deref(),
         ]
         .into_iter()
         .chain(
@@ -1165,6 +1201,7 @@ impl Config {
             VendorId::NousResearch => self.nous.enabled,
             VendorId::OpenCodeGo => self.opencode_go.enabled,
             VendorId::CommandCode => self.commandcode.enabled,
+            VendorId::Shvia => self.shvia.enabled,
         }
     }
 
