@@ -3,7 +3,6 @@
 
 use std::path::{Path, PathBuf};
 
-use base64::Engine;
 use serde::{Deserialize, Serialize};
 
 use crate::cache::atomic_write;
@@ -79,7 +78,7 @@ impl Tokens {
     /// Plan tier from the id_token's nested claim
     /// `https://api.openai.com/auth.chatgpt_plan_type`.
     pub fn plan_type_from_id_token(&self) -> Option<String> {
-        let claims = parse_jwt_claims(&self.id_token)?;
+        let claims = crate::jwt::claims(&self.id_token)?;
         claims
             .get("https://api.openai.com/auth")
             .and_then(|v| v.get("chatgpt_plan_type"))
@@ -90,27 +89,17 @@ impl Tokens {
 
 /// Parse a JWT's `exp` claim. Returns None for malformed tokens.
 fn parse_jwt_exp(token: &str) -> Option<i64> {
-    let claims = parse_jwt_claims(token)?;
+    let claims = crate::jwt::claims(token)?;
     claims
         .get("exp")
         .and_then(|v| v.as_i64())
         .or_else(|| claims.get("exp").and_then(|v| v.as_f64()).map(|f| f as i64))
 }
 
-fn parse_jwt_claims(token: &str) -> Option<serde_json::Value> {
-    let mut parts = token.split('.');
-    let _header = parts.next()?;
-    let payload = parts.next()?;
-    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(payload)
-        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(payload))
-        .ok()?;
-    serde_json::from_slice(&decoded).ok()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
     use std::io::Write;
     use tempfile::{NamedTempFile, TempDir};
 

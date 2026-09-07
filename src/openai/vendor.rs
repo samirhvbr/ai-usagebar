@@ -1,43 +1,33 @@
-//! OpenAI renderer — mirrors anthropic's layout closely since both expose the
-//! same primary+secondary window pattern.
+//! OpenAI renderer — mirrors Anthropic's rolling-window layout while omitting
+//! any 5h or weekly window the Codex endpoint does not report.
 
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 
 use crate::countdown;
-use crate::format::{placeholders, substitute, updated_at_hm};
+use crate::format::{placeholders, reset_credit_lines, reset_credits, substitute, updated_at_hm};
 use crate::pacing::{self, PaceSeverity};
 use crate::pango::{color_span, escape, severity_color, severity_for};
 use crate::theme::Theme;
 use crate::tooltip::{Line as TooltipLine, push_window, render_bordered};
-use crate::usage::{OpenAiSnapshot, OpenAiSource};
-use crate::vendor::{RenderOpts, VendorOutcome};
+use crate::usage::{OpenAiSnapshot, OpenAiSource, UsageWindow};
+use crate::vendor::{RenderOpts, VendorId, VendorOutcome};
 use crate::waybar::{Class, WaybarOutput};
 
 use super::fetch::FetchOutcome;
 
 pub const DEFAULT_FORMAT: &str = "{oai_session_pct}% · {oai_session_reset}";
+const WEEKLY_ONLY_FORMAT: &str = "{oai_weekly_pct}% · {oai_weekly_reset}";
+const NO_WINDOWS_FORMAT: &str = "{oai_plan}";
 
 pub fn build_placeholders(
     snap: &OpenAiSnapshot,
     opts: &RenderOpts,
     now: DateTime<Utc>,
 ) -> HashMap<&'static str, String> {
-    let session_p = pacing::calc(
-        snap.session.utilization_pct,
-        snap.session.resets_at,
-        now,
-        snap.session.window_duration,
-        opts.pace_tolerance,
-    );
-    let weekly_p = pacing::calc(
-        snap.weekly.utilization_pct,
-        snap.weekly.resets_at,
-        now,
-        snap.weekly.window_duration,
-        opts.pace_tolerance,
-    );
+    let session = window_placeholders(snap.session.as_ref(), opts, now);
+    let weekly = window_placeholders(snap.weekly.as_ref(), opts, now);
     let cr_pct = snap
         .code_review
         .as_ref()
@@ -60,62 +50,113 @@ pub fn build_placeholders(
         .and_then(|c| c.approx_cloud_messages)
         .map(|(a, b)| format!("{a}-{b}"))
         .unwrap_or_default();
+    let reset_summary = reset_credits(&snap.reset_credits);
 
     placeholders(vec![
         ("icon", "󱢆".to_string()),
-        ("vendor_short", "gpt".to_string()),
+        ("vendor_short", VendorId::Openai.short_name().to_string()),
         // Cross-vendor aliases — same names work across all vendors so a
         // single `--format '{vendor_short} {session_pct}% · {session_reset}'`
         // renders correctly during scroll-cycle.
-        ("session_pct", snap.session.utilization_pct.to_string()),
-        (
-            "session_reset",
-            countdown::format(snap.session.resets_at, now),
-        ),
-        ("weekly_pct", snap.weekly.utilization_pct.to_string()),
-        (
-            "weekly_reset",
-            countdown::format(snap.weekly.resets_at, now),
-        ),
+        ("session_pct", session.pct.clone()),
+        ("session_reset", session.reset.clone()),
+        ("weekly_pct", weekly.pct.clone()),
+        ("weekly_reset", weekly.reset.clone()),
+        ("session_elapsed", session.elapsed.clone()),
+        ("weekly_elapsed", weekly.elapsed.clone()),
         ("plan", snap.plan.clone()),
         ("oai_plan", snap.plan.clone()),
-        ("oai_session_pct", snap.session.utilization_pct.to_string()),
-        (
-            "oai_session_reset",
-            countdown::format(snap.session.resets_at, now),
-        ),
-        ("oai_session_elapsed", session_p.elapsed_pct.to_string()),
-        ("oai_session_pace", session_p.ratio_pace.glyph().to_string()),
-        (
-            "oai_session_pace_indicator",
-            session_p.point_pace.glyph().to_string(),
-        ),
-        ("oai_weekly_pct", snap.weekly.utilization_pct.to_string()),
-        (
-            "oai_weekly_reset",
-            countdown::format(snap.weekly.resets_at, now),
-        ),
-        ("oai_weekly_elapsed", weekly_p.elapsed_pct.to_string()),
-        ("oai_weekly_pace", weekly_p.ratio_pace.glyph().to_string()),
-        (
-            "oai_weekly_pace_indicator",
-            weekly_p.point_pace.glyph().to_string(),
-        ),
+        ("oai_session_pct", session.pct),
+        ("oai_session_reset", session.reset),
+        ("oai_session_elapsed", session.elapsed),
+        ("oai_session_pace", session.ratio_pace),
+        ("oai_session_pace_indicator", session.point_pace),
+        ("oai_weekly_pct", weekly.pct),
+        ("oai_weekly_reset", weekly.reset),
+        ("oai_weekly_elapsed", weekly.elapsed),
+        ("oai_weekly_pace", weekly.ratio_pace),
+        ("oai_weekly_pace_indicator", weekly.point_pace),
         ("oai_code_review_pct", cr_pct.to_string()),
         ("oai_credit_balance", credit_balance),
         ("oai_local_msgs", local_msgs),
         ("oai_cloud_msgs", cloud_msgs),
+        (
+            "oai_resets_available",
+            snap.reset_credits.available.to_string(),
+        ),
+        ("oai_resets", reset_summary),
+        (
+            "oai_extra_limits",
+            snap.additional_limits
+                .iter()
+                .map(|l| {
+                    let worst = [l.session.as_ref(), l.weekly.as_ref()]
+                        .into_iter()
+                        .flatten()
+                        .map(|w| w.utilization_pct)
+                        .max()
+                        .unwrap_or(0);
+                    format!("{} {}%", l.name, worst)
+                })
+                .collect::<Vec<_>>()
+                .join(" · "),
+        ),
+        (
+            "oai_unavailable_models",
+            snap.unavailable_models
+                .iter()
+                .map(|m| m.model.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+        ),
     ])
 }
 
-pub fn severity(snap: &OpenAiSnapshot) -> PaceSeverity {
-    let mut max = snap
-        .session
-        .utilization_pct
-        .max(snap.weekly.utilization_pct);
-    if let Some(c) = &snap.code_review {
-        max = max.max(c.utilization_pct);
+#[derive(Default)]
+struct WindowPlaceholderValues {
+    pct: String,
+    reset: String,
+    elapsed: String,
+    ratio_pace: String,
+    point_pace: String,
+}
+
+fn window_placeholders(
+    window: Option<&UsageWindow>,
+    opts: &RenderOpts,
+    now: DateTime<Utc>,
+) -> WindowPlaceholderValues {
+    let Some(window) = window else {
+        return WindowPlaceholderValues::default();
+    };
+    let pace = pacing::calc(
+        window.utilization_pct,
+        window.resets_at,
+        now,
+        window.window_duration,
+        opts.pace_tolerance,
+    );
+    WindowPlaceholderValues {
+        pct: window.utilization_pct.to_string(),
+        reset: countdown::format(window.resets_at, now),
+        elapsed: pace.elapsed_pct.to_string(),
+        ratio_pace: pace.ratio_pace.glyph().to_string(),
+        point_pace: pace.point_pace.glyph().to_string(),
     }
+}
+
+pub fn severity(snap: &OpenAiSnapshot) -> PaceSeverity {
+    let windows = [
+        snap.session.as_ref(),
+        snap.weekly.as_ref(),
+        snap.code_review.as_ref(),
+    ];
+    let max = windows
+        .into_iter()
+        .flatten()
+        .map(|window| window.utilization_pct)
+        .max()
+        .unwrap_or(0);
     severity_for(max)
 }
 
@@ -130,7 +171,7 @@ pub fn render(
     let format = opts
         .format
         .clone()
-        .unwrap_or_else(|| DEFAULT_FORMAT.to_string());
+        .unwrap_or_else(|| default_format(snap).to_string());
     let values = build_placeholders(snap, opts, now);
 
     let mut text = substitute(&format, &values);
@@ -157,6 +198,16 @@ pub fn render(
     }
 }
 
+fn default_format(snap: &OpenAiSnapshot) -> &'static str {
+    if snap.session.is_some() {
+        return DEFAULT_FORMAT;
+    }
+    if snap.weekly.is_some() {
+        return WEEKLY_ONLY_FORMAT;
+    }
+    NO_WINDOWS_FORMAT
+}
+
 fn render_tooltip(
     outcome: &VendorOutcome,
     snap: &OpenAiSnapshot,
@@ -175,16 +226,20 @@ fn render_tooltip(
     lines.push(TooltipLine::Sep);
     lines.push(TooltipLine::Body("".into()));
 
-    push_window(&mut lines, "  󰔟  Codex 5h", &snap.session, theme, now, None);
-    lines.push(TooltipLine::Body("".into()));
-    push_window(
-        &mut lines,
-        "  󰃰  Codex weekly",
-        &snap.weekly,
-        theme,
-        now,
-        None,
-    );
+    if let Some(session) = snap.session.as_ref() {
+        push_window(&mut lines, "  󰔟  Codex 5h", session, theme, now, None);
+    }
+    if let Some(weekly) = snap.weekly.as_ref() {
+        if snap.session.is_some() {
+            lines.push(TooltipLine::Body("".into()));
+        }
+        push_window(&mut lines, "  󰃰  Codex weekly", weekly, theme, now, None);
+    }
+    if snap.session.is_none() && snap.weekly.is_none() {
+        lines.push(TooltipLine::Body(format!(
+            " <span foreground='{dim}'>no usage windows reported</span>"
+        )));
+    }
 
     if let Some(cr) = snap.code_review.as_ref() {
         lines.push(TooltipLine::Body("".into()));
@@ -196,6 +251,50 @@ fn render_tooltip(
             now,
             None,
         );
+    }
+
+    for limit in &snap.additional_limits {
+        let name = escape(&limit.name);
+        if let Some(w) = limit.session.as_ref() {
+            lines.push(TooltipLine::Body("".into()));
+            push_window(
+                &mut lines,
+                &format!("  󰔟  {name} (5h)"),
+                w,
+                theme,
+                now,
+                None,
+            );
+        }
+        if let Some(w) = limit.weekly.as_ref() {
+            lines.push(TooltipLine::Body("".into()));
+            push_window(
+                &mut lines,
+                &format!("  󰃰  {name} (7d)"),
+                w,
+                theme,
+                now,
+                None,
+            );
+        }
+    }
+
+    // A model the account cannot dispatch to shows up in no percentage, so it
+    // is stated rather than left to be inferred from healthy bars.
+    if !snap.unavailable_models.is_empty() {
+        lines.push(TooltipLine::Body("".into()));
+        lines.push(TooltipLine::Sep);
+        for model in &snap.unavailable_models {
+            let detail = match model.available_at {
+                Some(at) => format!("back {}", countdown::format(Some(at), now)),
+                None => "at capacity".to_string(),
+            };
+            lines.push(TooltipLine::Body(format!(
+                " <span foreground='{red}'>  󰅚  {model}</span> <span foreground='{dim}'>{detail}</span>",
+                red = theme.red,
+                model = escape(&model.model),
+            )));
+        }
     }
 
     if let Some(c) = snap.credits.as_ref() {
@@ -225,11 +324,25 @@ fn render_tooltip(
         }
     }
 
+    if snap.reset_credits.available > 0 {
+        lines.push(TooltipLine::Body("".into()));
+        lines.push(TooltipLine::Sep);
+        lines.push(TooltipLine::Body(format!(
+            " <span foreground='{fg}'>  󰁯  Reset credits</span>"
+        )));
+        for line in reset_credit_lines(&snap.reset_credits, now) {
+            lines.push(TooltipLine::Body(format!(
+                " <span foreground='{dim}'>     {}</span>",
+                escape(&line)
+            )));
+        }
+    }
+
     if matches!(snap.source, OpenAiSource::Unavailable) {
         lines.push(TooltipLine::Body("".into()));
         lines.push(TooltipLine::Sep);
         lines.push(TooltipLine::Body(format!(
-            " <span foreground='{dim}'>OpenAI plan usage requires Codex OAuth.</span>"
+            " <span foreground='{dim}'>Codex plan usage requires Codex OAuth.</span>"
         )));
         lines.push(TooltipLine::Body(format!(
             " <span foreground='{dim}'>Run `codex login` to enable.</span>"
@@ -267,12 +380,7 @@ fn render_tooltip(
 
 impl From<FetchOutcome> for VendorOutcome {
     fn from(o: FetchOutcome) -> Self {
-        Self {
-            snapshot: crate::usage::VendorSnapshot::Openai(o.snapshot),
-            stale: o.stale,
-            last_error: o.last_error,
-            cache_age: o.cache_age,
-        }
+        o.map(crate::usage::VendorSnapshot::Openai)
     }
 }
 
@@ -284,18 +392,21 @@ mod tests {
     fn sample() -> OpenAiSnapshot {
         OpenAiSnapshot {
             plan: "ChatGPT Plus".into(),
-            session: UsageWindow {
+            session: Some(UsageWindow {
                 utilization_pct: 1,
                 resets_at: Some(Utc::now() + chrono::Duration::hours(5)),
                 window_duration: chrono::Duration::hours(5),
-            },
-            weekly: UsageWindow {
+            }),
+            weekly: Some(UsageWindow {
                 utilization_pct: 0,
                 resets_at: Some(Utc::now() + chrono::Duration::days(7)),
                 window_duration: chrono::Duration::days(7),
-            },
+            }),
             code_review: None,
+            additional_limits: Vec::new(),
+            unavailable_models: Vec::new(),
             credits: None,
+            reset_credits: Default::default(),
             source: OpenAiSource::CodexOauth,
         }
     }
@@ -328,6 +439,22 @@ mod tests {
     }
 
     #[test]
+    fn dual_window_placeholders_keep_existing_values() {
+        let s = sample();
+        let values = build_placeholders(&s, &opts(), Utc::now());
+        assert_eq!(values["oai_session_pct"], "1");
+        assert_eq!(values["oai_weekly_pct"], "0");
+        assert_eq!(values["session_pct"], "1");
+        assert_eq!(values["weekly_pct"], "0");
+        // Cross-vendor elapsed aliases must mirror the oai_* values so the
+        // macOS menu bar can render pace markers for OpenAI.
+        assert_eq!(values["session_elapsed"], values["oai_session_elapsed"]);
+        assert_eq!(values["weekly_elapsed"], values["oai_weekly_elapsed"]);
+        assert!(!values["session_elapsed"].is_empty());
+        assert!(!values["weekly_elapsed"].is_empty());
+    }
+
+    #[test]
     fn tooltip_has_both_windows() {
         let s = sample();
         let out = render(&oc(s.clone()), &s, &Theme::default(), &opts(), Utc::now());
@@ -335,6 +462,53 @@ mod tests {
         assert!(out.tooltip.contains("Codex weekly"));
         assert!(!out.tooltip.contains("Code review"));
         assert!(!out.tooltip.contains("Credits"));
+    }
+
+    #[test]
+    fn weekly_only_snapshot_uses_weekly_default_and_hides_session() {
+        let mut s = sample();
+        s.session = None;
+        s.weekly.as_mut().unwrap().utilization_pct = 66;
+        let out = render(&oc(s.clone()), &s, &Theme::default(), &opts(), Utc::now());
+        assert!(out.text.contains("66%"));
+        assert!(out.tooltip.contains("Codex weekly"));
+        assert!(!out.tooltip.contains("Codex 5h"));
+
+        let values = build_placeholders(&s, &opts(), Utc::now());
+        assert_eq!(values["oai_session_pct"], "");
+        assert_eq!(values["oai_weekly_pct"], "66");
+    }
+
+    #[test]
+    fn no_windows_uses_plan_only_format_and_reports_absence() {
+        let mut s = sample();
+        s.session = None;
+        s.weekly = None;
+        let out = render(&oc(s.clone()), &s, &Theme::default(), &opts(), Utc::now());
+        assert!(out.text.contains("ChatGPT Plus"));
+        assert!(!out.text.contains('%'));
+        assert!(out.tooltip.contains("no usage windows reported"));
+        assert!(!out.tooltip.contains("Codex 5h"));
+        assert!(!out.tooltip.contains("Codex weekly"));
+        // No windows means max utilization is 0, i.e. the lowest severity.
+        assert_eq!(severity(&s), PaceSeverity::Low);
+    }
+
+    #[test]
+    fn session_only_snapshot_renders_default_with_weekly_placeholders_empty() {
+        let mut s = sample();
+        s.weekly = None;
+        let out = render(&oc(s.clone()), &s, &Theme::default(), &opts(), Utc::now());
+        assert!(out.text.contains("1%"));
+        assert!(out.tooltip.contains("Codex 5h"));
+        assert!(!out.tooltip.contains("Codex weekly"));
+
+        let values = build_placeholders(&s, &opts(), Utc::now());
+        assert_eq!(values["oai_session_pct"], "1");
+        assert_eq!(values["oai_weekly_pct"], "");
+        assert_eq!(values["oai_weekly_reset"], "");
+        assert_eq!(values["oai_weekly_elapsed"], "");
+        assert_eq!(values["weekly_pct"], "");
     }
 
     #[test]
@@ -355,6 +529,42 @@ mod tests {
     }
 
     #[test]
+    fn tooltip_reports_banked_resets_and_stays_silent_without_them() {
+        let s = sample();
+        let quiet = render(&oc(s.clone()), &s, &Theme::default(), &opts(), Utc::now());
+        assert!(!quiet.tooltip.contains("available"), "{}", quiet.tooltip);
+
+        let mut s = s;
+        s.reset_credits = crate::usage::ResetCredits {
+            available: 2,
+            credits: vec![
+                crate::usage::ResetCredit {
+                    title: Some("Full reset (Weekly + 5 hr)".into()),
+                    expires_at: Some(Utc::now() + chrono::Duration::days(13)),
+                },
+                crate::usage::ResetCredit {
+                    title: Some("Full reset (Weekly + 5 hr)".into()),
+                    expires_at: Some(
+                        Utc::now() + chrono::Duration::days(13) + chrono::Duration::hours(6),
+                    ),
+                },
+            ],
+        };
+        let out = render(&oc(s.clone()), &s, &Theme::default(), &opts(), Utc::now());
+        assert!(out.tooltip.contains("Reset credits"), "{}", out.tooltip);
+        assert_eq!(
+            out.tooltip.matches("Full reset (Weekly + 5 hr)").count(),
+            2,
+            "{}",
+            out.tooltip
+        );
+
+        let values = build_placeholders(&s, &opts(), Utc::now());
+        assert_eq!(values["oai_resets_available"], "2");
+        assert_eq!(values["oai_resets"], "2 resets available");
+    }
+
+    #[test]
     fn unavailable_source_shows_codex_login_hint() {
         let mut s = sample();
         s.source = OpenAiSource::Unavailable;
@@ -365,7 +575,19 @@ mod tests {
     #[test]
     fn severity_picks_worst_window() {
         let mut s = sample();
-        s.weekly.utilization_pct = 95;
+        s.weekly.as_mut().unwrap().utilization_pct = 95;
         assert_eq!(severity(&s), PaceSeverity::Critical);
+    }
+
+    /// Codex was left out of the tooltip pace change on purpose. It calls the
+    /// stable `push_window`, so the glyph the row helper learned must not leak
+    /// through that path.
+    #[test]
+    fn tooltip_rows_carry_no_pace_glyph() {
+        let s = sample();
+        let out = render(&oc(s.clone()), &s, &Theme::default(), &opts(), Utc::now());
+        for glyph in ['↑', '→', '↓'] {
+            assert!(!out.tooltip.contains(glyph), "{}", out.tooltip);
+        }
     }
 }

@@ -1,8 +1,8 @@
 //! Canonical in-memory representation of "how much have I used my plan".
 //!
 //! Each vendor's snapshot lives in its own variant — this is deliberate.
-//! Anthropic exposes three windows + extra credits; OpenAI Codex exposes two
-//! windows + credit balance + message-count ranges; OpenRouter is a single
+//! Anthropic exposes three windows + extra credits; OpenAI Codex exposes up to
+//! two windows + credit balance + message-count ranges; OpenRouter is a single
 //! credit-balance number with daily/weekly/monthly totals; Z.AI is a list of
 //! token + MCP buckets; DeepSeek is a credit balance; Kimi is a weekly quota
 //! plus a 5h rolling rate-limit window. Forcing them into a shared shape would
@@ -13,6 +13,7 @@
 //! sharing the pacing math, color thresholds, and Pango primitives.
 
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 
 use crate::error::{AppError, Result};
 
@@ -163,11 +164,12 @@ fn fmt_minor_units(minor: i64, currency: &str) -> String {
     format!("{sign}{} minor units {currency}", minor.unsigned_abs())
 }
 
-/// Format an amount in minor units with its own currency and scale. Rendering
-/// R$ 141.57 as "$141.57" is a claim about the wrong currency — the same class
-/// of defect as a fabricated number. Known codes get their symbol (mirroring
-/// `deepseek::format_money`); anything else renders as `AMOUNT CODE`, which is
-/// still truthful.
+/// Format an amount in minor units with its own currency and scale.
+///
+/// The scale is this function's own — `money` cannot express a zero- or
+/// three-decimal currency — but the *symbol* comes from
+/// [`crate::format::with_currency`], so the two cannot disagree about what a
+/// given code looks like.
 pub fn fmt_minor(minor: i64, decimal_places: u32, currency: Option<&str>) -> String {
     let scale = 10_u64.pow(decimal_places);
     // `unsigned_abs`, not negation: `-i64::MIN` overflows. Unreachable from
@@ -184,14 +186,7 @@ pub fn fmt_minor(minor: i64, decimal_places: u32, currency: Option<&str>) -> Str
             width = decimal_places as usize
         )
     };
-    match currency {
-        None | Some("USD") => format!("{sign}${number}"),
-        Some("BRL") => format!("{sign}R${number}"),
-        Some("EUR") => format!("{sign}€{number}"),
-        Some("GBP") => format!("{sign}£{number}"),
-        Some("JPY") | Some("CNY") => format!("{sign}¥{number}"),
-        Some(other) => format!("{sign}{number} {other}"),
-    }
+    crate::format::with_currency(sign, &number, currency)
 }
 
 /// DeepSeek — credit balance from `/user/balance`.
@@ -219,6 +214,80 @@ impl Default for DeepseekSnapshot {
             topped_up: 0.0,
             currency: String::new(),
         }
+    }
+}
+
+/// Cursor — the two included-usage pools the dashboard shows, from the
+/// undocumented `cursor.com/api/usage-summary` endpoint (the same one the
+/// dashboard's own frontend calls), authenticated with the session token the
+/// Cursor IDE wrote to its local `state.vscdb`.
+///
+/// Since Cursor's mid-2026 pricing, a plan's included compute is split into two
+/// quota pools, each shown as a percentage: **Cursor Models** (Auto + Composer,
+/// `autoPercentUsed`) and **Other Models** (named / third-party, `apiPercentUsed`).
+/// Overflow past either pool falls to on-demand spend. Percentages are integers
+/// (rounded from the wire floats) to match the dashboard and every other
+/// vendor's integer-percent convention; they can exceed 100 when a pool is over
+/// its included allowance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CursorSnapshot {
+    /// Membership label, title-cased from `membershipType` (e.g. "Ultra").
+    pub plan: String,
+    /// "Cursor Models" pool — Auto + Composer (`autoPercentUsed`, rounded).
+    pub auto_pct: i32,
+    /// "Other Models" pool — named / third-party (`apiPercentUsed`, rounded).
+    pub api_pct: i32,
+    /// Overall included usage (`totalPercentUsed`, rounded) — the dashboard's
+    /// "you've used N% of your included total usage" headline.
+    pub total_pct: i32,
+    /// `true` when the plan reports `isUnlimited` — the pools don't cap and the
+    /// percentages are not meaningful.
+    pub unlimited: bool,
+    /// Whether on-demand (overage) spend is turned on (`onDemand.enabled`).
+    pub on_demand_enabled: bool,
+    /// End of the current billing cycle (`billingCycleEnd`) — when the pools
+    /// reset.
+    pub reset_at: Option<DateTime<Utc>>,
+}
+
+impl CursorSnapshot {
+    /// The binding pool — whichever is closest to (or furthest past) its cap.
+    /// Drives the bar color and the single generic `session_pct` alias.
+    pub fn worst_pct(&self) -> i32 {
+        self.auto_pct.max(self.api_pct)
+    }
+}
+
+/// Kiro CLI (AWS CodeWhisperer / Q Developer backend) — a single credit pool
+/// from `AmazonCodeWhispererService.GetUsageLimits`, the same call kiro-cli's
+/// own `/usage` slash command makes. Authenticated with the AWS SSO OIDC
+/// bearer token kiro-cli already cached locally, refreshed with the paired
+/// refresh token when it's close to expiry — see `kiro::db` and `kiro::oauth`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KiroSnapshot {
+    /// Subscription tier label (`subscriptionInfo.subscriptionTitle`, e.g.
+    /// "KIRO POWER").
+    pub plan: String,
+    /// Credits consumed this cycle (`currentUsageWithPrecision`).
+    pub used: f64,
+    /// Credits included in the plan (`usageLimitWithPrecision`).
+    pub limit: f64,
+    /// When the credit pool resets (`nextDateReset`).
+    pub reset_at: Option<DateTime<Utc>>,
+}
+
+impl Eq for KiroSnapshot {}
+
+impl KiroSnapshot {
+    /// Percentage of the credit pool consumed, rounded. `0` when `limit` is
+    /// not positive — defensive; the API has not been observed to send that.
+    pub fn pct(&self) -> i32 {
+        if self.limit <= 0.0 {
+            return 0;
+        }
+        ((self.used / self.limit) * 100.0)
+            .round()
+            .clamp(0.0, 9999.0) as i32
     }
 }
 
@@ -266,6 +335,7 @@ impl KimiSnapshot {
 pub enum VendorSnapshot {
     Anthropic(AnthropicSnapshot),
     Openai(OpenAiSnapshot),
+    Copilot(crate::copilot::types::Snapshot),
     Zai(ZaiSnapshot),
     Openrouter(OpenRouterSnapshot),
     Deepseek(DeepseekSnapshot),
@@ -274,15 +344,23 @@ pub enum VendorSnapshot {
     Novita(NovitaSnapshot),
     Moonshot(MoonshotSnapshot),
     Grok(GrokSnapshot),
+    SuperGrok(SuperGrokSnapshot),
     AnthropicApi(AnthropicApiSnapshot),
     Antigravity(AntigravitySnapshot),
+    Cursor(CursorSnapshot),
     Minimax(MinimaxSnapshot),
+    Kiro(KiroSnapshot),
+    NousResearch(crate::nous::types::AccountSnapshot),
+    OpenCodeGo(crate::opencode_go::types::Usage),
+    CommandCode(crate::commandcode::types::Snapshot),
     Shvia(ShviaSnapshot),
 }
 
 /// Google Antigravity 2.0 / CLI snapshot. The API groups models into Gemini
-/// and third-party (Claude/GPT) buckets, and each group carries its own 5-hour
-/// and weekly window — four independent windows in total.
+/// and third-party (Claude/GPT) buckets, and each group may carry a 5-hour and
+/// a weekly window — up to four, and not every product or plan offers all of
+/// them. Antigravity CLI 1.1.22 returns weekly buckets only, so every window is
+/// optional and a snapshot is valid when at least one arrived.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AntigravitySnapshot {
     pub plan: String,
@@ -290,9 +368,9 @@ pub struct AntigravitySnapshot {
     /// cache written for one Google account is not served for another.
     pub account: String,
     /// Gemini group, 5-hour window.
-    pub session: UsageWindow,
+    pub session: Option<UsageWindow>,
     /// Gemini group, weekly window.
-    pub weekly: UsageWindow,
+    pub weekly: Option<UsageWindow>,
     /// Claude/GPT group, 5-hour window.
     pub third_party_session: Option<UsageWindow>,
     /// Claude/GPT group, weekly window.
@@ -396,22 +474,143 @@ pub struct GrokSnapshot {
 
 impl Eq for GrokSnapshot {}
 
-/// OpenAI Codex OAuth — mirrors Anthropic's two-window + extras pattern.
+/// SuperGrok subscription usage from Grok Build's billing endpoint (ACP as
+/// fallback) plus banked remaining-resets. Distinct from [`GrokSnapshot`]
+/// (Management API prepaid balance).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SuperGrokSnapshot {
+    /// Subscription tier label when the billing response supplies one
+    /// (e.g. "SuperGrok", "SuperGrok Heavy"); otherwise `"SuperGrok"`.
+    pub plan: String,
+    /// Opaque digest of Grok auth/config state. Never displayed — cache
+    /// isolation only.
+    pub account: String,
+    /// Current included-credit usage percent. The field name is retained as a
+    /// compatibility alias for format/render code; [`Self::period`] says
+    /// whether the server's actual window is weekly or monthly.
+    pub weekly_pct: i32,
+    pub period: SuperGrokPeriod,
+    /// When the current usage period ends.
+    pub reset_at: Option<DateTime<Utc>>,
+    /// Remaining prepaid (purchased) API credit in USD, when present.
+    pub prepaid_balance: Option<f64>,
+    pub reset_credits: ResetCredits,
+}
+
+impl Eq for SuperGrokSnapshot {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SuperGrokPeriod {
+    Weekly,
+    Monthly,
+    Unknown,
+}
+
+impl SuperGrokPeriod {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Weekly => "Weekly",
+            Self::Monthly => "Monthly",
+            Self::Unknown => "Current period",
+        }
+    }
+
+    pub fn short(self) -> &'static str {
+        match self {
+            Self::Weekly => "wk",
+            Self::Monthly => "mo",
+            Self::Unknown => "period",
+        }
+    }
+}
+
+/// OpenAI Codex OAuth — exposes whichever rolling windows the API reports.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenAiSnapshot {
     pub plan: String,
-    /// 5h window (Codex `rate_limit.primary_window`).
-    pub session: UsageWindow,
-    /// 7d window (Codex `rate_limit.secondary_window`).
-    pub weekly: UsageWindow,
+    /// 5h window, identified by its duration rather than its wire position.
+    pub session: Option<UsageWindow>,
+    /// 7d window, identified by its duration rather than its wire position.
+    pub weekly: Option<UsageWindow>,
     /// Optional 7d code-review bucket.
     pub code_review: Option<UsageWindow>,
+    /// Named limits beside the main one, each with its own windows. Empty for
+    /// an account that has none.
+    pub additional_limits: Vec<OpenAiNamedLimit>,
+    /// Models the account currently cannot dispatch to, with the time they
+    /// return when the API states one. Only unavailable models are kept: a
+    /// list of everything that *is* working is noise, and the reason this
+    /// exists is to explain a refusal no percentage accounts for.
+    pub unavailable_models: Vec<OpenAiUnavailableModel>,
     /// Optional credit balance + approximate message-count ranges.
     pub credits: Option<OpenAiCredits>,
+    pub reset_credits: ResetCredits,
     /// Source of the snapshot — Codex OAuth vs admin-key fallback. Drives
     /// the placeholder set and the "OpenAI does not expose this for Plus"
     /// tooltip when the OAuth path isn't available.
     pub source: OpenAiSource,
+}
+
+/// A named limit that sits beside Codex's main window — a reserved pool or a
+/// model-specific allowance. It can be exhausted while the headline window is
+/// nearly untouched, which is the case it exists to make visible.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenAiNamedLimit {
+    /// The API's own name for it, shown as given.
+    pub name: String,
+    pub session: Option<UsageWindow>,
+    pub weekly: Option<UsageWindow>,
+}
+
+/// A model the account cannot currently dispatch to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenAiUnavailableModel {
+    pub model: String,
+    /// When the API says it returns. `None` means it did not say.
+    pub available_at: Option<DateTime<Utc>>,
+}
+
+/// Banked, user-redeemable quota resets — Codex's "rate limit reset credits"
+/// and SuperGrok's "remaining resets" are the same idea under two names: a
+/// count you have earned, each with its own expiry, redeemed by hand rather
+/// than arriving on the window's own schedule. Distinct from a
+/// [`UsageWindow::resets_at`], which needs no action and cannot be banked.
+///
+/// The redemption identifier each provider returns alongside these
+/// (`credits[].id`, `tokens[].token_id`) is deliberately *not* carried here:
+/// it is the handle that spends the credit, and nothing that renders a status
+/// bar needs it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResetCredits {
+    pub available: u32,
+    /// One row per credit the provider described. May be shorter than
+    /// `available` — Codex's usage endpoint gives the count without the
+    /// per-credit detail, and the detail call is allowed to fail on its own.
+    #[serde(default)]
+    pub credits: Vec<ResetCredit>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResetCredit {
+    /// Provider label when one exists ("Full reset (Weekly + 5 hr)"). SuperGrok
+    /// tokens have no title.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
+impl ResetCredits {
+    pub fn is_empty(&self) -> bool {
+        self.available == 0
+    }
+
+    pub fn next_expiry(&self) -> Option<DateTime<Utc>> {
+        self.credits
+            .iter()
+            .filter_map(|credit| credit.expires_at)
+            .min()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -510,11 +709,19 @@ pub struct OpenRouterSnapshot {
 impl Eq for OpenRouterSnapshot {}
 
 impl OpenRouterSnapshot {
+    /// Spendable credit, **which can be negative**: OpenRouter lets an account
+    /// run into debt, and clamping that to zero would report a healthy-looking
+    /// `$0.00` to someone who has to top up before anything works again. The
+    /// wire fields are each non-negative (see `openrouter::types`), so a
+    /// negative result only ever means usage has overrun credits.
     pub fn balance(&self) -> f64 {
-        (self.total_credits - self.total_usage).max(0.0)
+        self.total_credits - self.total_usage
     }
     /// Percentage of total_credits consumed (0..=100). Returns 0 when
-    /// `total_credits` is 0 (free-tier-only accounts).
+    /// `total_credits` is 0 (free-tier-only accounts) — there is no
+    /// denominator to be a percentage of. Severity does not come from this
+    /// number alone: see [`crate::openrouter::vendor::severity`], which treats
+    /// a negative [`Self::balance`] as critical regardless of the percentage.
     pub fn consumed_pct(&self) -> i32 {
         if self.total_credits <= 0.0 {
             return 0;
@@ -734,6 +941,28 @@ mod tests {
         };
         assert_eq!(snap.weekly_pct(), 50);
         assert_eq!(snap.window_pct(), 100);
+    }
+
+    #[test]
+    fn kiro_pct_is_zero_without_a_positive_limit() {
+        let snap = KiroSnapshot {
+            plan: "FREE".into(),
+            used: 5.0,
+            limit: 0.0,
+            reset_at: None,
+        };
+        assert_eq!(snap.pct(), 0);
+    }
+
+    #[test]
+    fn kiro_pct_rounds_the_credit_ratio() {
+        let snap = KiroSnapshot {
+            plan: "KIRO POWER".into(),
+            used: 1.0,
+            limit: 3.0,
+            reset_at: None,
+        };
+        assert_eq!(snap.pct(), 33);
     }
 
     #[test]

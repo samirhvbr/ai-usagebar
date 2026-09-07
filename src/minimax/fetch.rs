@@ -9,7 +9,7 @@
 
 use std::time::Duration;
 
-use crate::cache::{Cache, MAX_STALE, acquire_lock_async};
+use crate::cache::{Cache, acquire_lock_async};
 use crate::error::{AppError, Result};
 use crate::usage::{MinimaxSnapshot, UsageWindow};
 use crate::vendor::{MAX_BODY_BYTES, read_body_capped};
@@ -53,13 +53,9 @@ impl Default for Endpoints {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct FetchOutcome {
-    pub snapshot: MinimaxSnapshot,
-    pub stale: bool,
-    pub last_error: Option<(u16, String)>,
-    pub cache_age: Option<Duration>,
-}
+/// This vendor's [`Outcome`](crate::outcome::Outcome) — the shared shape,
+/// specialised to its snapshot.
+pub type FetchOutcome = crate::outcome::Outcome<MinimaxSnapshot>;
 
 pub async fn fetch_snapshot(
     client: &reqwest::Client,
@@ -71,7 +67,7 @@ pub async fn fetch_snapshot(
     cache.ensure_dir()?;
     let _lock = acquire_lock_async(&cache.lock_path(), LOCK_TIMEOUT).await?;
 
-    let target = target_key(endpoints);
+    let target = target_key(endpoints, api_key);
 
     if let Some(bytes) = cache.fresh_payload(cache_ttl)?
         && let Ok(outcome) = reuse_cache(&bytes, cache, false, &target)
@@ -85,70 +81,51 @@ pub async fn fetch_snapshot(
                 &serde_json::json!({ "target": target, "snapshot": serde_repr(&snap) }),
             )?;
             cache.write_payload(&bytes)?;
-            Ok(FetchOutcome {
-                snapshot: snap,
-                stale: false,
-                last_error: None,
-                cache_age: Some(Duration::ZERO),
-            })
+            Ok(crate::outcome::Outcome::fresh(snap))
         }
         Err(e) if e.is_transient() => fallback_silent(cache, &target, e),
         Err(AppError::Http { status, body }) => {
             cache.mark_stale();
-            cache.write_last_error(status, &body);
-            let diag = (status, body.clone());
+            let diag = cache.write_last_error(status, &body);
             fallback_with_error(cache, Some(diag), &target, AppError::Http { status, body })
         }
         Err(e) => {
             cache.mark_stale();
-            cache.write_last_error(0, &e.to_string());
-            let diag = (0, e.to_string());
+            let diag = cache.write_last_error(0, &e.to_string());
             fallback_with_error(cache, Some(diag), &target, e)
         }
     }
 }
 
-/// Identity of the instance the cached quota belongs to. The global and CN
-/// deployments are separate accounts, so a figure from one must never be shown
-/// after the user points the vendor at the other.
-fn target_key(endpoints: &Endpoints) -> String {
-    endpoints.remains.clone()
+/// Identity of the account and instance the cached quota belongs to. Global
+/// and CN are separate deployments, and changing the Token Plan key on the
+/// same deployment can change accounts. Store only a fingerprint of the key:
+/// it is a cache change detector, not an authentication secret.
+fn target_key(endpoints: &Endpoints, api_key: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    api_key.hash(&mut hasher);
+    format!("{}|key:{:016x}", endpoints.remains, hasher.finish())
 }
 
 fn fallback_silent(cache: &Cache, target: &str, original: AppError) -> Result<FetchOutcome> {
-    let Some(bytes) = cache.fallback_payload(MAX_STALE)? else {
-        return Err(original);
-    };
-    reuse_cache(&bytes, cache, true, target)
+    crate::outcome::fallback(cache, None, original, |bytes| parse_cache(bytes, target))
 }
 
-/// On failure we show the last good figure with the error alongside it. With
-/// nothing usable cached there is nothing to show, so the **original** error is
-/// returned rather than a generic "no usable cache" that hides what went wrong.
 fn fallback_with_error(
     cache: &Cache,
     last_error: Option<(u16, String)>,
     target: &str,
     original: AppError,
 ) -> Result<FetchOutcome> {
-    let Some(bytes) = cache.fallback_payload(MAX_STALE)? else {
-        return Err(original);
-    };
-    let Ok(mut outcome) = reuse_cache(&bytes, cache, true, target) else {
-        return Err(original);
-    };
-    outcome.last_error = last_error;
-    Ok(outcome)
+    crate::outcome::fallback(cache, last_error, original, |bytes| {
+        parse_cache(bytes, target)
+    })
 }
 
 fn reuse_cache(bytes: &[u8], cache: &Cache, stale: bool, target: &str) -> Result<FetchOutcome> {
     let snap = parse_cache(bytes, target)?;
-    Ok(FetchOutcome {
-        snapshot: snap,
-        stale,
-        last_error: cache.read_last_error(),
-        cache_age: cache.payload_age(),
-    })
+    Ok(crate::outcome::Outcome::cached(snap, cache, stale))
 }
 
 fn window_repr(w: &UsageWindow) -> serde_json::Value {
@@ -184,6 +161,11 @@ fn parse_window(v: &serde_json::Value, what: &str) -> Result<UsageWindow> {
     let secs = v["window_secs"]
         .as_i64()
         .ok_or_else(|| AppError::Schema(format!("minimax cache missing '{what}.window_secs'")))?;
+    if secs <= 0 {
+        return Err(AppError::Schema(format!(
+            "minimax cache '{what}.window_secs' must be greater than zero"
+        )));
+    }
     Ok(UsageWindow {
         utilization_pct: pct.clamp(0, 100) as i32,
         resets_at,
@@ -308,11 +290,7 @@ mod tests {
         assert!(Endpoints::for_region("cn").remains.starts_with(BASE_CN));
         assert!(Endpoints::for_region("CN").remains.starts_with(BASE_CN));
         // Anything unrecognized stays on the global instance.
-        assert!(
-            Endpoints::for_region("")
-                .remains
-                .starts_with(BASE_GLOBAL)
-        );
+        assert!(Endpoints::for_region("").remains.starts_with(BASE_GLOBAL));
     }
 
     #[tokio::test]
@@ -388,8 +366,9 @@ mod tests {
             .await;
 
         let (_td, cache) = cache_fixture();
+        let other_instance = Endpoints::for_region("cn");
         let seed = serde_json::json!({
-            "target": format!("{BASE_CN}/v1/token_plan/remains"),
+            "target": target_key(&other_instance, "mm-test"),
             "snapshot": {
                 "plan": "MiniMax Token Plan",
                 "session": {"pct": 77, "resets_at": null, "window_secs": 18000},
@@ -414,6 +393,51 @@ mod tests {
         assert_eq!(out.snapshot.session.utilization_pct, 1, "refetched, not 77");
     }
 
+    /// Replacing the configured key can select another Token Plan account on
+    /// the same host. A fresh cache from the previous key must not cross that
+    /// account boundary.
+    #[tokio::test]
+    async fn cache_from_another_key_is_rejected() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("GET", "/v1/token_plan/remains")
+            .match_header("authorization", "Bearer new-key")
+            .with_status(200)
+            .with_body(LIVE_BODY)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let (_td, cache) = cache_fixture();
+        let endpoints = endpoints_for(&server);
+        let seed = serde_json::json!({
+            "target": target_key(&endpoints, "old-key"),
+            "snapshot": {
+                "plan": "MiniMax Token Plan",
+                "session": {"pct": 77, "resets_at": null, "window_secs": 18000},
+                "weekly":  {"pct": 77, "resets_at": null, "window_secs": 604800},
+            }
+        });
+        cache
+            .write_payload(&serde_json::to_vec(&seed).unwrap())
+            .unwrap();
+
+        let out = fetch_snapshot(
+            &reqwest::Client::new(),
+            "new-key",
+            &cache,
+            &endpoints,
+            Duration::from_secs(3600),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.snapshot.session.utilization_pct, 1, "refetched, not 77");
+
+        let stored = std::fs::read(cache.payload_path()).unwrap();
+        let stored = String::from_utf8(stored).unwrap();
+        assert!(!stored.contains("new-key"), "cache leaked the API key");
+    }
+
     #[tokio::test]
     async fn http_error_falls_back_to_matching_cache() {
         let mut server = mockito::Server::new_async().await;
@@ -427,7 +451,7 @@ mod tests {
         let (_td, cache) = cache_fixture();
         let endpoints = endpoints_for(&server);
         let seed = serde_json::json!({
-            "target": target_key(&endpoints),
+            "target": target_key(&endpoints, "mm-test"),
             "snapshot": {
                 "plan": "MiniMax Token Plan",
                 "session": {"pct": 42, "resets_at": null, "window_secs": 18000},
@@ -477,11 +501,29 @@ mod tests {
             video_weekly: None,
         };
         let bytes = serde_json::to_vec(&serde_json::json!({
-            "target": target_key(&endpoints),
+            "target": target_key(&endpoints, "mm-test"),
             "snapshot": serde_repr(&snap),
         }))
         .unwrap();
-        let back = parse_cache(&bytes, &target_key(&endpoints)).unwrap();
+        let back = parse_cache(&bytes, &target_key(&endpoints, "mm-test")).unwrap();
         assert_eq!(back, snap);
+    }
+
+    #[test]
+    fn cache_rejects_non_positive_window_duration() {
+        let endpoints = Endpoints::default();
+        for seconds in [0, -1] {
+            let bytes = serde_json::to_vec(&serde_json::json!({
+                "target": target_key(&endpoints, "mm-test"),
+                "snapshot": {
+                    "plan": "MiniMax Token Plan",
+                    "session": {"pct": 1, "resets_at": null, "window_secs": seconds},
+                    "weekly":  {"pct": 2, "resets_at": null, "window_secs": 604800},
+                }
+            }))
+            .unwrap();
+            let error = parse_cache(&bytes, &target_key(&endpoints, "mm-test")).unwrap_err();
+            assert!(error.to_string().contains("greater than zero"), "{error:?}");
+        }
     }
 }

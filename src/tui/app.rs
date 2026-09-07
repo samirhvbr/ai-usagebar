@@ -1,5 +1,6 @@
 //! TUI app state — vendors, tab selection, per-vendor snapshot cache.
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use chrono::Utc;
@@ -35,13 +36,16 @@ pub struct ReadyTab {
     pub fetched_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-/// Identity of one TUI tab. Usually a whole vendor; for Anthropic it can also
-/// name a specific configured account (issues #14 / #17). `account: None` is a
-/// plain vendor tab — the default Claude account, or any non-Anthropic vendor.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Identity of one TUI tab. Usually a whole vendor; Claude and OpenRouter can
+/// also name a configured account. `account: None` is a plain vendor tab or
+/// that vendor's default account.
+/// `desktop` marks an account whose usage comes from the Claude Desktop app's
+/// own token rather than a `claude` CLI credential.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TabId {
     pub vendor: VendorId,
     pub account: Option<String>,
+    pub desktop: bool,
 }
 
 impl TabId {
@@ -50,34 +54,131 @@ impl TabId {
         Self {
             vendor,
             account: None,
+            desktop: false,
         }
     }
 
     /// A named Anthropic account tab (`[[anthropic.accounts]]` label).
     pub fn account(label: impl Into<String>) -> Self {
+        Self::account_for(VendorId::Anthropic, label)
+    }
+
+    /// A named account for a vendor that supports account arrays.
+    pub fn account_for(vendor: VendorId, label: impl Into<String>) -> Self {
+        Self {
+            vendor,
+            account: Some(label.into()),
+            desktop: false,
+        }
+    }
+
+    /// An Anthropic account whose usage is read from the Claude Desktop app's
+    /// own token store (a saved `~/.claude-acc/profiles/<label>` account).
+    pub fn desktop_account(label: impl Into<String>) -> Self {
         Self {
             vendor: VendorId::Anthropic,
             account: Some(label.into()),
+            desktop: true,
         }
     }
 }
 
-/// Expand enabled vendors into the tab list. Anthropic yields its default
-/// account tab followed by one tab per `[[anthropic.accounts]]` entry, in
-/// config order; every other vendor is a single tab. With no extra accounts
-/// configured the result equals `config.enabled_vendors()` — identical tab set
-/// and order to before (issue #14/#17 back-compat).
+/// Expand enabled vendors into the tab list. Claude, OpenRouter, and Codex
+/// (OpenAI) yield their default account followed by configured named accounts;
+/// every other vendor is a single tab. With no extra accounts the result equals
+/// `config.enabled_vendors()`, preserving the historical tab set and order.
+///
+/// Config-only and pure — no Desktop profiles. Production uses
+/// [`tabs_with_desktop`]; this stays for the hermetic unit tests and any caller
+/// that only wants configured accounts.
 pub fn tabs_from_config(config: &Config) -> Vec<TabId> {
+    build_tabs(config, &[])
+}
+
+/// The production aggregate-view tab list: configured accounts plus every saved
+/// Claude Desktop profile that has usable credentials. Desktop discovery is
+/// best-effort and macOS-only; anywhere else this equals [`tabs_from_config`].
+pub fn tabs_with_desktop(config: &Config) -> Vec<TabId> {
+    build_tabs(config, &desktop_profile_labels(config))
+}
+
+/// Core expansion, parameterized on the Desktop account labels so it stays pure
+/// and unit-testable. Desktop accounts follow the CLI accounts and count toward
+/// "Anthropic has accounts" for the default-tab suppression.
+///
+/// In aggregate views, a label present in both a `[[anthropic.accounts]]` CLI
+/// entry and a Desktop profile is sourced from **Desktop**, and the CLI entry is
+/// dropped. The same account in two stores means two of them refreshing one
+/// rotating refresh token — each rotation invalidates the other's copy — and
+/// the CLI copy can even refresh to a stale/wrong identity that still
+/// authenticates but reports another account's (often zero) usage, which no
+/// credential-health check can catch. The app-maintained Desktop token is the
+/// one source that avoids both the rotation war and that silent misattribution.
+fn build_tabs(config: &Config, desktop_labels: &[String]) -> Vec<TabId> {
+    let desktop_set: HashSet<&str> = desktop_labels.iter().map(String::as_str).collect();
     let mut tabs = Vec::new();
     for vendor in config.enabled_vendors() {
-        tabs.push(TabId::vendor(vendor));
         if vendor == VendorId::Anthropic {
-            for acct in &config.anthropic.accounts {
-                tabs.push(TabId::account(acct.label.clone()));
+            let accounts: Vec<_> = config
+                .anthropic
+                .all_accounts()
+                .into_iter()
+                .filter(|a| !desktop_set.contains(a.label.as_str()))
+                .collect();
+            // The default (unnamed) Claude tab is suppressible once every
+            // account is named — but never when it would leave Anthropic with
+            // no tab at all. Desktop accounts count as named accounts here.
+            if config.anthropic.show_default_account
+                || (accounts.is_empty() && desktop_labels.is_empty())
+            {
+                tabs.push(TabId::vendor(vendor));
             }
+            for acct in accounts {
+                tabs.push(TabId::account(acct.label));
+            }
+            for label in desktop_labels {
+                tabs.push(TabId::desktop_account(label.clone()));
+            }
+        } else if vendor == VendorId::Openrouter {
+            if config.openrouter.show_default_account || config.openrouter.accounts.is_empty() {
+                tabs.push(TabId::vendor(vendor));
+            }
+            for account in &config.openrouter.accounts {
+                tabs.push(TabId::account_for(vendor, account.label.clone()));
+            }
+        } else if vendor == VendorId::Openai {
+            tabs.push(TabId::vendor(vendor));
+            for account in &config.openai.accounts {
+                tabs.push(TabId::account_for(vendor, account.label.clone()));
+            }
+        } else {
+            tabs.push(TabId::vendor(vendor));
         }
     }
     tabs
+}
+
+/// Labels of saved Claude Desktop profiles with usable credentials. macOS-only
+/// (elsewhere there is no Desktop app); best-effort, so an unreadable profile
+/// store just yields none rather than failing the whole tab list.
+#[cfg(target_os = "macos")]
+fn desktop_profile_labels(config: &Config) -> Vec<String> {
+    let Ok(paths) = crate::claude_desktop::Paths::resolve(&config.anthropic) else {
+        return Vec::new();
+    };
+    if !paths.available() {
+        return Vec::new();
+    }
+    crate::claude_desktop::load_profiles(&paths.profiles_dir)
+        .into_iter()
+        .filter(|p| p.has_credentials)
+        .map(|p| p.label)
+        .collect()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn desktop_profile_labels(_config: &Config) -> Vec<String> {
+    Vec::new()
 }
 
 #[derive(Debug)]
@@ -85,10 +186,18 @@ pub struct App {
     pub tabs_meta: Vec<TabId>,
     pub active: usize,
     pub tabs: Vec<TabState>,
+    /// Tab identities with a request currently in flight. Kept separate from
+    /// `tabs` so a successful snapshot remains visible while it is refreshed.
+    refreshing_tabs: HashSet<TabId>,
     /// Monotonically increasing identity for a complete tab-set replacement.
     /// Background fetches carry this with their tab identity so results from a
     /// previous Settings reload cannot land in a new tab at the old index.
     pub tab_generation: u64,
+    /// When `true`, the Overview pane is selected (the virtual first tab that
+    /// summarizes every vendor at once) instead of a per-vendor detail tab.
+    pub overview: bool,
+    /// Which vendors the Overview lists (`[ui] overview_vendors`); `None` = all.
+    pub overview_vendors: Option<Vec<VendorId>>,
     pub theme: Theme,
     pub quit: bool,
     /// When `Some`, the Settings overlay is open and consuming key events.
@@ -101,6 +210,8 @@ pub struct App {
     pub context_generation: u64,
     /// When `Some`, the local Claude Code context overlay owns keyboard input.
     pub context: Option<crate::tui::context::ContextState>,
+    /// Presentation style for the vendor navigation box (`[ui] vendor_box`).
+    pub vendor_box: crate::config::VendorBoxStyle,
 }
 
 impl App {
@@ -121,13 +232,17 @@ impl App {
             tabs_meta,
             active: 0,
             tabs: vec![TabState::Loading; n],
+            refreshing_tabs: HashSet::new(),
             tab_generation: 0,
+            overview: false,
+            overview_vendors: None,
             theme,
             quit: false,
             settings: None,
             context_enabled: false,
             context_generation: 0,
             context: None,
+            vendor_box: crate::config::VendorBoxStyle::Sidebar,
         }
     }
 
@@ -136,7 +251,13 @@ impl App {
     /// isn't present (e.g. it was disabled).
     pub fn new_with_primary(tabs_meta: Vec<TabId>, primary: Option<VendorId>) -> Self {
         let mut app = Self::new(tabs_meta);
-        app.select_primary(primary);
+        // Default landing is the Overview (show everything at once). An explicit
+        // `[ui] primary` opts into opening on that vendor's tab instead.
+        if primary.is_some() {
+            app.select_primary(primary);
+        } else {
+            app.overview = true;
+        }
         app
     }
 
@@ -151,13 +272,46 @@ impl App {
     /// Replace the tab set — used after a Settings save reloads config, so
     /// tabs added or removed in `config.toml` while the TUI is open (e.g. a
     /// new `[[anthropic.accounts]]` entry) appear without a restart. Every
-    /// tab resets to `Loading` (the caller re-spawns fetches) and the
-    /// selection is clamped in case the list shrank.
+    /// tab resets to `Loading` (the caller re-spawns fetches). The selected tab
+    /// is preserved by identity when possible; otherwise its old position is
+    /// clamped in case the list shrank.
     pub fn set_tabs(&mut self, tabs_meta: Vec<TabId>) {
+        let selected = self.active_tab_id().cloned();
+        let fallback = self.active.min(tabs_meta.len().saturating_sub(1));
         self.tab_generation = self.tab_generation.wrapping_add(1);
-        self.active = self.active.min(tabs_meta.len().saturating_sub(1));
+        self.active = selected
+            .as_ref()
+            .and_then(|tab| tabs_meta.iter().position(|candidate| candidate == tab))
+            .unwrap_or(fallback);
         self.tabs = vec![TabState::Loading; tabs_meta.len()];
         self.tabs_meta = tabs_meta;
+        self.refreshing_tabs.clear();
+    }
+
+    /// Mark one tab as in flight. A ready snapshot stays in place; tabs that
+    /// have never succeeded still use the full `Loading` state. Returning
+    /// `false` suppresses duplicate requests for the same tab.
+    pub fn begin_refresh(&mut self, tab: &TabId) -> bool {
+        let Some(index) = self.tabs_meta.iter().position(|current| current == tab) else {
+            return false;
+        };
+        if !self.refreshing_tabs.insert(tab.clone()) {
+            return false;
+        }
+        if !matches!(self.tabs[index], TabState::Ready(_)) {
+            self.tabs[index] = TabState::Loading;
+        }
+        true
+    }
+
+    pub fn is_refreshing(&self, tab: &TabId) -> bool {
+        self.refreshing_tabs.contains(tab)
+    }
+
+    pub fn tab_is_refreshing(&self, index: usize) -> bool {
+        self.tabs_meta
+            .get(index)
+            .is_some_and(|tab| self.is_refreshing(tab))
     }
 
     /// Apply an asynchronous refresh only when it still belongs to this tab
@@ -171,7 +325,19 @@ impl App {
         let Some(index) = self.tabs_meta.iter().position(|current| current == tab) else {
             return false;
         };
-        self.tabs[index] = state;
+        let was_refreshing = self.refreshing_tabs.remove(tab);
+        // If revalidation fails after a successful snapshot, preserve the
+        // useful data but make the failure explicit. Initial failures still
+        // become the normal Error state because there is no data to preserve.
+        if was_refreshing
+            && let TabState::Ready(ready) = &mut self.tabs[index]
+            && let TabState::Error(message) = state
+        {
+            ready.stale = true;
+            ready.last_error = Some((0, message));
+        } else {
+            self.tabs[index] = state;
+        }
         true
     }
 
@@ -182,18 +348,53 @@ impl App {
             && let Some(idx) = self.tabs_meta.iter().position(|t| t.vendor == p)
         {
             self.active = idx;
+            self.overview = false;
         }
     }
 
+    /// The selectable ring is `[Overview, tab0, tab1, …]`. `next_tab`/`prev_tab`
+    /// walk it, wrapping through the Overview at the ends.
     pub fn next_tab(&mut self) {
-        if !self.tabs_meta.is_empty() {
-            self.active = (self.active + 1) % self.tabs_meta.len();
+        if self.overview {
+            if !self.tabs_meta.is_empty() {
+                self.overview = false;
+                self.active = 0;
+            }
+        } else if self.active + 1 < self.tabs_meta.len() {
+            self.active += 1;
+        } else {
+            self.overview = true;
         }
     }
 
     pub fn prev_tab(&mut self) {
-        if !self.tabs_meta.is_empty() {
-            self.active = (self.active + self.tabs_meta.len() - 1) % self.tabs_meta.len();
+        if self.overview {
+            if !self.tabs_meta.is_empty() {
+                self.overview = false;
+                self.active = self.tabs_meta.len() - 1;
+            }
+        } else if self.active > 0 {
+            self.active -= 1;
+        } else {
+            self.overview = true;
+        }
+    }
+
+    /// Tabs the Overview should list: `overview_vendors` filtered against the
+    /// live tab set (preserving the config order), or all tabs when unset.
+    pub fn overview_tabs(&self) -> Vec<usize> {
+        match &self.overview_vendors {
+            None => (0..self.tabs_meta.len()).collect(),
+            Some(wanted) => wanted
+                .iter()
+                .flat_map(|v| {
+                    self.tabs_meta
+                        .iter()
+                        .enumerate()
+                        .filter(move |(_, t)| t.vendor == *v)
+                        .map(|(i, _)| i)
+                })
+                .collect(),
         }
     }
 }
@@ -213,11 +414,13 @@ pub async fn refresh_one(client: &Client, config: &Config, tab: &TabId) -> TabSt
             TabState::Ready(Box::new(ReadyTab {
                 snapshot: outcome.snapshot,
                 stale: outcome.stale,
-                last_error: outcome.last_error,
+                last_error: outcome.last_error.map(|(code, message)| {
+                    (code, crate::display::sanitize_untrusted_field(&message))
+                }),
                 fetched_at,
             }))
         }
-        Err(e) => TabState::Error(e.to_string()),
+        Err(e) => TabState::Error(crate::display::sanitize_untrusted_field(&e.user_message())),
     }
 }
 
@@ -230,6 +433,9 @@ async fn build_outcome(client: &Client, config: &Config, tab: &TabId) -> Result<
             // `credentials_path` is an explicit strict read, and only the
             // platform default gets the macOS Keychain fallback.
             let (creds_target, cache) = match tab.account.as_deref() {
+                Some(label) if tab.desktop => {
+                    crate::anthropic::desktop_creds::account_target(config, label)?
+                }
                 Some(label) => config.anthropic.account_target(label)?,
                 None => {
                     let target = match config.anthropic.credentials_path.clone() {
@@ -250,12 +456,7 @@ async fn build_outcome(client: &Client, config: &Config, tab: &TabId) -> Result<
                 DEFAULT_TTL,
             )
             .await?;
-            Ok(crate::vendor::VendorOutcome {
-                snapshot: crate::usage::VendorSnapshot::Anthropic(outcome.snapshot),
-                stale: outcome.stale,
-                last_error: outcome.last_error,
-                cache_age: outcome.cache_age,
-            })
+            Ok(outcome.map(crate::usage::VendorSnapshot::Anthropic))
         }
         VendorId::AnthropicApi => {
             let key = crate::config::resolve_api_key(
@@ -277,12 +478,11 @@ async fn build_outcome(client: &Client, config: &Config, tab: &TabId) -> Result<
             Ok(outcome.into())
         }
         VendorId::Openrouter => {
-            let api_key = crate::config::resolve_api_key(
-                "OpenRouter",
-                &config.openrouter.api_key_env,
-                config.openrouter.api_key.as_deref(),
-            )?;
-            let cache = crate::cache::Cache::for_vendor("openrouter")?;
+            let api_key = config.openrouter.resolve_api_key(tab.account.as_deref())?;
+            let cache = match tab.account.as_deref() {
+                Some(label) => crate::cache::Cache::for_vendor_account("openrouter", label)?,
+                None => crate::cache::Cache::for_vendor("openrouter")?,
+            };
             let endpoints = crate::openrouter::fetch::Endpoints::default();
             let outcome = crate::openrouter::fetch_snapshot(
                 client,
@@ -314,15 +514,24 @@ async fn build_outcome(client: &Client, config: &Config, tab: &TabId) -> Result<
             Ok(outcome.into())
         }
         VendorId::Openai => {
-            let cache = crate::cache::Cache::for_vendor("openai")?;
-            let creds_path = config
-                .openai
-                .codex_auth_path
-                .clone()
-                .unwrap_or_else(|| crate::openai::creds::default_path().unwrap_or_default());
+            let label = tab.account.as_deref();
+            let cache = match label {
+                Some(label) => crate::cache::Cache::for_vendor_account("openai", label)?,
+                None => crate::cache::Cache::for_vendor("openai")?,
+            };
+            let creds_path = config.openai.resolve_auth_path(label)?;
             let endpoints = crate::openai::fetch::Endpoints::default();
             let outcome =
                 crate::openai::fetch_snapshot(client, &creds_path, &cache, &endpoints, DEFAULT_TTL)
+                    .await?;
+            Ok(outcome.into())
+        }
+        VendorId::Copilot => {
+            let token = config.copilot.resolve_token()?;
+            let cache = crate::cache::Cache::for_vendor("copilot")?;
+            let endpoints = crate::copilot::fetch::Endpoints::default();
+            let outcome =
+                crate::copilot::fetch_snapshot(client, &token, &cache, &endpoints, DEFAULT_TTL)
                     .await?;
             Ok(outcome.into())
         }
@@ -340,16 +549,16 @@ async fn build_outcome(client: &Client, config: &Config, tab: &TabId) -> Result<
             Ok(outcome.into())
         }
         VendorId::Kimi => {
-            let api_key = crate::config::resolve_api_key(
-                "Kimi",
-                &config.kimi.api_key_env,
-                config.kimi.api_key.as_deref(),
-            )?;
+            let (auth, endpoints) = crate::kimi::resolve_auth(&config.kimi)?;
             let cache = crate::cache::Cache::for_vendor("kimi")?;
-            let endpoints = crate::kimi::fetch::Endpoints::default();
-            let outcome =
-                crate::kimi::fetch_snapshot(client, &api_key, &cache, &endpoints, DEFAULT_TTL)
-                    .await?;
+            let outcome = crate::kimi::fetch::fetch_snapshot_with_auth(
+                client,
+                &auth,
+                &cache,
+                &endpoints,
+                DEFAULT_TTL,
+            )
+            .await?;
             Ok(outcome.into())
         }
         VendorId::Kilo => {
@@ -460,10 +669,111 @@ async fn build_outcome(client: &Client, config: &Config, tab: &TabId) -> Result<
             .await?;
             Ok(outcome.into())
         }
+        VendorId::Supergrok => {
+            let cache = crate::cache::Cache::for_vendor("supergrok")?;
+            let scope_paths = crate::supergrok::scope::ScopePaths::with_overrides(
+                config.supergrok.auth_path.as_deref(),
+                config.supergrok.config_path.as_deref(),
+            )?;
+            let outcome = crate::supergrok::fetch_snapshot(
+                &config.supergrok.grok_binary,
+                &scope_paths,
+                &cache,
+                DEFAULT_TTL,
+            )
+            .await?;
+            Ok(outcome.into())
+        }
         VendorId::Antigravity => {
             // No credentials: the local Antigravity server is the source.
             let cache = crate::cache::Cache::for_vendor("antigravity")?;
             let outcome = crate::antigravity::fetch_snapshot(client, &cache, DEFAULT_TTL).await?;
+            Ok(outcome.into())
+        }
+        VendorId::Cursor => {
+            let cache = crate::cache::Cache::for_vendor("cursor")?;
+            let db_path = config
+                .cursor
+                .db_path
+                .clone()
+                .map(Ok)
+                .unwrap_or_else(crate::cursor::db::default_db_path)?;
+            let agent_auth_path = config
+                .cursor
+                .agent_auth_path
+                .clone()
+                .map(Ok)
+                .unwrap_or_else(crate::cursor::db::default_agent_auth_path)?;
+            let endpoints = crate::cursor::fetch::Endpoints::default();
+            let outcome = crate::cursor::fetch_snapshot(
+                client,
+                &db_path,
+                &agent_auth_path,
+                &cache,
+                &endpoints,
+                DEFAULT_TTL,
+            )
+            .await?;
+            Ok(outcome.into())
+        }
+        VendorId::Kiro => {
+            let cache = crate::cache::Cache::for_vendor("kiro")?;
+            let db_path = config
+                .kiro
+                .db_path
+                .clone()
+                .map(Ok)
+                .unwrap_or_else(crate::kiro::db::default_db_path)?;
+            let outcome =
+                crate::kiro::fetch_snapshot(client, &db_path, &cache, DEFAULT_TTL).await?;
+            Ok(outcome.into())
+        }
+        VendorId::NousResearch => {
+            let store = crate::nous::credentials::CredentialStore::default();
+            let endpoints = crate::nous::fetch::Endpoints::default();
+            let account = crate::nous::fetch::fetch_account_with_refresh(
+                client,
+                &store,
+                &endpoints,
+                Utc::now(),
+            )
+            .await?;
+            // Nous keeps no cache of its own, so every read is a live one.
+            Ok(crate::outcome::Outcome::fresh(
+                crate::usage::VendorSnapshot::NousResearch(account),
+            ))
+        }
+        VendorId::OpenCodeGo => {
+            let api_key = crate::config::resolve_api_key(
+                "OpenCode Go",
+                &config.opencode_go.api_key_env,
+                config.opencode_go.api_key.as_deref(),
+            )?;
+            let cache = crate::cache::Cache::for_vendor("opencode-go")?;
+            let endpoints = crate::opencode_go::fetch::Endpoints::default();
+            let outcome = crate::opencode_go::fetch::fetch_snapshot(
+                client,
+                &api_key,
+                &cache,
+                &endpoints,
+                DEFAULT_TTL,
+            )
+            .await?;
+            Ok(outcome.into())
+        }
+        VendorId::CommandCode => {
+            let credential =
+                crate::commandcode::creds::resolve(config.commandcode.auth_paths.as_deref())?;
+            let cache = crate::cache::Cache::for_vendor("commandcode")?;
+            let endpoints = crate::commandcode::fetch::Endpoints::default();
+            let outcome = crate::commandcode::fetch::fetch_snapshot(
+                client,
+                &credential.token,
+                &cache,
+                &endpoints,
+                DEFAULT_TTL,
+            )
+            .await?;
             Ok(outcome.into())
         }
     }
@@ -473,6 +783,34 @@ async fn build_outcome(client: &Client, config: &Config, tab: &TabId) -> Result<
 /// automatic refreshes.
 pub const REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Gap between successive Anthropic fetches at refresh time. Every Anthropic
+/// tab (the default account and each named/discovered account) hits the same
+/// `/api/oauth/usage` + token-refresh endpoints, which rate-limit a burst of
+/// simultaneous requests from one client — so with several accounts the TUI
+/// would fire them all at once and some would come back `429`. Spacing them
+/// out keeps every account refreshing politely.
+pub const ANTHROPIC_REFRESH_STAGGER: Duration = Duration::from_millis(800);
+
+/// Per-tab startup delay for one `spawn_all` pass. Only Anthropic tabs are
+/// staggered (they share the rate-limited endpoint and multiply with accounts);
+/// every other vendor hits its own endpoint and starts immediately. The first
+/// Anthropic tab also starts immediately; each subsequent one waits one more
+/// `step`. Pure and position-based so it is unit-testable.
+pub fn refresh_stagger(tabs: &[TabId], step: Duration) -> Vec<Duration> {
+    let mut anthropic_seen: u32 = 0;
+    tabs.iter()
+        .map(|tab| {
+            if tab.vendor == VendorId::Anthropic {
+                let delay = step * anthropic_seen;
+                anthropic_seen += 1;
+                delay
+            } else {
+                Duration::ZERO
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -481,6 +819,43 @@ mod tests {
     // Use `App::with_theme(.., Theme::default())` rather than `App::new`, which
     // would read the real Omarchy theme file + `$HOME`. The tab-selection logic
     // under test is theme-agnostic.
+    #[test]
+    fn refresh_stagger_spaces_out_anthropic_tabs_only() {
+        let step = Duration::from_millis(800);
+        let tabs = vec![
+            TabId::vendor(VendorId::Anthropic), // default account
+            TabId::account("work"),
+            TabId::account("personal"),
+            TabId::vendor(VendorId::Openai),
+            TabId::vendor(VendorId::Zai),
+        ];
+        let delays = refresh_stagger(&tabs, step);
+        assert_eq!(
+            delays,
+            vec![
+                Duration::ZERO, // 1st anthropic — immediate
+                step,           // 2nd anthropic
+                step * 2,       // 3rd anthropic
+                Duration::ZERO, // openai — own endpoint, immediate
+                Duration::ZERO, // zai — own endpoint, immediate
+            ]
+        );
+    }
+
+    #[test]
+    fn refresh_stagger_is_a_noop_without_anthropic_accounts() {
+        // A single Anthropic tab (or none) never waits.
+        let tabs = vec![
+            TabId::vendor(VendorId::Anthropic),
+            TabId::vendor(VendorId::Openrouter),
+        ];
+        assert!(
+            refresh_stagger(&tabs, Duration::from_millis(800))
+                .iter()
+                .all(|d| d.is_zero())
+        );
+    }
+
     #[test]
     fn select_primary_moves_to_enabled_vendor() {
         let mut app = App::with_theme(
@@ -501,6 +876,55 @@ mod tests {
         assert_eq!(app.active_vendor(), Some(VendorId::Anthropic));
     }
 
+    #[test]
+    fn nav_ring_wraps_through_the_overview_at_both_ends() {
+        let mut app = App::with_theme(
+            vec![
+                TabId::vendor(VendorId::Anthropic),
+                TabId::vendor(VendorId::Openai),
+            ],
+            Theme::default(),
+        );
+        app.overview = true;
+
+        app.next_tab(); // Overview -> first vendor
+        assert!(!app.overview);
+        assert_eq!(app.active, 0);
+        app.next_tab();
+        assert_eq!(app.active, 1);
+        app.next_tab(); // last vendor -> Overview
+        assert!(app.overview);
+
+        app.prev_tab(); // Overview -> last vendor
+        assert!(!app.overview);
+        assert_eq!(app.active, 1);
+        app.prev_tab();
+        assert_eq!(app.active, 0);
+        app.prev_tab(); // first vendor -> Overview
+        assert!(app.overview);
+    }
+
+    #[test]
+    fn overview_tabs_defaults_to_all_and_honors_the_config_filter() {
+        let mut app = App::with_theme(
+            vec![
+                TabId::vendor(VendorId::Anthropic),
+                TabId::vendor(VendorId::Openai),
+                TabId::vendor(VendorId::Zai),
+            ],
+            Theme::default(),
+        );
+        assert_eq!(app.overview_tabs(), vec![0, 1, 2]);
+
+        // Subset in the given order.
+        app.overview_vendors = Some(vec![VendorId::Zai, VendorId::Anthropic]);
+        assert_eq!(app.overview_tabs(), vec![2, 0]);
+
+        // A listed-but-absent vendor is simply skipped.
+        app.overview_vendors = Some(vec![VendorId::Grok, VendorId::Openai]);
+        assert_eq!(app.overview_tabs(), vec![1]);
+    }
+
     fn config_with_accounts(labels: &[&str]) -> Config {
         let mut config = Config::default();
         // Keep only Anthropic enabled so the test asserts on account expansion,
@@ -517,6 +941,30 @@ mod tests {
             })
             .collect();
         config
+    }
+
+    #[test]
+    fn show_default_account_false_hides_the_unnamed_claude_tab() {
+        // With named accounts and show_default_account=false, only the named
+        // tabs appear — no redundant default "Claude" tab.
+        let mut config = config_with_accounts(&["work", "personal"]);
+        config.anthropic.show_default_account = false;
+        assert_eq!(
+            tabs_from_config(&config),
+            vec![TabId::account("work"), TabId::account("personal")]
+        );
+
+        // But with no named accounts it is kept, so Anthropic never loses its
+        // only tab.
+        let mut empty = Config::default();
+        empty.openai.enabled = false;
+        empty.zai.enabled = false;
+        empty.openrouter.enabled = false;
+        empty.anthropic.show_default_account = false;
+        assert_eq!(
+            tabs_from_config(&empty),
+            vec![TabId::vendor(VendorId::Anthropic)]
+        );
     }
 
     #[test]
@@ -544,6 +992,162 @@ mod tests {
     }
 
     #[test]
+    fn tabs_expand_openrouter_accounts_without_changing_other_vendors() {
+        let mut config = Config::default();
+        config.anthropic.enabled = false;
+        config.openai.enabled = false;
+        config.zai.enabled = false;
+        config.openrouter.accounts = vec![
+            crate::config::OpenRouterAccount {
+                label: "work".into(),
+                api_key_env: Some("OPENROUTER_WORK_API_KEY".into()),
+                api_key: None,
+            },
+            crate::config::OpenRouterAccount {
+                label: "personal".into(),
+                api_key_env: None,
+                api_key: Some("personal-key".into()),
+            },
+        ];
+        assert_eq!(
+            tabs_from_config(&config),
+            vec![
+                TabId::vendor(VendorId::Openrouter),
+                TabId::account_for(VendorId::Openrouter, "work"),
+                TabId::account_for(VendorId::Openrouter, "personal"),
+            ]
+        );
+    }
+
+    #[test]
+    fn openai_named_accounts_get_their_own_tabs_after_the_default() {
+        let mut config = Config::default();
+        config.anthropic.enabled = false;
+        config.zai.enabled = false;
+        config.openrouter.enabled = false;
+        config.openai.accounts.push(crate::config::OpenAiAccount {
+            label: "work".into(),
+            codex_auth_path: "/tmp/codex-work/auth.json".into(),
+        });
+        assert_eq!(
+            tabs_from_config(&config),
+            vec![
+                TabId::vendor(VendorId::Openai),
+                TabId::account_for(VendorId::Openai, "work"),
+            ]
+        );
+    }
+
+    #[test]
+    fn openrouter_can_hide_default_only_when_named_accounts_exist() {
+        let mut config = Config::default();
+        config.anthropic.enabled = false;
+        config.openai.enabled = false;
+        config.zai.enabled = false;
+        config.openrouter.show_default_account = false;
+        assert_eq!(
+            tabs_from_config(&config),
+            vec![TabId::vendor(VendorId::Openrouter)]
+        );
+
+        config
+            .openrouter
+            .accounts
+            .push(crate::config::OpenRouterAccount {
+                label: "work".into(),
+                api_key_env: Some("OPENROUTER_WORK_API_KEY".into()),
+                api_key: None,
+            });
+        assert_eq!(
+            tabs_from_config(&config),
+            vec![TabId::account_for(VendorId::Openrouter, "work")]
+        );
+    }
+
+    #[test]
+    fn tabs_include_accounts_auto_discovered_from_accounts_dir() {
+        // A CLAUDE_CONFIG_DIR-style directory becomes account tabs with no
+        // explicit [[anthropic.accounts]] entry. Hermetic: real TempDir.
+        let td = tempfile::tempdir().unwrap();
+        for label in ["work", "personal"] {
+            let dir = td.path().join(label);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(".credentials.json"), "{}").unwrap();
+        }
+        let mut config = Config::default();
+        config.openai.enabled = false;
+        config.zai.enabled = false;
+        config.openrouter.enabled = false;
+        config.anthropic.accounts_dir = Some(td.path().to_path_buf());
+
+        let tabs = tabs_from_config(&config);
+        assert_eq!(
+            tabs,
+            vec![
+                TabId::vendor(VendorId::Anthropic),
+                TabId::account("personal"), // sorted by label
+                TabId::account("work"),
+            ]
+        );
+    }
+
+    #[test]
+    fn desktop_labels_become_account_tabs_after_cli_accounts() {
+        // Pure core: desktop accounts follow CLI accounts, in the order given.
+        let config = config_with_accounts(&["work"]);
+        let tabs = build_tabs(&config, &["gmail".into(), "hotmail".into()]);
+        assert_eq!(
+            tabs,
+            vec![
+                TabId::vendor(VendorId::Anthropic),
+                TabId::account("work"),
+                TabId::desktop_account("gmail"),
+                TabId::desktop_account("hotmail"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_desktop_profile_wins_a_label_collision_with_a_cli_account() {
+        // One tab per label; the Desktop source wins so the label is never fed
+        // from two stores refreshing one rotating token (which invalidate each
+        // other and can silently show a wrong account's usage). The CLI entry is
+        // dropped; a CLI-only label (work) is untouched.
+        let config = config_with_accounts(&["gmail", "work"]);
+        let tabs = build_tabs(&config, &["gmail".into(), "hotmail".into()]);
+        assert_eq!(
+            tabs,
+            vec![
+                TabId::vendor(VendorId::Anthropic),
+                TabId::account("work"),
+                TabId::desktop_account("gmail"),
+                TabId::desktop_account("hotmail"),
+            ]
+        );
+    }
+
+    #[test]
+    fn desktop_accounts_suppress_the_default_tab_like_named_ones() {
+        // show_default_account=false + only Desktop accounts => no default tab,
+        // exactly as if they were [[anthropic.accounts]] (the Desktop-only user).
+        let mut config = config_with_accounts(&[]);
+        config.cursor.enabled = false;
+        config.anthropic.show_default_account = false;
+
+        // No accounts of either kind: the default tab survives (never leave
+        // Anthropic tab-less).
+        assert_eq!(
+            build_tabs(&config, &[]),
+            vec![TabId::vendor(VendorId::Anthropic)]
+        );
+        // A Desktop account is present: default suppressed, only the account.
+        assert_eq!(
+            build_tabs(&config, &["gmail".into()]),
+            vec![TabId::desktop_account("gmail")]
+        );
+    }
+
+    #[test]
     fn set_tabs_resets_states_and_clamps_selection() {
         // Simulates a Settings save that shrank the tab list: the selection
         // must clamp into range and every tab must reset to Loading so the
@@ -554,11 +1158,35 @@ mod tests {
         );
         app.active = 2; // "personal"
         app.tabs[0] = TabState::Error("old".into());
+        let old_tab = app.tabs_meta[0].clone();
+        assert!(app.begin_refresh(&old_tab));
 
         app.set_tabs(tabs_from_config(&config_with_accounts(&[])));
         assert_eq!(app.tabs_meta, vec![TabId::vendor(VendorId::Anthropic)]);
         assert_eq!(app.active, 0, "selection clamped after shrink");
         assert!(matches!(app.tabs[0], TabState::Loading));
+        assert!(!app.is_refreshing(&old_tab));
+    }
+
+    #[test]
+    fn set_tabs_preserves_selected_identity_when_entries_are_inserted() {
+        let mut app = App::with_theme(
+            vec![
+                TabId::vendor(VendorId::Anthropic),
+                TabId::vendor(VendorId::Openai),
+            ],
+            Theme::default(),
+        );
+        app.active = 1;
+
+        app.set_tabs(vec![
+            TabId::vendor(VendorId::Anthropic),
+            TabId::account("work"),
+            TabId::vendor(VendorId::Openai),
+        ]);
+
+        assert_eq!(app.active, 2);
+        assert_eq!(app.active_tab_id(), Some(&TabId::vendor(VendorId::Openai)));
     }
 
     #[test]
@@ -594,6 +1222,7 @@ mod tests {
         let openai = TabId::vendor(VendorId::Openai);
         let mut app = App::with_theme(vec![anthropic.clone(), openai.clone()], Theme::default());
         let generation = app.tab_generation;
+        assert!(app.begin_refresh(&anthropic));
 
         // A reorder is safe because delivery resolves the captured identity,
         // not a stale positional index.
@@ -602,6 +1231,7 @@ mod tests {
         assert!(app.apply_refresh(generation, &anthropic, TabState::Error("ready".into())));
         assert!(matches!(app.tabs[0], TabState::Loading));
         assert!(matches!(&app.tabs[1], TabState::Error(message) if message == "ready"));
+        assert!(!app.is_refreshing(&anthropic));
     }
 
     fn ready_at(fetched_at: chrono::DateTime<Utc>) -> TabState {
@@ -621,6 +1251,103 @@ mod tests {
             last_error: None,
             fetched_at: Some(fetched_at),
         }))
+    }
+
+    #[test]
+    fn refresh_keeps_ready_snapshot_visible_and_suppresses_duplicates() {
+        let tab = TabId::vendor(VendorId::Openrouter);
+        let fetched_at = Utc.with_ymd_and_hms(2026, 5, 23, 12, 0, 0).unwrap();
+        let mut app = App::with_theme(vec![tab.clone()], Theme::default());
+        app.tabs[0] = ready_at(fetched_at);
+
+        assert!(app.begin_refresh(&tab));
+        assert!(
+            !app.begin_refresh(&tab),
+            "duplicate request must be suppressed"
+        );
+        assert!(app.is_refreshing(&tab));
+        match &app.tabs[0] {
+            TabState::Ready(ready) => assert_eq!(ready.fetched_at, Some(fetched_at)),
+            other => panic!("ready snapshot disappeared during refresh: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn first_refresh_still_uses_loading_until_data_arrives() {
+        let tab = TabId::vendor(VendorId::Openrouter);
+        let mut app = App::with_theme(vec![tab.clone()], Theme::default());
+
+        assert!(app.begin_refresh(&tab));
+        assert!(app.is_refreshing(&tab));
+        assert!(matches!(app.tabs[0], TabState::Loading));
+
+        assert!(app.apply_refresh(
+            app.tab_generation,
+            &tab,
+            TabState::Error("not signed in".into()),
+        ));
+        assert!(!app.is_refreshing(&tab));
+        assert!(matches!(&app.tabs[0], TabState::Error(message) if message == "not signed in"));
+    }
+
+    #[test]
+    fn successful_revalidation_replaces_snapshot_and_clears_indicator() {
+        let tab = TabId::vendor(VendorId::Openrouter);
+        let old_at = Utc.with_ymd_and_hms(2026, 5, 23, 12, 0, 0).unwrap();
+        let new_at = Utc.with_ymd_and_hms(2026, 5, 23, 12, 1, 0).unwrap();
+        let mut app = App::with_theme(vec![tab.clone()], Theme::default());
+        app.tabs[0] = ready_at(old_at);
+
+        assert!(app.begin_refresh(&tab));
+        assert!(app.apply_refresh(app.tab_generation, &tab, ready_at(new_at)));
+        assert!(!app.is_refreshing(&tab));
+        match &app.tabs[0] {
+            TabState::Ready(ready) => assert_eq!(ready.fetched_at, Some(new_at)),
+            other => panic!("expected replacement snapshot, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn failed_revalidation_preserves_snapshot_with_visible_warning() {
+        let tab = TabId::vendor(VendorId::Openrouter);
+        let fetched_at = Utc.with_ymd_and_hms(2026, 5, 23, 12, 0, 0).unwrap();
+        let mut app = App::with_theme(vec![tab.clone()], Theme::default());
+        app.tabs[0] = ready_at(fetched_at);
+
+        assert!(app.begin_refresh(&tab));
+        assert!(app.apply_refresh(
+            app.tab_generation,
+            &tab,
+            TabState::Error("refresh failed".into()),
+        ));
+        assert!(!app.is_refreshing(&tab));
+        match &app.tabs[0] {
+            TabState::Ready(ready) => {
+                assert_eq!(ready.fetched_at, Some(fetched_at));
+                assert!(ready.stale);
+                assert_eq!(ready.last_error, Some((0, "refresh failed".into())));
+            }
+            other => panic!("last successful snapshot was lost: {other:?}"),
+        }
+        let sections = crate::tui::panels::sections_for(&app.tabs[0], Utc::now(), 5);
+        assert!(sections.iter().any(|section| matches!(
+            section,
+            crate::tui::panels::Section::Text { label, value }
+                if label == "Warning" && value == "refresh failed"
+        )));
+    }
+
+    #[test]
+    fn old_generation_result_does_not_clear_current_refresh() {
+        let tab = TabId::vendor(VendorId::Openrouter);
+        let mut app = App::with_theme(vec![tab.clone()], Theme::default());
+        let old_generation = app.tab_generation;
+        app.set_tabs(vec![tab.clone()]);
+        assert!(app.begin_refresh(&tab));
+
+        assert!(!app.apply_refresh(old_generation, &tab, TabState::Error("old result".into()),));
+        assert!(app.is_refreshing(&tab));
+        assert!(matches!(app.tabs[0], TabState::Loading));
     }
 
     #[test]

@@ -30,39 +30,15 @@ struct RefreshRequest<'a> {
 
 #[derive(Debug, Deserialize)]
 pub struct RefreshResponse {
-    #[serde(deserialize_with = "de_nonempty_string")]
+    #[serde(deserialize_with = "crate::serde_helpers::de_nonempty_string")]
     pub access_token: String,
-    #[serde(default, deserialize_with = "de_opt_nonempty_string")]
+    #[serde(
+        default,
+        deserialize_with = "crate::serde_helpers::de_opt_nonempty_string"
+    )]
     pub refresh_token: Option<String>,
     #[serde(deserialize_with = "de_expires_in")]
     pub expires_in: u64,
-}
-
-fn de_nonempty_string<'de, D>(d: D) -> std::result::Result<String, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = String::deserialize(d)?;
-    if value.trim().is_empty() {
-        Err(serde::de::Error::custom("token cannot be empty"))
-    } else {
-        Ok(value)
-    }
-}
-
-fn de_opt_nonempty_string<'de, D>(d: D) -> std::result::Result<Option<String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    Option::<String>::deserialize(d)?
-        .map(|value| {
-            if value.trim().is_empty() {
-                Err(serde::de::Error::custom("token cannot be empty"))
-            } else {
-                Ok(value)
-            }
-        })
-        .transpose()
 }
 
 fn de_expires_in<'de, D>(d: D) -> std::result::Result<u64, D::Error>
@@ -134,7 +110,7 @@ pub async fn refresh(
     }
 
     serde_json::from_str(&body)
-        .map_err(|e| AppError::Schema(format!("token refresh response: {e}; body: {body}")))
+        .map_err(|e| AppError::Schema(format!("token refresh response: {e}")))
 }
 
 /// Extract a human-readable error message from a non-2xx refresh body.
@@ -294,6 +270,29 @@ mod tests {
             .unwrap();
         assert_eq!(resp.expires_in, 3600);
         assert!(resp.refresh_token.is_none());
+    }
+
+    #[tokio::test]
+    async fn malformed_success_does_not_echo_tokens_in_the_error() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/v1/oauth/token")
+            .with_status(200)
+            .with_body(
+                r#"{"access_token":"sensitive-access-token","refresh_token":"sensitive-refresh-token","expires_in":"invalid"}"#,
+            )
+            .create_async()
+            .await;
+
+        let client = reqwest::Client::new();
+        let error = refresh(&client, &format!("{}/v1/oauth/token", server.url()), "old")
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("token refresh response"));
+        assert!(!error.contains("sensitive-access-token"));
+        assert!(!error.contains("sensitive-refresh-token"));
     }
 
     #[tokio::test]

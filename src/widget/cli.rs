@@ -10,7 +10,9 @@ use clap::{Parser, ValueEnum};
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "ai-usagebar",
-    about = "Waybar widget for AI plan usage (Anthropic / OpenAI / Z.AI / OpenRouter / DeepSeek / Kimi)",
+    version,
+    args_conflicts_with_subcommands = true,
+    about = "Waybar widget and terminal dashboard for multi-provider AI plan usage",
     long_about = "\
 Drop-in replacement for `claudebar` with multi-vendor support.
 
@@ -114,13 +116,163 @@ pub struct Cli {
     #[arg(long, value_name = "FILE")]
     pub creds_path: Option<std::path::PathBuf>,
 
-    /// Select a named Anthropic account from `[[anthropic.accounts]]` in
-    /// config (issue #14). Without it, `--vendor anthropic` uses the default
-    /// account — the singular `[anthropic] credentials_path` — with unchanged
-    /// output and cache path. Anthropic only; conflicts with the lower-level
-    /// `--creds-path` (they both name a credentials file).
+    /// Select a named Claude, OpenRouter, or Codex (OpenAI) account from the matching
+    /// `[[...accounts]]` config array. Without it, the vendor's default account
+    /// and original cache path are unchanged. For Claude it conflicts with the
+    /// lower-level `--creds-path` because both select a credential source.
     #[arg(long, value_name = "LABEL", conflicts_with = "creds_path")]
     pub account: Option<String>,
+
+    /// Read `--account <LABEL>`'s usage from the Claude **Desktop app's** own
+    /// token instead of a `claude` CLI credential — a saved
+    /// `~/.claude-acc/profiles/<LABEL>` account, no CLI login required (macOS).
+    /// This is how the menu bar shows Desktop accounts in its overview.
+    #[arg(long, requires = "account")]
+    pub desktop: bool,
+
+    /// Administrative command. Omit it to run the normal usage widget.
+    #[command(subcommand)]
+    pub command: Option<Command>,
+}
+
+#[derive(clap::Subcommand, Debug, Clone)]
+pub enum Command {
+    /// Manage named Claude (Anthropic) accounts.
+    Account {
+        #[command(subcommand)]
+        action: AccountAction,
+    },
+
+    /// Quota and time-to-reset for every configured vendor and account.
+    Usage {
+        /// Machine-readable output.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Read or update settings for native desktop frontends.
+    Settings {
+        #[command(subcommand)]
+        action: SettingsAction,
+    },
+
+    /// Authenticate a provider without starting the widget.
+    Auth {
+        #[command(subcommand)]
+        provider: AuthProvider,
+    },
+}
+
+#[derive(clap::Subcommand, Debug, Clone)]
+pub enum AuthProvider {
+    Nous {
+        #[command(subcommand)]
+        action: NousAuthAction,
+    },
+}
+
+#[derive(clap::Subcommand, Debug, Clone)]
+pub enum NousAuthAction {
+    /// Start the Nous Research OAuth device flow.
+    Login,
+    /// Remove only the Nous Research credential.
+    Logout,
+}
+
+#[derive(clap::Subcommand, Debug, Clone)]
+pub enum SettingsAction {
+    /// Print a non-secret JSON settings description.
+    Show,
+
+    /// Apply one JSON settings patch read from standard input.
+    Apply,
+}
+
+#[derive(clap::Subcommand, Debug, Clone)]
+pub enum AccountAction {
+    /// Register an isolated account and open Claude Code to sign it in.
+    Add {
+        /// Stable name used by `--account`, the TUI, and desktop apps.
+        label: String,
+
+        /// Only register the account; do not launch interactive login.
+        #[arg(long, conflicts_with = "desktop")]
+        no_login: bool,
+
+        /// Capture a Claude **Desktop app** account under this label instead
+        /// of a `claude` CLI one (macOS). The app has a single login slot, so
+        /// this signs it out, waits for you to sign in as the new account, and
+        /// saves what it writes. Your current login is restored if you cancel.
+        #[arg(long)]
+        desktop: bool,
+
+        /// E-mail to label a `--desktop` account with. Asked for at the prompt
+        /// if omitted; purely cosmetic, and skipped when not interactive.
+        #[arg(long, requires = "desktop")]
+        email: Option<String>,
+
+        /// Skip the confirmation before signing the Desktop app out.
+        #[arg(short = 'y', long, requires = "desktop")]
+        yes: bool,
+    },
+
+    /// Show which Claude account the Desktop app and the `claude` CLI use.
+    Status {
+        /// Machine-readable output, consumed by the macOS menu bar.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Make <LABEL> the active Claude account (macOS).
+    Switch {
+        /// Account to switch to. Desktop profiles come from claude-acc's store;
+        /// CLI accounts from `[[anthropic.accounts]]` / `accounts_dir`.
+        label: String,
+
+        /// Only switch the Claude Desktop app. Neither flag switches both.
+        #[arg(long)]
+        desktop: bool,
+
+        /// Only switch the `claude` CLI's default login.
+        #[arg(long)]
+        cli: bool,
+
+        /// Report what would change and exit without touching anything.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Skip the confirmation before quitting the Claude Desktop app.
+        #[arg(short = 'y', long)]
+        yes: bool,
+
+        /// Overwrite a `claude` CLI login that belongs to no managed account.
+        /// That login cannot be saved first, so this discards it.
+        #[arg(long)]
+        force: bool,
+
+        /// Keep `bridge-state.json` rather than clearing it. Diagnostic only:
+        /// a stale remote-control session id breaks `/remote-control`.
+        #[arg(long)]
+        keep_bridge: bool,
+
+        /// Also archive the whole session tree, as claude-acc does. Off by
+        /// default because the history merge is additive.
+        #[arg(long)]
+        backup_sessions: bool,
+
+        /// Rollback archives to retain.
+        #[arg(long, default_value_t = 10)]
+        keep_backups: usize,
+
+        /// Confirm that this type-scoped conflict key, deleted in one account
+        /// but still held by another, should be removed everywhere. Repeatable.
+        /// Supplying any suppresses the interactive prompt — keys not listed
+        /// are kept — which is how the macOS menu bar passes an answered dialog
+        /// through.
+        /// `account status --json` lists the candidates as `deletion_conflicts`.
+        #[arg(long, value_name = "KEY")]
+        delete_conflict: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
@@ -129,6 +281,7 @@ pub enum Vendor {
     #[value(name = "anthropic_api")]
     AnthropicApi,
     Openai,
+    Copilot,
     Zai,
     Openrouter,
     Deepseek,
@@ -137,9 +290,18 @@ pub enum Vendor {
     Novita,
     Moonshot,
     Grok,
+    Supergrok,
     Antigravity,
-    Shvia,
+    Cursor,
     Minimax,
+    Kiro,
+    #[value(name = "nous")]
+    NousResearch,
+    #[value(name = "opencode-go")]
+    OpenCodeGo,
+    #[value(name = "commandcode")]
+    CommandCode,
+    Shvia,
 }
 
 impl Vendor {
@@ -148,6 +310,7 @@ impl Vendor {
             Vendor::Anthropic => crate::vendor::VendorId::Anthropic,
             Vendor::AnthropicApi => crate::vendor::VendorId::AnthropicApi,
             Vendor::Openai => crate::vendor::VendorId::Openai,
+            Vendor::Copilot => crate::vendor::VendorId::Copilot,
             Vendor::Zai => crate::vendor::VendorId::Zai,
             Vendor::Openrouter => crate::vendor::VendorId::Openrouter,
             Vendor::Deepseek => crate::vendor::VendorId::Deepseek,
@@ -156,9 +319,15 @@ impl Vendor {
             Vendor::Novita => crate::vendor::VendorId::Novita,
             Vendor::Moonshot => crate::vendor::VendorId::Moonshot,
             Vendor::Grok => crate::vendor::VendorId::Grok,
+            Vendor::Supergrok => crate::vendor::VendorId::Supergrok,
             Vendor::Antigravity => crate::vendor::VendorId::Antigravity,
-            Vendor::Shvia => crate::vendor::VendorId::Shvia,
+            Vendor::Cursor => crate::vendor::VendorId::Cursor,
             Vendor::Minimax => crate::vendor::VendorId::Minimax,
+            Vendor::Kiro => crate::vendor::VendorId::Kiro,
+            Vendor::NousResearch => crate::vendor::VendorId::NousResearch,
+            Vendor::OpenCodeGo => crate::vendor::VendorId::OpenCodeGo,
+            Vendor::CommandCode => crate::vendor::VendorId::CommandCode,
+            Vendor::Shvia => crate::vendor::VendorId::Shvia,
         }
     }
 }
@@ -234,6 +403,7 @@ fn id_to_vendor(id: crate::vendor::VendorId) -> Vendor {
         crate::vendor::VendorId::Anthropic => Vendor::Anthropic,
         crate::vendor::VendorId::AnthropicApi => Vendor::AnthropicApi,
         crate::vendor::VendorId::Openai => Vendor::Openai,
+        crate::vendor::VendorId::Copilot => Vendor::Copilot,
         crate::vendor::VendorId::Zai => Vendor::Zai,
         crate::vendor::VendorId::Openrouter => Vendor::Openrouter,
         crate::vendor::VendorId::Deepseek => Vendor::Deepseek,
@@ -242,9 +412,15 @@ fn id_to_vendor(id: crate::vendor::VendorId) -> Vendor {
         crate::vendor::VendorId::Novita => Vendor::Novita,
         crate::vendor::VendorId::Moonshot => Vendor::Moonshot,
         crate::vendor::VendorId::Grok => Vendor::Grok,
+        crate::vendor::VendorId::Supergrok => Vendor::Supergrok,
         crate::vendor::VendorId::Antigravity => Vendor::Antigravity,
-        crate::vendor::VendorId::Shvia => Vendor::Shvia,
+        crate::vendor::VendorId::Cursor => Vendor::Cursor,
         crate::vendor::VendorId::Minimax => Vendor::Minimax,
+        crate::vendor::VendorId::Kiro => Vendor::Kiro,
+        crate::vendor::VendorId::NousResearch => Vendor::NousResearch,
+        crate::vendor::VendorId::OpenCodeGo => Vendor::OpenCodeGo,
+        crate::vendor::VendorId::CommandCode => Vendor::CommandCode,
+        crate::vendor::VendorId::Shvia => Vendor::Shvia,
     }
 }
 
@@ -271,7 +447,60 @@ fn is_stdout_tty() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::Parser;
+    use clap::{Parser, error::ErrorKind};
+
+    #[test]
+    fn version_flags_report_the_crate_version() {
+        let expected = format!("ai-usagebar {}\n", env!("CARGO_PKG_VERSION"));
+
+        for flag in ["--version", "-V"] {
+            let err = Cli::try_parse_from(["ai-usagebar", flag])
+                .expect_err("a version flag exits through clap's display path");
+            assert_eq!(err.kind(), ErrorKind::DisplayVersion, "flag: {flag}");
+            assert_eq!(err.to_string(), expected, "flag: {flag}");
+        }
+    }
+
+    #[test]
+    fn usage_subcommand_parses_machine_readable_mode() {
+        let cli = Cli::parse_from(["ai-usagebar", "usage", "--json"]);
+        assert!(matches!(cli.command, Some(Command::Usage { json: true })));
+    }
+
+    #[test]
+    fn new_vendor_values_and_auth_commands_parse_exactly() {
+        let nous = Cli::parse_from(["ai-usagebar", "--vendor", "nous"]);
+        assert_eq!(nous.vendor, Some(Vendor::NousResearch));
+        let opencode = Cli::parse_from(["ai-usagebar", "--vendor", "opencode-go"]);
+        assert_eq!(opencode.vendor, Some(Vendor::OpenCodeGo));
+        let copilot = Cli::parse_from(["ai-usagebar", "--vendor", "copilot"]);
+        assert_eq!(copilot.vendor, Some(Vendor::Copilot));
+        let login = Cli::parse_from(["ai-usagebar", "auth", "nous", "login"]);
+        assert!(matches!(login.command, Some(Command::Auth { .. })));
+    }
+
+    #[test]
+    fn settings_subcommands_are_additive_and_take_no_widget_flags() {
+        let show = Cli::parse_from(["ai-usagebar", "settings", "show"]);
+        assert!(matches!(
+            show.command,
+            Some(Command::Settings {
+                action: SettingsAction::Show
+            })
+        ));
+
+        let apply = Cli::parse_from(["ai-usagebar", "settings", "apply"]);
+        assert!(matches!(
+            apply.command,
+            Some(Command::Settings {
+                action: SettingsAction::Apply
+            })
+        ));
+
+        assert!(
+            Cli::try_parse_from(["ai-usagebar", "--vendor", "kimi", "settings", "show",]).is_err()
+        );
+    }
 
     #[test]
     fn defaults_match_claudebar() {
@@ -292,6 +521,99 @@ mod tests {
         assert!(!cli.pretty);
         assert!(!cli.json);
         assert!(cli.watch.is_none());
+        assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn account_add_subcommand_parses_without_widget_flags() {
+        let cli = Cli::parse_from(["ai-usagebar", "account", "add", "work", "--no-login"]);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Account {
+                action: AccountAction::Add {
+                    ref label,
+                    no_login: true,
+                    desktop: false,
+                    ..
+                }
+            }) if label == "work"
+        ));
+    }
+
+    /// The two halves of `add` capture different things and cannot be combined:
+    /// `--no-login` skips a `claude` login the Desktop capture never runs.
+    #[test]
+    fn account_add_desktop_takes_an_email_and_rejects_no_login() {
+        let cli = Cli::parse_from([
+            "ai-usagebar",
+            "account",
+            "add",
+            "work",
+            "--desktop",
+            "--email",
+            "a@b.test",
+            "-y",
+        ]);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Account {
+                action: AccountAction::Add {
+                    desktop: true,
+                    yes: true,
+                    email: Some(ref email),
+                    ..
+                }
+            }) if email == "a@b.test"
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "ai-usagebar",
+                "account",
+                "add",
+                "w",
+                "--desktop",
+                "--no-login"
+            ])
+            .is_err()
+        );
+        // --email / -y only mean something for the Desktop capture.
+        assert!(
+            Cli::try_parse_from(["ai-usagebar", "account", "add", "w", "--email", "a@b.test"])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn account_switch_defaults_to_both_surfaces() {
+        let cli = Cli::parse_from(["ai-usagebar", "account", "switch", "work", "--dry-run"]);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Account {
+                action: AccountAction::Switch {
+                    ref label,
+                    desktop: false,
+                    cli: false,
+                    dry_run: true,
+                    keep_backups: 10,
+                    ..
+                }
+            }) if label == "work"
+        ));
+    }
+
+    #[test]
+    fn account_subcommand_rejects_ignored_widget_flags() {
+        assert!(
+            Cli::try_parse_from([
+                "ai-usagebar",
+                "--vendor",
+                "anthropic",
+                "account",
+                "add",
+                "work",
+            ])
+            .is_err()
+        );
     }
 
     #[test]

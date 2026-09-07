@@ -13,31 +13,65 @@
 //!     "secondary_window": {"used_percent": 0, "limit_window_seconds": 604800, "reset_at": 1780184124}
 //!   },
 //!   "code_review_rate_limit": {...optional...},
-//!   "credits": {...optional...}
+//!   "credits": {...optional...},
+//!   "rate_limit_reset_credits": {"available_count": 2}
 //! }
 //! ```
 
-use serde::Deserialize;
+use std::collections::BTreeMap;
 
-use crate::usage::{OpenAiCredits, OpenAiSnapshot, OpenAiSource, UsageWindow};
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Default, Clone, Deserialize)]
+use crate::error::{AppError, Result as AppResult};
+use crate::usage::{
+    OpenAiCredits, OpenAiNamedLimit, OpenAiSnapshot, OpenAiSource, OpenAiUnavailableModel,
+    ResetCredit as BankedReset, ResetCredits, UsageWindow,
+};
+
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct UsageResponse {
     pub plan_type: Option<String>,
     pub rate_limit: Option<RateLimit>,
     pub code_review_rate_limit: Option<RateLimit>,
     pub credits: Option<CreditsBlock>,
+    pub rate_limit_reset_credits: Option<ResetCreditsBlock>,
+    /// Named limits alongside the main one — a reserved pool, a
+    /// model-specific allowance. Each carries its own windows and can be the
+    /// binding constraint while `rate_limit` still reads low, which is
+    /// precisely when a user needs to see it.
+    pub additional_rate_limits: Vec<AdditionalRateLimit>,
+    /// Per-model availability. `available: false` is what "Selected model is
+    /// at capacity" looks like in the data — a dispatch-time refusal, not a
+    /// quota, so no percentage anywhere else reflects it.
+    pub model_usage: BTreeMap<String, ModelUsage>,
 }
 
-#[derive(Debug, Default, Clone, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct AdditionalRateLimit {
+    pub limit_name: Option<String>,
+    pub metered_feature: Option<String>,
+    pub rate_limit: Option<RateLimit>,
+}
+
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ModelUsage {
+    /// Absent means "not stated", which is not the same as unavailable.
+    pub available: Option<bool>,
+    pub available_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct RateLimit {
     pub primary_window: Option<Window>,
     pub secondary_window: Option<Window>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Window {
     #[serde(deserialize_with = "de_percent_number_or_string")]
     pub used_percent: f64,
@@ -51,7 +85,7 @@ pub struct Window {
     pub reset_after_seconds: Option<i64>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CreditsBlock {
     #[serde(default, deserialize_with = "de_opt_money_string")]
     pub balance: Option<String>,
@@ -61,6 +95,31 @@ pub struct CreditsBlock {
     pub approx_local_messages: Option<Vec<i64>>,
     #[serde(default)]
     pub approx_cloud_messages: Option<Vec<i64>>,
+}
+
+/// Banked rate-limit reset credits. `available_count` rides along with the
+/// usage response; `credits` only ever arrives from the separate
+/// `/rate-limit-reset-credits` call, so it is routinely empty while the count
+/// is not. The redemption `id` each entry carries is deliberately not
+/// deserialized.
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ResetCreditsBlock {
+    pub available_count: u32,
+    pub credits: Vec<ResetCredit>,
+}
+
+/// Cached beside the usage payload. Status, title, and expiry are written
+/// back — the wire's redemption `id` is never deserialized.
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ResetCredit {
+    /// "available", "redeemed", … — only an available credit is one you still
+    /// have, so a redeemed entry's expiry must not become a deadline on screen.
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    pub expires_at: Option<DateTime<Utc>>,
 }
 
 /// Accept a JSON number or numeric string without turning malformed, non-finite
@@ -164,7 +223,7 @@ where
         serde_json::Value::Null => Ok(None),
         serde_json::Value::String(s) => Ok(Some(s)),
         serde_json::Value::Number(n) => match n.as_f64() {
-            Some(value) if value.is_finite() => Ok(Some(format!("${value:.2}"))),
+            Some(value) if value.is_finite() => Ok(Some(crate::format::usd(value))),
             _ => Err(serde::de::Error::custom(
                 "credit balance is not a finite number",
             )),
@@ -175,14 +234,25 @@ where
     }
 }
 
-impl UsageResponse {
-    pub fn into_snapshot(self, plan_hint: Option<&str>) -> OpenAiSnapshot {
-        let plan_type = self.plan_type.as_deref().or(plan_hint).unwrap_or("Unknown");
-        let plan = format!("ChatGPT {}", capitalize(plan_type));
+const MAX_RESET_TITLE_CHARS: usize = 80;
 
-        let rl = self.rate_limit.unwrap_or_default();
-        let session = window_or_default(rl.primary_window, chrono::Duration::hours(5));
-        let weekly = window_or_default(rl.secondary_window, chrono::Duration::days(7));
+fn checked_reset_title(value: Option<String>) -> Option<String> {
+    let value = value
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())?;
+    if value.chars().count() > MAX_RESET_TITLE_CHARS || value.chars().any(char::is_control) {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+impl UsageResponse {
+    pub fn into_snapshot(self, plan_hint: Option<&str>) -> AppResult<OpenAiSnapshot> {
+        let plan_type = self.plan_type.as_deref().or(plan_hint).unwrap_or("Unknown");
+        let plan = format!("ChatGPT {}", crate::format::capitalize(plan_type));
+
+        let (session, weekly) = classify_rate_limit(self.rate_limit.unwrap_or_default())?;
         let code_review = self
             .code_review_rate_limit
             .and_then(|c| c.primary_window)
@@ -195,27 +265,163 @@ impl UsageResponse {
             approx_local_messages: range_from_vec(c.approx_local_messages),
             approx_cloud_messages: range_from_vec(c.approx_cloud_messages),
         });
+        let reset_credits = self
+            .rate_limit_reset_credits
+            .map(|credits| ResetCredits {
+                available: credits.available_count,
+                credits: credits
+                    .credits
+                    .into_iter()
+                    .filter(|credit| credit.status == "available")
+                    .map(|credit| BankedReset {
+                        title: checked_reset_title(credit.title),
+                        expires_at: credit.expires_at,
+                    })
+                    .collect(),
+            })
+            .unwrap_or_default();
 
-        OpenAiSnapshot {
+        let additional_limits = self
+            .additional_rate_limits
+            .into_iter()
+            .filter_map(named_limit)
+            .collect();
+        // Only the unavailable ones: a roster of working models is noise, and
+        // this list exists to name a refusal nothing else accounts for.
+        let unavailable_models = self
+            .model_usage
+            .into_iter()
+            .filter(|(_, usage)| usage.available == Some(false))
+            .map(|(model, usage)| OpenAiUnavailableModel {
+                model,
+                available_at: usage.available_at,
+            })
+            .collect();
+
+        Ok(OpenAiSnapshot {
             plan,
             session,
             weekly,
             code_review,
+            additional_limits,
+            unavailable_models,
             credits,
+            reset_credits,
             source: OpenAiSource::CodexOauth,
-        }
+        })
     }
 }
 
-fn window_or_default(w: Option<Window>, default_dur: chrono::Duration) -> UsageWindow {
-    let Some(w) = w else {
-        return UsageWindow {
-            utilization_pct: 0,
-            resets_at: None,
-            window_duration: default_dur,
-        };
+#[derive(Clone, Copy, Debug)]
+enum WindowKind {
+    Session,
+    Weekly,
+}
+
+/// `limit_window_seconds` value the Codex API reports for the 5-hour window.
+pub(crate) const SESSION_WINDOW_SECS: u64 = 18_000;
+/// `limit_window_seconds` value the Codex API reports for the 7-day window.
+pub(crate) const WEEKLY_WINDOW_SECS: u64 = 604_800;
+
+/// One named limit, or `None` when it carries no window we can show. Windows
+/// go through the same classifier as the main limit — identified by duration,
+/// not wire position — so a named 5h reads as a 5h everywhere.
+fn named_limit(entry: AdditionalRateLimit) -> Option<OpenAiNamedLimit> {
+    let name = entry
+        .limit_name
+        .or(entry.metered_feature)
+        .filter(|name| !name.trim().is_empty())?;
+    let (session, weekly) = classify_rate_limit(entry.rate_limit?).ok()?;
+    if session.is_none() && weekly.is_none() {
+        return None;
+    }
+    Some(OpenAiNamedLimit {
+        name: crate::display::sanitize_untrusted_field(&name),
+        session,
+        weekly,
+    })
+}
+
+fn classify_rate_limit(
+    rate_limit: RateLimit,
+) -> AppResult<(Option<UsageWindow>, Option<UsageWindow>)> {
+    let mut session = None;
+    let mut weekly = None;
+    insert_window(
+        rate_limit.primary_window,
+        WindowKind::Session,
+        &mut session,
+        &mut weekly,
+    )?;
+    insert_window(
+        rate_limit.secondary_window,
+        WindowKind::Weekly,
+        &mut session,
+        &mut weekly,
+    )?;
+    Ok((session, weekly))
+}
+
+fn insert_window(
+    wire_window: Option<Window>,
+    fallback_kind: WindowKind,
+    session: &mut Option<UsageWindow>,
+    weekly: &mut Option<UsageWindow>,
+) -> AppResult<()> {
+    let Some(wire_window) = wire_window else {
+        return Ok(());
     };
-    to_window(&w, default_dur)
+    let kind = window_kind(&wire_window).unwrap_or(fallback_kind);
+    let default_duration = kind.default_duration();
+    let target = semantic_window_target(kind, session, weekly);
+    if target.is_some() {
+        return Err(duplicate_window_error(
+            kind,
+            wire_window.limit_window_seconds,
+        ));
+    }
+    *target = Some(to_window(&wire_window, default_duration));
+    Ok(())
+}
+
+fn semantic_window_target<'a>(
+    kind: WindowKind,
+    session: &'a mut Option<UsageWindow>,
+    weekly: &'a mut Option<UsageWindow>,
+) -> &'a mut Option<UsageWindow> {
+    match kind {
+        WindowKind::Session => session,
+        WindowKind::Weekly => weekly,
+    }
+}
+
+fn window_kind(window: &Window) -> Option<WindowKind> {
+    // OpenAI temporarily moved the 7d window into `primary_window` and omitted
+    // `secondary_window`; wire position is not semantic (openai/codex#32707).
+    match window.limit_window_seconds {
+        s if s == SESSION_WINDOW_SECS as i64 => Some(WindowKind::Session),
+        s if s == WEEKLY_WINDOW_SECS as i64 => Some(WindowKind::Weekly),
+        _ => None,
+    }
+}
+
+fn duplicate_window_error(kind: WindowKind, seconds: i64) -> AppError {
+    let label = match kind {
+        WindowKind::Session => "5h",
+        WindowKind::Weekly => "7d",
+    };
+    AppError::Schema(format!(
+        "duplicate OpenAI {label} window with limit_window_seconds={seconds}; expected at most one 5h and one 7d window"
+    ))
+}
+
+impl WindowKind {
+    fn default_duration(self) -> chrono::Duration {
+        match self {
+            Self::Session => chrono::Duration::seconds(SESSION_WINDOW_SECS as i64),
+            Self::Weekly => chrono::Duration::seconds(WEEKLY_WINDOW_SECS as i64),
+        }
+    }
 }
 
 fn to_window(w: &Window, default_dur: chrono::Duration) -> UsageWindow {
@@ -250,21 +456,6 @@ fn range_from_vec(v: Option<Vec<i64>>) -> Option<(i64, i64)> {
     }
 }
 
-fn capitalize(s: &str) -> String {
-    let mut chars = s.chars();
-    match chars.next() {
-        Some(c) => {
-            let mut out = String::with_capacity(s.len());
-            for u in c.to_uppercase() {
-                out.push(u);
-            }
-            out.push_str(chars.as_str());
-            out
-        }
-        None => String::new(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,25 +472,91 @@ mod tests {
     #[test]
     fn parses_real_shape() {
         let r: UsageResponse = serde_json::from_str(REAL).unwrap();
-        let s = r.into_snapshot(None);
+        let s = r.into_snapshot(None).unwrap();
         assert_eq!(s.plan, "ChatGPT Plus");
-        assert_eq!(s.session.utilization_pct, 1);
-        assert_eq!(s.weekly.utilization_pct, 0);
-        assert_eq!(s.session.window_duration, chrono::Duration::hours(5));
-        assert_eq!(s.weekly.window_duration, chrono::Duration::days(7));
-        assert!(s.session.resets_at.is_some());
+        assert_eq!(s.session.as_ref().unwrap().utilization_pct, 1);
+        assert_eq!(s.weekly.as_ref().unwrap().utilization_pct, 0);
+        assert_eq!(
+            s.session.as_ref().unwrap().window_duration,
+            chrono::Duration::hours(5)
+        );
+        assert_eq!(
+            s.weekly.as_ref().unwrap().window_duration,
+            chrono::Duration::days(7)
+        );
+        assert!(s.session.as_ref().unwrap().resets_at.is_some());
         assert!(s.code_review.is_none());
         assert!(s.credits.is_none());
         assert!(matches!(s.source, OpenAiSource::CodexOauth));
     }
 
     #[test]
-    fn missing_rate_limit_yields_neutral() {
+    fn missing_rate_limit_reports_no_windows() {
         let r: UsageResponse = serde_json::from_str(r#"{"plan_type":"pro"}"#).unwrap();
-        let s = r.into_snapshot(None);
+        let s = r.into_snapshot(None).unwrap();
         assert_eq!(s.plan, "ChatGPT Pro");
-        assert_eq!(s.session.utilization_pct, 0);
-        assert_eq!(s.weekly.utilization_pct, 0);
+        assert!(s.session.is_none());
+        assert!(s.weekly.is_none());
+    }
+
+    #[test]
+    fn weekly_only_primary_window_is_not_mislabeled_as_session() {
+        // Sanitized live response captured 2026-07-23 during OpenAI's
+        // temporary weekly-only rollout (openai/codex#32707).
+        let body = r#"{
+            "plan_type":"prolite",
+            "rate_limit":{
+                "primary_window":{
+                    "used_percent":66,
+                    "limit_window_seconds":604800,
+                    "reset_at":1785261834
+                },
+                "secondary_window":null
+            }
+        }"#;
+        let response: UsageResponse = serde_json::from_str(body).unwrap();
+        let snapshot = response.into_snapshot(None).unwrap();
+        assert!(snapshot.session.is_none());
+        assert_eq!(snapshot.weekly.unwrap().utilization_pct, 66);
+    }
+
+    #[test]
+    fn duration_classification_survives_reordered_wire_windows() {
+        let body = r#"{"rate_limit":{
+            "primary_window":{"used_percent":41,"limit_window_seconds":604800},
+            "secondary_window":{"used_percent":7,"limit_window_seconds":18000}
+        }}"#;
+        let response: UsageResponse = serde_json::from_str(body).unwrap();
+        let snapshot = response.into_snapshot(None).unwrap();
+        assert_eq!(snapshot.session.unwrap().utilization_pct, 7);
+        assert_eq!(snapshot.weekly.unwrap().utilization_pct, 41);
+    }
+
+    #[test]
+    fn duplicate_semantic_windows_are_schema_drift() {
+        let body = r#"{"rate_limit":{
+            "primary_window":{"used_percent":41,"limit_window_seconds":604800},
+            "secondary_window":{"used_percent":7,"limit_window_seconds":604800}
+        }}"#;
+        let response: UsageResponse = serde_json::from_str(body).unwrap();
+        let error = response.into_snapshot(None).unwrap_err().to_string();
+        assert!(error.contains("duplicate OpenAI 7d window"));
+        assert!(error.contains("limit_window_seconds=604800"));
+    }
+
+    #[test]
+    fn unknown_duration_falls_back_to_wire_position() {
+        // A `limit_window_seconds` value we do not recognize (e.g. 3600) is
+        // classified by wire position: `primary_window` → session,
+        // `secondary_window` → weekly.
+        let body = r#"{"rate_limit":{
+            "primary_window":{"used_percent":10,"limit_window_seconds":3600},
+            "secondary_window":{"used_percent":20,"limit_window_seconds":3600}
+        }}"#;
+        let response: UsageResponse = serde_json::from_str(body).unwrap();
+        let snapshot = response.into_snapshot(None).unwrap();
+        assert_eq!(snapshot.session.unwrap().utilization_pct, 10);
+        assert_eq!(snapshot.weekly.unwrap().utilization_pct, 20);
     }
 
     #[test]
@@ -310,7 +567,7 @@ mod tests {
                 "approx_local_messages":[100,200],"approx_cloud_messages":[40,60]}
         }"#;
         let r: UsageResponse = serde_json::from_str(body).unwrap();
-        let s = r.into_snapshot(None);
+        let s = r.into_snapshot(None).unwrap();
         let c = s.credits.unwrap();
         assert_eq!(c.balance, "$2.50");
         assert!(c.has_credits);
@@ -318,11 +575,61 @@ mod tests {
         assert_eq!(c.approx_cloud_messages, Some((40, 60)));
     }
 
+    /// The count travels with the usage response; the per-credit detail only
+    /// arrives from the second endpoint, so a snapshot must be able to report
+    /// "2 available" with no expiry attached to either of them.
+    #[test]
+    fn reset_credit_count_stands_on_its_own_without_the_detail_call() {
+        let body = r#"{"plan_type":"plus","rate_limit_reset_credits":{"available_count":2}}"#;
+        let s: UsageResponse = serde_json::from_str(body).unwrap();
+        let s = s.into_snapshot(None).unwrap();
+        assert_eq!(s.reset_credits.available, 2);
+        assert!(s.reset_credits.credits.is_empty());
+        assert!(!s.reset_credits.is_empty());
+    }
+
+    /// A redeemed credit still appears in the detail list. Its expiry is not a
+    /// deadline the user can act on, so it must not become the next one shown.
+    #[test]
+    fn only_an_available_credit_contributes_an_expiry() {
+        let body = r#"{
+            "rate_limit_reset_credits":{
+                "available_count":1,
+                "credits":[
+                    {"id":"c1","status":"redeemed","title":"Full reset (Weekly + 5 hr)","expires_at":"2026-07-01T00:00:00Z"},
+                    {"id":"c2","status":"available","title":"Full reset (Weekly + 5 hr)","expires_at":"2026-07-17T00:00:00Z"},
+                    {"id":"c3","status":"available","expires_at":null}
+                ]
+            }
+        }"#;
+        let s: UsageResponse = serde_json::from_str(body).unwrap();
+        let s = s.into_snapshot(None).unwrap();
+        assert_eq!(s.reset_credits.available, 1);
+        assert_eq!(s.reset_credits.credits.len(), 2);
+        assert_eq!(
+            s.reset_credits.credits[0].title.as_deref(),
+            Some("Full reset (Weekly + 5 hr)")
+        );
+        assert_eq!(
+            s.reset_credits.next_expiry(),
+            Some("2026-07-17T00:00:00Z".parse::<DateTime<Utc>>().unwrap())
+        );
+    }
+
+    /// Every other vendor's absent block means "none". This one is load-bearing
+    /// in the same way: a response from an account with no banked resets, or
+    /// from a Codex build that predates them, reports none rather than failing.
+    #[test]
+    fn an_absent_reset_block_is_no_credits_rather_than_an_error() {
+        let s: UsageResponse = serde_json::from_str(r#"{"plan_type":"plus"}"#).unwrap();
+        assert!(s.into_snapshot(None).unwrap().reset_credits.is_empty());
+    }
+
     #[test]
     fn balance_as_number_formats_to_dollars() {
         let body = r#"{"credits":{"balance":1.5,"has_credits":true,"unlimited":false}}"#;
         let r: UsageResponse = serde_json::from_str(body).unwrap();
-        let s = r.into_snapshot(None);
+        let s = r.into_snapshot(None).unwrap();
         assert_eq!(s.credits.unwrap().balance, "$1.50");
     }
 
@@ -331,8 +638,8 @@ mod tests {
         let body =
             r#"{"rate_limit":{"primary_window":{"used_percent":100.6,"limit_window_seconds":1}}}"#;
         let r: UsageResponse = serde_json::from_str(body).unwrap();
-        let s = r.into_snapshot(None);
-        assert_eq!(s.session.utilization_pct, 100);
+        let s = r.into_snapshot(None).unwrap();
+        assert_eq!(s.session.unwrap().utilization_pct, 100);
     }
 
     #[test]
@@ -351,7 +658,7 @@ mod tests {
     #[test]
     fn plan_hint_used_when_response_omits_plan_type() {
         let r: UsageResponse = serde_json::from_str("{}").unwrap();
-        let s = r.into_snapshot(Some("team"));
+        let s = r.into_snapshot(Some("team")).unwrap();
         assert_eq!(s.plan, "ChatGPT Team");
     }
 
@@ -372,7 +679,14 @@ mod tests {
             r#"{"rate_limit":{"primary_window":{"used_percent":42.7,"limit_window_seconds":18000}}}"#,
         )
         .unwrap();
-        assert_eq!(r.into_snapshot(None).session.utilization_pct, 43);
+        assert_eq!(
+            r.into_snapshot(None)
+                .unwrap()
+                .session
+                .unwrap()
+                .utilization_pct,
+            43
+        );
     }
 
     #[test]
@@ -465,7 +779,15 @@ mod tests {
             r#"{"credits":{"balance":null,"has_credits":false,"unlimited":true}}"#,
         )
         .unwrap();
-        assert_eq!(response.into_snapshot(None).credits.unwrap().balance, "");
+        assert_eq!(
+            response
+                .into_snapshot(None)
+                .unwrap()
+                .credits
+                .unwrap()
+                .balance,
+            ""
+        );
     }
 
     #[test]
@@ -478,9 +800,10 @@ mod tests {
             "reset_after_seconds":9223372036854775807
         }}}"#;
         let r: UsageResponse = serde_json::from_str(body).unwrap();
-        let s = r.into_snapshot(None);
-        assert_eq!(s.session.window_duration, chrono::Duration::hours(5));
-        assert!(s.session.resets_at.is_none());
+        let s = r.into_snapshot(None).unwrap();
+        let session = s.session.unwrap();
+        assert_eq!(session.window_duration, chrono::Duration::hours(5));
+        assert!(session.resets_at.is_none());
     }
 
     #[test]
@@ -489,11 +812,128 @@ mod tests {
             "used_percent":50,"limit_window_seconds":1000,"reset_after_seconds":500
         }}}"#;
         let r: UsageResponse = serde_json::from_str(body).unwrap();
-        let s = r.into_snapshot(None);
+        let s = r.into_snapshot(None).unwrap();
         // The reset should be ~500s from now (within tolerance).
         let now = chrono::Utc::now();
-        let reset = s.session.resets_at.unwrap();
+        let reset = s.session.unwrap().resets_at.unwrap();
         let delta = reset.signed_duration_since(now).num_seconds();
         assert!((400..=600).contains(&delta), "got delta={delta}");
+    }
+    /// The shape that prompted this: a real account whose headline window read
+    /// 5% while two named limits and a per-model availability flag went
+    /// unparsed entirely. Field names and nesting are from a live
+    /// `wham/usage` response; the numbers are made up.
+    #[test]
+    fn named_limits_and_unavailable_models_are_read_from_the_live_shape() {
+        let response: UsageResponse = serde_json::from_str(
+            r#"{
+              "plan_type": "pro",
+              "rate_limit": {
+                "allowed": true, "limit_reached": false,
+                "primary_window": {"used_percent": 5, "limit_window_seconds": 604800,
+                                   "reset_after_seconds": 400000, "reset_at": 1789000000},
+                "secondary_window": null
+              },
+              "code_review_rate_limit": null,
+              "additional_rate_limits": [
+                {"limit_name": "GPT-5.3-Codex-Spark", "metered_feature": "codex_bengalfox",
+                 "rate_limit": {
+                   "primary_window": {"used_percent": 12, "limit_window_seconds": 18000,
+                                      "reset_at": 1788000000},
+                   "secondary_window": {"used_percent": 34, "limit_window_seconds": 604800,
+                                        "reset_at": 1789500000}},
+                 "normal_model_slug": null},
+                {"limit_name": "gpt-reserve", "metered_feature": "base_model_inference",
+                 "rate_limit": {
+                   "primary_window": {"used_percent": 71, "limit_window_seconds": 604800,
+                                      "reset_at": 1789500000},
+                   "secondary_window": null}}
+              ],
+              "model_usage": {
+                "gpt-6-astra": {"available": false, "available_at": "2026-09-05T22:00:00Z",
+                                "credits_would_enable": false},
+                "gpt-5.3-codex": {"available": true, "available_at": null}
+              }
+            }"#,
+        )
+        .expect("the live response shape parses");
+
+        let snap = response.into_snapshot(None).unwrap();
+
+        // The headline window is unchanged and still low — which is the point:
+        // it is not what stopped the request.
+        assert_eq!(snap.weekly.as_ref().unwrap().utilization_pct, 5);
+
+        assert_eq!(snap.additional_limits.len(), 2);
+        let spark = &snap.additional_limits[0];
+        assert_eq!(spark.name, "GPT-5.3-Codex-Spark");
+        assert_eq!(spark.session.as_ref().unwrap().utilization_pct, 12);
+        assert_eq!(spark.weekly.as_ref().unwrap().utilization_pct, 34);
+        // Classified by duration, not wire position: a 7d in the primary slot
+        // is still the weekly one.
+        let reserve = &snap.additional_limits[1];
+        assert_eq!(reserve.name, "gpt-reserve");
+        assert!(reserve.session.is_none());
+        assert_eq!(reserve.weekly.as_ref().unwrap().utilization_pct, 71);
+
+        // Only the unavailable model is kept.
+        assert_eq!(snap.unavailable_models.len(), 1);
+        assert_eq!(snap.unavailable_models[0].model, "gpt-6-astra");
+        assert!(snap.unavailable_models[0].available_at.is_some());
+    }
+
+    /// An account with none of this — which is most of them — must look
+    /// exactly as it did before, not gain empty rows.
+    #[test]
+    fn an_account_without_extra_limits_reports_none_rather_than_empty_rows() {
+        let response: UsageResponse = serde_json::from_str(
+            r#"{"plan_type": "plus",
+                "rate_limit": {"primary_window": {"used_percent": 3,
+                               "limit_window_seconds": 604800}}}"#,
+        )
+        .unwrap();
+        let snap = response.into_snapshot(None).unwrap();
+
+        assert!(snap.additional_limits.is_empty());
+        assert!(snap.unavailable_models.is_empty());
+    }
+
+    /// A named limit with no usable window is dropped rather than drawn as a
+    /// nameless empty row, and one with no name at all falls back to the
+    /// metered feature before being dropped.
+    #[test]
+    fn nameless_or_windowless_limits_are_dropped() {
+        let response: UsageResponse = serde_json::from_str(
+            r#"{"additional_rate_limits": [
+                 {"limit_name": null, "metered_feature": "base_model_inference",
+                  "rate_limit": {"primary_window": {"used_percent": 9,
+                                 "limit_window_seconds": 604800}}},
+                 {"limit_name": "no windows", "rate_limit": {"primary_window": null,
+                                                             "secondary_window": null}},
+                 {"limit_name": "  ", "rate_limit": {"primary_window":
+                   {"used_percent": 1, "limit_window_seconds": 18000}}}
+               ]}"#,
+        )
+        .unwrap();
+        let snap = response.into_snapshot(None).unwrap();
+
+        assert_eq!(snap.additional_limits.len(), 1);
+        assert_eq!(snap.additional_limits[0].name, "base_model_inference");
+    }
+
+    /// `available` absent is "not stated", which is not the same as
+    /// unavailable — inventing a capacity warning is worse than staying quiet.
+    #[test]
+    fn a_model_without_an_availability_flag_is_not_reported_as_down() {
+        let response: UsageResponse =
+            serde_json::from_str(r#"{"model_usage": {"gpt-6-astra": {"available_at": null}}}"#)
+                .unwrap();
+        assert!(
+            response
+                .into_snapshot(None)
+                .unwrap()
+                .unavailable_models
+                .is_empty()
+        );
     }
 }

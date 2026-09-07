@@ -16,6 +16,7 @@ use crate::pango::{self, color_span, escape, severity_for};
 use crate::theme::Theme;
 use crate::tooltip::{self, Line};
 use crate::usage::{ExtraUsage, anthropic_severity};
+use crate::vendor::VendorId;
 use crate::waybar::{Class, WaybarOutput};
 
 /// Default format string when `--format` is omitted (claudebar:55).
@@ -170,7 +171,7 @@ fn build_placeholders(input: &RenderInput) -> HashMap<&'static str, String> {
 
     let mut v = placeholders(vec![
         ("icon", "󰚩".to_string()),
-        ("vendor_short", "cld".to_string()),
+        ("vendor_short", VendorId::Anthropic.short_name().to_string()),
         ("plan", snap.plan.clone()),
         ("session_pct", snap.session.utilization_pct.to_string()),
         (

@@ -2,6 +2,7 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui_bubbletea_components::{Help, KeyBinding, ListItem, SelectList};
@@ -11,7 +12,7 @@ use crate::tui::app::App;
 use crate::tui::app::TabId;
 use crate::tui::app::TabState;
 use crate::tui::panels;
-use crate::tui::style::bubble_theme;
+use crate::tui::style::{bubble_theme, color, severity_color};
 use crate::vendor::VendorId;
 
 const WIDE_LAYOUT_MIN_WIDTH: u16 = 86;
@@ -69,59 +70,32 @@ fn draw_body(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn vendor_label(id: VendorId) -> &'static str {
-    match id {
-        VendorId::Anthropic => "Claude",
-        VendorId::AnthropicApi => "Anthropic API",
-        VendorId::Openai => "OpenAI",
-        VendorId::Zai => "GLM (Z.AI)",
-        VendorId::Openrouter => "OpenRouter",
-        VendorId::Deepseek => "DeepSeek",
-        VendorId::Kimi => "Kimi",
-        VendorId::Kilo => "Kilo",
-        VendorId::Novita => "Novita",
-        VendorId::Moonshot => "Moonshot",
-        VendorId::Grok => "Grok",
-        VendorId::Antigravity => "Antigravity",
-        VendorId::Shvia => "ShvIA",
-        VendorId::Minimax => "MiniMax",
+    // The wide label adds product context for Z.AI; all canonical names live
+    // on VendorId so new providers do not require another copied match table.
+    if id == VendorId::Zai {
+        "GLM (Z.AI)"
+    } else {
+        id.display_name()
     }
 }
 
-fn compact_vendor_label(id: VendorId) -> &'static str {
-    match id {
-        VendorId::Anthropic => "Claude",
-        VendorId::AnthropicApi => "Anthropic API",
-        VendorId::Openai => "OpenAI",
-        VendorId::Zai => "Z.AI",
-        VendorId::Openrouter => "OpenRouter",
-        VendorId::Deepseek => "DeepSeek",
-        VendorId::Kimi => "Kimi",
-        VendorId::Kilo => "Kilo",
-        VendorId::Novita => "Novita",
-        VendorId::Moonshot => "Moonshot",
-        VendorId::Grok => "Grok",
-        VendorId::Antigravity => "Antigravity",
-        VendorId::Shvia => "ShvIA",
-        VendorId::Minimax => "MiniMax",
-    }
-}
-
-/// Tab label for the header/sidebar/detail title. A named Anthropic account
-/// (#14/#17) appends its label, e.g. `Claude · work`; a plain vendor tab is
-/// just the vendor name.
+/// Tab label for the header/sidebar/detail title. A named account appends its
+/// label, e.g. `Claude · work` or `OpenRouter · personal`.
 fn tab_label(tab: &TabId) -> String {
-    match &tab.account {
+    let label = match &tab.account {
         Some(acct) => format!("{} · {}", vendor_label(tab.vendor), acct),
         None => vendor_label(tab.vendor).to_string(),
-    }
+    };
+    crate::display::sanitize_untrusted_field(&label)
 }
 
 /// Compact variant for the narrow top-nav strip.
 fn compact_tab_label(tab: &TabId) -> String {
-    match &tab.account {
-        Some(acct) => format!("{} · {}", compact_vendor_label(tab.vendor), acct),
-        None => compact_vendor_label(tab.vendor).to_string(),
-    }
+    let label = match &tab.account {
+        Some(acct) => format!("{} · {}", tab.vendor.display_name(), acct),
+        None => tab.vendor.display_name().to_string(),
+    };
+    crate::display::sanitize_untrusted_field(&label)
 }
 
 fn draw_header(f: &mut Frame, app: &App, area: Rect) {
@@ -130,10 +104,13 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let active = app
-        .active_tab_id()
-        .map(tab_label)
-        .unwrap_or_else(|| "no vendor".to_string());
+    let active = if app.overview {
+        "Overview".to_string()
+    } else {
+        app.active_tab_id()
+            .map(tab_label)
+            .unwrap_or_else(|| "no vendor".to_string())
+    };
     let line = Line::from(vec![
         theme.accent("  Usage dashboard"),
         theme.muted(" · "),
@@ -165,20 +142,37 @@ fn header_refresh_text(app: &App) -> String {
 }
 
 fn draw_main(f: &mut Frame, app: &App, area: Rect) {
-    if area.width >= WIDE_LAYOUT_MIN_WIDTH {
-        let chunks = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(SIDEBAR_WIDTH), Constraint::Min(1)])
-            .split(area);
-        draw_sidebar(f, app, chunks[0]);
-        draw_detail(f, app, chunks[1]);
-    } else {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(3), Constraint::Min(1)])
-            .split(area);
-        draw_top_nav(f, app, chunks[0]);
-        draw_detail(f, app, chunks[1]);
+    use crate::config::VendorBoxStyle;
+
+    match app.vendor_box {
+        VendorBoxStyle::Sidebar => {
+            if area.width >= WIDE_LAYOUT_MIN_WIDTH {
+                let chunks = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Length(SIDEBAR_WIDTH), Constraint::Min(1)])
+                    .split(area);
+                draw_sidebar(f, app, chunks[0]);
+                draw_detail(f, app, chunks[1]);
+            } else {
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Length(3), Constraint::Min(1)])
+                    .split(area);
+                draw_top_nav(f, app, chunks[0]);
+                draw_detail(f, app, chunks[1]);
+            }
+        }
+        VendorBoxStyle::Navbar => {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(3), Constraint::Min(1)])
+                .split(area);
+            draw_top_nav(f, app, chunks[0]);
+            draw_detail(f, app, chunks[1]);
+        }
+        VendorBoxStyle::None => {
+            draw_detail(f, app, area);
+        }
     }
 }
 
@@ -190,16 +184,16 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let items = app
-        .tabs_meta
-        .iter()
-        .enumerate()
-        .map(|(index, tab)| {
-            ListItem::new(tab_label(tab)).description(tab_status(app.tabs.get(index)))
-        })
-        .collect::<Vec<_>>();
+    // The Overview is the virtual first entry, before the per-vendor tabs.
+    let mut items = vec![ListItem::new("Overview").description("all vendors")];
+    items.extend(app.tabs_meta.iter().enumerate().map(|(index, tab)| {
+        ListItem::new(tab_label(tab)).description(tab_status(
+            app.tabs.get(index),
+            app.tab_is_refreshing(index),
+        ))
+    }));
     let mut list = SelectList::new(items).theme(theme);
-    list.select(Some(app.active));
+    list.select(Some(if app.overview { 0 } else { app.active + 1 }));
     f.render_widget(&list, inner);
 }
 
@@ -212,11 +206,11 @@ fn draw_top_nav(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(block, area);
 
     let mut spans = vec![theme.muted(" ")];
-    for (index, tab) in app.tabs_meta.iter().enumerate() {
-        if index > 0 {
+    // Overview entry first, then each vendor tab.
+    let push_entry = |spans: &mut Vec<Span>, first: bool, selected: bool, label: String| {
+        if !first {
             spans.push(theme.muted("  "));
         }
-        let selected = index == app.active;
         let marker = if selected {
             theme.symbols.selected
         } else {
@@ -226,20 +220,36 @@ fn draw_top_nav(f: &mut Frame, app: &App, area: Rect) {
         let label_style = if selected { theme.selected } else { theme.text };
         spans.push(Span::styled(marker, marker_style));
         spans.push(theme.span(" "));
-        spans.push(Span::styled(compact_tab_label(tab), label_style));
+        spans.push(Span::styled(label, label_style));
+    };
+    push_entry(&mut spans, true, app.overview, "Overview".to_string());
+    for (index, tab) in app.tabs_meta.iter().enumerate() {
+        let selected = !app.overview && index == app.active;
+        push_entry(&mut spans, false, selected, compact_tab_label(tab));
     }
     f.render_widget(Paragraph::new(Line::from(spans)), inner);
 }
 
 fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
     let theme = bubble_theme(&app.theme);
-    let title = app
-        .active_tab_id()
-        .map(|tab| format!(" {} ", tab_label(tab)))
-        .unwrap_or_else(|| " details ".to_string());
+    let title = if app.overview {
+        " Overview ".to_string()
+    } else {
+        app.active_tab_id()
+            .map(|tab| {
+                let refreshing = if app.is_refreshing(tab) { " ↻" } else { "" };
+                format!(" {}{refreshing} ", tab_label(tab))
+            })
+            .unwrap_or_else(|| " details ".to_string())
+    };
     let block = theme.titled_block(title);
     let inner = block.inner(area);
     f.render_widget(block, area);
+
+    if app.overview {
+        draw_overview(f, app, inner);
+        return;
+    }
 
     let Some(tab) = app.tabs.get(app.active) else {
         return;
@@ -248,8 +258,94 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
     panels::render(f, inner, &app.theme, &sections);
 }
 
-fn tab_status(tab: Option<&TabState>) -> &'static str {
+/// Render the Overview: one compact row per configured vendor — its name, a
+/// plan/tier sub-label, and its key metric cells colored by severity.
+/// Width of the per-row mini bar in the Overview (cells).
+const OVERVIEW_BAR_W: usize = 12;
+
+fn draw_overview(f: &mut Frame, app: &App, area: Rect) {
+    let theme = bubble_theme(&app.theme);
+    let idxs = app.overview_tabs();
+    if idxs.is_empty() {
+        f.render_widget(
+            Paragraph::new(Line::from(theme.muted("  No vendors to summarize."))),
+            area,
+        );
+        return;
+    }
+    // Left-align the metric columns by padding the vendor-name column to the
+    // widest name (bounded so one long account label can't blow out the layout).
+    let name_w = idxs
+        .iter()
+        .map(|&i| tab_label(&app.tabs_meta[i]).chars().count())
+        .max()
+        .unwrap_or(6)
+        .clamp(6, 22);
+
+    let mut lines: Vec<Line> = Vec::new();
+    for &i in &idxs {
+        let name = tab_label(&app.tabs_meta[i]);
+        let pad = name_w.saturating_sub(name.chars().count());
+        let mut spans = vec![
+            Span::styled(name, theme.text),
+            theme.span(" ".repeat(pad + 2)),
+        ];
+        match app.tabs.get(i) {
+            Some(TabState::Ready(r)) => {
+                // Mini bar for the vendor's headline metric, mirroring the
+                // menu-bar overview; balance-only vendors have none.
+                if let Some(p) = panels::headline_pct(&r.snapshot) {
+                    let filled = (p.clamp(0, 100) as usize * OVERVIEW_BAR_W).div_ceil(100);
+                    let sev_color =
+                        severity_color(&app.theme, &theme, crate::pango::severity_for(p));
+                    spans.push(Span::styled(
+                        "█".repeat(filled),
+                        Style::default().fg(sev_color),
+                    ));
+                    let empty =
+                        color(&app.theme.bar_empty).unwrap_or(theme.palette.selected_background);
+                    spans.push(Span::styled(
+                        "░".repeat(OVERVIEW_BAR_W - filled),
+                        Style::default().fg(empty),
+                    ));
+                    spans.push(theme.span("  "));
+                }
+                let (plan, cells) = panels::compact_cells(&r.snapshot);
+                if !plan.is_empty() {
+                    spans.push(theme.muted(format!("{plan}  ")));
+                }
+                for (j, (text, sev)) in cells.iter().enumerate() {
+                    if j > 0 {
+                        spans.push(theme.span("  "));
+                    }
+                    let color = severity_color(&app.theme, &theme, *sev);
+                    spans.push(Span::styled(text.clone(), Style::default().fg(color)));
+                }
+                if r.stale {
+                    spans.push(theme.muted("  ⏸"));
+                }
+                if r.last_error.is_some() {
+                    spans.push(theme.muted(" ⚠"));
+                }
+                if app.tab_is_refreshing(i) {
+                    spans.push(theme.muted("  ↻"));
+                }
+            }
+            Some(TabState::Error(_)) => spans.push(Span::styled(
+                "error",
+                Style::default().fg(theme.palette.error),
+            )),
+            Some(TabState::Loading) | None => spans.push(theme.muted("fetching…")),
+        }
+        lines.push(Line::from(spans));
+        lines.push(Line::from(""));
+    }
+    f.render_widget(Paragraph::new(lines), area);
+}
+
+fn tab_status(tab: Option<&TabState>, refreshing: bool) -> &'static str {
     match tab {
+        Some(TabState::Ready(_)) if refreshing => "refreshing",
         Some(TabState::Loading) => "fetching",
         Some(TabState::Error(_)) => "error",
         Some(TabState::Ready(ready)) if ready.stale => "stale cache",
@@ -368,6 +464,21 @@ mod tests {
         assert_eq!(header_refresh_text(&app), "last refresh —");
     }
 
+    #[test]
+    fn overview_keeps_metrics_visible_while_refreshing() {
+        let fetched_at = Utc.with_ymd_and_hms(2026, 5, 23, 12, 0, 0).unwrap();
+        let mut app = app_with(vec![ready_at(Some(fetched_at)), ready_at(Some(fetched_at))]);
+        app.overview = true;
+        let tab = app.tabs_meta[0].clone();
+        assert!(app.begin_refresh(&tab));
+
+        let out = body_text(&app);
+        assert!(out.contains("$0.00"), "ready metrics disappeared: {out}");
+        assert!(out.contains('↻'), "refresh indicator missing: {out}");
+        assert!(!out.contains("fetching…"), "ready row flickered: {out}");
+        assert_eq!(tab_status(app.tabs.first(), true), "refreshing");
+    }
+
     fn app_with_context(layout: crate::config::ContextLayout) -> App {
         let mut app = app_with(vec![TabState::Loading, TabState::Loading]);
         app.context_enabled = true;
@@ -439,5 +550,80 @@ mod tests {
 
         let enabled = rendered(app_with(vec![TabState::Loading, TabState::Loading]), true);
         assert!(enabled.contains("context"));
+    }
+
+    /// Renders `draw_main` alone (no header/footer) into `width x height` and
+    /// returns it as one string per row, so a test can inspect which titled
+    /// blocks landed on which row — that's what tells a horizontal sidebar
+    /// split (both titles on row 0) apart from a stacked navbar (nav title on
+    /// row 0, detail title only once the 3-row nav strip ends).
+    fn main_rows(app: &App, width: u16, height: u16) -> Vec<String> {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| draw_main(frame, app, frame.area()))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|row| {
+                (0..width)
+                    .map(|col| buffer[(col, row)].symbol())
+                    .collect::<Vec<_>>()
+                    .concat()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn vendor_box_sidebar_splits_horizontally_on_wide_terminals() {
+        let mut app = app_with(vec![TabState::Loading, TabState::Loading]);
+        app.overview = true;
+        let rows = main_rows(&app, 160, 24);
+        // Sidebar and detail panel sit side by side, so their titles share row 0.
+        assert!(rows[0].contains("vendors"), "{:?}", rows[0]);
+        assert!(rows[0].contains("Overview"), "{:?}", rows[0]);
+    }
+
+    #[test]
+    fn vendor_box_sidebar_falls_back_to_top_nav_on_narrow_terminals() {
+        let mut app = app_with(vec![TabState::Loading, TabState::Loading]);
+        app.overview = true;
+        let rows = main_rows(&app, 60, 24);
+        assert!(rows[0].contains("vendors"), "{:?}", rows[0]);
+        // Stacked layout: the detail panel's own title lands below the 3-row
+        // nav strip, not sharing row 0 with it.
+        assert!(!rows[0].contains(" Overview "), "{:?}", rows[0]);
+        assert!(
+            rows.iter().any(|r| r.contains(" Overview ")),
+            "detail title missing entirely: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn vendor_box_navbar_forces_top_nav_even_on_wide_terminals() {
+        let mut app = app_with(vec![TabState::Loading, TabState::Loading]);
+        app.overview = true;
+        app.vendor_box = crate::config::VendorBoxStyle::Navbar;
+        let rows = main_rows(&app, 160, 24);
+        assert!(rows[0].contains("vendors"), "{:?}", rows[0]);
+        assert!(
+            !rows[0].contains(" Overview "),
+            "navbar must stack, not sit beside the detail panel: {:?}",
+            rows[0]
+        );
+    }
+
+    #[test]
+    fn vendor_box_none_hides_navigation_and_uses_full_width() {
+        let mut app = app_with(vec![TabState::Loading, TabState::Loading]);
+        app.overview = true;
+        app.vendor_box = crate::config::VendorBoxStyle::None;
+        let rows = main_rows(&app, 160, 24);
+        assert!(
+            !rows.iter().any(|r| r.contains("vendors")),
+            "vendor nav must be fully hidden: {rows:?}"
+        );
+        assert!(rows[0].contains(" Overview "), "{:?}", rows[0]);
     }
 }

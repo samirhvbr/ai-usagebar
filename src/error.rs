@@ -7,10 +7,23 @@ use std::path::PathBuf;
 
 pub type Result<T> = std::result::Result<T, AppError>;
 
+pub const AUTH_FAILURE_MESSAGE: &str =
+    "authentication rejected — credentials may be missing, expired, or invalid";
+
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
     /// Local I/O failed (cache write, credentials read, theme file, etc.).
-    #[error("io error at {path}: {source}")]
+    ///
+    /// **The path is sanitized here rather than at each print site.** A path in
+    /// this variant is not always a literal this program chose — it can carry a
+    /// component from an account label, a vendor response, or an archive
+    /// member — and `Display for Path` escapes nothing. Doing it at the
+    /// `Display` covers every site that formats an `AppError`, including the
+    /// ones written after this comment.
+    #[error(
+        "io error at {}: {source}",
+        crate::display::sanitize_untrusted_path(path)
+    )]
     Io {
         path: PathBuf,
         #[source]
@@ -72,6 +85,17 @@ impl AppError {
     pub fn is_transient(&self) -> bool {
         matches!(self, AppError::Transport(_))
     }
+
+    /// Render an error for a local UI or report without exposing an upstream
+    /// authentication response body. Other errors retain their diagnostic text.
+    pub fn user_message(&self) -> String {
+        match self {
+            AppError::Http { status, .. } if matches!(status, 401 | 403) => {
+                format!("HTTP {status}: {AUTH_FAILURE_MESSAGE}")
+            }
+            other => other.to_string(),
+        }
+    }
 }
 
 /// Map a reqwest error into the right variant. Connection-class failures
@@ -88,5 +112,54 @@ impl From<reqwest::Error> for AppError {
             };
         }
         AppError::Other(err.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Asserted at the `Display`, not at a print site, because that is the
+    /// whole point: a path in this variant can come from an account label, a
+    /// vendor response, or an archive member, and there are a dozen places
+    /// that format one.
+    #[test]
+    fn an_io_path_carrying_a_terminal_escape_renders_without_it() {
+        let rendered = AppError::Io {
+            path: PathBuf::from("/tmp/\x1b[2Kspoofed\nRESTORED: 0"),
+            source: io::Error::other("disk full"),
+        }
+        .to_string();
+
+        assert!(!rendered.contains('\u{1b}'), "{rendered:?}");
+        assert!(
+            !rendered.contains('\n'),
+            "an embedded newline forges a line: {rendered:?}"
+        );
+        assert!(rendered.contains("disk full"), "{rendered}");
+    }
+
+    #[test]
+    fn user_message_does_not_expose_authentication_response_bodies() {
+        for status in [401, 403] {
+            let error = AppError::Http {
+                status,
+                body: "PANCEA user@example.test <credential>&token".into(),
+            };
+            let rendered = error.user_message();
+            assert!(rendered.contains(AUTH_FAILURE_MESSAGE));
+            assert!(!rendered.contains("PANCEA"));
+            assert!(!rendered.contains("user@example.test"));
+            assert!(!rendered.contains("&token"));
+        }
+    }
+
+    #[test]
+    fn user_message_preserves_non_authentication_diagnostics() {
+        let error = AppError::Http {
+            status: 500,
+            body: "provider unavailable".into(),
+        };
+        assert!(error.user_message().contains("provider unavailable"));
     }
 }

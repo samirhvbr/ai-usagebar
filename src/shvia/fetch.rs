@@ -39,13 +39,9 @@ impl Endpoints {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct FetchOutcome {
-    pub snapshot: ShviaSnapshot,
-    pub stale: bool,
-    pub last_error: Option<(u16, String)>,
-    pub cache_age: Option<Duration>,
-}
+/// This vendor's [`Outcome`](crate::outcome::Outcome) — the shared shape,
+/// specialised to its snapshot.
+pub type FetchOutcome = crate::outcome::Outcome<ShviaSnapshot>;
 
 pub async fn fetch_snapshot(
     client: &reqwest::Client,
@@ -58,75 +54,72 @@ pub async fn fetch_snapshot(
     cache.ensure_dir()?;
     let _lock = acquire_lock(&cache.lock_path(), LOCK_TIMEOUT)?;
 
-    if let Some(bytes) = cache.fresh_payload(cache_ttl)? {
-        return Ok(reuse(bytes, cache, false, config_plan));
+    if let Some(bytes) = cache.fresh_payload(cache_ttl)?
+        && let Ok(outcome) = reuse(bytes, cache, false, config_plan)
+    {
+        return Ok(outcome);
     }
+    // Corrupt fresh cache: fall through to live fetch rather than return a
+    // fabricated snapshot with no windows.
 
     match fetch_live(client, &endpoints.usage, api_key).await {
         Ok(bytes) => {
             cache.write_payload(&bytes)?;
             let env: Envelope = serde_json::from_slice(&bytes)?;
-            Ok(FetchOutcome {
-                snapshot: env.into_snapshot(config_plan),
-                stale: false,
-                last_error: None,
-                cache_age: Some(Duration::ZERO),
-            })
+            Ok(crate::outcome::Outcome::fresh(
+                env.into_snapshot(config_plan),
+            ))
         }
-        Err(e) if e.is_transient() => fallback_silent(cache, config_plan),
+        Err(e) if e.is_transient() => fallback_silent(cache, config_plan, e),
         Err(AppError::Http { status, body }) => {
             cache.mark_stale();
-            cache.write_last_error(status, &body);
-            fallback_with_error(cache, Some((status, body)), config_plan)
+            // The pair comes back from `write_last_error`, which redacts
+            // 401/403 bodies — the raw body must not reach the tooltip.
+            let last_error = Some(cache.write_last_error(status, &body));
+            fallback_with_error(
+                cache,
+                last_error,
+                config_plan,
+                AppError::Http { status, body },
+            )
         }
         Err(e) => {
             cache.mark_stale();
-            cache.write_last_error(0, &e.to_string());
-            fallback_with_error(cache, Some((0, e.to_string())), config_plan)
+            let last_error = Some(cache.write_last_error(0, &e.to_string()));
+            fallback_with_error(cache, last_error, config_plan, e)
         }
     }
 }
 
-fn reuse(bytes: Vec<u8>, cache: &Cache, stale: bool, plan: Option<&str>) -> FetchOutcome {
-    let snapshot = serde_json::from_slice::<Envelope>(&bytes)
-        .map(|e| e.into_snapshot(plan))
-        .unwrap_or_else(|_| ShviaSnapshot {
-            plan: plan
-                .filter(|p| !p.is_empty())
-                .unwrap_or("ShvIA")
-                .to_string(),
-            today: None,
-            week: None,
-            month: None,
-        });
-    FetchOutcome {
-        snapshot,
+fn reuse(bytes: Vec<u8>, cache: &Cache, stale: bool, plan: Option<&str>) -> Result<FetchOutcome> {
+    Ok(crate::outcome::Outcome::cached(
+        parse_cache(&bytes, plan)?,
+        cache,
         stale,
-        last_error: cache.read_last_error(),
-        cache_age: cache.payload_age(),
-    }
+    ))
 }
 
-fn fallback_silent(cache: &Cache, plan: Option<&str>) -> Result<FetchOutcome> {
-    let Some(bytes) = cache.maybe_payload()? else {
-        return Err(AppError::Transport(
-            "shvia: no cache and network unreachable".into(),
-        ));
-    };
-    Ok(reuse(bytes, cache, true, plan))
+/// A cached payload that no longer parses is not usage data. Reporting that
+/// through `outcome::fallback` surfaces the original fetch error instead of a
+/// fabricated all-empty snapshot, which used to read as "0% used".
+fn parse_cache(bytes: &[u8], plan: Option<&str>) -> Result<ShviaSnapshot> {
+    let env: Envelope = serde_json::from_slice(bytes)?;
+    Ok(env.into_snapshot(plan))
+}
+
+fn fallback_silent(cache: &Cache, plan: Option<&str>, original: AppError) -> Result<FetchOutcome> {
+    crate::outcome::fallback(cache, None, original, |bytes| parse_cache(bytes, plan))
 }
 
 fn fallback_with_error(
     cache: &Cache,
     last_error: Option<(u16, String)>,
     plan: Option<&str>,
+    original: AppError,
 ) -> Result<FetchOutcome> {
-    let Some(bytes) = cache.maybe_payload()? else {
-        return Err(AppError::Other("shvia: no usable cache".into()));
-    };
-    let mut out = reuse(bytes, cache, true, plan);
-    out.last_error = last_error;
-    Ok(out)
+    crate::outcome::fallback(cache, last_error, original, |bytes| {
+        parse_cache(bytes, plan)
+    })
 }
 
 async fn fetch_live(client: &reqwest::Client, url: &str, api_key: &str) -> Result<Vec<u8>> {

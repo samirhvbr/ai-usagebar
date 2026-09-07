@@ -13,11 +13,14 @@ use crate::anthropic_api;
 use crate::antigravity;
 use crate::cache::{Cache, DEFAULT_TTL};
 use crate::config::Config;
+use crate::copilot;
+use crate::cursor;
 use crate::deepseek;
 use crate::error::{AppError, Result};
 use crate::grok;
 use crate::kilo;
 use crate::kimi;
+use crate::kiro;
 use crate::minimax;
 use crate::moonshot;
 use crate::novita;
@@ -25,6 +28,7 @@ use crate::openai;
 use crate::openrouter;
 use crate::pango::escape;
 use crate::shvia;
+use crate::supergrok;
 use crate::theme::Theme;
 use crate::vendor::{HTTP_CLIENT_TIMEOUT, RenderOpts, VendorOutcome};
 use crate::waybar::WaybarOutput;
@@ -131,6 +135,7 @@ async fn build_output(cli: &Cli) -> Result<WaybarOutput> {
     // typo'd section shows another account's usage with no diagnostic.
     let config = Config::load()?;
     let vendor = cli.resolved_vendor(&config);
+    validate_vendor_options(cli, vendor)?;
     if !dispatch_is_eligible(cli, &config, vendor) {
         return Err(AppError::Other(format!(
             "vendor {:?} is disabled in {}",
@@ -143,6 +148,7 @@ async fn build_output(cli: &Cli) -> Result<WaybarOutput> {
         Vendor::AnthropicApi => anthropic_api_output(cli, &config).await,
         Vendor::Openrouter => openrouter_output(cli, &config).await,
         Vendor::Openai => openai_output(cli, &config).await,
+        Vendor::Copilot => copilot_output(cli, &config).await,
         Vendor::Zai => zai_output(cli, &config).await,
         Vendor::Deepseek => deepseek_output(cli, &config).await,
         Vendor::Kimi => kimi_output(cli, &config).await,
@@ -150,10 +156,35 @@ async fn build_output(cli: &Cli) -> Result<WaybarOutput> {
         Vendor::Novita => novita_output(cli, &config).await,
         Vendor::Moonshot => moonshot_output(cli, &config).await,
         Vendor::Grok => grok_output(cli, &config).await,
+        Vendor::Supergrok => supergrok_output(cli, &config).await,
         Vendor::Antigravity => antigravity_output(cli, &config).await,
-        Vendor::Shvia => shvia_output(cli, &config).await,
+        Vendor::Cursor => cursor_output(cli, &config).await,
         Vendor::Minimax => minimax_output(cli, &config).await,
+        Vendor::Kiro => kiro_output(cli, &config).await,
+        Vendor::NousResearch => nous_output(cli).await,
+        Vendor::OpenCodeGo => opencode_go_output(cli, &config).await,
+        Vendor::CommandCode => commandcode_output(cli, &config).await,
+        Vendor::Shvia => shvia_output(cli, &config).await,
     }
+}
+
+fn validate_vendor_options(cli: &Cli, vendor: Vendor) -> Result<()> {
+    if cli.account.is_some()
+        && !matches!(
+            vendor,
+            Vendor::Anthropic | Vendor::Openrouter | Vendor::Openai
+        )
+    {
+        return Err(AppError::Other(
+            "--account is supported only for Claude, OpenRouter, and Codex (OpenAI)".into(),
+        ));
+    }
+    if cli.desktop && vendor != Vendor::Anthropic {
+        return Err(AppError::Other(
+            "--desktop is supported only for Claude accounts".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Config and persisted selections may only dispatch enabled vendors. An
@@ -161,6 +192,97 @@ async fn build_output(cli: &Cli) -> Result<WaybarOutput> {
 /// that default to disabled (such as Kimi).
 fn dispatch_is_eligible(cli: &Cli, config: &Config, vendor: Vendor) -> bool {
     cli.has_explicit_vendor() || config.is_enabled(vendor.to_id())
+}
+
+/// Nous Research authenticates with the independent OAuth credential store.
+async fn nous_output(cli: &Cli) -> Result<WaybarOutput> {
+    let client = http_client()?;
+    let store = crate::nous::credentials::CredentialStore::default();
+    let endpoints = crate::nous::fetch::Endpoints::default();
+    let account =
+        crate::nous::fetch::fetch_account_with_refresh(&client, &store, &endpoints, Utc::now())
+            .await?;
+    let snapshot = account.clone();
+    // Nous keeps no cache of its own, so every read is a live one.
+    let outcome =
+        crate::outcome::Outcome::fresh(crate::usage::VendorSnapshot::NousResearch(account));
+    let theme = theme_from_cli(cli);
+    Ok(crate::nous::vendor::render(
+        &outcome,
+        &snapshot,
+        &theme,
+        &RenderOpts::from_cli(cli),
+        Utc::now(),
+    ))
+}
+
+async fn opencode_go_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
+    let api_key = crate::config::resolve_api_key(
+        "OpenCode Go",
+        &config.opencode_go.api_key_env,
+        config.opencode_go.api_key.as_deref(),
+    )?;
+    let client = http_client()?;
+    let cache = vendor_cache(cli, "opencode-go")?;
+    let endpoints = crate::opencode_go::fetch::Endpoints::default();
+    let outcome = match crate::opencode_go::fetch::fetch_snapshot(
+        &client,
+        &api_key,
+        &cache,
+        &endpoints,
+        DEFAULT_TTL,
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) if error.is_transient() => {
+            return Ok(WaybarOutput::loading(cli.icon.as_deref()));
+        }
+        Err(error) => return Err(error),
+    };
+    let snapshot = outcome.snapshot.clone();
+    let vendor_outcome: VendorOutcome = outcome.into();
+    Ok(crate::opencode_go::vendor::render(
+        &vendor_outcome,
+        &snapshot,
+        &theme_from_cli(cli),
+        &RenderOpts::from_cli(cli),
+        Utc::now(),
+    ))
+}
+
+/// Command Code has no API key of its own: it reuses the OAuth credential a
+/// local agent harness already holds, so there is nothing to resolve from
+/// config beyond an optional override of where to look.
+async fn commandcode_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
+    let credential = crate::commandcode::creds::resolve(config.commandcode.auth_paths.as_deref())?;
+    let client = http_client()?;
+    let cache = vendor_cache(cli, "commandcode")?;
+    let endpoints = crate::commandcode::fetch::Endpoints::default();
+    let outcome = match crate::commandcode::fetch::fetch_snapshot(
+        &client,
+        &credential.token,
+        &cache,
+        &endpoints,
+        DEFAULT_TTL,
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) if error.is_transient() => {
+            return Ok(WaybarOutput::loading(cli.icon.as_deref()));
+        }
+        Err(error) => return Err(error),
+    };
+    let snapshot = outcome.snapshot.clone();
+    let vendor_outcome: VendorOutcome = outcome.into();
+    Ok(crate::commandcode::vendor::render(
+        &vendor_outcome,
+        &snapshot,
+        &theme_from_cli(cli),
+        &RenderOpts::from_cli(cli),
+        Utc::now(),
+    ))
 }
 
 /// Antigravity authenticates through whichever local product is running (the
@@ -179,6 +301,79 @@ async fn antigravity_output(cli: &Cli, _config: &Config) -> Result<WaybarOutput>
     let vendor_outcome: VendorOutcome = outcome.into();
     let opts = RenderOpts::from_cli(cli);
     Ok(antigravity::vendor::render(
+        &vendor_outcome,
+        &snap,
+        &theme,
+        &opts,
+        chrono::Utc::now(),
+    ))
+}
+
+/// Cursor authenticates via a session token the Cursor IDE already wrote to
+/// its local `state.vscdb` — no API key to resolve, but (unlike Antigravity)
+/// a real on-disk path that can be overridden, mirroring OpenAI's
+/// `codex_auth_path`.
+async fn cursor_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
+    let client = http_client()?;
+    let cache = vendor_cache(cli, "cursor")?;
+    let db_path = match config.cursor.db_path.as_deref() {
+        Some(p) => p.to_path_buf(),
+        None => cursor::db::default_db_path()?,
+    };
+    let agent_auth_path = match config.cursor.agent_auth_path.as_deref() {
+        Some(p) => p.to_path_buf(),
+        None => cursor::db::default_agent_auth_path()?,
+    };
+    let endpoints = cursor::fetch::Endpoints::default();
+    let outcome = match cursor::fetch_snapshot(
+        &client,
+        &db_path,
+        &agent_auth_path,
+        &cache,
+        &endpoints,
+        DEFAULT_TTL,
+    )
+    .await
+    {
+        Ok(o) => o,
+        Err(e) if e.is_transient() => return Ok(WaybarOutput::loading(cli.icon.as_deref())),
+        Err(e) => return Err(e),
+    };
+
+    let theme = theme_from_cli(cli);
+    let snap = outcome.snapshot.clone();
+    let vendor_outcome: VendorOutcome = outcome.into();
+    let opts = RenderOpts::from_cli(cli);
+    Ok(cursor::vendor::render(
+        &vendor_outcome,
+        &snap,
+        &theme,
+        &opts,
+        chrono::Utc::now(),
+    ))
+}
+
+/// Kiro CLI authenticates via the AWS SSO OIDC session kiro-cli already wrote
+/// to its own local `data.sqlite3` — no API key to resolve, but (like Cursor)
+/// a real on-disk path that can be overridden.
+async fn kiro_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
+    let client = http_client()?;
+    let cache = vendor_cache(cli, "kiro")?;
+    let db_path = match config.kiro.db_path.as_deref() {
+        Some(p) => p.to_path_buf(),
+        None => kiro::db::default_db_path()?,
+    };
+    let outcome = match kiro::fetch_snapshot(&client, &db_path, &cache, DEFAULT_TTL).await {
+        Ok(o) => o,
+        Err(e) if e.is_transient() => return Ok(WaybarOutput::loading(cli.icon.as_deref())),
+        Err(e) => return Err(e),
+    };
+
+    let theme = theme_from_cli(cli);
+    let snap = outcome.snapshot.clone();
+    let vendor_outcome: VendorOutcome = outcome.into();
+    let opts = RenderOpts::from_cli(cli);
+    Ok(kiro::vendor::render(
         &vendor_outcome,
         &snap,
         &theme,
@@ -216,6 +411,41 @@ async fn grok_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
     let vendor_outcome: VendorOutcome = outcome.into();
     let opts = RenderOpts::from_cli(cli);
     Ok(grok::vendor::render(
+        &vendor_outcome,
+        &snap,
+        &theme,
+        &opts,
+        chrono::Utc::now(),
+    ))
+}
+
+/// SuperGrok reads billing over the CLI's documented HTTPS endpoint (or, as a
+/// fallback, its ACP process). The login's `key` is used only inside one
+/// outgoing Authorization header — never cached, refreshed, or written back.
+async fn supergrok_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
+    let cache = vendor_cache(cli, "supergrok")?;
+    let scope_paths = supergrok::scope::ScopePaths::with_overrides(
+        config.supergrok.auth_path.as_deref(),
+        config.supergrok.config_path.as_deref(),
+    )?;
+    let outcome = match supergrok::fetch_snapshot(
+        &config.supergrok.grok_binary,
+        &scope_paths,
+        &cache,
+        DEFAULT_TTL,
+    )
+    .await
+    {
+        Ok(o) => o,
+        Err(e) if e.is_transient() => return Ok(WaybarOutput::loading(cli.icon.as_deref())),
+        Err(e) => return Err(e),
+    };
+
+    let theme = theme_from_cli(cli);
+    let snap = outcome.snapshot.clone();
+    let vendor_outcome: VendorOutcome = outcome.into();
+    let opts = RenderOpts::from_cli(cli);
+    Ok(supergrok::vendor::render(
         &vendor_outcome,
         &snap,
         &theme,
@@ -393,13 +623,25 @@ async fn anthropic_api_output(cli: &Cli, config: &Config) -> Result<WaybarOutput
     ))
 }
 
+/// Resolve a Codex login and its cache as one identity, the way
+/// [`openrouter_target`] does for a key. The default login keeps the historical
+/// vendor-root cache; each named account is isolated below `openai/<label>`, so
+/// two ChatGPT subscriptions never serve each other's usage from a warm cache.
+fn openai_target(cli: &Cli, config: &Config) -> Result<(std::path::PathBuf, Cache)> {
+    let label = cli.account.as_deref();
+    let creds_path = config.openai.resolve_auth_path(label)?;
+    let cache = match (cli.cache_dir.as_deref(), label) {
+        (Some(root), Some(label)) => Cache::at(root.join("openai").join(label)),
+        (Some(root), None) => Cache::at(root.join("openai")),
+        (None, Some(label)) => Cache::for_vendor_account("openai", label)?,
+        (None, None) => Cache::for_vendor("openai")?,
+    };
+    Ok((creds_path, cache))
+}
+
 async fn openai_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
     let client = http_client()?;
-    let cache = vendor_cache(cli, "openai")?;
-    let creds_path = match config.openai.codex_auth_path.as_deref() {
-        Some(p) => p.to_path_buf(),
-        None => openai::creds::default_path()?,
-    };
+    let (creds_path, cache) = openai_target(cli, config)?;
     let endpoints = openai::fetch::Endpoints::default();
     let outcome =
         match openai::fetch_snapshot(&client, &creds_path, &cache, &endpoints, DEFAULT_TTL).await {
@@ -418,6 +660,30 @@ async fn openai_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
         &theme,
         &opts,
         chrono::Utc::now(),
+    ))
+}
+
+async fn copilot_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
+    let token = config.copilot.resolve_token()?;
+    let client = http_client()?;
+    let cache = vendor_cache(cli, "copilot")?;
+    let endpoints = copilot::fetch::Endpoints::default();
+    let outcome =
+        match copilot::fetch_snapshot(&client, &token, &cache, &endpoints, DEFAULT_TTL).await {
+            Ok(outcome) => outcome,
+            Err(error) if error.is_transient() => {
+                return Ok(WaybarOutput::loading(cli.icon.as_deref()));
+            }
+            Err(error) => return Err(error),
+        };
+    let snapshot = outcome.snapshot.clone();
+    let vendor_outcome: VendorOutcome = outcome.into();
+    Ok(copilot::vendor::render(
+        &vendor_outcome,
+        &snapshot,
+        &theme_from_cli(cli),
+        &RenderOpts::from_cli(cli),
+        Utc::now(),
     ))
 }
 
@@ -499,13 +765,8 @@ async fn shvia_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
 }
 
 async fn openrouter_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
-    let api_key = crate::config::resolve_api_key(
-        "OpenRouter",
-        &config.openrouter.api_key_env,
-        config.openrouter.api_key.as_deref(),
-    )?;
+    let (api_key, cache) = openrouter_target(cli, config)?;
     let client = http_client()?;
-    let cache = vendor_cache(cli, "openrouter")?;
     let endpoints = openrouter::fetch::Endpoints::default();
     let outcome = match openrouter::fetch_snapshot(
         &client,
@@ -533,6 +794,21 @@ async fn openrouter_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
         &opts,
         chrono::Utc::now(),
     ))
+}
+
+/// Resolve an OpenRouter key and its cache as one identity. The unnamed key
+/// keeps the historical vendor-root cache; each named key is isolated below
+/// `openrouter/<label>` so fresh data can never cross accounts.
+fn openrouter_target(cli: &Cli, config: &Config) -> Result<(String, Cache)> {
+    let label = cli.account.as_deref();
+    let api_key = config.openrouter.resolve_api_key(label)?;
+    let cache = match (cli.cache_dir.as_deref(), label) {
+        (Some(root), Some(label)) => Cache::at(root.join("openrouter").join(label)),
+        (Some(root), None) => Cache::at(root.join("openrouter")),
+        (None, Some(label)) => Cache::for_vendor_account("openrouter", label)?,
+        (None, None) => Cache::for_vendor("openrouter")?,
+    };
+    Ok((api_key, cache))
 }
 
 async fn deepseek_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
@@ -565,20 +841,22 @@ async fn deepseek_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
 }
 
 async fn kimi_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
-    let api_key = crate::config::resolve_api_key(
-        "Kimi",
-        &config.kimi.api_key_env,
-        config.kimi.api_key.as_deref(),
-    )?;
+    let (auth, endpoints) = kimi::resolve_auth(&config.kimi)?;
     let client = http_client()?;
     let cache = vendor_cache(cli, "kimi")?;
-    let endpoints = kimi::fetch::Endpoints::default();
-    let outcome =
-        match kimi::fetch_snapshot(&client, &api_key, &cache, &endpoints, DEFAULT_TTL).await {
-            Ok(o) => o,
-            Err(e) if e.is_transient() => return Ok(WaybarOutput::loading(cli.icon.as_deref())),
-            Err(e) => return Err(e),
-        };
+    let outcome = match kimi::fetch::fetch_snapshot_with_auth(
+        &client,
+        &auth,
+        &cache,
+        &endpoints,
+        DEFAULT_TTL,
+    )
+    .await
+    {
+        Ok(o) => o,
+        Err(e) if e.is_transient() => return Ok(WaybarOutput::loading(cli.icon.as_deref())),
+        Err(e) => return Err(e),
+    };
 
     let theme = theme_from_cli(cli);
     let snap = outcome.snapshot.clone();
@@ -633,9 +911,10 @@ fn render_with_theme(outcome: &FetchOutcome, theme: &Theme, cli: &Cli) -> Waybar
     render_anthropic(&input)
 }
 
-fn http_client() -> Result<Client> {
+pub(crate) fn http_client() -> Result<Client> {
     Client::builder()
         .timeout(HTTP_CLIENT_TIMEOUT)
+        .redirect(crate::vendor::same_origin_redirect_policy())
         .build()
         .map_err(|e| AppError::Other(format!("http client init: {e}")))
 }
@@ -654,6 +933,18 @@ fn vendor_cache(cli: &Cli, vendor: &str) -> Result<Cache> {
 /// account behaves byte-identically to before.
 fn anthropic_target(cli: &Cli, config: &Config) -> Result<(CredsTarget, Cache)> {
     match cli.account.as_deref() {
+        // `--account <label> --desktop`: read the Claude Desktop app's own token
+        // for that saved profile (the menu bar's overview path). `--cache-dir`
+        // still relocates the cache for scripted/multi-monitor setups.
+        Some(label) if cli.desktop => {
+            let (target, default_cache) =
+                crate::anthropic::desktop_creds::account_target(config, label)?;
+            let cache = match cli.cache_dir.as_deref() {
+                Some(p) => Cache::at(p.join("anthropic").join(label)),
+                None => default_cache,
+            };
+            Ok((target, cache))
+        }
         Some(label) => named_account_target(cli, config, label),
         None => Ok((
             anthropic_default_creds(cli, config)?,
@@ -707,6 +998,9 @@ fn theme_from_cli(cli: &Cli) -> Theme {
 fn fallback(err: &AppError, _cli: &Cli) -> WaybarOutput {
     let tooltip = match err {
         AppError::Credentials(m) => format!("Credentials error.\n{m}"),
+        AppError::Http { status, .. } if matches!(status, 401 | 403) => {
+            format!("HTTP {status}\n{}", crate::error::AUTH_FAILURE_MESSAGE)
+        }
         AppError::Http { status, body } => format!("HTTP {status}\n{body}"),
         AppError::Schema(m) => format!("API schema drift.\n{m}"),
         AppError::Io { path, source } => format!("I/O error at {}.\n{source}", path.display()),
@@ -717,6 +1011,8 @@ fn fallback(err: &AppError, _cli: &Cli) -> WaybarOutput {
     };
     // Tooltips are Pango markup. Escape error text before serializing it so an
     // error cannot inject markup; serde still produces valid one-line JSON.
+    // `escape` also runs `display::sanitize_untrusted_field`, which is what
+    // bounds and de-controls the vendor body this tooltip can carry.
     WaybarOutput::error(&escape(&tooltip))
 }
 
@@ -784,6 +1080,37 @@ mod tests {
         assert!(out.tooltip.contains("missing token"));
     }
 
+    /// A vendor body reaches this tooltip verbatim on a cold cache — nothing
+    /// on the way has been through `Cache::write_last_error`. What protects it
+    /// is that `pango::escape` runs `sanitize_untrusted_field` first, so bidi
+    /// overrides (which reorder the text around them and survive XML escaping)
+    /// and a body up to the 2 MiB `MAX_BODY_BYTES` ceiling are both handled.
+    /// That is load-bearing and easy to lose if `escape` is ever reduced to
+    /// plain XML escaping, so pin it here at the sink that depends on it.
+    #[test]
+    fn fallback_strips_control_characters_and_caps_a_hostile_body() {
+        let hostile = "start\u{202E}reordered\u{1B}[31m".to_string()
+            + &"A".repeat(crate::display::MAX_UNTRUSTED_FIELD_CHARS);
+        let out = fallback(
+            &AppError::Http {
+                status: 500,
+                body: hostile,
+            },
+            &cli_default(),
+        );
+
+        assert_eq!(out.text, "\u{26a0}");
+        assert!(!out.tooltip.contains('\u{202E}'), "bidi override survived");
+        assert!(!out.tooltip.contains('\u{1B}'), "escape sequence survived");
+        assert!(
+            out.tooltip.chars().count() <= crate::display::MAX_UNTRUSTED_FIELD_CHARS,
+            "uncapped tooltip of {} chars",
+            out.tooltip.chars().count()
+        );
+        // The diagnostic itself still survives the cleaning.
+        assert!(out.tooltip.contains("HTTP 500"), "{}", out.tooltip);
+    }
+
     #[test]
     fn watch_only_clears_the_screen_on_a_terminal() {
         // Redirected to a file or piped, the clear-screen escape is garbage in
@@ -825,7 +1152,24 @@ mod tests {
             &cli_default(),
         );
         assert_eq!(out.tooltip, "bad &lt;markup&gt; &amp; value");
-        assert!(serde_json::from_str::<serde_json::Value>(out.to_json_line().trim()).is_ok());
+        let json: serde_json::Value = serde_json::from_str(out.to_json_line().trim()).unwrap();
+        assert_eq!(json["text"], "⚠");
+        assert_eq!(json["tooltip"], "bad &lt;markup&gt; &amp; value");
+    }
+
+    #[test]
+    fn fallback_does_not_expose_authentication_response_bodies() {
+        let out = fallback(
+            &AppError::Http {
+                status: 401,
+                body: "PANCEA user@example.test <credential>&token".into(),
+            },
+            &cli_default(),
+        );
+        assert!(out.tooltip.contains(crate::error::AUTH_FAILURE_MESSAGE));
+        assert!(!out.tooltip.contains("PANCEA"));
+        assert!(!out.tooltip.contains("user@example.test"));
+        assert!(!out.tooltip.contains("&amp;token"));
     }
 
     #[test]
@@ -896,14 +1240,18 @@ mod tests {
 
     #[test]
     fn named_account_uses_its_creds_and_label_subdir() {
-        // A named account's file is Explicit: a missing/broken path must fail
-        // loudly, never silently read another account's Keychain item (#15).
+        // A named account's file is read strictly first; the Keychain fallback
+        // (if the file is missing/unusable) is scoped to its own directory, so
+        // it can never silently read a *different* account's item (#15).
         let config = config_with_account("work", "/creds/work.json");
         let cli = cli_with(Some("work"), None, Some("/tmp/cache"));
         let (creds, cache) = anthropic_target(&cli, &config).unwrap();
         assert_eq!(
             creds,
-            CredsTarget::Explicit(PathBuf::from("/creds/work.json"))
+            CredsTarget::Named {
+                path: PathBuf::from("/creds/work.json"),
+                config_dir: PathBuf::from("/creds"),
+            }
         );
         assert_eq!(
             cache.dir(),
@@ -926,5 +1274,69 @@ mod tests {
         use clap::Parser;
         let res = Cli::try_parse_from(["ai-usagebar", "--account", "work", "--creds-path", "/x"]);
         assert!(res.is_err(), "--account and --creds-path must conflict");
+    }
+
+    #[test]
+    fn openrouter_named_account_uses_its_key_and_cache_subdir() {
+        let mut config = Config::default();
+        config
+            .openrouter
+            .accounts
+            .push(crate::config::OpenRouterAccount {
+                label: "work".into(),
+                api_key_env: None,
+                api_key: Some("work-key".into()),
+            });
+        config
+            .openrouter
+            .accounts
+            .push(crate::config::OpenRouterAccount {
+                label: "personal".into(),
+                api_key_env: None,
+                api_key: Some("personal-key".into()),
+            });
+        let root = tempfile::tempdir().unwrap();
+        let root_str = root.path().to_str().unwrap();
+        let cli = cli_with(Some("work"), None, Some(root_str));
+        let (key, cache) = openrouter_target(&cli, &config).unwrap();
+        assert_eq!(key, "work-key");
+        assert_eq!(cache.dir(), root.path().join("openrouter/work"));
+        cache.write_payload(b"work-only").unwrap();
+
+        let personal_cli = cli_with(Some("personal"), None, Some(root_str));
+        let (personal_key, personal_cache) = openrouter_target(&personal_cli, &config).unwrap();
+        assert_eq!(personal_key, "personal-key");
+        assert!(
+            personal_cache.maybe_payload().unwrap().is_none(),
+            "a named account must not reuse another account's fresh cache"
+        );
+    }
+
+    #[test]
+    fn openrouter_default_target_keeps_the_original_cache_path() {
+        let mut config = Config::default();
+        config.openrouter.api_key_env.clear();
+        config.openrouter.api_key = Some("default-key".into());
+        let cli = cli_with(None, None, Some("/tmp/cache"));
+        let (key, cache) = openrouter_target(&cli, &config).unwrap();
+        assert_eq!(key, "default-key");
+        assert_eq!(cache.dir(), std::path::Path::new("/tmp/cache/openrouter"));
+    }
+
+    #[test]
+    fn account_flag_rejects_unrelated_vendors() {
+        let cli = cli_with(Some("work"), None, Some("/tmp/cache"));
+        assert!(validate_vendor_options(&cli, Vendor::Zai).is_err());
+        assert!(validate_vendor_options(&cli, Vendor::Anthropic).is_ok());
+        assert!(validate_vendor_options(&cli, Vendor::Openrouter).is_ok());
+        assert!(validate_vendor_options(&cli, Vendor::Openai).is_ok());
+    }
+
+    #[test]
+    fn desktop_flag_remains_claude_only() {
+        let mut cli = cli_with(Some("work"), None, Some("/tmp/cache"));
+        cli.desktop = true;
+        assert!(validate_vendor_options(&cli, Vendor::Openrouter).is_err());
+        assert!(validate_vendor_options(&cli, Vendor::Anthropic).is_ok());
     }
 }

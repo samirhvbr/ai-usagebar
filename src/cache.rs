@@ -17,7 +17,7 @@ use std::time::{Duration, SystemTime};
 
 use fs2::FileExt;
 
-use crate::error::{AppError, Result};
+use crate::error::{AUTH_FAILURE_MESSAGE, AppError, Result};
 
 /// Default TTL — claudebar's `CACHE_TTL=60`.
 pub const DEFAULT_TTL: Duration = Duration::from_secs(60);
@@ -172,11 +172,29 @@ impl Cache {
     /// Write the `.last_error` marker — first line `code`, everything after it
     /// `msg`. Best-effort, never errors (matches claudebar:478-486 which
     /// silently continues if the cache dir isn't writable).
-    pub fn write_last_error(&self, code: u16, msg: &str) {
+    ///
+    /// **Returns exactly what was written**, so a caller that also puts the
+    /// failure in its [`crate::vendor::VendorOutcome`] can hand over this pair
+    /// instead of deriving a second one from the raw body. The two must not be
+    /// computed separately: persisting a redacted message while the in-memory
+    /// copy kept the original is how a `401` body reached the widget tooltip on
+    /// the one run that had a warm cache to fall back on. Callers that only
+    /// persist can keep ignoring the return.
+    pub fn write_last_error(&self, code: u16, msg: &str) -> (u16, String) {
         let _ = self.ensure_dir();
         let path = self.last_error_path();
+        // Authentication failure bodies routinely include account identifiers or
+        // partial credential details. Do not persist them; other status bodies
+        // remain useful diagnostics after their usual control-char cleanup.
+        let msg = if matches!(code, 401 | 403) {
+            AUTH_FAILURE_MESSAGE
+        } else {
+            msg
+        };
+        let msg = crate::display::sanitize_untrusted_field(msg);
         let body = format!("{code}\n{msg}");
         let _ = atomic_write(&path, body.as_bytes());
+        (code, msg)
     }
 
     /// Best-effort removal of the `.last_error` marker.
@@ -435,6 +453,126 @@ mod tests {
         assert_eq!(msg, "");
     }
 
+    #[test]
+    fn last_error_replaces_401_body_with_credential_neutral_message() {
+        let (_td, cache) = fixture();
+        cache.write_last_error(401, "PANCEA user@example.test <credential>&token");
+
+        let persisted = fs::read_to_string(cache.last_error_path()).unwrap();
+        assert_eq!(persisted, format!("401\n{AUTH_FAILURE_MESSAGE}"));
+        assert!(!persisted.contains("PANCEA"));
+        assert!(!persisted.contains("<credential>"));
+    }
+
+    #[test]
+    fn last_error_replaces_403_body_with_credential_neutral_message() {
+        let (_td, cache) = fixture();
+        cache.write_last_error(403, "PANCEA account@example.test <credential>&token");
+
+        let persisted = fs::read_to_string(cache.last_error_path()).unwrap();
+        assert_eq!(persisted, format!("403\n{AUTH_FAILURE_MESSAGE}"));
+        assert!(!persisted.contains("PANCEA"));
+        assert!(!persisted.contains("<credential>"));
+    }
+
+    /// The invariant that keeps the displayed message from drifting away from
+    /// the persisted one: what comes back is what a later run would read from
+    /// disk, so a caller that shows the return value cannot show anything the
+    /// cache refused to keep. Asserted for the redacting arm and the ordinary
+    /// one, since only the first rewrites the message.
+    #[test]
+    fn write_last_error_returns_exactly_what_a_later_run_would_read() {
+        for (code, raw) in [
+            (401u16, "PANCEA user@example.test <credential>&token"),
+            (403, "PANCEA account@example.test <credential>&token"),
+            (429, "rate limited, retry in 60s"),
+            (500, "bad\x1b]52;c;Y2FuYXJ5\x07field"),
+        ] {
+            let (_td, cache) = fixture();
+            let returned = cache.write_last_error(code, raw);
+            assert_eq!(
+                returned,
+                cache.read_last_error().unwrap(),
+                "returned pair diverged from the persisted one for {code}"
+            );
+        }
+    }
+
+    /// The defect recurred once under a second name — six vendors wrote
+    /// `Some((status, body))` inline and six more built a `diag` local first —
+    /// so the sweep that fixed the first six missed the rest. This forbids the
+    /// shape rather than the spelling: a `last_error` pair must come from
+    /// [`Cache::write_last_error`], which is the only thing that redacts.
+    ///
+    /// `error_to_pair` in `cursor`, `kimi` and `kiro` is untouched by this: it
+    /// redacts on its own and destructures as `(*status, body)`, which is not
+    /// the borrowed shape a leak takes.
+    #[test]
+    fn no_vendor_builds_a_last_error_pair_from_a_raw_http_body() {
+        let mut sites = Vec::new();
+        for file in crate::guard::rs_files_in("src") {
+            if !file.ends_with("fetch.rs") {
+                continue;
+            }
+            let source = std::fs::read_to_string(&file).expect("readable module");
+            for (n, line) in crate::guard::production_code(&source).lines().enumerate() {
+                if line.contains("(status, body") {
+                    sites.push(format!("{}:{}", file.display(), n + 1));
+                }
+            }
+        }
+        assert!(
+            sites.is_empty(),
+            "a last_error pair must be the return of `write_last_error`, which \
+             redacts 401/403 — building one from the raw body puts the response \
+             body in the widget tooltip. Found: {sites:#?}"
+        );
+    }
+
+    /// The cold-cache decision — serve a stale figure, or surface the error
+    /// that caused the refresh to fail — is `outcome::fallback`'s alone. It
+    /// drifted into two disagreeing generations once, when each vendor owned a
+    /// copy: five replaced the original error with a generic "no usable cache"
+    /// while thirteen returned it. `fallback_payload` is the entry point to
+    /// that decision, so a second caller is a second copy in the making.
+    #[test]
+    fn only_the_shared_fallback_reads_the_stale_payload() {
+        let mut sites = Vec::new();
+        for file in crate::guard::rs_files_in("src") {
+            if file.ends_with("outcome.rs") || file.ends_with("cache.rs") {
+                continue;
+            }
+            let source = std::fs::read_to_string(&file).expect("readable module");
+            for (n, line) in crate::guard::production_code(&source).lines().enumerate() {
+                if line.contains("fallback_payload(") {
+                    sites.push(format!("{}:{}", file.display(), n + 1));
+                }
+            }
+        }
+        assert!(
+            sites.is_empty(),
+            "reach the stale payload through `outcome::fallback`, which decides \
+             what a cold cache means for every vendor at once. Found: {sites:#?}"
+        );
+    }
+
+    /// The bug this closes: the pair handed to the widget was built from the
+    /// raw body in parallel with the redacted one going to disk, so the run
+    /// that hit the `401` showed the body and only the *next* run showed the
+    /// neutral message. The returned pair carries the redaction.
+    #[test]
+    fn the_returned_pair_carries_the_auth_redaction() {
+        for code in [401u16, 403] {
+            let (_td, cache) = fixture();
+            let (returned_code, msg) =
+                cache.write_last_error(code, "PANCEA user@example.test <credential>&token");
+            assert_eq!(returned_code, code);
+            assert_eq!(msg, AUTH_FAILURE_MESSAGE);
+            assert!(!msg.contains("PANCEA"), "{msg}");
+            assert!(!msg.contains("<credential>"), "{msg}");
+        }
+    }
+
     /// The regression this guards: vendors write the raw HTTP body, which is
     /// usually multi-line JSON. The reader kept only line 2, so the tooltip
     /// showed `{` and dropped the actual API explanation.
@@ -451,6 +589,21 @@ mod tests {
             msg.contains("quota exhausted"),
             "message was truncated to its first line: {msg:?}"
         );
+    }
+
+    #[test]
+    fn last_error_strips_terminal_controls_before_persisting() {
+        let (_td, cache) = fixture();
+        cache.write_last_error(500, "bad\x1b]52;c;Y2FuYXJ5\x07\nnext\tfield");
+
+        let (code, msg) = cache.read_last_error().unwrap();
+        assert_eq!(code, 500);
+        assert_eq!(msg, "bad]52;c;Y2FuYXJ5\nnext field");
+        assert!(
+            msg.contains("Y2FuYXJ5"),
+            "non-auth diagnostic was not preserved"
+        );
+        assert!(!msg.chars().any(|ch| ch.is_control() && ch != '\n'));
     }
 
     /// A user upgrades with a `.last_error` already on disk; it must still

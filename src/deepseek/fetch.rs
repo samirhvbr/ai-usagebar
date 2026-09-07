@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use crate::cache::{Cache, MAX_STALE, acquire_lock_async};
+use crate::cache::{Cache, acquire_lock_async};
 use crate::error::{AppError, Result};
 use crate::usage::DeepseekSnapshot;
 
@@ -25,13 +25,9 @@ impl Default for Endpoints {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct FetchOutcome {
-    pub snapshot: DeepseekSnapshot,
-    pub stale: bool,
-    pub last_error: Option<(u16, String)>,
-    pub cache_age: Option<Duration>,
-}
+/// This vendor's [`Outcome`](crate::outcome::Outcome) — the shared shape,
+/// specialised to its snapshot.
+pub type FetchOutcome = crate::outcome::Outcome<DeepseekSnapshot>;
 
 pub async fn fetch_snapshot(
     client: &reqwest::Client,
@@ -55,53 +51,37 @@ pub async fn fetch_snapshot(
         Ok(snap) => {
             let bytes = serde_json::to_vec(&snap_to_json(&snap))?;
             cache.write_payload(&bytes)?;
-            Ok(FetchOutcome {
-                snapshot: snap,
-                stale: false,
-                last_error: None,
-                cache_age: Some(Duration::ZERO),
-            })
+            Ok(crate::outcome::Outcome::fresh(snap))
         }
-        Err(e) if e.is_transient() => fallback_silent(cache),
+        Err(e) if e.is_transient() => fallback_silent(cache, e),
         Err(AppError::Http { status, body }) => {
             cache.mark_stale();
-            cache.write_last_error(status, &body);
-            fallback_with_error(cache, Some((status, body)))
+            let last_error = Some(cache.write_last_error(status, &body));
+            fallback_with_error(cache, last_error, AppError::Http { status, body })
         }
         Err(e) => {
             cache.mark_stale();
-            cache.write_last_error(0, &e.to_string());
-            fallback_with_error(cache, Some((0, e.to_string())))
+            let last_error = Some(cache.write_last_error(0, &e.to_string()));
+            fallback_with_error(cache, last_error, e)
         }
     }
 }
 
-fn fallback_silent(cache: &Cache) -> Result<FetchOutcome> {
-    let Some(bytes) = cache.fallback_payload(MAX_STALE)? else {
-        return Err(AppError::Transport(
-            "deepseek: no cache and network unreachable".into(),
-        ));
-    };
-    reuse_cache(bytes, cache, true)
+fn fallback_silent(cache: &Cache, original: AppError) -> Result<FetchOutcome> {
+    crate::outcome::fallback(cache, None, original, parse_cache)
 }
 
-fn fallback_with_error(cache: &Cache, last_error: Option<(u16, String)>) -> Result<FetchOutcome> {
-    let Some(bytes) = cache.fallback_payload(MAX_STALE)? else {
-        return Err(AppError::Other("deepseek: no usable cache".into()));
-    };
-    let mut outcome = reuse_cache(bytes, cache, true)?;
-    outcome.last_error = last_error;
-    Ok(outcome)
+fn fallback_with_error(
+    cache: &Cache,
+    last_error: Option<(u16, String)>,
+    original: AppError,
+) -> Result<FetchOutcome> {
+    crate::outcome::fallback(cache, last_error, original, parse_cache)
 }
 
 fn reuse_cache(bytes: Vec<u8>, cache: &Cache, stale: bool) -> Result<FetchOutcome> {
     let snap = parse_cache(&bytes)?;
-    Ok(FetchOutcome {
-        snapshot: snap,
-        stale,
-        last_error: cache.read_last_error(),
-        cache_age: cache.payload_age(),
-    })
+    Ok(crate::outcome::Outcome::cached(snap, cache, stale))
 }
 
 /// Cached money is required, not optional: a truncated or half-written payload
@@ -242,6 +222,55 @@ mod tests {
         assert!((out.snapshot.balance - 5.0).abs() < 1e-9);
         assert_eq!(out.snapshot.currency, "USD");
         assert!(!out.stale);
+    }
+
+    /// The whole bug in one path. `reuse_cache` already puts the *redacted*
+    /// message in the outcome — it reads it back from disk — and
+    /// `fallback_with_error` then overwrote it with a pair built from the raw
+    /// body. So the run that hit the `401` displayed the body and every run
+    /// after it displayed the neutral message.
+    ///
+    /// Written against Deepseek because it is the smallest harness that reaches
+    /// the shared path; the same two lines were repeated in five other vendors.
+    #[tokio::test]
+    async fn a_401_body_does_not_reach_the_outcome_when_a_cache_is_warm() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("GET", "/user/balance")
+            .with_status(401)
+            .with_body("PANCEA user@example.test <credential>&token")
+            .create_async()
+            .await;
+
+        let (_td, cache) = cache_fixture();
+        let warm = serde_json::json!({
+            "is_available": true,
+            "balance": 5.0,
+            "granted": 5.0,
+            "topped_up": 0.0,
+            "currency": "USD"
+        });
+        cache.write_payload(warm.to_string().as_bytes()).unwrap();
+
+        let endpoints = Endpoints {
+            balance: format!("{}/user/balance", server.url()),
+        };
+        let out = fetch_snapshot(
+            &reqwest::Client::new(),
+            "sk-test",
+            &cache,
+            &endpoints,
+            Duration::from_secs(0),
+        )
+        .await
+        .unwrap();
+
+        let (code, msg) = out.last_error.expect("the 401 must still be reported");
+        assert_eq!(code, 401);
+        assert_eq!(msg, crate::error::AUTH_FAILURE_MESSAGE);
+        assert!(!msg.contains("PANCEA"), "{msg}");
+        assert!(!msg.contains("<credential>"), "{msg}");
+        assert!(out.stale);
     }
 
     #[tokio::test]

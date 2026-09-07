@@ -4,13 +4,13 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 
-use crate::format::{placeholders, substitute, updated_at_hm};
+use crate::format::{money, placeholders, substitute, updated_at_hm};
 use crate::pacing::PaceSeverity;
 use crate::pango::{color_span, escape, severity_color};
 use crate::theme::Theme;
 use crate::tooltip::{Line as TooltipLine, render_bordered};
 use crate::usage::DeepseekSnapshot;
-use crate::vendor::{RenderOpts, VendorOutcome};
+use crate::vendor::{RenderOpts, VendorId, VendorOutcome};
 use crate::waybar::{Class, WaybarOutput};
 
 use super::fetch::FetchOutcome;
@@ -19,10 +19,10 @@ pub const DEFAULT_FORMAT: &str = "{ds_balance}";
 
 pub fn build_placeholders(snap: &DeepseekSnapshot) -> HashMap<&'static str, String> {
     let avail = if snap.is_available { "up" } else { "down" };
-    let balance = format_money(snap.balance, &snap.currency);
+    let balance = money(snap.balance, &snap.currency);
     placeholders(vec![
         ("icon", "󰧑".to_string()),
-        ("vendor_short", "dsk".to_string()),
+        ("vendor_short", VendorId::Deepseek.short_name().to_string()),
         // Cross-vendor aliases — DeepSeek has neither rate-limit windows nor a
         // spend denominator (`/user/balance` reports only money *remaining*),
         // so these percentages are structurally meaningless for this vendor.
@@ -41,40 +41,18 @@ pub fn build_placeholders(snap: &DeepseekSnapshot) -> HashMap<&'static str, Stri
         // "OpenRouter — {label}".
         ("plan", format!("DeepSeek — {balance}")),
         ("ds_balance", balance),
-        ("ds_granted", format_money(snap.granted, &snap.currency)),
-        ("ds_topped_up", format_money(snap.topped_up, &snap.currency)),
+        ("ds_granted", money(snap.granted, &snap.currency)),
+        ("ds_topped_up", money(snap.topped_up, &snap.currency)),
         ("ds_available", avail.to_string()),
         ("currency", snap.currency.clone()),
     ])
-}
-
-fn format_money(v: f64, currency: &str) -> String {
-    match currency {
-        "USD" => format!("${v:.2}"),
-        "CNY" => format!("¥{v:.2}"),
-        _ => format!("{v:.2} {currency}"),
-    }
 }
 
 pub fn severity(snap: &DeepseekSnapshot) -> PaceSeverity {
     if !snap.is_available {
         return PaceSeverity::Critical;
     }
-    // Thresholds scaled by currency. CNY ≈ 7× USD (rough parity).
-    // critical / high / mid boundaries in each currency unit.
-    let (t_critical, t_high, t_mid) = match snap.currency.as_str() {
-        "CNY" => (7.0_f64, 35.0, 140.0),
-        _ => (1.0_f64, 5.0, 20.0), // USD and unknowns treated as USD-scale
-    };
-    if snap.balance < t_critical {
-        PaceSeverity::Critical
-    } else if snap.balance < t_high {
-        PaceSeverity::High
-    } else if snap.balance < t_mid {
-        PaceSeverity::Mid
-    } else {
-        PaceSeverity::Low
-    }
+    crate::pango::balance_severity(snap.balance, &snap.currency)
 }
 
 pub fn render(
@@ -145,12 +123,12 @@ fn render_tooltip(
     )));
     lines.push(TooltipLine::Body(format!(
         "   <span font_weight='bold' foreground='{color}'>{bal}</span>",
-        bal = escape(&format_money(snap.balance, &snap.currency))
+        bal = escape(&money(snap.balance, &snap.currency))
     )));
     lines.push(TooltipLine::Body(format!(
         " <span foreground='{dim}'>     granted {granted} · topped-up {topped}</span>",
-        granted = escape(&format_money(snap.granted, &snap.currency)),
-        topped = escape(&format_money(snap.topped_up, &snap.currency))
+        granted = escape(&money(snap.granted, &snap.currency)),
+        topped = escape(&money(snap.topped_up, &snap.currency))
     )));
 
     lines.push(TooltipLine::Body("".into()));
@@ -189,12 +167,7 @@ fn render_tooltip(
 
 impl From<FetchOutcome> for VendorOutcome {
     fn from(o: FetchOutcome) -> Self {
-        Self {
-            snapshot: crate::usage::VendorSnapshot::Deepseek(o.snapshot),
-            stale: o.stale,
-            last_error: o.last_error,
-            cache_age: o.cache_age,
-        }
+        o.map(crate::usage::VendorSnapshot::Deepseek)
     }
 }
 
@@ -240,6 +213,33 @@ mod tests {
         let theme = Theme::default();
         let out = render(&outcome, &snap, &theme, &opts(), Utc::now());
         assert!(out.text.contains("$5.50"));
+    }
+
+    /// A DeepSeek balance can go under, and used to print "$-5.71" here while
+    /// OpenRouter printed "-$5.71" for the same thing. One formatter now.
+    #[test]
+    fn a_negative_balance_carries_its_sign_ahead_of_the_symbol() {
+        let mut snap = sample_snap();
+        snap.balance = -5.71;
+        let out = render(
+            &sample_outcome(snap.clone()),
+            &snap,
+            &Theme::default(),
+            &opts(),
+            Utc::now(),
+        );
+        assert!(out.text.contains("-$5.71"), "{}", out.text);
+        assert!(!out.text.contains("$-5.71"), "{}", out.text);
+
+        snap.currency = "CNY".into();
+        let out = render(
+            &sample_outcome(snap.clone()),
+            &snap,
+            &Theme::default(),
+            &opts(),
+            Utc::now(),
+        );
+        assert!(out.text.contains("-¥5.71"), "{}", out.text);
     }
 
     #[test]
@@ -308,6 +308,6 @@ mod tests {
             topped_up: 0.0,
             currency: "CNY".into(),
         };
-        assert_eq!(format_money(snap.balance, &snap.currency), "¥20.00");
+        assert_eq!(money(snap.balance, &snap.currency), "¥20.00");
     }
 }

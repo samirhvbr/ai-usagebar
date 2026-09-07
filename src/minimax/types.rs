@@ -60,14 +60,12 @@ impl RemainsEnvelope {
         if self.base_resp.status_code == 0 {
             return Ok(());
         }
+        // Do not surface `status_msg`: it is arbitrary upstream text and can
+        // contain request details. The stable numeric code is sufficient for
+        // diagnostics and safe to persist in the shared error cache.
         Err(AppError::Schema(format!(
-            "minimax: API reported failure (status_code {}, {})",
-            self.base_resp.status_code,
-            if self.base_resp.status_msg.is_empty() {
-                "no message"
-            } else {
-                &self.base_resp.status_msg
-            }
+            "minimax: API reported failure (status_code {})",
+            self.base_resp.status_code
         )))
     }
 }
@@ -275,6 +273,15 @@ mod tests {
                 "unexpected error: {err:?}"
             );
         }
+    }
+
+    #[test]
+    fn in_band_failure_does_not_surface_upstream_message() {
+        let env =
+            parse(r#"{"base_resp":{"status_code":9001,"status_msg":"secret request detail"}}"#);
+        let error = env.check_ok().unwrap_err().to_string();
+        assert!(error.contains("9001"), "{error}");
+        assert!(!error.contains("secret request detail"), "{error}");
     }
 
     /// A plan without video quota is normal, not an error.

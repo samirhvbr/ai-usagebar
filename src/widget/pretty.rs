@@ -46,6 +46,12 @@ pub fn pango_to_ansi(s: &str) -> String {
             } else {
                 out.push(c);
             }
+        } else if c.is_control() && c != '\n' {
+            // Raw remote/control input is never an ANSI instruction. The
+            // renderer's own color escapes are emitted only by `apply_tag`.
+            if c == '\t' || c == '\r' {
+                out.push(' ');
+            }
         } else {
             out.push(c);
         }
@@ -184,5 +190,11 @@ mod tests {
     #[test]
     fn escaped_entities_are_not_double_decoded() {
         assert_eq!(pango_to_ansi("&amp;lt;"), "&lt;\x1b[0m");
+    }
+
+    #[test]
+    fn raw_terminal_controls_are_not_forwarded() {
+        let rendered = pango_to_ansi("before\x1b]52;c;Y2FuYXJ5\x07after\tfield");
+        assert_eq!(rendered, "before]52;c;Y2FuYXJ5after field\x1b[0m");
     }
 }

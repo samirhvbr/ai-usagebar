@@ -37,7 +37,7 @@ claude        # authenticates; creds land in the login Keychain
 ### 4. Build the app
 
 ```bash
-./build.sh    # runs: swiftc -O ai-usagebar-menubar.swift -o ai-usagebar-menubar
+./build.sh    # runs: swiftc -O -parse-as-library ai-usagebar-menubar.swift -o ai-usagebar-menubar
 ```
 
 ### 5. Run it
@@ -47,15 +47,23 @@ claude        # authenticates; creds land in the login Keychain
 ```
 
 It appears in the menu bar next to the clock (no Dock icon). Click it for the
-per-window dropdown (Session / Weekly / Sonnet / Extra).
+dropdown: usage rows (Session / Weekly / Sonnet / Extra for rate-limit vendors,
+or a credit balance for balance-only vendors), a **"Trocar vendor"** submenu to
+switch vendors quickly, and Preferences.
 
 ### 6. Start automatically at login
+
+The easiest way is the **Preferências… → Sistema → "Iniciar no login"** toggle in
+the app itself — it installs (or removes) the LaunchAgent for you, no Terminal
+needed. It takes effect at your next login.
+
+Or do it from the shell:
 
 ```bash
 ./install-agent.sh
 ```
 
-This installs a LaunchAgent at
+Either way installs a LaunchAgent at
 `~/Library/LaunchAgents/com.akitaonrails.ai-usagebar-menubar.plist` with
 `RunAtLoad`, so the app starts on every login. It is not kept alive after you
 choose **Sair/Quit**.

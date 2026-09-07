@@ -11,6 +11,7 @@
 use chrono::{DateTime, Utc};
 
 use crate::countdown;
+use crate::pacing;
 use crate::pango::{self, escape, severity_color, severity_for, visible_width};
 use crate::theme::Theme;
 use crate::usage::UsageWindow;
@@ -25,10 +26,54 @@ pub enum Line {
     Sep,
 }
 
+/// Optional decorations for a [`push_window`] row. `Default` reproduces the
+/// plain row every vendor drew before pacing reached the tooltip: bar +
+/// percentage, then `⏱  Resets in …`.
+///
+/// `glyph` is inserted into Pango markup as-is, so a caller passing anything
+/// vendor-reported must [`escape`] it first.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WindowRow {
+    /// Elapsed-time marker drawn inside the bar (`--tooltip-pace-pts`).
+    pub marker_pct: Option<i32>,
+    /// Pace glyph appended after the bold percentage (`↑` / `→` / `↓`).
+    pub glyph: Option<&'static str>,
+}
+
+impl WindowRow {
+    /// The Anthropic tooltip's pace convention in one place (mirrors
+    /// `widget::render::pick_pace_glyph`): the ratio glyph by default, and with
+    /// `point_mode` (`--tooltip-pace-pts`) the point-delta glyph plus the
+    /// elapsed marker inside the bar.
+    ///
+    /// A window with no reported reset degrades to `pacing::Pacing::neutral()`,
+    /// so it still gets a `→` rather than a blank where every sibling row has
+    /// a glyph.
+    pub fn paced(w: &UsageWindow, now: DateTime<Utc>, tolerance: u32, point_mode: bool) -> Self {
+        let p = pacing::calc(
+            w.utilization_pct,
+            w.resets_at,
+            now,
+            w.window_duration,
+            tolerance,
+        );
+        Self {
+            marker_pct: point_mode.then_some(p.elapsed_pct),
+            glyph: Some(if point_mode {
+                p.point_pace.glyph()
+            } else {
+                p.ratio_pace.glyph()
+            }),
+        }
+    }
+}
+
 /// Append the standard three-line block every vendor uses for a usage window:
 /// icon + label, progress bar + bold percentage, then the dim reset countdown.
 ///
 /// `elapsed` draws the pace marker inside the bar; pass `None` for a plain bar.
+/// Keep this signature stable for library callers — a row that also wants the
+/// pace glyph goes through [`push_window_with_row`].
 pub fn push_window(
     lines: &mut Vec<Line>,
     label: &str,
@@ -37,15 +82,38 @@ pub fn push_window(
     now: DateTime<Utc>,
     elapsed: Option<i32>,
 ) {
+    push_window_with_row(
+        lines,
+        label,
+        w,
+        theme,
+        now,
+        WindowRow {
+            marker_pct: elapsed,
+            ..WindowRow::default()
+        },
+    );
+}
+
+/// [`push_window`], plus the optional decorations a [`WindowRow`] carries.
+pub fn push_window_with_row(
+    lines: &mut Vec<Line>,
+    label: &str,
+    w: &UsageWindow,
+    theme: &Theme,
+    now: DateTime<Utc>,
+    row: WindowRow,
+) {
     let color = severity_color(severity_for(w.utilization_pct), theme);
-    let bar = pango::progress_bar(w.utilization_pct, color, theme, elapsed);
+    let bar = pango::progress_bar(w.utilization_pct, color, theme, row.marker_pct);
     let fg = &theme.fg;
     let dim = &theme.dim;
+    let glyph = row.glyph.map(|g| format!(" {g}")).unwrap_or_default();
     lines.push(Line::Body(format!(
         " <span foreground='{fg}'>{label}</span>"
     )));
     lines.push(Line::Body(format!(
-        "   {bar}  <span font_weight='bold' foreground='{color}'>{pct}%</span>",
+        "   {bar}  <span font_weight='bold' foreground='{color}'>{pct}%{glyph}</span>",
         pct = w.utilization_pct
     )));
     lines.push(Line::Body(format!(
@@ -182,5 +250,88 @@ mod tests {
         // The separator should reach the inner width of the box (just check
         // that it contains the unicode dash glyph repeated).
         assert!(out.contains("─"));
+    }
+
+    fn at(h: u32) -> DateTime<Utc> {
+        use chrono::TimeZone;
+        Utc.with_ymd_and_hms(2026, 8, 25, h, 0, 0).unwrap()
+    }
+
+    /// One five-hour window `resets_in` hours from `at(12)`.
+    fn window(pct: i32, resets_in: i64) -> UsageWindow {
+        UsageWindow {
+            utilization_pct: pct,
+            resets_at: Some(at(12) + chrono::Duration::hours(resets_in)),
+            window_duration: chrono::Duration::hours(5),
+        }
+    }
+
+    fn row_markup(w: &UsageWindow, row: WindowRow) -> String {
+        let mut lines = Vec::new();
+        push_window_with_row(&mut lines, "  L", w, &theme(), at(12), row);
+        render_bordered(&lines, &theme())
+    }
+
+    /// Every vendor that has not opted into pacing still renders the original
+    /// row; `WindowRow::default()` is what keeps that output untouched.
+    #[test]
+    fn a_default_row_stays_the_plain_bar_percent_and_reset() {
+        let out = row_markup(&window(40, 2), WindowRow::default());
+        assert!(out.contains("40%"), "{out}");
+        assert!(out.contains("Resets in 2h 00m"), "{out}");
+        assert!(
+            !out.contains('↑') && !out.contains('→') && !out.contains('↓'),
+            "an unpaced row must not grow a glyph: {out}"
+        );
+        assert!(!out.contains(" · "), "an unpaced row has no detail: {out}");
+    }
+
+    /// Mirrors the Anthropic tooltip: the ratio glyph always, the elapsed
+    /// marker only behind `--tooltip-pace-pts`.
+    #[test]
+    fn paced_rows_keep_the_marker_behind_point_mode() {
+        // 3h left of a 5h window → 40% elapsed, matched by 40% used.
+        let w = window(40, 3);
+        let ratio = WindowRow::paced(&w, at(12), pacing::DEFAULT_TOLERANCE, false);
+        assert_eq!(ratio.glyph, Some("→"));
+        assert_eq!(ratio.marker_pct, None);
+
+        let points = WindowRow::paced(&w, at(12), pacing::DEFAULT_TOLERANCE, true);
+        assert_eq!(points.glyph, Some("→"));
+        assert_eq!(points.marker_pct, Some(40));
+    }
+
+    /// The two modes disagree inside the tolerance band — the split `pacing`
+    /// documents, and the reason the glyph is picked from the mode.
+    #[test]
+    fn the_pace_modes_can_disagree_on_the_glyph() {
+        let w = window(42, 3); // 40% elapsed, 42% used
+        assert_eq!(WindowRow::paced(&w, at(12), 5, false).glyph, Some("→"));
+        assert_eq!(WindowRow::paced(&w, at(12), 5, true).glyph, Some("↑"));
+    }
+
+    /// A window the vendor reports without a reset still gets a glyph, so a
+    /// row never sits blank beside siblings that have one.
+    #[test]
+    fn a_window_without_a_reset_still_gets_the_neutral_glyph() {
+        let w = UsageWindow {
+            utilization_pct: 0,
+            resets_at: None,
+            window_duration: chrono::Duration::hours(5),
+        };
+        let row = WindowRow::paced(&w, at(12), 5, false);
+        assert_eq!(row.glyph, Some("→"));
+        assert_eq!(row.marker_pct, None);
+    }
+
+    #[test]
+    fn the_glyph_reaches_the_rendered_row() {
+        let w = window(40, 3);
+        let out = row_markup(&w, WindowRow::paced(&w, at(12), 5, false));
+        assert!(out.contains("40% →"), "{out}");
+        assert!(out.contains("Resets in 3h 00m"), "{out}");
+        // The reset line carries nothing after the countdown now that no
+        // vendor appends a fragment to it.
+        assert!(!out.contains("Resets in 3h 00m ·"), "{out}");
     }
 }

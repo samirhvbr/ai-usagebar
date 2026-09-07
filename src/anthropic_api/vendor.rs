@@ -6,22 +6,18 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 
-use crate::format::{placeholders, substitute, updated_at_hm};
+use crate::format::{placeholders, substitute, updated_at_hm, usd};
 use crate::pacing::PaceSeverity;
 use crate::pango::{color_span, escape, severity_color, severity_for};
 use crate::theme::Theme;
 use crate::tooltip::{Line as TooltipLine, render_bordered};
 use crate::usage::AnthropicApiSnapshot;
-use crate::vendor::{RenderOpts, VendorOutcome};
+use crate::vendor::{RenderOpts, VendorId, VendorOutcome};
 use crate::waybar::{Class, WaybarOutput};
 
 use super::fetch::FetchOutcome;
 
 pub const DEFAULT_FORMAT: &str = "{aapi_headline}";
-
-fn money(v: f64) -> String {
-    format!("${v:.2}")
-}
 
 /// Bar headline: spend-vs-limit with a % when a limit is configured, otherwise
 /// just the month-to-date spend.
@@ -29,11 +25,11 @@ fn headline(snap: &AnthropicApiSnapshot) -> String {
     match snap.limit {
         Some(l) if l > 0.0 => format!(
             "{} / ${:.0} · {}%",
-            money(snap.spent),
+            usd(snap.spent),
             l,
             snap.pct().unwrap_or(0)
         ),
-        _ => format!("{}/mo", money(snap.spent)),
+        _ => format!("{}/mo", usd(snap.spent)),
     }
 }
 
@@ -41,7 +37,10 @@ pub fn build_placeholders(snap: &AnthropicApiSnapshot) -> HashMap<&'static str, 
     let pct = snap.pct().unwrap_or(0);
     placeholders(vec![
         ("icon", "󰢗".to_string()),
-        ("vendor_short", "aac".to_string()),
+        (
+            "vendor_short",
+            VendorId::AnthropicApi.short_name().to_string(),
+        ),
         // Cross-vendor aliases — spend% maps to the session/weekly slots.
         ("session_pct", pct.to_string()),
         ("session_reset", "—".to_string()),
@@ -49,7 +48,7 @@ pub fn build_placeholders(snap: &AnthropicApiSnapshot) -> HashMap<&'static str, 
         ("weekly_reset", "—".to_string()),
         ("plan", "Anthropic API".to_string()),
         ("aapi_headline", headline(snap)),
-        ("aapi_spent", money(snap.spent)),
+        ("aapi_spent", usd(snap.spent)),
         (
             "aapi_limit",
             snap.limit
@@ -131,7 +130,7 @@ fn render_tooltip(
     )));
     lines.push(TooltipLine::Body(format!(
         "   <span font_weight='bold' foreground='{color}'>{spent}</span>",
-        spent = escape(&money(snap.spent))
+        spent = escape(&usd(snap.spent))
     )));
     match snap.limit {
         Some(l) if l > 0.0 => {
@@ -202,12 +201,7 @@ fn render_tooltip(
 
 impl From<FetchOutcome> for VendorOutcome {
     fn from(o: FetchOutcome) -> Self {
-        Self {
-            snapshot: crate::usage::VendorSnapshot::AnthropicApi(o.snapshot),
-            stale: o.stale,
-            last_error: o.last_error,
-            cache_age: o.cache_age,
-        }
+        o.map(crate::usage::VendorSnapshot::AnthropicApi)
     }
 }
 

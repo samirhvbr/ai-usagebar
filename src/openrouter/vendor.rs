@@ -4,13 +4,13 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 
-use crate::format::{placeholders, substitute, updated_at_hm};
+use crate::format::{placeholders, substitute, updated_at_hm, usd};
 use crate::pacing::PaceSeverity;
 use crate::pango::{self, color_span, escape, severity_color, severity_for};
 use crate::theme::Theme;
 use crate::tooltip::{Line as TooltipLine, render_bordered};
 use crate::usage::OpenRouterSnapshot;
-use crate::vendor::{RenderOpts, VendorOutcome};
+use crate::vendor::{RenderOpts, VendorId, VendorOutcome};
 use crate::waybar::{Class, WaybarOutput};
 
 use super::fetch::FetchOutcome;
@@ -21,7 +21,10 @@ pub const DEFAULT_FORMAT: &str = "${or_balance} · ${or_used_today}";
 pub fn build_placeholders(snap: &OpenRouterSnapshot) -> HashMap<&'static str, String> {
     placeholders(vec![
         ("icon", "󱙺".to_string()),
-        ("vendor_short", "opr".to_string()),
+        (
+            "vendor_short",
+            VendorId::Openrouter.short_name().to_string(),
+        ),
         // Cross-vendor aliases — for OpenRouter the "session" concept maps
         // to "credit consumed %", and there's no reset time so we render "—".
         ("session_pct", snap.consumed_pct().to_string()),
@@ -30,12 +33,12 @@ pub fn build_placeholders(snap: &OpenRouterSnapshot) -> HashMap<&'static str, St
         ("weekly_reset", "—".to_string()),
         ("plan", snap.label.clone()),
         ("or_label", snap.label.clone()),
-        ("or_balance", format_money(snap.balance())),
-        ("or_total", format_money(snap.total_credits)),
-        ("or_used", format_money(snap.total_usage)),
-        ("or_used_today", format_money(snap.usage_daily)),
-        ("or_used_week", format_money(snap.usage_weekly)),
-        ("or_used_month", format_money(snap.usage_monthly)),
+        ("or_balance", usd(snap.balance())),
+        ("or_total", usd(snap.total_credits)),
+        ("or_used", usd(snap.total_usage)),
+        ("or_used_today", usd(snap.usage_daily)),
+        ("or_used_week", usd(snap.usage_weekly)),
+        ("or_used_month", usd(snap.usage_monthly)),
         ("or_consumed_pct", snap.consumed_pct().to_string()),
         (
             "or_free_tier",
@@ -43,25 +46,15 @@ pub fn build_placeholders(snap: &OpenRouterSnapshot) -> HashMap<&'static str, St
         ),
         (
             "or_limit",
-            snap.limit
-                .map(format_money)
-                .unwrap_or_else(|| "unlimited".into()),
+            snap.limit.map(usd).unwrap_or_else(|| "unlimited".into()),
         ),
         (
             "or_limit_remaining",
             snap.limit_remaining
-                .map(format_money)
+                .map(usd)
                 .unwrap_or_else(|| "unlimited".into()),
         ),
     ])
-}
-
-fn format_money(v: f64) -> String {
-    if v < 0.0 {
-        format!("-${:.2}", -v)
-    } else {
-        format!("${v:.2}")
-    }
 }
 
 /// Compose the full Waybar output for an OpenRouter snapshot.
@@ -117,13 +110,19 @@ pub fn render(
 }
 
 fn or_balance_bar(snap: &OpenRouterSnapshot, theme: &Theme) -> String {
-    let pct = snap.consumed_pct();
-    let color = severity_color(severity_for(pct), theme);
-    pango::progress_bar(pct, color, theme, None)
+    let color = severity_color(severity(snap), theme);
+    pango::progress_bar(snap.consumed_pct(), color, theme, None)
 }
 
-/// OpenRouter severity is keyed on consumed-percentage (low credit = critical).
+/// OpenRouter severity is keyed on consumed-percentage (low credit = critical),
+/// with one case the percentage cannot express: an account that owes money.
+/// `consumed_pct` needs `total_credits` as a denominator and reports 0 without
+/// one, so an account that never bought credits but ran up usage would
+/// otherwise show a debt in reassuring green.
 pub fn severity(snap: &OpenRouterSnapshot) -> PaceSeverity {
+    if snap.balance() < 0.0 {
+        return PaceSeverity::Critical;
+    }
     severity_for(snap.consumed_pct())
 }
 
@@ -153,12 +152,12 @@ fn render_tooltip(
     )));
     lines.push(TooltipLine::Body(format!(
         "   {bar}  <span font_weight='bold' foreground='{color}'>{bal}</span>",
-        bal = escape(&format_money(snap.balance()))
+        bal = escape(&usd(snap.balance()))
     )));
     lines.push(TooltipLine::Body(format!(
         " <span foreground='{dim}'>  {used} of {total} used ({pct}%)</span>",
-        used = escape(&format_money(snap.total_usage)),
-        total = escape(&format_money(snap.total_credits)),
+        used = escape(&usd(snap.total_usage)),
+        total = escape(&usd(snap.total_credits)),
         pct = snap.consumed_pct()
     )));
 
@@ -168,9 +167,9 @@ fn render_tooltip(
     )));
     lines.push(TooltipLine::Body(format!(
         " <span foreground='{dim}'>     today {today} · week {week} · month {month}</span>",
-        today = escape(&format_money(snap.usage_daily)),
-        week = escape(&format_money(snap.usage_weekly)),
-        month = escape(&format_money(snap.usage_monthly))
+        today = escape(&usd(snap.usage_daily)),
+        week = escape(&usd(snap.usage_weekly)),
+        month = escape(&usd(snap.usage_monthly))
     )));
 
     if let Some(limit) = snap.limit {
@@ -181,8 +180,8 @@ fn render_tooltip(
         )));
         lines.push(TooltipLine::Body(format!(
             " <span foreground='{dim}'>     {rem} of {tot} remaining</span>",
-            rem = escape(&format_money(rem)),
-            tot = escape(&format_money(limit))
+            rem = escape(&usd(rem)),
+            tot = escape(&usd(limit))
         )));
     }
 
@@ -227,12 +226,7 @@ fn render_tooltip(
 
 impl From<FetchOutcome> for VendorOutcome {
     fn from(o: FetchOutcome) -> Self {
-        Self {
-            snapshot: crate::usage::VendorSnapshot::Openrouter(o.snapshot),
-            stale: o.stale,
-            last_error: o.last_error,
-            cache_age: o.cache_age,
-        }
+        o.map(crate::usage::VendorSnapshot::Openrouter)
     }
 }
 
@@ -335,6 +329,64 @@ mod tests {
         assert!(out.tooltip.contains("paid tier"));
         assert!(out.tooltip.contains("Per-key limit"));
         assert!(out.tooltip.contains("$24.50 of $50.00"));
+    }
+
+    /// Reported as #118: an account that never bought credits but ran up usage
+    /// showed a reassuring `$0.00` in green. Both halves were wrong — the
+    /// number was clamped, and the severity came from a percentage that has no
+    /// denominator to work with.
+    #[test]
+    fn a_debt_is_shown_as_a_debt_not_as_zero() {
+        let mut snap = sample_snap();
+        snap.total_credits = 0.0;
+        snap.total_usage = 5.71;
+        assert!((snap.balance() + 5.71).abs() < 1e-9);
+        assert_eq!(snap.consumed_pct(), 0);
+        assert_eq!(severity(&snap), PaceSeverity::Critical);
+
+        let out = render(
+            &sample_outcome(snap.clone()),
+            &snap,
+            &Theme::default(),
+            &opts(),
+            Utc::now(),
+        );
+        assert!(out.text.contains("-$5.71"), "{}", out.text);
+        assert!(!out.text.contains("$0.00"), "{}", out.text);
+        assert!(out.tooltip.contains("-$5.71"), "{}", out.tooltip);
+    }
+
+    /// The other way into debt: credits were bought, then overrun. Here the
+    /// percentage already saturates at 100, so only the clamped number was
+    /// wrong — but it must render identically.
+    #[test]
+    fn overrunning_purchased_credit_is_also_a_debt() {
+        let mut snap = sample_snap();
+        snap.total_credits = 10.0;
+        snap.total_usage = 12.5;
+        assert!((snap.balance() + 2.5).abs() < 1e-9);
+        assert_eq!(snap.consumed_pct(), 100);
+        assert_eq!(severity(&snap), PaceSeverity::Critical);
+
+        let out = render(
+            &sample_outcome(snap.clone()),
+            &snap,
+            &Theme::default(),
+            &opts(),
+            Utc::now(),
+        );
+        assert!(out.text.contains("-$2.50"), "{}", out.text);
+    }
+
+    /// A free-tier account that has spent nothing is not in debt, and must
+    /// stay green — the fix keys on the balance, not on "credits are zero".
+    #[test]
+    fn a_zero_credit_account_with_no_usage_stays_low() {
+        let mut snap = sample_snap();
+        snap.total_credits = 0.0;
+        snap.total_usage = 0.0;
+        assert_eq!(snap.balance(), 0.0);
+        assert_eq!(severity(&snap), PaceSeverity::Low);
     }
 
     #[test]

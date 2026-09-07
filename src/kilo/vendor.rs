@@ -5,13 +5,13 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 
-use crate::format::{placeholders, substitute, updated_at_hm};
+use crate::format::{placeholders, substitute, updated_at_hm, usd};
 use crate::pacing::PaceSeverity;
 use crate::pango::{color_span, escape, severity_color};
 use crate::theme::Theme;
 use crate::tooltip::{Line as TooltipLine, render_bordered};
 use crate::usage::KiloSnapshot;
-use crate::vendor::{RenderOpts, VendorOutcome};
+use crate::vendor::{RenderOpts, VendorId, VendorOutcome};
 use crate::waybar::{Class, WaybarOutput};
 
 use super::fetch::FetchOutcome;
@@ -21,38 +21,22 @@ pub const DEFAULT_FORMAT: &str = "{kilo_balance}";
 pub fn build_placeholders(snap: &KiloSnapshot) -> HashMap<&'static str, String> {
     placeholders(vec![
         ("icon", "󰭟".to_string()),
-        ("vendor_short", "klo".to_string()),
+        ("vendor_short", VendorId::Kilo.short_name().to_string()),
         // Cross-vendor aliases — Kilo has no rate-limit windows.
         ("session_pct", "0".to_string()),
         ("session_reset", "—".to_string()),
         ("weekly_pct", "0".to_string()),
         ("weekly_reset", "—".to_string()),
         ("plan", snap.label.clone()),
-        ("kilo_balance", format_money(snap.balance)),
+        ("kilo_balance", usd(snap.balance)),
     ])
-}
-
-fn format_money(v: f64) -> String {
-    if v < 0.0 {
-        format!("-${:.2}", -v)
-    } else {
-        format!("${v:.2}")
-    }
 }
 
 /// Kilo has no purchased-total on this endpoint, so severity keys on the
 /// absolute remaining USD balance (mirrors DeepSeek's USD thresholds): running
 /// low = warmer color, empty = critical (the `402` boundary).
 pub fn severity(snap: &KiloSnapshot) -> PaceSeverity {
-    if snap.balance < 1.0 {
-        PaceSeverity::Critical
-    } else if snap.balance < 5.0 {
-        PaceSeverity::High
-    } else if snap.balance < 20.0 {
-        PaceSeverity::Mid
-    } else {
-        PaceSeverity::Low
-    }
+    crate::pango::balance_severity(snap.balance, "USD")
 }
 
 pub fn render(
@@ -118,7 +102,7 @@ fn render_tooltip(
     )));
     lines.push(TooltipLine::Body(format!(
         "   <span font_weight='bold' foreground='{color}'>{bal}</span>",
-        bal = escape(&format_money(snap.balance))
+        bal = escape(&usd(snap.balance))
     )));
 
     if let Some((code, msg)) = outcome.last_error.as_ref()
@@ -152,12 +136,7 @@ fn render_tooltip(
 
 impl From<FetchOutcome> for VendorOutcome {
     fn from(o: FetchOutcome) -> Self {
-        Self {
-            snapshot: crate::usage::VendorSnapshot::Kilo(o.snapshot),
-            stale: o.stale,
-            last_error: o.last_error,
-            cache_age: o.cache_age,
-        }
+        o.map(crate::usage::VendorSnapshot::Kilo)
     }
 }
 

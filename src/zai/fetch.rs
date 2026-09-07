@@ -4,7 +4,7 @@
 
 use std::time::Duration;
 
-use crate::cache::{Cache, MAX_STALE, acquire_lock_async};
+use crate::cache::{Cache, acquire_lock_async};
 use crate::error::{AppError, Result};
 use crate::usage::ZaiSnapshot;
 
@@ -27,13 +27,9 @@ impl Default for Endpoints {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct FetchOutcome {
-    pub snapshot: ZaiSnapshot,
-    pub stale: bool,
-    pub last_error: Option<(u16, String)>,
-    pub cache_age: Option<Duration>,
-}
+/// This vendor's [`Outcome`](crate::outcome::Outcome) — the shared shape,
+/// specialised to its snapshot.
+pub type FetchOutcome = crate::outcome::Outcome<ZaiSnapshot>;
 
 pub async fn fetch_snapshot(
     client: &reqwest::Client,
@@ -60,59 +56,57 @@ pub async fn fetch_snapshot(
             // `success: false` can never overwrite the last good payload nor
             // clear the recorded error.
             cache.write_payload(&bytes)?;
-            Ok(FetchOutcome {
-                snapshot: env.into_snapshot(config_plan_tier),
-                stale: false,
-                last_error: None,
-                cache_age: Some(Duration::ZERO),
-            })
+            Ok(crate::outcome::Outcome::fresh(
+                env.into_snapshot(config_plan_tier),
+            ))
         }
-        Err(e) if e.is_transient() => fallback_silent(cache, config_plan_tier),
+        Err(e) if e.is_transient() => fallback_silent(cache, config_plan_tier, e),
         Err(AppError::Http { status, body }) => {
             cache.mark_stale();
-            cache.write_last_error(status, &body);
-            fallback_with_error(cache, Some((status, body)), config_plan_tier)
+            let last_error = Some(cache.write_last_error(status, &body));
+            fallback_with_error(
+                cache,
+                last_error,
+                config_plan_tier,
+                AppError::Http { status, body },
+            )
         }
         Err(e) => {
             cache.mark_stale();
-            cache.write_last_error(0, &e.to_string());
-            fallback_with_error(cache, Some((0, e.to_string())), config_plan_tier)
+            let last_error = Some(cache.write_last_error(0, &e.to_string()));
+            fallback_with_error(cache, last_error, config_plan_tier, e)
         }
     }
 }
 
 fn reuse(bytes: Vec<u8>, cache: &Cache, stale: bool, tier: Option<&str>) -> Result<FetchOutcome> {
-    let env: Envelope = serde_json::from_slice(&bytes)?;
-    // A cached failure envelope is not usage data, even if it parses.
-    env.check_ok()?;
-    Ok(FetchOutcome {
-        snapshot: env.into_snapshot(tier),
+    Ok(crate::outcome::Outcome::cached(
+        parse_cache(&bytes, tier)?,
+        cache,
         stale,
-        last_error: cache.read_last_error(),
-        cache_age: cache.payload_age(),
-    })
+    ))
 }
 
-fn fallback_silent(cache: &Cache, tier: Option<&str>) -> Result<FetchOutcome> {
-    let Some(bytes) = cache.fallback_payload(MAX_STALE)? else {
-        return Err(AppError::Transport(
-            "zai: no cache and network unreachable".into(),
-        ));
-    };
-    reuse(bytes, cache, true, tier)
+fn parse_cache(bytes: &[u8], tier: Option<&str>) -> Result<ZaiSnapshot> {
+    let env: Envelope = serde_json::from_slice(bytes)?;
+    // A cached failure envelope is not usage data, even if it parses.
+    env.check_ok()?;
+    Ok(env.into_snapshot(tier))
+}
+
+fn fallback_silent(cache: &Cache, tier: Option<&str>, original: AppError) -> Result<FetchOutcome> {
+    crate::outcome::fallback(cache, None, original, |bytes| parse_cache(bytes, tier))
 }
 
 fn fallback_with_error(
     cache: &Cache,
     last_error: Option<(u16, String)>,
     tier: Option<&str>,
+    original: AppError,
 ) -> Result<FetchOutcome> {
-    let Some(bytes) = cache.fallback_payload(MAX_STALE)? else {
-        return Err(AppError::Other("zai: no usable cache".into()));
-    };
-    let mut out = reuse(bytes, cache, true, tier)?;
-    out.last_error = last_error;
-    Ok(out)
+    crate::outcome::fallback(cache, last_error, original, |bytes| {
+        parse_cache(bytes, tier)
+    })
 }
 
 /// Returns the raw bytes (for the cache) alongside the *validated* envelope,

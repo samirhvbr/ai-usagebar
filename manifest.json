@@ -1,0 +1,66 @@
+{
+  "schemaVersion": 1,
+  "id": "akitaonrails.ai-usagebar",
+  "name": "AI Usage",
+  "version": "1.11.0",
+  "author": "AkitaOnRails",
+  "license": "MIT",
+  "description": "Multi-provider AI plan usage and balances in a native Omarchy Quattro panel.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "activation": "on-demand",
+  "entryPoints": {
+    "barWidget": "omarchy/BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "AI Usage",
+    "description": "Usage windows, reset countdowns, balances, and provider switching for every provider configured in ai-usagebar.",
+    "category": "AI",
+    "aliases": [
+      "ai-usage",
+      "usagebar",
+      "quota"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "provider": "",
+      "refreshIntervalSec": 300,
+      "showValue": true,
+      "showProvider": false
+    },
+    "schema": [
+      {
+        "key": "provider",
+        "type": "string",
+        "label": "Provider or account id",
+        "description": "Optional id from ai-usagebar usage --json (for example openai or anthropic@work). Leave blank to switch between all configured entries.",
+        "defaultValue": ""
+      },
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 30,
+        "max": 3600,
+        "step": 30,
+        "defaultValue": 300
+      },
+      {
+        "key": "showValue",
+        "type": "boolean",
+        "label": "Show usage value",
+        "description": "Show the selected provider's percentage or balance next to the icon in the top bar.",
+        "defaultValue": true
+      },
+      {
+        "key": "showProvider",
+        "type": "boolean",
+        "label": "Show provider name",
+        "description": "Show the selected provider's short code (cld, gpt, zai, agy) before the usage value, the way Waybar's {vendor_short} does. Off by default.",
+        "defaultValue": false
+      }
+    ]
+  }
+}

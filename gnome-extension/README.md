@@ -13,7 +13,7 @@ GNOME screenshot is currently bundled.
 
 ## Vendor scope
 
-The selector supports **Anthropic, OpenAI, Z.AI, OpenRouter, DeepSeek, and
+The selector supports **Claude, Codex, Z.AI, OpenRouter, DeepSeek, and
 Google Antigravity**. **Kimi is widget/TUI-only in this release**; desktop
 protocol and marker parity for Kimi is dedicated future work. DeepSeek is
 balance-only, so the extension shows its balance in the header and suppresses
@@ -66,7 +66,7 @@ mkdir -p "$DEST" && cp -r * "$DEST"/      # or: ln -s "$PWD" "$DEST"
 | Show percentage | on | numeric `%` next to each bar |
 | Bar width | 8 | cells per bar (4–20) |
 | Refresh interval | 30 s | 5–3600 |
-| Vendor | `anthropic` | selectors: Anthropic, OpenAI, Z.AI, OpenRouter, DeepSeek, Antigravity (not Kimi). Anthropic, OpenAI, Z.AI and Antigravity expose generic session/weekly windows. |
+| Vendor | `anthropic` | selectors: Claude, Codex, Z.AI, OpenRouter, DeepSeek, Antigravity (not Kimi). Claude, Codex, Z.AI and Antigravity expose generic session/weekly windows. |
 | Panel pools | `both` | two-pool vendors only: `both`, first pool, second pool, or `auto` |
 | Auto threshold | 95 % | `auto` switches pools once the shown one reaches this usage |
 | Binary path | auto | empty = `PATH` then `~/.cargo/bin` |

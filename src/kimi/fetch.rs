@@ -1,17 +1,24 @@
 //! Fetch Kimi usage from `/coding/v1/usages`.
+//!
+//! One endpoint, two credentials: an **API key**, or the **Kimi Code CLI's
+//! OAuth session** — the credential a subscriber already has locally, with no
+//! key to create or paste. See [`Auth`] and `oauth.rs`.
 
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 
-use crate::cache::{Cache, MAX_STALE, acquire_lock_async};
+use crate::cache::{Cache, acquire_lock_async};
 use crate::error::{AppError, Result};
 use crate::usage::KimiSnapshot;
 
-use super::types::UsagesResponse;
+use super::oauth::{self, Region};
+use super::types::{UsagesResponse, UserInfoResponse, humanize_membership_level};
 
 pub const BASE_URL: &str = "https://api.kimi.com";
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+const REFRESH_TIMEOUT: Duration = Duration::from_secs(15);
 const LOCK_TIMEOUT: Duration = Duration::from_secs(15);
 /// Stable marker stored alongside code 0 for a successful HTTP response whose
 /// payload no longer matches Kimi's undocumented usage schema.
@@ -20,24 +27,72 @@ pub const SCHEMA_DRIFT_MESSAGE: &str = "Kimi API schema drift";
 #[derive(Debug, Clone)]
 pub struct Endpoints {
     pub usages: String,
+    /// Profile endpoint, read solely for the subscription's own tier name.
+    pub me: String,
+    /// OAuth token endpoint for the same deployment. Unused by the API-key
+    /// path, which never refreshes anything.
+    pub token: String,
 }
 
 impl Default for Endpoints {
     fn default() -> Self {
+        Self::for_region(Region::MainlandCn)
+    }
+}
+
+impl Endpoints {
+    pub fn for_region(region: Region) -> Self {
         Self {
-            usages: format!("{BASE_URL}/coding/v1/usages"),
+            usages: format!("{}/usages", region.api_base()),
+            me: format!("{}/me", region.api_base()),
+            token: oauth::token_endpoint(region.oauth_host()),
         }
     }
 }
 
+/// Where the bearer for `/coding/v1/usages` comes from.
 #[derive(Debug, Clone)]
-pub struct FetchOutcome {
-    pub snapshot: KimiSnapshot,
-    pub stale: bool,
-    pub last_error: Option<(u16, String)>,
-    pub cache_age: Option<Duration>,
+pub enum Auth {
+    /// A platform API key (`KIMI_API_KEY` or `[kimi] api_key`).
+    ApiKey(String),
+    /// The Kimi Code CLI's own OAuth session — a subscription login.
+    KimiCode(KimiCodeAuth),
 }
 
+/// The two paths inside a kimi-code home this vendor touches: the credential
+/// file it reads and rewrites, and the lock target that serializes a refresh
+/// against the CLI's own (see `lock.rs`).
+#[derive(Debug, Clone)]
+pub struct KimiCodeAuth {
+    pub credentials_path: PathBuf,
+    pub lock_target: PathBuf,
+}
+
+impl KimiCodeAuth {
+    pub fn in_home(home: &Path) -> Self {
+        Self {
+            credentials_path: oauth::credentials_path_in(home),
+            lock_target: oauth::lock_target_in(home),
+        }
+    }
+
+    /// A credential file relocated by config (`[kimi] credentials_path`) still
+    /// belongs to a kimi-code home; the lock target is derived from that home
+    /// so both clients agree on which file the lock protects.
+    pub fn with_credentials_path(home: &Path, credentials_path: PathBuf) -> Self {
+        Self {
+            credentials_path,
+            lock_target: oauth::lock_target_in(home),
+        }
+    }
+}
+
+/// This vendor's [`Outcome`](crate::outcome::Outcome) — the shared shape,
+/// specialised to its snapshot.
+pub type FetchOutcome = crate::outcome::Outcome<KimiSnapshot>;
+
+/// API-key fetch. Kept as-is for existing callers; the OAuth path goes
+/// through [`fetch_snapshot_with_auth`].
 pub async fn fetch_snapshot(
     client: &reqwest::Client,
     api_key: &str,
@@ -45,27 +100,59 @@ pub async fn fetch_snapshot(
     endpoints: &Endpoints,
     cache_ttl: Duration,
 ) -> Result<FetchOutcome> {
+    fetch_snapshot_with_auth(
+        client,
+        &Auth::ApiKey(api_key.to_string()),
+        cache,
+        endpoints,
+        cache_ttl,
+    )
+    .await
+}
+
+pub async fn fetch_snapshot_with_auth(
+    client: &reqwest::Client,
+    auth: &Auth,
+    cache: &Cache,
+    endpoints: &Endpoints,
+    cache_ttl: Duration,
+) -> Result<FetchOutcome> {
+    fetch_snapshot_at(client, auth, cache, endpoints, cache_ttl, Utc::now()).await
+}
+
+/// Clock seam for the OAuth expiry decision, mirroring
+/// `kiro::fetch::fetch_snapshot_at`.
+async fn fetch_snapshot_at(
+    client: &reqwest::Client,
+    auth: &Auth,
+    cache: &Cache,
+    endpoints: &Endpoints,
+    cache_ttl: Duration,
+    now: DateTime<Utc>,
+) -> Result<FetchOutcome> {
     cache.ensure_dir()?;
     let _lock = acquire_lock_async(&cache.lock_path(), LOCK_TIMEOUT).await?;
 
-    if let Some(bytes) = cache.fresh_payload(cache_ttl)?
-        && let Ok(outcome) = reuse_cache(bytes, cache, false)
-    {
-        return Ok(outcome);
+    if let Some(bytes) = cache.fresh_payload(cache_ttl)? {
+        // Releases before the profile lookup cached `/usages`' internal enum
+        // verbatim. Do not let a still-fresh legacy entry postpone `/me` until
+        // the normal TTL expires: refresh it once and replace it with Kimi's
+        // own tier name. If the network is down, the fallback path below still
+        // serves the quota after humanizing the enum.
+        if !cache_has_legacy_plan(&bytes)
+            && let Ok(outcome) = reuse_cache(bytes, cache, false)
+        {
+            return Ok(outcome);
+        }
     }
     // Corrupt fresh cache: fall through to live fetch rather than return a
     // fabricated zero snapshot.
 
-    match fetch_live(client, &endpoints.usages, api_key).await {
+    match fetch_live(client, endpoints, auth, now).await {
         Ok(snap) => {
             let bytes = serde_json::to_vec(&snap_to_json(&snap))?;
             cache.write_payload(&bytes)?;
-            Ok(FetchOutcome {
-                snapshot: snap,
-                stale: false,
-                last_error: None,
-                cache_age: Some(Duration::ZERO),
-            })
+            Ok(crate::outcome::Outcome::fresh(snap))
         }
         Err(e) if e.is_transient() => fallback_silent(cache, e),
         Err(e) => {
@@ -79,26 +166,12 @@ pub async fn fetch_snapshot(
 }
 
 fn fallback_silent(cache: &Cache, original: AppError) -> Result<FetchOutcome> {
-    let Some(bytes) = cache.fallback_payload(MAX_STALE)? else {
-        return Err(original);
-    };
-    match reuse_cache(bytes, cache, true) {
-        Ok(outcome) => Ok(outcome),
-        Err(_) => Err(original),
-    }
+    crate::outcome::fallback(cache, None, original, parse_cache)
 }
 
 fn fallback_with_error(cache: &Cache, original: AppError) -> Result<FetchOutcome> {
-    let Some(bytes) = cache.fallback_payload(MAX_STALE)? else {
-        return Err(original);
-    };
-    match reuse_cache(bytes, cache, true) {
-        Ok(mut outcome) => {
-            outcome.last_error = error_to_pair(&original);
-            Ok(outcome)
-        }
-        Err(_) => Err(original),
-    }
+    let last_error = error_to_pair(&original);
+    crate::outcome::fallback(cache, last_error, original, parse_cache)
 }
 
 fn error_to_pair(e: &AppError) -> Option<(u16, String)> {
@@ -112,18 +185,19 @@ fn error_to_pair(e: &AppError) -> Option<(u16, String)> {
 
 fn reuse_cache(bytes: Vec<u8>, cache: &Cache, stale: bool) -> Result<FetchOutcome> {
     let snap = parse_cache(&bytes)?;
-    Ok(FetchOutcome {
-        snapshot: snap,
-        stale,
-        last_error: cache.read_last_error(),
-        cache_age: cache.payload_age(),
-    })
+    Ok(crate::outcome::Outcome::cached(snap, cache, stale))
 }
 
 fn parse_cache(bytes: &[u8]) -> Result<KimiSnapshot> {
     let v: serde_json::Value = serde_json::from_slice(bytes)?;
     Ok(KimiSnapshot {
-        plan: v["plan"].as_str().map(|s| s.to_string()),
+        plan: v["plan"].as_str().map(|plan| {
+            if plan.starts_with("LEVEL_") {
+                humanize_membership_level(plan)
+            } else {
+                plan.to_string()
+            }
+        }),
         weekly_limit: parse_cache_u64(&v["weekly_limit"], "weekly_limit")?,
         weekly_used: parse_cache_u64(&v["weekly_used"], "weekly_used")?,
         weekly_remaining: parse_cache_u64(&v["weekly_remaining"], "weekly_remaining")?,
@@ -133,6 +207,13 @@ fn parse_cache(bytes: &[u8]) -> Result<KimiSnapshot> {
         window_remaining: parse_cache_u64(&v["window_remaining"], "window_remaining")?,
         window_reset_at: parse_cache_datetime(&v["window_reset_at"])?,
     })
+}
+
+fn cache_has_legacy_plan(bytes: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(bytes)
+        .ok()
+        .and_then(|value| value["plan"].as_str().map(str::to_owned))
+        .is_some_and(|plan| plan.starts_with("LEVEL_"))
 }
 
 fn parse_cache_u64(v: &serde_json::Value, name: &str) -> Result<u64> {
@@ -166,17 +247,118 @@ fn snap_to_json(snap: &KimiSnapshot) -> serde_json::Value {
     })
 }
 
-async fn fetch_live(client: &reqwest::Client, url: &str, api_key: &str) -> Result<KimiSnapshot> {
+/// Resolve the bearer for this fetch. The API key is already one; a Kimi Code
+/// login may first need a refresh, which rotates the CLI's stored token pair
+/// and is therefore serialized against the CLI itself.
+async fn bearer_token(
+    client: &reqwest::Client,
+    endpoints: &Endpoints,
+    auth: &Auth,
+    now: DateTime<Utc>,
+) -> Result<String> {
+    let kimi_code = match auth {
+        Auth::ApiKey(key) => return Ok(key.clone()),
+        Auth::KimiCode(kimi_code) => kimi_code,
+    };
+
+    let creds = oauth::read_from(&kimi_code.credentials_path)?;
+    if !oauth::needs_refresh(creds.expires_at, now.timestamp()) {
+        return Ok(creds.access_token);
+    }
+
+    let _lock = super::lock::acquire(&kimi_code.lock_target).await?;
+    // Re-read under the lock: the CLI (or another ai-usagebar process) may
+    // have refreshed while we waited, and reusing our pre-lock copy would burn
+    // an already-rotated refresh token.
+    let creds = oauth::read_from(&kimi_code.credentials_path)?;
+    if !oauth::needs_refresh(creds.expires_at, now.timestamp()) {
+        return Ok(creds.access_token);
+    }
+
+    let refreshed = tokio::time::timeout(
+        REFRESH_TIMEOUT,
+        oauth::refresh(
+            client,
+            &endpoints.token,
+            oauth::CLIENT_ID,
+            &creds.refresh_token,
+        ),
+    )
+    .await
+    .map_err(|_| AppError::Transport(format!("kimi token refresh timeout: {}", endpoints.token)))?
+    .map_err(|e| match e {
+        AppError::Transport(msg) => AppError::Transport(msg),
+        e => AppError::Credentials(format!(
+            "Kimi Code CLI token refresh failed ({e}). Run `kimi` and log in again."
+        )),
+    })?;
+
+    let next = oauth::apply_refresh(&creds, refreshed, now.timestamp());
+    oauth::write_to(&kimi_code.credentials_path, &next).map_err(|e| {
+        // The rotation already happened upstream, so a failed write-back means
+        // the CLI is now holding a dead refresh token: say so plainly instead
+        // of leaving the user to discover it at their next `kimi` run.
+        AppError::Credentials(format!(
+            "the refreshed Kimi Code CLI credentials could not be saved ({e}); run `kimi` and log in again"
+        ))
+    })?;
+    Ok(next.access_token)
+}
+
+/// Ask `/coding/v1/me` for the subscription's own tier name ("Allegretto"),
+/// which is the only place the vendor spells its plans the way its pricing
+/// page does — `/usages` only carries the `LEVEL_*` wire enum.
+///
+/// Best-effort by construction: every failure returns `None` and leaves the
+/// humanized enum in place. A missing plan label must never cost the user
+/// their quota numbers, and this endpoint is documented (by kimi-code's own
+/// error text) to 404 for accounts without a coding profile.
+async fn plan_label(client: &reqwest::Client, url: &str, token: &str) -> Option<String> {
     let resp = tokio::time::timeout(
         HTTP_TIMEOUT,
         client
             .get(url)
-            .header("Authorization", format!("Bearer {api_key}"))
+            .header("Authorization", format!("Bearer {token}"))
             .header("Accept", "application/json")
             .send(),
     )
     .await
-    .map_err(|_| AppError::Transport(format!("kimi timeout: {url}")))??;
+    .ok()?
+    .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let bytes = crate::vendor::read_body_capped(resp, crate::vendor::MAX_BODY_BYTES)
+        .await
+        .ok()?;
+    serde_json::from_slice::<UserInfoResponse>(&bytes)
+        .ok()?
+        .plan_label()
+}
+
+async fn fetch_live(
+    client: &reqwest::Client,
+    endpoints: &Endpoints,
+    auth: &Auth,
+    now: DateTime<Utc>,
+) -> Result<KimiSnapshot> {
+    let url = &endpoints.usages;
+    let token = bearer_token(client, endpoints, auth, now).await?;
+    // Concurrent, not sequential: the plan label is a second request against
+    // the same deployment, and a widget tick should cost one round-trip's
+    // latency, not two.
+    let (usages, label) = tokio::join!(
+        tokio::time::timeout(
+            HTTP_TIMEOUT,
+            client
+                .get(url)
+                .header("Authorization", format!("Bearer {token}"))
+                .header("Accept", "application/json")
+                .send(),
+        ),
+        plan_label(client, &endpoints.me, &token),
+    );
+    let resp = usages.map_err(|_| AppError::Transport(format!("kimi timeout: {url}")))??;
 
     let status = resp.status();
 
@@ -197,7 +379,11 @@ async fn fetch_live(client: &reqwest::Client, url: &str, api_key: &str) -> Resul
     let bytes = crate::vendor::read_body_capped(resp, crate::vendor::MAX_BODY_BYTES).await?;
     let r: UsagesResponse = serde_json::from_slice(&bytes)
         .map_err(|e| AppError::Schema(format!("kimi usages response: {e}")))?;
-    r.into_snapshot()
+    let mut snap = r.into_snapshot()?;
+    if let Some(label) = label {
+        snap.plan = Some(label);
+    }
+    Ok(snap)
 }
 
 #[cfg(test)]
@@ -210,6 +396,16 @@ mod tests {
         let cache = Cache::at(td.path().join("kimi"));
         cache.ensure_dir().unwrap();
         (td, cache)
+    }
+
+    /// Both endpoints point at the same mock server, so an OAuth test can
+    /// serve `/api/oauth/token` and `/coding/v1/usages` from one mockito.
+    fn test_endpoints(base: &str) -> Endpoints {
+        Endpoints {
+            usages: format!("{base}/coding/v1/usages"),
+            me: format!("{base}/coding/v1/me"),
+            token: format!("{base}/api/oauth/token"),
+        }
     }
 
     fn sample_json() -> &'static str {
@@ -253,9 +449,7 @@ mod tests {
 
         let (_td, cache) = cache_fixture();
         let client = reqwest::Client::new();
-        let endpoints = Endpoints {
-            usages: format!("{}/coding/v1/usages", server.url()),
-        };
+        let endpoints = test_endpoints(&server.url());
         let out = fetch_snapshot(
             &client,
             "sk-test",
@@ -266,7 +460,8 @@ mod tests {
         .await
         .unwrap();
         m.assert_async().await;
-        assert_eq!(out.snapshot.plan, Some("LEVEL_INTERMEDIATE".into()));
+        // No /me mock on this server, so the humanized wire enum stands.
+        assert_eq!(out.snapshot.plan, Some("Intermediate".into()));
         assert_eq!(out.snapshot.weekly_limit, 100);
         assert_eq!(out.snapshot.weekly_used, 26);
         assert_eq!(out.snapshot.weekly_remaining, 74);
@@ -291,9 +486,7 @@ mod tests {
             .unwrap();
 
         let client = reqwest::Client::new();
-        let endpoints = Endpoints {
-            usages: format!("{}/coding/v1/usages", server.url()),
-        };
+        let endpoints = test_endpoints(&server.url());
         let out = fetch_snapshot(
             &client,
             "bad-key",
@@ -324,9 +517,7 @@ mod tests {
             .unwrap();
 
         let client = reqwest::Client::new();
-        let endpoints = Endpoints {
-            usages: format!("{}/coding/v1/usages", server.url()),
-        };
+        let endpoints = test_endpoints(&server.url());
         let out = fetch_snapshot(
             &client,
             "sk-test",
@@ -352,9 +543,7 @@ mod tests {
 
         let (_td, cache) = cache_fixture();
         let client = reqwest::Client::new();
-        let endpoints = Endpoints {
-            usages: format!("{}/coding/v1/usages", server.url()),
-        };
+        let endpoints = test_endpoints(&server.url());
         let err = fetch_snapshot(
             &client,
             "bad-key",
@@ -382,9 +571,7 @@ mod tests {
 
         let (_td, cache) = cache_fixture();
         let client = reqwest::Client::new();
-        let endpoints = Endpoints {
-            usages: format!("{}/coding/v1/usages", server.url()),
-        };
+        let endpoints = test_endpoints(&server.url());
         let err = fetch_snapshot(
             &client,
             "sk-test",
@@ -415,9 +602,7 @@ mod tests {
         cache.write_payload(seeded.as_bytes()).unwrap();
 
         let client = reqwest::Client::new();
-        let endpoints = Endpoints {
-            usages: format!("{}/coding/v1/usages", server.url()),
-        };
+        let endpoints = test_endpoints(&server.url());
         let out = fetch_snapshot(
             &client,
             "sk-test",
@@ -450,9 +635,7 @@ mod tests {
 
         let (_td, cache) = cache_fixture();
         let client = reqwest::Client::new();
-        let endpoints = Endpoints {
-            usages: format!("{}/coding/v1/usages", server.url()),
-        };
+        let endpoints = test_endpoints(&server.url());
         let err = fetch_snapshot(
             &client,
             "sk-test",
@@ -479,9 +662,7 @@ mod tests {
         cache.write_payload(b"not valid json".as_slice()).unwrap();
 
         let client = reqwest::Client::new();
-        let endpoints = Endpoints {
-            usages: format!("{}/coding/v1/usages", server.url()),
-        };
+        let endpoints = test_endpoints(&server.url());
         let out = fetch_snapshot(
             &client,
             "sk-test",
@@ -493,6 +674,52 @@ mod tests {
         .unwrap();
         assert_eq!(out.snapshot.weekly_used, 26);
         assert!(!out.stale);
+    }
+
+    #[tokio::test]
+    async fn a_fresh_legacy_plan_cache_is_upgraded_through_the_profile_endpoint() {
+        let mut server = mockito::Server::new_async().await;
+        let usages = server
+            .mock("GET", "/coding/v1/usages")
+            .with_status(200)
+            .with_body(sample_json())
+            .create_async()
+            .await;
+        let me = server
+            .mock("GET", "/coding/v1/me")
+            .with_status(200)
+            .with_body(r#"{"user_level_name":"Allegretto"}"#)
+            .create_async()
+            .await;
+
+        let (_td, cache) = cache_fixture();
+        cache
+            .write_payload(sample_seed().to_string().as_bytes())
+            .unwrap();
+
+        let out = fetch_snapshot(
+            &reqwest::Client::new(),
+            "sk-test",
+            &cache,
+            &test_endpoints(&server.url()),
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+
+        usages.assert_async().await;
+        me.assert_async().await;
+        assert_eq!(out.snapshot.plan, Some("Allegretto".into()));
+        let cached: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(cache.payload_path()).unwrap()).unwrap();
+        assert_eq!(cached["plan"], "Allegretto");
+    }
+
+    #[test]
+    fn a_legacy_plan_is_humanized_when_only_fallback_cache_is_available() {
+        let bytes = sample_seed().to_string();
+        let snap = parse_cache(bytes.as_bytes()).unwrap();
+        assert_eq!(snap.plan, Some("Intermediate".into()));
     }
 
     #[tokio::test]
@@ -509,9 +736,7 @@ mod tests {
         cache.write_payload(b"not valid json".as_slice()).unwrap();
 
         let client = reqwest::Client::new();
-        let endpoints = Endpoints {
-            usages: format!("{}/coding/v1/usages", server.url()),
-        };
+        let endpoints = test_endpoints(&server.url());
         let err = fetch_snapshot(
             &client,
             "bad-key",
@@ -536,9 +761,7 @@ mod tests {
             .unwrap();
 
         let client = reqwest::Client::new();
-        let endpoints = Endpoints {
-            usages: "http://localhost:1/coding/v1/usages".into(),
-        };
+        let endpoints = test_endpoints("http://localhost:1");
         let out = fetch_snapshot(
             &client,
             "sk-test",
@@ -568,9 +791,7 @@ mod tests {
             &reqwest::Client::new(),
             "sk-test",
             &cache,
-            &Endpoints {
-                usages: format!("{}/coding/v1/usages", server.url()),
-            },
+            &test_endpoints(&server.url()),
             Duration::ZERO,
         )
         .await
@@ -595,9 +816,7 @@ mod tests {
             &reqwest::Client::new(),
             "sk-test",
             &cache,
-            &Endpoints {
-                usages: format!("{}/coding/v1/usages", server.url()),
-            },
+            &test_endpoints(&server.url()),
             Duration::ZERO,
         )
         .await
@@ -624,9 +843,7 @@ mod tests {
             &reqwest::Client::new(),
             "sk-test",
             &cache,
-            &Endpoints {
-                usages: format!("{}/coding/v1/usages", server.url()),
-            },
+            &test_endpoints(&server.url()),
             Duration::ZERO,
         )
         .await
@@ -634,5 +851,348 @@ mod tests {
         assert!(
             matches!(err, AppError::Http { status: 500, ref body } if body == "Kimi API returned HTTP 500")
         );
+    }
+
+    // ---- Kimi Code CLI (subscription) credential path ----
+
+    /// A kimi-code home with a stored login. `expires_at` is relative to
+    /// `NOW_SECS`, the instant every OAuth test below passes in.
+    const NOW_SECS: i64 = 1_800_000_000;
+
+    fn kimi_code_home(td: &TempDir, expires_in: i64) -> (PathBuf, KimiCodeAuth) {
+        let home = td.path().join(".kimi-code");
+        let auth = KimiCodeAuth::in_home(&home);
+        std::fs::create_dir_all(auth.credentials_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &auth.credentials_path,
+            serde_json::json!({
+                "access_token": "cli-at",
+                "refresh_token": "cli-rt",
+                "expires_at": NOW_SECS + expires_in,
+                "expires_in": 900,
+                "scope": "kimi-code",
+                "token_type": "Bearer",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        (home, auth)
+    }
+
+    fn now() -> DateTime<Utc> {
+        DateTime::from_timestamp(NOW_SECS, 0).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_valid_cli_token_is_used_as_is_and_never_refreshed() {
+        let mut server = mockito::Server::new_async().await;
+        let usages = server
+            .mock("GET", "/coding/v1/usages")
+            .match_header("authorization", "Bearer cli-at")
+            .with_status(200)
+            .with_body(sample_json())
+            .create_async()
+            .await;
+        let refresh = server
+            .mock("POST", "/api/oauth/token")
+            .expect(0)
+            .create_async()
+            .await;
+
+        let (td, cache) = cache_fixture();
+        let (_home, auth) = kimi_code_home(&td, 600);
+        let out = fetch_snapshot_at(
+            &reqwest::Client::new(),
+            &Auth::KimiCode(auth.clone()),
+            &cache,
+            &test_endpoints(&server.url()),
+            Duration::ZERO,
+            now(),
+        )
+        .await
+        .unwrap();
+
+        usages.assert_async().await;
+        refresh.assert_async().await;
+        assert_eq!(out.snapshot.weekly_used, 26);
+        let stored = std::fs::read_to_string(&auth.credentials_path).unwrap();
+        assert!(stored.contains("cli-rt"), "an unused token must not rotate");
+    }
+
+    #[tokio::test]
+    async fn an_expiring_cli_token_is_refreshed_and_the_rotation_is_written_back() {
+        let mut server = mockito::Server::new_async().await;
+        let refresh = server
+            .mock("POST", "/api/oauth/token")
+            .match_body(mockito::Matcher::UrlEncoded(
+                "refresh_token".into(),
+                "cli-rt".into(),
+            ))
+            .with_status(200)
+            .with_body(
+                r#"{"access_token":"fresh-at","refresh_token":"fresh-rt","expires_in":900,
+                    "scope":"kimi-code","token_type":"Bearer"}"#,
+            )
+            .create_async()
+            .await;
+        let usages = server
+            .mock("GET", "/coding/v1/usages")
+            .match_header("authorization", "Bearer fresh-at")
+            .with_status(200)
+            .with_body(sample_json())
+            .create_async()
+            .await;
+
+        let (td, cache) = cache_fixture();
+        // Inside the refresh buffer: still valid, but not for long enough.
+        let (home, auth) = kimi_code_home(&td, 30);
+        let out = fetch_snapshot_at(
+            &reqwest::Client::new(),
+            &Auth::KimiCode(auth.clone()),
+            &cache,
+            &test_endpoints(&server.url()),
+            Duration::ZERO,
+            now(),
+        )
+        .await
+        .unwrap();
+
+        refresh.assert_async().await;
+        usages.assert_async().await;
+        assert_eq!(out.snapshot.weekly_used, 26);
+
+        let stored: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&auth.credentials_path).unwrap()).unwrap();
+        assert_eq!(stored["access_token"], "fresh-at");
+        assert_eq!(
+            stored["refresh_token"], "fresh-rt",
+            "the CLI's own store must carry the rotated token, or its next run is dead"
+        );
+        assert_eq!(stored["expires_at"], NOW_SECS + 900);
+        // The lock is the CLI's own target, and it must not be left behind.
+        assert!(!super::super::lock::lock_dir_for(&auth.lock_target).exists());
+        assert!(home.join("oauth").is_dir());
+    }
+
+    #[tokio::test]
+    async fn a_rejected_refresh_reports_a_credential_error_naming_the_cli() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/api/oauth/token")
+            .with_status(401)
+            .with_body(r#"{"error":"invalid_grant"}"#)
+            .create_async()
+            .await;
+
+        let (td, cache) = cache_fixture();
+        let (_home, auth) = kimi_code_home(&td, -60);
+        let err = fetch_snapshot_at(
+            &reqwest::Client::new(),
+            &Auth::KimiCode(auth),
+            &cache,
+            &test_endpoints(&server.url()),
+            Duration::ZERO,
+            now(),
+        )
+        .await
+        .unwrap_err();
+        let message = err.to_string();
+        assert!(matches!(err, AppError::Credentials(_)), "{err:?}");
+        assert!(message.contains("log in again"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn a_logged_out_cli_falls_back_to_cache_with_a_credential_warning() {
+        let (td, cache) = cache_fixture();
+        let (_home, auth) = kimi_code_home(&td, 600);
+        std::fs::write(
+            &auth.credentials_path,
+            r#"{"access_token":"","refresh_token":"","expires_at":0}"#,
+        )
+        .unwrap();
+        cache
+            .write_payload(sample_seed().to_string().as_bytes())
+            .unwrap();
+
+        let out = fetch_snapshot_at(
+            &reqwest::Client::new(),
+            &Auth::KimiCode(auth),
+            &cache,
+            &test_endpoints("http://localhost:1"),
+            Duration::ZERO,
+            now(),
+        )
+        .await
+        .unwrap();
+        assert!(out.stale);
+        assert_eq!(out.snapshot.weekly_used, 30);
+        let (code, message) = out.last_error.unwrap();
+        assert_eq!(code, 0);
+        assert!(message.contains("logged out"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn a_peer_refresh_during_the_wait_is_picked_up_instead_of_rotating_again() {
+        let mut server = mockito::Server::new_async().await;
+        let refresh = server
+            .mock("POST", "/api/oauth/token")
+            .expect(0)
+            .create_async()
+            .await;
+        let usages = server
+            .mock("GET", "/coding/v1/usages")
+            .match_header("authorization", "Bearer peer-at")
+            .with_status(200)
+            .with_body(sample_json())
+            .create_async()
+            .await;
+
+        let (td, cache) = cache_fixture();
+        let (_home, auth) = kimi_code_home(&td, -60);
+        // Stand in for the CLI finishing its own refresh while we queued: the
+        // re-read under the lock must win over the copy read before it.
+        let peer = serde_json::json!({
+            "access_token": "peer-at",
+            "refresh_token": "peer-rt",
+            "expires_at": NOW_SECS + 900,
+            "expires_in": 900,
+            "scope": "kimi-code",
+            "token_type": "Bearer",
+        });
+        std::fs::write(&auth.credentials_path, peer.to_string()).unwrap();
+
+        let out = fetch_snapshot_at(
+            &reqwest::Client::new(),
+            &Auth::KimiCode(auth),
+            &cache,
+            &test_endpoints(&server.url()),
+            Duration::ZERO,
+            now(),
+        )
+        .await
+        .unwrap();
+        refresh.assert_async().await;
+        usages.assert_async().await;
+        assert_eq!(out.snapshot.weekly_used, 26);
+    }
+
+    #[test]
+    fn endpoints_follow_the_region() {
+        let cn = Endpoints::for_region(Region::MainlandCn);
+        assert_eq!(cn.usages, "https://api.kimi.com/coding/v1/usages");
+        assert_eq!(cn.token, "https://auth.kimi.com/api/oauth/token");
+        let global = Endpoints::for_region(Region::Global);
+        assert_eq!(global.usages, "https://api.kimi.ai/coding/v1/usages");
+        assert_eq!(global.token, "https://auth.kimi.ai/api/oauth/token");
+        // The default stays the endpoint the API-key path has always used.
+        assert_eq!(Endpoints::default().usages, cn.usages);
+    }
+
+    #[tokio::test]
+    async fn the_vendors_own_tier_name_replaces_the_wire_enum() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("GET", "/coding/v1/usages")
+            .with_status(200)
+            .with_body(sample_json())
+            .create_async()
+            .await;
+        let me = server
+            .mock("GET", "/coding/v1/me")
+            .match_header("authorization", "Bearer sk-test")
+            .with_status(200)
+            .with_body(r#"{"user_id":"u-1","user_level":25,"user_level_name":"Allegretto"}"#)
+            .create_async()
+            .await;
+
+        let (_td, cache) = cache_fixture();
+        let out = fetch_snapshot(
+            &reqwest::Client::new(),
+            "sk-test",
+            &cache,
+            &test_endpoints(&server.url()),
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+        me.assert_async().await;
+        assert_eq!(out.snapshot.plan, Some("Allegretto".into()));
+        // …and it survives the cache round-trip, not just the live fetch.
+        let cached: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(cache.payload_path()).unwrap()).unwrap();
+        assert_eq!(cached["plan"], "Allegretto");
+    }
+
+    #[tokio::test]
+    async fn a_profile_endpoint_that_fails_costs_the_label_and_nothing_else() {
+        // 404 is documented by kimi-code's own error text for accounts with no
+        // coding profile; the quota numbers must still come through.
+        for status in [404, 401, 500] {
+            let mut server = mockito::Server::new_async().await;
+            server
+                .mock("GET", "/coding/v1/usages")
+                .with_status(200)
+                .with_body(sample_json())
+                .create_async()
+                .await;
+            server
+                .mock("GET", "/coding/v1/me")
+                .with_status(status)
+                .with_body(r#"{"error":"nope"}"#)
+                .create_async()
+                .await;
+
+            let (_td, cache) = cache_fixture();
+            let out = fetch_snapshot(
+                &reqwest::Client::new(),
+                "sk-test",
+                &cache,
+                &test_endpoints(&server.url()),
+                Duration::ZERO,
+            )
+            .await
+            .unwrap();
+            assert_eq!(out.snapshot.plan, Some("Intermediate".into()), "{status}");
+            assert_eq!(out.snapshot.weekly_used, 26, "{status}");
+            assert!(out.last_error.is_none(), "{status}: must not warn");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_profile_endpoint_does_not_fail_the_fetch() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("GET", "/coding/v1/usages")
+            .with_status(200)
+            .with_body(sample_json())
+            .create_async()
+            .await;
+        let mut endpoints = test_endpoints(&server.url());
+        endpoints.me = "http://localhost:1/coding/v1/me".into();
+
+        let (_td, cache) = cache_fixture();
+        let out = fetch_snapshot(
+            &reqwest::Client::new(),
+            "sk-test",
+            &cache,
+            &endpoints,
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.snapshot.plan, Some("Intermediate".into()));
+        assert!(!out.stale);
+    }
+
+    #[test]
+    fn a_relocated_credential_file_keeps_the_homes_lock_target() {
+        let home = Path::new("/home/u/.kimi-code");
+        let auth =
+            KimiCodeAuth::with_credentials_path(home, PathBuf::from("/elsewhere/kimi-code.json"));
+        assert_eq!(
+            auth.credentials_path,
+            PathBuf::from("/elsewhere/kimi-code.json")
+        );
+        assert_eq!(auth.lock_target, oauth::lock_target_in(home));
     }
 }

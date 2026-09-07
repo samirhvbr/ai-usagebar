@@ -10,10 +10,13 @@
 //!   q / Esc / Ctrl-C   quit
 
 use std::io;
+use std::path::PathBuf;
+use std::time::{Duration, SystemTime};
 
 use ai_usagebar::config::Config;
 use ai_usagebar::tui::app::{
-    App, REFRESH_INTERVAL, TabId, TabState, refresh_one, tabs_from_config,
+    ANTHROPIC_REFRESH_STAGGER, App, REFRESH_INTERVAL, TabId, TabState, refresh_one,
+    refresh_stagger, tabs_with_desktop,
 };
 use ai_usagebar::tui::view::draw;
 use ai_usagebar::vendor::HTTP_CLIENT_TIMEOUT;
@@ -26,6 +29,7 @@ use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+use ratatui::layout::Rect;
 use reqwest::Client;
 use tokio::sync::mpsc;
 
@@ -47,7 +51,7 @@ async fn run() -> io::Result<()> {
             ai_usagebar::config::config_path_hint()
         ))
     })?;
-    let tabs = tabs_from_config(&config);
+    let tabs = tabs_with_desktop(&config);
     if tabs.is_empty() {
         eprintln!(
             "No vendors are enabled in {}. Exiting.",
@@ -58,11 +62,14 @@ async fn run() -> io::Result<()> {
 
     let client = Client::builder()
         .timeout(HTTP_CLIENT_TIMEOUT)
+        .redirect(ai_usagebar::vendor::same_origin_redirect_policy())
         .build()
         .map_err(io::Error::other)?;
 
     let mut app = App::new_with_primary(tabs, config.ui.primary);
     app.context_enabled = config.context.enabled;
+    app.overview_vendors = config.ui.overview_vendors.clone();
+    app.vendor_box = config.ui.vendor_box();
 
     // RAII: restoring the terminal must survive an error or a panic in the
     // loop below. Doing it inline left the user in raw mode on the alternate
@@ -104,6 +111,69 @@ impl Drop for TerminalGuard {
     }
 }
 
+/// How often to check `config.toml`'s mtime for edits made outside the TUI
+/// (a text editor, `ai-usagebar account add`, another tool).
+// ponytail: an mtime poll, not a notify(7)/FSEvents watcher — one stat() every
+// couple seconds beats pulling in a file-watching crate + its background thread
+// for a file that changes a handful of times a session. The macOS menu-bar app
+// watches natively (DispatchSource, free via Foundation); the TUI polls.
+const CONFIG_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Cheap identity for the resolved config file. Including the resolved path and
+/// length avoids missing a canonical/legacy-path switch or a same-timestamp
+/// rewrite on filesystems with coarse mtime resolution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConfigStamp {
+    path: PathBuf,
+    modified: SystemTime,
+    len: u64,
+}
+
+/// Stamp of the resolved config file, or `None` when there is no config yet or
+/// it can't be stat'd. Re-resolves the path each call, so a config file created
+/// after the TUI started is still noticed.
+fn config_stamp() -> Option<ConfigStamp> {
+    let path = ai_usagebar::config::resolved_path()?;
+    let metadata = std::fs::metadata(&path).ok()?;
+    Some(ConfigStamp {
+        path,
+        modified: metadata.modified().ok()?,
+        len: metadata.len(),
+    })
+}
+
+/// Re-read `config.toml` into `config` and rebuild everything the TUI derives
+/// from it — the tab set (vendor + `[[anthropic.accounts]]` changes), the
+/// overview vendor list, the context toggle — then re-fetch every tab. Returns
+/// `false` and touches nothing if the file can't be parsed, so a half-written
+/// edit never wipes the session back to defaults; the next poll retries.
+///
+/// `reselect_primary` snaps back to the configured primary tab — wanted right
+/// after an explicit Settings save, but not on a background file-watch reload,
+/// where `set_tabs` already clamps the current tab and yanking the user away
+/// from where they were browsing would be rude.
+fn reload_config(
+    app: &mut App,
+    config: &mut Config,
+    client: &Client,
+    tx: &mpsc::UnboundedSender<(u64, TabId, TabState)>,
+    reselect_primary: bool,
+) -> bool {
+    let Ok(reloaded) = Config::load() else {
+        return false;
+    };
+    *config = reloaded;
+    app.context_enabled = config.context.enabled;
+    app.overview_vendors = config.ui.overview_vendors.clone();
+    app.vendor_box = config.ui.vendor_box();
+    app.set_tabs(tabs_with_desktop(config));
+    if reselect_primary {
+        app.select_primary(config.ui.primary);
+    }
+    spawn_all(app, client, config, tx);
+    true
+}
+
 async fn event_loop<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
@@ -127,15 +197,24 @@ where
     // raced each other on `event::read()`, so keypresses could be consumed by
     // an orphan and lost. A dedicated thread also means a slow branch can never
     // delay input.
-    let (key_tx, mut key_rx) = mpsc::unbounded_channel::<event::KeyEvent>();
+    //
+    // Resize must wake the loop too: discarding `Event::Resize` left the
+    // alternate screen at the previous paint size (UI stuck in a corner after
+    // maximize, or ghost cells after shrink) until a keypress forced a draw.
+    let (input_tx, mut input_rx) = mpsc::unbounded_channel::<InputEvent>();
     std::thread::spawn(move || {
         loop {
             // A blocking read is fine here: this thread does nothing else, and
             // the channel send wakes the runtime.
             match event::read() {
                 Ok(Event::Key(k)) => {
-                    if key_tx.send(k).is_err() {
+                    if input_tx.send(InputEvent::Key(k)).is_err() {
                         return; // receiver gone: the TUI is shutting down.
+                    }
+                }
+                Ok(Event::Resize(cols, rows)) => {
+                    if input_tx.send(InputEvent::Resize { cols, rows }).is_err() {
+                        return;
                     }
                 }
                 Ok(_) => {}
@@ -146,6 +225,11 @@ where
 
     let mut tick = tokio::time::interval(REFRESH_INTERVAL);
     tick.tick().await; // consume the immediate tick.
+
+    // Watch config.toml for external edits and hot-reload without a restart.
+    let mut config_poll = tokio::time::interval(CONFIG_POLL_INTERVAL);
+    config_poll.tick().await; // consume the immediate tick.
+    let mut last_config_stamp = config_stamp();
 
     loop {
         terminal.draw(|f| draw(f, app))?;
@@ -167,10 +251,37 @@ where
             _ = tick.tick() => {
                 spawn_all(app, client, config, &tx);
             }
-            // Keyboard events, delivered by the single reader thread.
-            maybe_key = key_rx.recv() => {
-                let Some(k) = maybe_key else {
+            // Hot-reload config.toml when it changes on disk (external editor,
+            // `ai-usagebar account add`, etc.), preserving the current tab.
+            _ = config_poll.tick() => {
+                let now = config_stamp();
+                if now != last_config_stamp
+                    && reload_config(app, config, client, &tx, false)
+                {
+                    // Only consume the stamp after a successful parse. A
+                    // half-written file is retried until it becomes valid.
+                    last_config_stamp = now;
+                }
+            }
+            // Keyboard + resize, delivered by the single reader thread.
+            maybe_input = input_rx.recv() => {
+                let Some(input) = maybe_input else {
                     return Ok(()); // reader thread ended: stdin closed.
+                };
+                let k = match input {
+                    InputEvent::Resize { cols, rows } => {
+                        // Prefer resize() over clear(): clear() snapshots the
+                        // cursor via DSR (\x1b[6n) and can hang/fail when the
+                        // terminal doesn't answer. resize() for Fullscreen
+                        // clears the viewport + resets the diff buffer without
+                        // that round-trip; the next draw fills the new area.
+                        // Ignore the result: a failed resize (e.g. a transient
+                        // ioctl error) must not tear down the whole TUI — the
+                        // next successful resize or redraw recovers.
+                        let _ = terminal.resize(Rect::new(0, 0, cols, rows));
+                        continue;
+                    }
+                    InputEvent::Key(k) => k,
                 };
                 {
                     // On Windows Terminal (and terminals advertising the
@@ -208,22 +319,17 @@ where
                             SAction::Close => app.settings = None,
                             SAction::SavedAndClose => {
                                 app.settings = None;
-                                // Re-load config so the new primary takes effect
-                                // on the next render, rebuild the tab set so
-                                // account/vendor changes made to config.toml
-                                // while the TUI was open appear without a
-                                // restart, and queue an immediate refresh of
-                                // every tab so newly-set API keys are picked up.
-                                // Keep the config we already have if the reload
-                                // fails — reverting to defaults would silently
-                                // drop the user's real settings mid-session.
-                                if let Ok(reloaded) = ai_usagebar::config::Config::load() {
-                                    *config = reloaded;
+                                // Reload config and rebuild the tab set so a
+                                // just-saved primary / account / vendor / API-key
+                                // change takes effect without a restart, snapping
+                                // to the configured primary since the user just
+                                // asked for it. A broken reload keeps the current
+                                // config rather than reverting to defaults.
+                                if reload_config(app, config, client, &tx, true) {
+                                    // The save just rewrote config.toml; adopt its
+                                    // new stamp so the poll doesn't reload again.
+                                    last_config_stamp = config_stamp();
                                 }
-                                app.context_enabled = config.context.enabled;
-                                app.set_tabs(tabs_from_config(config));
-                                app.select_primary(config.ui.primary);
-                                spawn_all(app, client, config, &tx);
                             }
                             SAction::Quit => return Ok(()),
                         }
@@ -260,10 +366,14 @@ where
                         return Ok(());
                     }
                     // Refresh-on-key handling.
-                    if matches!(k.code, KeyCode::Char('r'))
-                        && let Some(tab) = app.active_tab_id().cloned()
-                    {
-                        spawn_one(app, tab, client, config, &tx);
+                    if matches!(k.code, KeyCode::Char('r')) {
+                        if app.overview {
+                            // No single active tab on the Overview — refresh all.
+                            spawn_all(app, client, config, &tx);
+                        } else if let Some(tab) = app.active_tab_id().cloned() {
+                            // A manual single-tab refresh isn't a burst — no stagger.
+                            spawn_one(app, tab, client, config, &tx, Duration::ZERO);
+                        }
                     }
                     if matches!(k.code, KeyCode::Char('R')) {
                         spawn_all(app, client, config, &tx);
@@ -276,6 +386,12 @@ where
             return Ok(());
         }
     }
+}
+
+/// Crossterm events the dedicated reader thread forwards into the async loop.
+enum InputEvent {
+    Key(event::KeyEvent),
+    Resize { cols: u16, rows: u16 },
 }
 
 fn spawn_context_scan(
@@ -313,8 +429,12 @@ fn spawn_all(
     config: &Config,
     tx: &mpsc::UnboundedSender<(u64, TabId, TabState)>,
 ) {
-    for tab in app.tabs_meta.clone() {
-        spawn_one(app, tab, client, config, tx);
+    let tabs = app.tabs_meta.clone();
+    // Space out the Anthropic tabs so several accounts don't burst the shared
+    // usage/token endpoint and trip its rate limit (429).
+    let delays = refresh_stagger(&tabs, ANTHROPIC_REFRESH_STAGGER);
+    for (tab, delay) in tabs.into_iter().zip(delays) {
+        spawn_one(app, tab, client, config, tx, delay);
     }
 }
 
@@ -324,15 +444,19 @@ fn spawn_one(
     client: &Client,
     config: &Config,
     tx: &mpsc::UnboundedSender<(u64, TabId, TabState)>,
+    delay: Duration,
 ) {
+    if !app.begin_refresh(&tab) {
+        return;
+    }
     let tx = tx.clone();
     let client = client.clone();
     let cfg = config.clone();
     let generation = app.tab_generation;
-    if let Some(index) = app.tabs_meta.iter().position(|current| current == &tab) {
-        app.tabs[index] = TabState::Loading;
-    }
     tokio::spawn(async move {
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
         let state = refresh_one(&client, &cfg, &tab).await;
         let _ = tx.send((generation, tab, state));
     });

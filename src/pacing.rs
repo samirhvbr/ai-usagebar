@@ -149,6 +149,18 @@ pub enum PaceSeverity {
     Critical,
 }
 
+impl PaceSeverity {
+    /// Stable lowercase token used by JSON/CSS-facing presentation layers.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Mid => "mid",
+            Self::High => "high",
+            Self::Critical => "critical",
+        }
+    }
+}
+
 pub fn pace_severity(delta: i32) -> PaceSeverity {
     if delta >= 10 {
         PaceSeverity::Critical
@@ -289,6 +301,14 @@ mod tests {
         assert_eq!(pace_severity(9), PaceSeverity::High);
         assert_eq!(pace_severity(10), PaceSeverity::Critical);
         assert_eq!(pace_severity(100), PaceSeverity::Critical);
+    }
+
+    #[test]
+    fn severity_tokens_are_stable_for_external_presenters() {
+        assert_eq!(PaceSeverity::Low.as_str(), "low");
+        assert_eq!(PaceSeverity::Mid.as_str(), "mid");
+        assert_eq!(PaceSeverity::High.as_str(), "high");
+        assert_eq!(PaceSeverity::Critical.as_str(), "critical");
     }
 
     #[test]

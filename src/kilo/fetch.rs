@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use crate::cache::{Cache, MAX_STALE, acquire_lock_async};
+use crate::cache::{Cache, acquire_lock_async};
 use crate::error::{AppError, Result};
 use crate::usage::{KiloSnapshot, finite_amount};
 use crate::vendor::{MAX_BODY_BYTES, read_body_capped};
@@ -29,13 +29,9 @@ impl Default for Endpoints {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct FetchOutcome {
-    pub snapshot: KiloSnapshot,
-    pub stale: bool,
-    pub last_error: Option<(u16, String)>,
-    pub cache_age: Option<Duration>,
-}
+/// This vendor's [`Outcome`](crate::outcome::Outcome) — the shared shape,
+/// specialised to its snapshot.
+pub type FetchOutcome = crate::outcome::Outcome<KiloSnapshot>;
 
 /// Cache-aware fetch. `organization_id`, when set, scopes the balance to a team
 /// (the `x-kilocode-organizationid` header); omitting it returns the personal
@@ -68,24 +64,17 @@ pub async fn fetch_snapshot(
             });
             let bytes = serde_json::to_vec(&cache_repr)?;
             cache.write_payload(&bytes)?;
-            Ok(FetchOutcome {
-                snapshot: snap,
-                stale: false,
-                last_error: None,
-                cache_age: Some(Duration::ZERO),
-            })
+            Ok(crate::outcome::Outcome::fresh(snap))
         }
         Err(e) if e.is_transient() => fallback_silent(cache, &target, e),
         Err(AppError::Http { status, body }) => {
             cache.mark_stale();
-            cache.write_last_error(status, &body);
-            let diag = (status, body.clone());
+            let diag = cache.write_last_error(status, &body);
             fallback_with_error(cache, Some(diag), &target, AppError::Http { status, body })
         }
         Err(e) => {
             cache.mark_stale();
-            cache.write_last_error(0, &e.to_string());
-            let diag = (0, e.to_string());
+            let diag = cache.write_last_error(0, &e.to_string());
             fallback_with_error(cache, Some(diag), &target, e)
         }
     }
@@ -102,40 +91,23 @@ fn target_key(organization_id: Option<&str>) -> String {
 }
 
 fn fallback_silent(cache: &Cache, target: &str, original: AppError) -> Result<FetchOutcome> {
-    let Some(bytes) = cache.fallback_payload(MAX_STALE)? else {
-        return Err(original);
-    };
-    reuse_cache(&bytes, cache, true, target)
+    crate::outcome::fallback(cache, None, original, |bytes| parse_cache(bytes, target))
 }
 
-/// On failure we show the last good figure with the error alongside it. With
-/// nothing usable cached there is nothing to show, so the **original** error is
-/// returned rather than a generic "no usable cache" that hides what went wrong.
 fn fallback_with_error(
     cache: &Cache,
     last_error: Option<(u16, String)>,
     target: &str,
     original: AppError,
 ) -> Result<FetchOutcome> {
-    let Some(bytes) = cache.fallback_payload(MAX_STALE)? else {
-        return Err(original);
-    };
-    // A cache we cannot attribute to this target is no better than no cache.
-    let Ok(mut outcome) = reuse_cache(&bytes, cache, true, target) else {
-        return Err(original);
-    };
-    outcome.last_error = last_error;
-    Ok(outcome)
+    crate::outcome::fallback(cache, last_error, original, |bytes| {
+        parse_cache(bytes, target)
+    })
 }
 
 fn reuse_cache(bytes: &[u8], cache: &Cache, stale: bool, target: &str) -> Result<FetchOutcome> {
     let snap = parse_cache(bytes, target)?;
-    Ok(FetchOutcome {
-        snapshot: snap,
-        stale,
-        last_error: cache.read_last_error(),
-        cache_age: cache.payload_age(),
-    })
+    Ok(crate::outcome::Outcome::cached(snap, cache, stale))
 }
 
 fn parse_cache(bytes: &[u8], target: &str) -> Result<KiloSnapshot> {

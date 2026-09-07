@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 
-use crate::cache::{Cache, MAX_STALE, acquire_lock_async};
+use crate::cache::{Cache, acquire_lock_async};
 use crate::error::{AppError, Result};
 use crate::usage::{AntigravitySnapshot, UsageWindow};
 
@@ -30,22 +30,13 @@ const STATUS_RPC: &str = "exa.language_server_pb.LanguageServerService/GetUserSt
 
 const DEFAULT_PLAN: &str = "Antigravity";
 
-#[derive(Debug, Clone)]
-pub struct FetchOutcome {
-    pub snapshot: AntigravitySnapshot,
-    pub stale: bool,
-    pub last_error: Option<(u16, String)>,
-    pub cache_age: Option<Duration>,
-}
+/// This vendor's [`Outcome`](crate::outcome::Outcome) — the shared shape,
+/// specialised to its snapshot.
+pub type FetchOutcome = crate::outcome::Outcome<AntigravitySnapshot>;
 
 impl From<FetchOutcome> for crate::vendor::VendorOutcome {
     fn from(o: FetchOutcome) -> Self {
-        Self {
-            snapshot: crate::usage::VendorSnapshot::Antigravity(o.snapshot),
-            stale: o.stale,
-            last_error: o.last_error,
-            cache_age: o.cache_age,
-        }
+        o.map(crate::usage::VendorSnapshot::Antigravity)
     }
 }
 
@@ -85,27 +76,18 @@ pub async fn fetch_snapshot_at(
         Ok(snap) => {
             let bytes = serde_json::to_vec(&snap_to_json(&snap))?;
             cache.write_payload(&bytes)?;
-            Ok(FetchOutcome {
-                snapshot: snap,
-                stale: false,
-                last_error: None,
-                cache_age: Some(Duration::ZERO),
-            })
+            Ok(crate::outcome::Outcome::fresh(snap))
         }
         Err(e) if e.is_transient() => fallback_silent(cache, now, e),
         Err(AppError::Http { status, body }) => {
             cache.mark_stale();
-            cache.write_last_error(status, &body);
-            let reason = AppError::Http {
-                status,
-                body: body.clone(),
-            };
-            fallback_with_error(cache, Some((status, body)), reason, now)
+            let last_error = Some(cache.write_last_error(status, &body));
+            let reason = AppError::Http { status, body };
+            fallback_with_error(cache, last_error, reason, now)
         }
         Err(e) => {
             cache.mark_stale();
-            cache.write_last_error(0, &e.to_string());
-            let last_error = Some((0, e.to_string()));
+            let last_error = Some(cache.write_last_error(0, &e.to_string()));
             fallback_with_error(cache, last_error, e, now)
         }
     }
@@ -134,7 +116,7 @@ async fn open_session(client: &reqwest::Client) -> Result<Session> {
         ));
     }
 
-    let mut last_err = None;
+    let mut errors = Vec::new();
     for base in bases {
         let csrf = fetch_csrf(client, &base).await;
         match post_rpc(client, &base, csrf.as_deref(), STATUS_RPC).await {
@@ -146,12 +128,68 @@ async fn open_session(client: &reqwest::Client) -> Result<Session> {
                     account: account_key(&v),
                 });
             }
-            Err(e) => last_err = Some(e),
+            Err(e) => errors.push(e),
         }
     }
-    Err(last_err.unwrap_or_else(|| {
+    Err(select_probe_error(errors))
+}
+
+/// Which failure to report when no candidate answered.
+///
+/// A server that replies `401`/`403` is running and reachable but signed out —
+/// the user can act on that, so it outranks the connection refusals from the
+/// products that simply are not up. Without this, a stale
+/// `ANTIGRAVITY_LS_ADDRESS` (or a second product on another port) would mask
+/// the one message worth reading behind transport noise.
+///
+/// Note that this also decides *visibility*: transport errors are transient and
+/// fall back silently to cache, while the `401` surfaces in the widget. That is
+/// why a TLS listener's echo is ranked below everything else rather than merely
+/// tie-breaking — see [`is_tls_echo`]. Being an `Http`, it is not transient, so
+/// letting it stand as "the last failure" turns a product that simply is not
+/// serving RPC into a visible error about a protocol the user never chose.
+fn select_probe_error(errors: Vec<AppError>) -> AppError {
+    let mut actionable = None;
+    let mut last = None;
+    let mut echo = None;
+    for e in errors {
+        if actionable.is_none() && is_actionable(&e) {
+            actionable = Some(e);
+        } else if is_tls_echo(&e) {
+            echo = Some(e);
+        } else {
+            last = Some(e);
+        }
+    }
+    actionable.or(last).or(echo).unwrap_or_else(|| {
         AppError::Other("antigravity: no local server answered GetUserStatus".into())
-    }))
+    })
+}
+
+/// An error the user can do something about, as opposed to "that product is not
+/// running". `post_rpc` only ever yields `Http`/`Transport`/`Other`, so the
+/// authentication statuses are the whole set.
+fn is_actionable(e: &AppError) -> bool {
+    matches!(e, AppError::Http { status, .. } if *status == 401 || *status == 403)
+}
+
+/// A TLS listener answering the plaintext JSON-RPC probe.
+///
+/// Each Antigravity product binds two ports: JSON-RPC in the clear on one and
+/// HTTPS on another. `probe_order` deliberately tries the RPC listener first
+/// and leaves the TLS one behind it, so reaching the TLS port at all means the
+/// RPC port already had its say. Go's `net/http.Server` answers cleartext on a
+/// TLS listener with this fixed `400`, which describes our own probe rather
+/// than anything wrong with the product — as a diagnosis it is noise that
+/// always arrives last and therefore always wins.
+///
+/// Matched on the body, not the status alone: a real `400` from the language
+/// server is a genuine complaint about the request and must keep outranking it.
+fn is_tls_echo(e: &AppError) -> bool {
+    matches!(
+        e,
+        AppError::Http { status: 400, body } if body.contains("HTTP request to an HTTPS server")
+    )
 }
 
 async fn fetch_live(
@@ -254,6 +292,40 @@ pub fn plan_from_status(v: &serde_json::Value) -> String {
 /// Buckets are keyed by `bucketId` (`gemini-5h`, `gemini-weekly`, `3p-5h`,
 /// `3p-weekly`), falling back to the group display name plus the `window`
 /// discriminator so a renamed bucket id still lands in the right slot.
+/// One bucket, named the way the response named it.
+fn describe_bucket(group_name: &str, id: &str, window: Option<&str>) -> String {
+    let id = if id.is_empty() { "<unnamed>" } else { id };
+    let group = if group_name.is_empty() {
+        String::new()
+    } else {
+        format!(" in {group_name:?}")
+    };
+    match window {
+        Some(window) if !window.is_empty() => format!("{id} (window {window}){group}"),
+        _ => format!("{id}{group}"),
+    }
+}
+
+/// A quota summary with nothing we can render. Naming the buckets that *were*
+/// present turns a report of this into something actionable — the alternative
+/// says only what we wanted, which tells neither the user nor a maintainer
+/// whether the plan has no such pool, the product renamed one, or a new
+/// cadence appeared.
+fn no_usable_bucket(seen: &[String]) -> AppError {
+    if seen.is_empty() {
+        return AppError::Other(
+            "antigravity: quota summary has no buckets at all — the running product may \
+             not have a quota for this account yet"
+                .into(),
+        );
+    }
+    AppError::Other(format!(
+        "antigravity: quota summary has no bucket in a window we recognise (5h or \
+         weekly, Gemini or Claude/GPT); it offered: {}",
+        seen.join(", ")
+    ))
+}
+
 pub fn parse_quota_summary(v: &serde_json::Value, plan: String) -> Result<AntigravitySnapshot> {
     let groups = v["response"]["groups"]
         .as_array()
@@ -264,6 +336,10 @@ pub fn parse_quota_summary(v: &serde_json::Value, plan: String) -> Result<Antigr
     let mut gemini_weekly = None;
     let mut tp_5h = None;
     let mut tp_weekly = None;
+    // What the response actually offered, so a summary we cannot use says so
+    // instead of only naming what it wanted. Bucket ids and group names are
+    // quota vocabulary, not account data.
+    let mut seen: Vec<String> = Vec::new();
 
     for group in groups {
         let group_name = group["displayName"].as_str().unwrap_or_default();
@@ -272,6 +348,7 @@ pub fn parse_quota_summary(v: &serde_json::Value, plan: String) -> Result<Antigr
         };
         for bucket in buckets {
             let id = bucket["bucketId"].as_str().unwrap_or_default();
+            seen.push(describe_bucket(group_name, id, bucket["window"].as_str()));
             let window = bucket["window"].as_str().unwrap_or_default();
             let is_weekly = if id.ends_with("weekly") || window == "weekly" {
                 true
@@ -311,19 +388,19 @@ pub fn parse_quota_summary(v: &serde_json::Value, plan: String) -> Result<Antigr
         }
     }
 
-    let session = gemini_5h.ok_or_else(|| {
-        AppError::Other("antigravity: quota summary has no Gemini 5h bucket".into())
-    })?;
-    let weekly = gemini_weekly.ok_or_else(|| {
-        AppError::Other("antigravity: quota summary has no Gemini weekly bucket".into())
-    })?;
+    // Not every product offers every window: Antigravity CLI 1.1.22 returns
+    // weekly buckets only. One recognised window is enough to render — what
+    // must never happen is showing a figure for a window that did not arrive.
+    if gemini_5h.is_none() && gemini_weekly.is_none() && tp_5h.is_none() && tp_weekly.is_none() {
+        return Err(no_usable_bucket(&seen));
+    }
 
     Ok(AntigravitySnapshot {
         plan,
         // Stamped by the caller, which is what knows the session's identity.
         account: String::new(),
-        session,
-        weekly,
+        session: gemini_5h,
+        weekly: gemini_weekly,
         third_party_session: tp_5h,
         third_party_weekly: tp_weekly,
     })
@@ -387,29 +464,42 @@ fn candidate_bases() -> Vec<String> {
 /// Test seam for [`candidate_bases`] — takes the address override and the
 /// discovered ports instead of reading the environment and `/proc`.
 fn candidate_bases_with(override_addr: Option<&str>, discovered: Vec<u16>) -> Vec<String> {
-    if let Some(addr) = override_addr {
-        let addr = addr.trim();
-        if !addr.is_empty() {
-            return vec![normalize_base(addr)];
-        }
+    let mut bases = Vec::new();
+    if let Some(base) = override_addr.and_then(normalize_base) {
+        bases.push(base);
     }
 
     // No hardcoded fallback port on purpose: the server always binds with
     // `--https_server_port 0`, so its port is drawn from the ephemeral range
     // and cannot be guessed. Probing a fixed one would just poke whatever
-    // unrelated process happens to own it. Discovery or the explicit override.
-    discovered
-        .into_iter()
-        .map(|p| format!("http://127.0.0.1:{p}"))
-        .collect()
+    // unrelated process happens to own it. Discovered ports follow any
+    // explicit override as fallback, with duplicates omitted.
+    for p in discovered {
+        let candidate = format!("http://127.0.0.1:{p}");
+        if !bases.contains(&candidate) {
+            bases.push(candidate);
+        }
+    }
+
+    bases
 }
 
-fn normalize_base(addr: &str) -> String {
-    if addr.starts_with("http://") || addr.starts_with("https://") {
-        addr.to_string()
-    } else {
-        format!("http://{addr}")
-    }
+/// Turn a configured address into a base URL: trim surrounding whitespace,
+/// supply the default scheme when it is missing, and drop trailing slashes so
+/// the RPC paths built on top do not come out with a double slash.
+///
+/// Returns `None` when nothing but a scheme survives. `ANTIGRAVITY_LS_ADDRESS`
+/// is user input, and a value like `"/"` carries no authority to connect to;
+/// admitting it as a candidate would spend a probe to learn what is already
+/// knowable here.
+fn normalize_base(addr: &str) -> Option<String> {
+    let trimmed = addr.trim();
+    let (scheme, authority) = match trimmed.split_once("://") {
+        Some((scheme @ ("http" | "https"), rest)) => (scheme, rest),
+        _ => ("http", trimmed),
+    };
+    let authority = authority.trim_end_matches('/');
+    (!authority.is_empty()).then(|| format!("{scheme}://{authority}"))
 }
 
 /// Does this process look like one of the three Antigravity products?
@@ -419,11 +509,71 @@ fn normalize_base(addr: &str) -> String {
 /// matching on the server binary alone would miss a CLI-only install. `comm` is
 /// truncated to 15 bytes by the kernel, which `language_server` exactly fills.
 fn is_antigravity_process(comm: &str, exe: Option<&str>) -> bool {
-    let comm = comm.trim();
+    let comm = comm.trim().to_lowercase();
+    let comm = comm.strip_suffix(".exe").unwrap_or(&comm);
     if comm.contains("language_server") || comm == "agy" || comm == "antigravity" {
         return true;
     }
-    exe.is_some_and(|p| p.contains("antigravity") || p.ends_with("/agy"))
+    exe.is_some_and(|p| {
+        let p = p.to_lowercase().replace('\\', "/");
+        let p = p.strip_suffix(".exe").unwrap_or(&p);
+        p.contains("antigravity") || p.ends_with("/agy")
+    })
+}
+
+/// Flatten per-process listener ports into the order they should be probed.
+///
+/// Each Antigravity product binds an HTTPS/TLS listener and the unencrypted
+/// HTTP JSON-RPC listener that serves `GetUserStatus` and
+/// `RetrieveUserQuotaSummary`. Both are ephemeral, but they are bound in that
+/// order, so in practice the RPC listener draws the higher number and probing
+/// high-to-low reaches it first — which keeps Go's `net/http.Server` from
+/// logging a TLS handshake error for every unencrypted request that lands on
+/// its HTTPS listener.
+///
+/// Sorting every discovered port as one descending set only gets that right
+/// for a single process, because the high/low tendency holds *within* a
+/// product and says nothing across two of them: with Antigravity 2.0 and an
+/// `agy` session both up, one product's TLS port can sort above the other's
+/// RPC port. Ports are therefore grouped per pid, sorted high-to-low inside
+/// each group, and taken rank by rank — every product's highest port, then
+/// every product's second-highest, and so on. Where each product shows both
+/// listeners that puts every RPC one ahead of every TLS one.
+///
+/// This stays a preference, not a guarantee, and the two-listener shape is the
+/// assumption it rests on: a product caught mid-startup, with only its TLS port
+/// bound so far, sits alone at rank 0 and is probed first. Every candidate is
+/// probed regardless, so a mis-ranked one costs an extra round-trip and a line
+/// on `agy`'s stderr, nothing more.
+///
+/// Order among products is arbitrary — all of them report the same
+/// account-wide quota, so whichever answers first is authoritative — and pid
+/// order is used only to keep the result reproducible, since `/proc`, `lsof`
+/// and the Windows TCP table each enumerate in their own order.
+#[cfg(any(test, target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn probe_order(per_pid: std::collections::BTreeMap<u32, Vec<u16>>) -> Vec<u16> {
+    let groups: Vec<Vec<u16>> = per_pid
+        .into_values()
+        .map(|mut group| {
+            group.sort_unstable_by(|a, b| b.cmp(a));
+            // Within a product a port is one listener however many rows named
+            // it — a dual-stack bind reports the same port from both
+            // `/proc/net/tcp` and `tcp6`. Collapsing them here keeps a rank
+            // meaning "the Nth listener" rather than "the Nth row".
+            group.dedup();
+            group
+        })
+        .collect();
+
+    let mut ports: Vec<u16> = Vec::new();
+    for rank in 0..groups.iter().map(Vec::len).max().unwrap_or(0) {
+        for port in groups.iter().filter_map(|group| group.get(rank)) {
+            if !ports.contains(port) {
+                ports.push(*port);
+            }
+        }
+    }
+    ports
 }
 
 /// Loopback ports listened on by any running Antigravity product.
@@ -434,14 +584,23 @@ fn is_antigravity_process(comm: &str, exe: Option<&str>) -> bool {
 /// shared quota, so whichever answers first is authoritative.
 #[cfg(target_os = "linux")]
 fn discover_ls_ports() -> Vec<u16> {
-    use std::collections::HashSet;
+    use std::collections::{BTreeMap, HashMap};
 
-    let mut inodes: HashSet<u64> = HashSet::new();
+    // Socket inode -> owning pid, so the ports found in `/proc/net` can be
+    // grouped back per process for `probe_order`.
+    let mut owners: HashMap<u64, u32> = HashMap::new();
     let Ok(entries) = std::fs::read_dir("/proc") else {
         return Vec::new();
     };
     for entry in entries.flatten() {
         let pid_dir = entry.path();
+        let Some(pid) = pid_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
         let Ok(comm) = std::fs::read_to_string(pid_dir.join("comm")) else {
             continue;
         };
@@ -462,33 +621,295 @@ fn discover_ls_ports() -> Vec<u16> {
                 .and_then(|s| s.strip_suffix(']'))
                 .and_then(|s| s.parse::<u64>().ok())
             {
-                inodes.insert(ino);
+                owners.insert(ino, pid);
             }
         }
     }
 
-    if inodes.is_empty() {
+    if owners.is_empty() {
         return Vec::new();
     }
 
-    let mut ports = Vec::new();
+    let mut per_pid: BTreeMap<u32, Vec<u16>> = BTreeMap::new();
     for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
         let Ok(contents) = std::fs::read_to_string(table) else {
             continue;
         };
         for line in contents.lines().skip(1) {
             if let Some((port, ino)) = parse_proc_net_line(line)
-                && inodes.contains(&ino)
-                && !ports.contains(&port)
+                && let Some(&pid) = owners.get(&ino)
             {
-                ports.push(port);
+                per_pid.entry(pid).or_default().push(port);
             }
         }
     }
-    ports
+    probe_order(per_pid)
 }
 
-#[cfg(not(target_os = "linux"))]
+/// macOS has no `/proc`, so fall back to `lsof` (present on every macOS
+/// install by default, unlike Linux where shelling out was deliberately
+/// avoided — see the doc comment above). `-F pcn` asks for machine-parsable
+/// output: one `p<pid>` line per process, one `c<command>` line for its name,
+/// then an `n<address>` line per matching socket already filtered down to
+/// listening TCP sockets by `-iTCP -sTCP:LISTEN`.
+#[cfg(target_os = "macos")]
+fn discover_ls_ports() -> Vec<u16> {
+    let Ok(output) = std::process::Command::new("lsof")
+        .args(["-nP", "-iTCP", "-sTCP:LISTEN", "-F", "pcn"])
+        .output()
+    else {
+        return Vec::new();
+    };
+    // A non-zero exit still emits usable output for the fds it *could* read,
+    // so parse regardless of status — an empty/garbled stdout just parses to
+    // an empty port list.
+    parse_lsof_pcn(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Pure parser for `lsof -F pcn` output, kept separate from process spawning
+/// so the parsing logic is unit-testable without shelling out. Compiled under
+/// `test` on every platform, like [`matching_windows_ports`], so its tests are
+/// not macOS-only.
+#[cfg(any(test, target_os = "macos"))]
+fn parse_lsof_pcn(output: &str) -> Vec<u16> {
+    let mut per_pid: std::collections::BTreeMap<u32, Vec<u16>> = std::collections::BTreeMap::new();
+    // The pid arrives on the `p` line and the command name on the `c` line
+    // right after it, so hold the pid until the name confirms it is ours.
+    let mut pid = None;
+    let mut owner = None;
+    for line in output.lines() {
+        let Some(rest) = line.get(1..) else { continue };
+        match line.as_bytes().first() {
+            Some(b'p') => {
+                pid = rest.parse::<u32>().ok();
+                owner = None;
+            }
+            Some(b'c') => owner = pid.filter(|_| is_antigravity_process(rest, None)),
+            Some(b'n') => {
+                if let Some(pid) = owner
+                    && let Some(port) = rest.rsplit(':').next().and_then(|p| p.parse::<u16>().ok())
+                {
+                    per_pid.entry(pid).or_default().push(port);
+                }
+            }
+            _ => {}
+        }
+    }
+    probe_order(per_pid)
+}
+
+#[cfg(any(test, target_os = "windows"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WindowsTcpRow {
+    local_addr: [u8; 4],
+    local_port: u32,
+    pid: u32,
+}
+
+#[cfg(any(test, target_os = "windows"))]
+fn decode_windows_process_name(raw: &[u16]) -> String {
+    let end = raw.iter().position(|&unit| unit == 0).unwrap_or(raw.len());
+    String::from_utf16_lossy(&raw[..end])
+}
+
+#[cfg(any(test, target_os = "windows"))]
+fn matching_windows_process_ids(processes: &[(u32, String)]) -> std::collections::HashSet<u32> {
+    processes
+        .iter()
+        .filter(|(_, name)| is_antigravity_process(name, None))
+        .map(|(pid, _)| *pid)
+        .collect()
+}
+
+/// Loopback ports owned by the matching processes, grouped per pid and handed
+/// to [`probe_order`], which explains why the grouping matters.
+#[cfg(any(test, target_os = "windows"))]
+fn matching_windows_ports(
+    pids: &std::collections::HashSet<u32>,
+    rows: &[WindowsTcpRow],
+) -> Vec<u16> {
+    let mut per_pid: std::collections::BTreeMap<u32, Vec<u16>> = std::collections::BTreeMap::new();
+    for row in rows {
+        if !pids.contains(&row.pid) || row.local_addr != [127, 0, 0, 1] {
+            continue;
+        }
+        let port = u16::from_be((row.local_port & u32::from(u16::MAX)) as u16);
+        if port != 0 {
+            per_pid.entry(row.pid).or_default().push(port);
+        }
+    }
+    probe_order(per_pid)
+}
+
+#[cfg(any(test, target_os = "windows"))]
+fn checked_windows_row_count(
+    buffer_len: usize,
+    rows_offset: usize,
+    row_size: usize,
+    declared: usize,
+) -> Option<usize> {
+    let rows_len = row_size.checked_mul(declared)?;
+    let end = rows_offset.checked_add(rows_len)?;
+    (row_size != 0 && end <= buffer_len).then_some(declared)
+}
+
+#[cfg(target_os = "windows")]
+struct WindowsHandle(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(target_os = "windows")]
+impl Drop for WindowsHandle {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_processes() -> Vec<(u32, String)> {
+    use std::mem::size_of;
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+
+    let handle = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if handle == INVALID_HANDLE_VALUE {
+        return Vec::new();
+    }
+    let snapshot = WindowsHandle(handle);
+    let mut entry = PROCESSENTRY32W::default();
+    let Ok(entry_size) = u32::try_from(size_of::<PROCESSENTRY32W>()) else {
+        return Vec::new();
+    };
+    entry.dwSize = entry_size;
+    if unsafe { Process32FirstW(snapshot.0, &mut entry) } == 0 {
+        return Vec::new();
+    }
+
+    let mut processes = Vec::new();
+    loop {
+        processes.push((
+            entry.th32ProcessID,
+            decode_windows_process_name(&entry.szExeFile),
+        ));
+        if unsafe { Process32NextW(snapshot.0, &mut entry) } == 0 {
+            break;
+        }
+    }
+    processes
+}
+
+#[cfg(target_os = "windows")]
+fn parse_windows_tcp_rows(buffer: &[u32], used_bytes: usize) -> Vec<WindowsTcpRow> {
+    use std::mem::{offset_of, size_of, size_of_val};
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        MIB_TCPROW_OWNER_PID, MIB_TCPTABLE_OWNER_PID,
+    };
+
+    let available = used_bytes.min(size_of_val(buffer));
+    let rows_offset = offset_of!(MIB_TCPTABLE_OWNER_PID, table);
+    if available < size_of::<u32>() || available < rows_offset {
+        return Vec::new();
+    }
+    let base = buffer.as_ptr().cast::<u8>();
+    let declared = unsafe { base.cast::<u32>().read_unaligned() } as usize;
+    if checked_windows_row_count(
+        available,
+        rows_offset,
+        size_of::<MIB_TCPROW_OWNER_PID>(),
+        declared,
+    )
+    .is_none()
+    {
+        return Vec::new();
+    }
+
+    let rows = unsafe { base.add(rows_offset).cast::<MIB_TCPROW_OWNER_PID>() };
+    (0..declared)
+        .map(|index| unsafe { rows.add(index).read_unaligned() })
+        .map(|row| WindowsTcpRow {
+            local_addr: row.dwLocalAddr.to_ne_bytes(),
+            local_port: row.dwLocalPort,
+            pid: row.dwOwningPid,
+        })
+        .collect()
+}
+
+#[cfg(target_os = "windows")]
+fn windows_tcp_rows() -> Vec<WindowsTcpRow> {
+    use std::mem::size_of;
+    use std::ptr::null_mut;
+    use windows_sys::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        GetExtendedTcpTable, TCP_TABLE_OWNER_PID_LISTENER,
+    };
+    use windows_sys::Win32::Networking::WinSock::AF_INET;
+
+    let mut size = 0u32;
+    let status = unsafe {
+        GetExtendedTcpTable(
+            null_mut(),
+            &mut size,
+            0,
+            u32::from(AF_INET),
+            TCP_TABLE_OWNER_PID_LISTENER,
+            0,
+        )
+    };
+    if status != ERROR_INSUFFICIENT_BUFFER {
+        return Vec::new();
+    }
+
+    for _ in 0..3 {
+        let Some(words) = (size as usize)
+            .checked_add(size_of::<u32>() - 1)
+            .map(|bytes| bytes / size_of::<u32>())
+        else {
+            return Vec::new();
+        };
+        if words == 0 {
+            return Vec::new();
+        }
+        let mut buffer = Vec::<u32>::new();
+        if buffer.try_reserve_exact(words).is_err() {
+            return Vec::new();
+        }
+        buffer.resize(words, 0);
+        let mut used = size;
+        let status = unsafe {
+            GetExtendedTcpTable(
+                buffer.as_mut_ptr().cast(),
+                &mut used,
+                0,
+                u32::from(AF_INET),
+                TCP_TABLE_OWNER_PID_LISTENER,
+                0,
+            )
+        };
+        if status == ERROR_INSUFFICIENT_BUFFER {
+            size = used;
+            continue;
+        }
+        if status != 0 {
+            return Vec::new();
+        }
+        return parse_windows_tcp_rows(&buffer, used as usize);
+    }
+    Vec::new()
+}
+
+#[cfg(target_os = "windows")]
+fn discover_ls_ports() -> Vec<u16> {
+    let pids = matching_windows_process_ids(&windows_processes());
+    if pids.is_empty() {
+        return Vec::new();
+    }
+    matching_windows_ports(&pids, &windows_tcp_rows())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 fn discover_ls_ports() -> Vec<u16> {
     Vec::new()
 }
@@ -515,10 +936,9 @@ fn parse_proc_net_line(line: &str) -> Option<(u16, u64)> {
 // ---------------------------------------------------------------------------
 
 fn fallback_silent(cache: &Cache, now: DateTime<Utc>, original: AppError) -> Result<FetchOutcome> {
-    let Some(bytes) = cache.fallback_payload(MAX_STALE)? else {
-        return Err(original);
-    };
-    reuse_cache(bytes, cache, true, None, now).or(Err(original))
+    crate::outcome::fallback(cache, None, original, |bytes| {
+        parse_cache_at(bytes, None, now)
+    })
 }
 
 /// Serve the stale cache when there is one. With no cache to fall back on,
@@ -531,14 +951,9 @@ fn fallback_with_error(
     reason: AppError,
     now: DateTime<Utc>,
 ) -> Result<FetchOutcome> {
-    let Some(bytes) = cache.fallback_payload(MAX_STALE)? else {
-        return Err(reason);
-    };
-    let Ok(mut outcome) = reuse_cache(bytes, cache, true, None, now) else {
-        return Err(reason);
-    };
-    outcome.last_error = last_error;
-    Ok(outcome)
+    crate::outcome::fallback(cache, last_error, reason, |bytes| {
+        parse_cache_at(bytes, None, now)
+    })
 }
 
 fn reuse_cache(
@@ -549,12 +964,7 @@ fn reuse_cache(
     now: DateTime<Utc>,
 ) -> Result<FetchOutcome> {
     let snap = parse_cache_at(&bytes, account, now)?;
-    Ok(FetchOutcome {
-        snapshot: snap,
-        stale,
-        last_error: cache.read_last_error(),
-        cache_age: cache.payload_age(),
-    })
+    Ok(crate::outcome::Outcome::cached(snap, cache, stale))
 }
 
 /// `account` is the fingerprint of the currently signed-in account, or `None`
@@ -577,8 +987,8 @@ pub fn parse_cache(bytes: &[u8], account: Option<&str>) -> Result<AntigravitySna
 /// five hours after which the session window is guaranteed wrong.
 fn expired_window(snap: &AntigravitySnapshot, now: DateTime<Utc>) -> Option<&'static str> {
     [
-        ("Gemini 5h", Some(&snap.session)),
-        ("Gemini weekly", Some(&snap.weekly)),
+        ("Gemini 5h", snap.session.as_ref()),
+        ("Gemini weekly", snap.weekly.as_ref()),
         ("Claude & GPT OSS 5h", snap.third_party_session.as_ref()),
         ("Claude & GPT OSS weekly", snap.third_party_weekly.as_ref()),
     ]
@@ -607,9 +1017,17 @@ pub fn parse_cache_at(
     // to 0 would render a confident "0% used" and keep serving it for the rest
     // of the TTL; returning an error makes the caller fall through to a live
     // fetch instead of displaying a fabricated snapshot.
+    // An absent window and a truncated payload look alike unless we insist on
+    // the difference: `snap_to_json` always writes every key, so an explicit
+    // `null` means "this product reported no such window" while a *missing*
+    // key means the document is not one we wrote whole. Only the first is a
+    // snapshot; the second must refetch rather than render a window short.
     let cached_pct = |pct_key: &'static str| -> Result<Option<i32>> {
         match v.get(pct_key) {
-            None | Some(serde_json::Value::Null) => Ok(None),
+            None => Err(AppError::Schema(format!(
+                "antigravity: cached payload is missing {pct_key}"
+            ))),
+            Some(serde_json::Value::Null) => Ok(None),
             Some(value) => value
                 .as_i64()
                 .filter(|pct| (0..=100).contains(pct))
@@ -620,21 +1038,6 @@ pub fn parse_cache_at(
                     ))
                 }),
         }
-    };
-
-    let window = |pct_key: &'static str, reset_key: &str, weekly: bool| {
-        let pct = cached_pct(pct_key)?.ok_or_else(|| {
-            AppError::Schema(format!("antigravity: cached payload missing {pct_key}"))
-        })?;
-        Ok::<_, AppError>(UsageWindow {
-            utilization_pct: pct,
-            resets_at: parse_reset(&v[reset_key], reset_key)?,
-            window_duration: if weekly {
-                chrono::Duration::days(7)
-            } else {
-                chrono::Duration::hours(5)
-            },
-        })
     };
 
     let optional = |pct_key: &'static str, reset_key: &str, weekly: bool| {
@@ -655,11 +1058,23 @@ pub fn parse_cache_at(
     let snap = AntigravitySnapshot {
         plan: v["plan"].as_str().unwrap_or(DEFAULT_PLAN).to_string(),
         account: cached_account.unwrap_or_default().to_string(),
-        session: window("session_pct", "session_reset", false)?,
-        weekly: window("weekly_pct", "weekly_reset", true)?,
+        session: optional("session_pct", "session_reset", false)?,
+        weekly: optional("weekly_pct", "weekly_reset", true)?,
         third_party_session: optional("tp_session_pct", "tp_session_reset", false)?,
         third_party_weekly: optional("tp_weekly_pct", "tp_weekly_reset", true)?,
     };
+
+    // A cache with no window left is not a snapshot; refetch rather than draw
+    // an empty panel from it. Mirrors the live parse.
+    if snap.session.is_none()
+        && snap.weekly.is_none()
+        && snap.third_party_session.is_none()
+        && snap.third_party_weekly.is_none()
+    {
+        return Err(AppError::Schema(
+            "antigravity cache holds no usable window; refetching".into(),
+        ));
+    }
 
     if let Some(window) = expired_window(&snap, now) {
         return Err(AppError::Schema(format!(
@@ -673,10 +1088,10 @@ pub fn snap_to_json(snap: &AntigravitySnapshot) -> serde_json::Value {
     serde_json::json!({
         "plan": snap.plan,
         "account": snap.account,
-        "session_pct": snap.session.utilization_pct,
-        "session_reset": snap.session.resets_at.map(|dt| dt.to_rfc3339()),
-        "weekly_pct": snap.weekly.utilization_pct,
-        "weekly_reset": snap.weekly.resets_at.map(|dt| dt.to_rfc3339()),
+        "session_pct": snap.session.as_ref().map(|w| w.utilization_pct),
+        "session_reset": snap.session.as_ref().and_then(|w| w.resets_at.map(|dt| dt.to_rfc3339())),
+        "weekly_pct": snap.weekly.as_ref().map(|w| w.utilization_pct),
+        "weekly_reset": snap.weekly.as_ref().and_then(|w| w.resets_at.map(|dt| dt.to_rfc3339())),
         "tp_session_pct": snap.third_party_session.as_ref().map(|w| w.utilization_pct),
         "tp_session_reset": snap.third_party_session.as_ref().and_then(|w| w.resets_at.map(|dt| dt.to_rfc3339())),
         "tp_weekly_pct": snap.third_party_weekly.as_ref().map(|w| w.utilization_pct),
@@ -736,8 +1151,8 @@ mod tests {
         let snap = parsed();
         assert_eq!(snap.plan, "Google AI Pro");
         // remainingFraction is inverted into "used".
-        assert_eq!(snap.session.utilization_pct, 43);
-        assert_eq!(snap.weekly.utilization_pct, 8);
+        assert_eq!(snap.session.as_ref().unwrap().utilization_pct, 43);
+        assert_eq!(snap.weekly.as_ref().unwrap().utilization_pct, 8);
         assert_eq!(
             snap.third_party_session.as_ref().unwrap().utilization_pct,
             75
@@ -749,21 +1164,36 @@ mod tests {
     fn each_window_keeps_its_own_reset_time() {
         let snap = parsed();
         let at = |s: &str| Some(DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc));
-        assert_eq!(snap.session.resets_at, at("2026-07-22T17:47:00Z"));
-        assert_eq!(snap.weekly.resets_at, at("2026-07-28T17:39:58Z"));
+        assert_eq!(
+            snap.session.as_ref().unwrap().resets_at,
+            at("2026-07-22T17:47:00Z")
+        );
+        assert_eq!(
+            snap.weekly.as_ref().unwrap().resets_at,
+            at("2026-07-28T17:39:58Z")
+        );
         assert_eq!(
             snap.third_party_weekly.as_ref().unwrap().resets_at,
             at("2026-07-29T12:47:00Z")
         );
         // Regression: weekly must never be a copy of the 5h window.
-        assert_ne!(snap.session.resets_at, snap.weekly.resets_at);
+        assert_ne!(
+            snap.session.as_ref().unwrap().resets_at,
+            snap.weekly.as_ref().unwrap().resets_at
+        );
     }
 
     #[test]
     fn window_durations_match_their_bucket() {
         let snap = parsed();
-        assert_eq!(snap.session.window_duration, chrono::Duration::hours(5));
-        assert_eq!(snap.weekly.window_duration, chrono::Duration::days(7));
+        assert_eq!(
+            snap.session.as_ref().unwrap().window_duration,
+            chrono::Duration::hours(5)
+        );
+        assert_eq!(
+            snap.weekly.as_ref().unwrap().window_duration,
+            chrono::Duration::days(7)
+        );
         assert_eq!(
             snap.third_party_weekly.as_ref().unwrap().window_duration,
             chrono::Duration::days(7)
@@ -783,8 +1213,8 @@ mod tests {
         )
         .unwrap();
         let snap = parse_quota_summary(&v, "Pro".into()).unwrap();
-        assert_eq!(snap.session.utilization_pct, 50);
-        assert_eq!(snap.weekly.utilization_pct, 10);
+        assert_eq!(snap.session.as_ref().unwrap().utilization_pct, 50);
+        assert_eq!(snap.weekly.as_ref().unwrap().utilization_pct, 10);
         assert_eq!(snap.third_party_session.unwrap().utilization_pct, 100);
         assert!(snap.third_party_weekly.is_none());
     }
@@ -846,6 +1276,136 @@ mod tests {
             let err = parse_quota_summary(&v, "Pro".into()).unwrap_err();
             assert!(err.to_string().contains("resetTime"), "{err}");
         }
+    }
+
+    /// The cache must round-trip a product that has no 5h window, and must
+    /// still reject a document it did not write whole — an explicit `null`
+    /// means "no such window", a missing key means truncation.
+    #[test]
+    fn a_weekly_only_snapshot_round_trips_through_the_cache() {
+        let mut snap = parsed();
+        snap.session = None;
+        snap.third_party_session = None;
+
+        let bytes = serde_json::to_vec(&snap_to_json(&snap)).unwrap();
+        let back = parse_cache_at(&bytes, None, now()).expect("weekly-only cache is usable");
+
+        assert!(back.session.is_none());
+        assert_eq!(
+            back.weekly.as_ref().unwrap().utilization_pct,
+            snap.weekly.as_ref().unwrap().utilization_pct
+        );
+    }
+
+    /// Issue #139: Antigravity CLI 1.1.22 on a paid account returns weekly
+    /// buckets and no 5-hour ones. Two usable windows arrived, so requiring a
+    /// Gemini 5h bucket threw both away and failed the whole vendor. This is
+    /// the reporter's payload.
+    #[test]
+    fn a_product_reporting_only_weekly_buckets_still_renders_them() {
+        let summary = serde_json::json!({
+            "groups": [
+                {
+                    "displayName": "Gemini Models",
+                    "buckets": [{
+                        "bucketId": "gemini-weekly", "window": "weekly",
+                        "remainingFraction": 0.42,
+                    }],
+                },
+                {
+                    "displayName": "Claude and GPT models",
+                    "buckets": [{
+                        "bucketId": "3p-weekly", "window": "weekly",
+                        "remainingFraction": 0.9,
+                    }],
+                },
+            ],
+        });
+
+        let snap = parse_quota_summary(&summary, "Pro".into()).expect("weekly-only is usable");
+
+        assert!(snap.session.is_none(), "no 5h bucket arrived");
+        assert!(snap.third_party_session.is_none());
+        assert_eq!(snap.weekly.as_ref().unwrap().utilization_pct, 58);
+        assert_eq!(
+            snap.third_party_weekly.as_ref().unwrap().utilization_pct,
+            10
+        );
+    }
+
+    /// The opposite shape must work for the same reason — the fix is "at least
+    /// one window", not "weekly is the required one now".
+    #[test]
+    fn a_product_reporting_only_five_hour_buckets_still_renders_them() {
+        let summary = serde_json::json!({
+            "groups": [{
+                "displayName": "Gemini Models",
+                "buckets": [{
+                    "bucketId": "gemini-5h", "window": "5h", "remainingFraction": 0.25,
+                }],
+            }],
+        });
+
+        let snap = parse_quota_summary(&summary, "Pro".into()).expect("5h-only is usable");
+
+        assert_eq!(snap.session.as_ref().unwrap().utilization_pct, 75);
+        assert!(snap.weekly.is_none());
+    }
+
+    /// Nothing recognisable is still an error, and still names what arrived so
+    /// the next report is diagnosable.
+    #[test]
+    fn a_summary_with_no_recognisable_bucket_errors_and_names_what_it_had() {
+        let summary = serde_json::json!({
+            "groups": [{
+                "displayName": "Gemini Models",
+                "buckets": [{
+                    "bucketId": "gemini-daily", "window": "daily", "remainingFraction": 0.9,
+                }],
+            }],
+        });
+
+        let rendered = parse_quota_summary(&summary, "Pro".into())
+            .expect_err("an unrecognised cadence alone is not a snapshot")
+            .to_string();
+
+        assert!(
+            rendered.contains("no bucket in a window we recognise"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("gemini-daily"), "{rendered}");
+        assert!(rendered.contains("window daily"), "{rendered}");
+    }
+
+    /// A summary with groups but no buckets at all is a different situation
+    /// from a summary whose buckets we did not recognise, and says so.
+    #[test]
+    fn a_summary_with_no_buckets_at_all_says_that_rather_than_listing_nothing() {
+        let summary = serde_json::json!({
+            "groups": [{"displayName": "Gemini", "buckets": []}],
+        });
+
+        let rendered = parse_quota_summary(&summary, "Pro".into())
+            .expect_err("no buckets is an error")
+            .to_string();
+
+        assert!(rendered.contains("no buckets at all"), "{rendered}");
+        assert!(!rendered.contains("it offered:"), "{rendered}");
+    }
+
+    /// An unnamed bucket must still be listed — a summary of nothing but
+    /// unnamed buckets is itself the finding.
+    #[test]
+    fn buckets_without_an_id_are_still_named_in_the_error() {
+        let summary = serde_json::json!({
+            "groups": [{"displayName": "", "buckets": [{"remainingFraction": 0.5}]}],
+        });
+
+        let rendered = parse_quota_summary(&summary, "Pro".into())
+            .expect_err("an unusable summary is an error")
+            .to_string();
+
+        assert!(rendered.contains("<unnamed>"), "{rendered}");
     }
 
     #[test]
@@ -932,7 +1492,7 @@ mod tests {
     fn expiry_names_the_window_that_rolled_over() {
         let mut snap = parsed();
         // Drop the 5h windows so only the weeklies can expire.
-        snap.session.resets_at = None;
+        snap.session.as_mut().unwrap().resets_at = None;
         snap.third_party_session = None;
         let bytes = serde_json::to_vec(&snap_to_json(&snap)).unwrap();
         let at = |s: &str| DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc);
@@ -949,7 +1509,7 @@ mod tests {
     #[test]
     fn a_window_without_a_reset_never_expires() {
         let mut snap = parsed();
-        for w in [&mut snap.session, &mut snap.weekly] {
+        for w in [&mut snap.session, &mut snap.weekly].into_iter().flatten() {
             w.resets_at = None;
         }
         snap.third_party_session = None;
@@ -1064,16 +1624,185 @@ mod tests {
     }
 
     #[test]
-    fn explicit_address_wins_and_gets_a_scheme() {
+    fn explicit_address_comes_first_and_gets_a_scheme() {
         assert_eq!(
             candidate_bases_with(Some("127.0.0.1:1234"), vec![5678]),
-            vec!["http://127.0.0.1:1234".to_string()]
+            vec![
+                "http://127.0.0.1:1234".to_string(),
+                "http://127.0.0.1:5678".to_string(),
+            ]
+        );
+        // Trailing slashes are trimmed.
+        assert_eq!(
+            candidate_bases_with(Some("127.0.0.1:1234/"), vec![5678]),
+            vec![
+                "http://127.0.0.1:1234".to_string(),
+                "http://127.0.0.1:5678".to_string(),
+            ]
+        );
+        // Duplicate base URL is omitted.
+        assert_eq!(
+            candidate_bases_with(Some("127.0.0.1:5678"), vec![5678]),
+            vec!["http://127.0.0.1:5678".to_string()]
+        );
+        // Duplicate discovered ports are omitted.
+        assert_eq!(
+            candidate_bases_with(None, vec![5678, 5678]),
+            vec!["http://127.0.0.1:5678".to_string()]
         );
         // An address that already carries a scheme is left alone.
         assert_eq!(
             candidate_bases_with(Some("https://host:9"), vec![]),
             vec!["https://host:9".to_string()]
         );
+    }
+
+    fn http(status: u16) -> AppError {
+        AppError::Http {
+            status,
+            body: String::new(),
+        }
+    }
+
+    /// A signed-out server is worth reporting even when a later candidate only
+    /// refused the connection — that is the whole point of probing on past the
+    /// first failure.
+    #[test]
+    fn an_auth_failure_outranks_later_transport_noise() {
+        let err = select_probe_error(vec![
+            http(401),
+            AppError::Transport("connection refused".into()),
+        ]);
+        assert!(matches!(err, AppError::Http { status: 401, .. }), "{err}");
+
+        let err = select_probe_error(vec![
+            AppError::Transport("connection refused".into()),
+            http(403),
+        ]);
+        assert!(matches!(err, AppError::Http { status: 403, .. }), "{err}");
+    }
+
+    /// The *first* actionable failure wins, so the explicit override's message
+    /// survives a second signed-out product further down the list.
+    #[test]
+    fn the_first_auth_failure_wins() {
+        let err = select_probe_error(vec![http(401), http(403)]);
+        assert!(matches!(err, AppError::Http { status: 401, .. }), "{err}");
+    }
+
+    /// With nothing actionable, the last failure stands in for "nothing
+    /// answered" — and stays transient, so the widget falls back silently
+    /// instead of shouting about a product that simply is not running.
+    #[test]
+    fn without_an_auth_failure_the_last_error_stands() {
+        let err = select_probe_error(vec![
+            AppError::Transport("first".into()),
+            http(500),
+            AppError::Transport("last".into()),
+        ]);
+        assert!(
+            matches!(&err, AppError::Transport(m) if m == "last"),
+            "{err}"
+        );
+        assert!(err.is_transient());
+    }
+
+    /// A 5xx is a server that answered but broke; the user cannot act on it, so
+    /// it must not outrank a later real failure the way a 401 does.
+    #[test]
+    fn a_server_error_is_not_treated_as_actionable() {
+        let err = select_probe_error(vec![http(500), http(401)]);
+        assert!(matches!(err, AppError::Http { status: 401, .. }), "{err}");
+    }
+
+    #[test]
+    fn no_candidates_at_all_yields_a_generic_error() {
+        let err = select_probe_error(Vec::new());
+        assert!(
+            err.to_string().contains("no local server answered"),
+            "{err}"
+        );
+    }
+
+    /// Verbatim from Go's `net/http`: this is what every Antigravity product's
+    /// HTTPS listener replies to the cleartext probe, so it is the tail of a
+    /// normal discovery run rather than a symptom.
+    fn tls_echo() -> AppError {
+        AppError::Http {
+            status: 400,
+            body: "Client sent an HTTP request to an HTTPS server.\n".into(),
+        }
+    }
+
+    /// The RPC listener is probed first, so whatever it said is the diagnosis.
+    /// The TLS port is reached only afterwards and always "fails", so without
+    /// demoting it, it overwrites the one error that came from the server the
+    /// user actually cares about.
+    #[test]
+    fn a_tls_echo_does_not_mask_what_the_rpc_listener_said() {
+        let err = select_probe_error(vec![
+            AppError::Http {
+                status: 500,
+                body: "GetUserStatus: internal".into(),
+            },
+            tls_echo(),
+        ]);
+        assert!(
+            matches!(&err, AppError::Http { status: 500, body } if body.contains("internal")),
+            "{err}"
+        );
+    }
+
+    /// The regression that motivated this: an `Http` is not transient, so an
+    /// echo standing in as "the last failure" costs the silent cache fallback
+    /// that `without_an_auth_failure_the_last_error_stands` exists to protect.
+    /// A product that is merely not serving RPC must stay quiet.
+    #[test]
+    fn a_tls_echo_does_not_cost_the_silent_fallback() {
+        let err = select_probe_error(vec![
+            AppError::Transport("connection refused".into()),
+            tls_echo(),
+        ]);
+        assert!(
+            matches!(&err, AppError::Transport(m) if m == "connection refused"),
+            "{err}"
+        );
+        assert!(
+            err.is_transient(),
+            "the echo must not make the run non-transient: {err}"
+        );
+    }
+
+    /// Demoted, not discarded. When the TLS listener is genuinely all that
+    /// answered, its reply is still better than a generic "nothing answered".
+    #[test]
+    fn a_tls_echo_still_stands_when_it_is_the_only_thing_that_answered() {
+        let err = select_probe_error(vec![tls_echo()]);
+        assert!(matches!(err, AppError::Http { status: 400, .. }), "{err}");
+    }
+
+    /// The demotion keys on the body, so the language server's own `400` — a
+    /// real complaint about a real request — keeps its normal rank.
+    #[test]
+    fn a_genuine_bad_request_is_not_mistaken_for_a_tls_echo() {
+        let err = select_probe_error(vec![
+            AppError::Http {
+                status: 400,
+                body: "unknown method GetUserStatus".into(),
+            },
+            tls_echo(),
+        ]);
+        assert!(
+            matches!(&err, AppError::Http { status: 400, body } if body.contains("unknown method")),
+            "{err}"
+        );
+    }
+
+    /// Ranking the echo last must not disturb the top of the order.
+    #[test]
+    fn an_auth_failure_still_outranks_a_tls_echo() {
+        let err = select_probe_error(vec![tls_echo(), http(401)]);
+        assert!(matches!(err, AppError::Http { status: 401, .. }), "{err}");
     }
 
     #[test]
@@ -1115,6 +1844,17 @@ mod tests {
             Some("/opt/antigravity/bin/helper")
         ));
         assert!(is_antigravity_process("antigravity", None));
+        assert!(is_antigravity_process("agy.exe", None));
+        assert!(is_antigravity_process("Antigravity.exe", None));
+        assert!(is_antigravity_process("language_server.exe", None));
+        assert!(is_antigravity_process(
+            "language_server_windows_x64.exe",
+            None
+        ));
+        assert!(is_antigravity_process(
+            "node.exe",
+            Some(r"C:\Users\u\AppData\Local\agy.exe")
+        ));
     }
 
     #[test]
@@ -1123,7 +1863,278 @@ mod tests {
         assert!(!is_antigravity_process("node", Some("/usr/bin/node")));
         // "legacy" ends in a substring of "/agy" but is not the CLI.
         assert!(!is_antigravity_process("legacy", Some("/usr/bin/legacy")));
+        assert!(!is_antigravity_process("legacy.exe", None));
+        assert!(!is_antigravity_process("not-agy.exe", None));
         assert!(!is_antigravity_process("", None));
+    }
+
+    #[test]
+    fn windows_process_names_decode_until_nul_and_tolerate_invalid_utf16() {
+        let mut raw: Vec<u16> = "agy.exe".encode_utf16().collect();
+        raw.extend([0, b'x' as u16]);
+        assert_eq!(decode_windows_process_name(&raw), "agy.exe");
+        assert_eq!(decode_windows_process_name(&[0xd800]), "�");
+        assert_eq!(decode_windows_process_name(&[]), "");
+    }
+
+    #[test]
+    fn windows_process_filter_keeps_only_antigravity_pids() {
+        let processes = vec![
+            (10, "agy.exe".to_string()),
+            (20, "language_server_windows_x64.exe".to_string()),
+            (30, "sshd.exe".to_string()),
+        ];
+        let pids = matching_windows_process_ids(&processes);
+        assert_eq!(pids, std::collections::HashSet::from([10, 20]));
+    }
+
+    #[test]
+    fn windows_listener_filter_joins_pid_loopback_and_port() {
+        let pids = std::collections::HashSet::from([10]);
+        let rows = [
+            WindowsTcpRow {
+                local_addr: [127, 0, 0, 1],
+                local_port: u32::from(59870u16.to_be()),
+                pid: 10,
+            },
+            WindowsTcpRow {
+                local_addr: [127, 0, 0, 1],
+                local_port: u32::from(59868u16.to_be()),
+                pid: 10,
+            },
+            WindowsTcpRow {
+                local_addr: [127, 0, 0, 1],
+                local_port: u32::from(59870u16.to_be()),
+                pid: 10,
+            },
+            WindowsTcpRow {
+                local_addr: [0, 0, 0, 0],
+                local_port: u32::from(50000u16.to_be()),
+                pid: 10,
+            },
+            WindowsTcpRow {
+                local_addr: [127, 0, 0, 1],
+                local_port: u32::from(50001u16.to_be()),
+                pid: 99,
+            },
+            WindowsTcpRow {
+                local_addr: [127, 0, 0, 1],
+                local_port: 0,
+                pid: 10,
+            },
+        ];
+        assert_eq!(matching_windows_ports(&pids, &rows), vec![59870, 59868]);
+    }
+
+    /// Antigravity 2.0 and an interactive `agy` session at once. Their port
+    /// pairs must not be flattened into one set: sorting all four descending
+    /// would put pid 20's TLS listener ahead of pid 10's RPC listener.
+    #[test]
+    fn windows_ports_from_two_products_keep_tls_listeners_last() {
+        let pids = std::collections::HashSet::from([10, 20]);
+        let row = |port: u16, pid: u32| WindowsTcpRow {
+            local_addr: [127, 0, 0, 1],
+            local_port: u32::from(port.to_be()),
+            pid,
+        };
+        let rows = [
+            row(40000, 10),
+            row(40001, 10),
+            row(50000, 20),
+            row(50001, 20),
+        ];
+        assert_eq!(
+            matching_windows_ports(&pids, &rows),
+            vec![40001, 50001, 40000, 50000]
+        );
+    }
+
+    /// The high-to-low preference only means something per product, so the
+    /// grouping is what keeps a second product's TLS listener from being
+    /// probed before the first product's RPC listener.
+    #[test]
+    fn probe_order_puts_every_rpc_listener_ahead_of_every_tls_listener() {
+        use std::collections::BTreeMap;
+
+        // One process, the ordinary case: RPC (higher) before TLS (lower).
+        assert_eq!(
+            probe_order(BTreeMap::from([(10, vec![59868, 59870])])),
+            vec![59870, 59868]
+        );
+        // Two products. A plain descending sort would yield 50001, 50000,
+        // 40001, 40000 and reach pid 20's TLS listener second; taking the
+        // ports rank by rank leaves both TLS listeners at the back, where they
+        // are touched only if no RPC listener answered.
+        assert_eq!(
+            probe_order(BTreeMap::from([
+                (10, vec![40000, 40001]),
+                (20, vec![50000, 50001]),
+            ])),
+            vec![40001, 50001, 40000, 50000]
+        );
+        // Uneven groups: the extra port of the deeper group trails everything
+        // it ranks below, and a port claimed by two pids is probed once.
+        assert_eq!(
+            probe_order(BTreeMap::from([
+                (10, vec![6000, 5000, 4000]),
+                (20, vec![6000, 7000]),
+            ])),
+            vec![6000, 7000, 5000, 4000]
+        );
+        assert!(probe_order(BTreeMap::new()).is_empty());
+    }
+
+    /// A dual-stack bind names the same port from both `/proc/net/tcp` and
+    /// `tcp6`. Those rows are one listener, so they must not consume two ranks
+    /// and push the product's real second listener down past another
+    /// product's.
+    #[test]
+    fn a_port_named_twice_by_one_product_still_occupies_one_rank() {
+        use std::collections::BTreeMap;
+
+        assert_eq!(
+            probe_order(BTreeMap::from([
+                (10, vec![40001, 40001, 40000, 40000]),
+                (20, vec![50001, 50000]),
+            ])),
+            vec![40001, 50001, 40000, 50000],
+            "duplicate rows must not reorder the ranks below them"
+        );
+    }
+
+    /// The ordering rests on each product showing both listeners. A product
+    /// caught mid-startup, with only its TLS port bound, sits alone at rank 0
+    /// and is probed first — documented as the known cost, and harmless
+    /// because every candidate is probed anyway.
+    #[test]
+    fn a_half_started_product_is_the_documented_exception() {
+        use std::collections::BTreeMap;
+
+        assert_eq!(
+            probe_order(BTreeMap::from([
+                (10, vec![40000]),
+                (20, vec![50001, 50000])
+            ])),
+            vec![40000, 50001, 50000]
+        );
+    }
+
+    /// `ANTIGRAVITY_LS_ADDRESS` is user input. An entry that leaves no
+    /// authority to connect to is dropped instead of probed, so it can neither
+    /// spend a round-trip nor add a failure that competes with the real one in
+    /// [`select_probe_error`].
+    #[test]
+    fn an_override_with_no_authority_is_dropped_not_probed() {
+        for junk in ["/", "///", "http://", "https://", "  /  "] {
+            assert_eq!(
+                candidate_bases_with(Some(junk), vec![4242]),
+                vec!["http://127.0.0.1:4242".to_string()],
+                "{junk:?} should not survive as a candidate"
+            );
+        }
+        assert!(candidate_bases_with(Some("/"), vec![]).is_empty());
+    }
+
+    #[test]
+    fn windows_table_bounds_reject_truncation_and_overflow() {
+        assert_eq!(checked_windows_row_count(52, 4, 24, 2), Some(2));
+        assert_eq!(checked_windows_row_count(51, 4, 24, 2), None);
+        assert_eq!(checked_windows_row_count(4, 4, 24, 0), Some(0));
+        assert_eq!(checked_windows_row_count(52, 4, 0, 2), None);
+        assert_eq!(
+            checked_windows_row_count(usize::MAX, 4, 24, usize::MAX),
+            None
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_tcp_table_parser_copies_complete_rows_only() {
+        use std::mem::{offset_of, size_of};
+        use windows_sys::Win32::NetworkManagement::IpHelper::{
+            MIB_TCPROW_OWNER_PID, MIB_TCPTABLE_OWNER_PID,
+        };
+
+        let offset = offset_of!(MIB_TCPTABLE_OWNER_PID, table);
+        let used = offset + 2 * size_of::<MIB_TCPROW_OWNER_PID>();
+        let words = used.div_ceil(size_of::<u32>());
+        let mut buffer = vec![0u32; words];
+        let first = MIB_TCPROW_OWNER_PID {
+            dwLocalAddr: u32::from_ne_bytes([127, 0, 0, 1]),
+            dwLocalPort: u32::from(59868u16.to_be()),
+            dwOwningPid: 10,
+            ..Default::default()
+        };
+        let second = MIB_TCPROW_OWNER_PID {
+            dwLocalAddr: u32::from_ne_bytes([127, 0, 0, 1]),
+            dwLocalPort: u32::from(59870u16.to_be()),
+            dwOwningPid: 10,
+            ..Default::default()
+        };
+        unsafe {
+            buffer.as_mut_ptr().write_unaligned(2);
+            let rows = buffer
+                .as_mut_ptr()
+                .cast::<u8>()
+                .add(offset)
+                .cast::<MIB_TCPROW_OWNER_PID>();
+            rows.write_unaligned(first);
+            rows.add(1).write_unaligned(second);
+        }
+
+        assert_eq!(
+            parse_windows_tcp_rows(&buffer, used),
+            vec![
+                WindowsTcpRow {
+                    local_addr: [127, 0, 0, 1],
+                    local_port: u32::from(59868u16.to_be()),
+                    pid: 10,
+                },
+                WindowsTcpRow {
+                    local_addr: [127, 0, 0, 1],
+                    local_port: u32::from(59870u16.to_be()),
+                    pid: 10,
+                },
+            ]
+        );
+        assert!(parse_windows_tcp_rows(&buffer, used - 1).is_empty());
+    }
+
+    #[test]
+    fn lsof_parser_keeps_only_ports_owned_by_antigravity_processes() {
+        // `agy` (pid 74101) has three listening sockets; `sshd` (pid 200) has
+        // one that must be excluded even though it sorts right after `c`.
+        let output = "p74101\ncagy\nf10\nn127.0.0.1:8829\nf11\nn127.0.0.1:61289\nf12\nn127.0.0.1:61290\np200\ncsshd\nf5\nn*:22\n";
+        assert_eq!(parse_lsof_pcn(output), vec![61290, 61289, 8829]);
+    }
+
+    /// The pid on each `p` line has to survive to the `n` lines, or the ports
+    /// of two running products collapse into one group and rank ordering can
+    /// no longer keep the TLS listeners last.
+    #[test]
+    fn lsof_parser_keeps_each_products_ports_in_its_own_group() {
+        let output = concat!(
+            "p100\ncagy\nf3\nn127.0.0.1:40000\nf4\nn127.0.0.1:40001\n",
+            "p200\nclanguage_server\nf5\nn127.0.0.1:50000\nf6\nn127.0.0.1:50001\n",
+        );
+        assert_eq!(
+            parse_lsof_pcn(output),
+            vec![40001, 50001, 40000, 50000],
+            "both HTTP listeners must precede both TLS listeners"
+        );
+    }
+
+    #[test]
+    fn lsof_parser_matches_the_capitalised_macos_app_name() {
+        let output = "p900\ncAntigravity\nf7\nn127.0.0.1:54321\n";
+        assert_eq!(parse_lsof_pcn(output), vec![54321]);
+    }
+
+    #[test]
+    fn lsof_parser_deduplicates_and_handles_empty_output() {
+        let output = "p1\ncagy\nf3\nn127.0.0.1:9000\nf4\nn127.0.0.1:9000\n";
+        assert_eq!(parse_lsof_pcn(output), vec![9000]);
+        assert!(parse_lsof_pcn("").is_empty());
     }
 
     /// First run with Antigravity closed: no cache to serve, so the user must

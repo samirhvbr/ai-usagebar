@@ -297,7 +297,12 @@ fn render_list(f: &mut Frame, area: Rect, state: &ContextState, scan: &ContextSc
         .sessions
         .iter()
         .map(|session| {
-            ListItem::new(session.display_name()).description(session_description(session))
+            ListItem::new(crate::display::sanitize_untrusted_field(
+                &session.display_name(),
+            ))
+            .description(crate::display::sanitize_untrusted_field(
+                &session_description(session),
+            ))
         })
         .collect::<Vec<_>>();
     let mut list = SelectList::new(items).theme(bubble);

@@ -18,7 +18,7 @@ use crate::pango::{color_span, escape, severity_color};
 use crate::theme::Theme;
 use crate::tooltip::{Line as TooltipLine, push_window, render_bordered};
 use crate::usage::{AntigravitySnapshot, UsageWindow};
-use crate::vendor::{RenderOpts, VendorOutcome};
+use crate::vendor::{RenderOpts, VendorId, VendorOutcome};
 use crate::waybar::{Class, WaybarOutput};
 
 pub const DEFAULT_FORMAT: &str = "{icon} {session_pct}% · {weekly_pct}%";
@@ -33,9 +33,9 @@ pub const GROUP_THIRD_PARTY: &str = "Claude & GPT OSS";
 /// under "Session", then the two weekly ones under "Weekly".
 fn windows(snap: &AntigravitySnapshot) -> [(&'static str, Option<&UsageWindow>); 4] {
     [
-        (GROUP_PRIMARY, Some(&snap.session)),
+        (GROUP_PRIMARY, snap.session.as_ref()),
         (GROUP_THIRD_PARTY, snap.third_party_session.as_ref()),
-        (GROUP_PRIMARY, Some(&snap.weekly)),
+        (GROUP_PRIMARY, snap.weekly.as_ref()),
         (GROUP_THIRD_PARTY, snap.third_party_weekly.as_ref()),
     ]
 }
@@ -71,6 +71,13 @@ pub fn build_placeholders(
         None => (String::new(), String::new(), String::new(), String::new()),
     };
 
+    // The Gemini windows go through the same closure as the third-party ones:
+    // a product that reports only weekly buckets leaves the 5h placeholders
+    // empty rather than claiming a figure it never received.
+    let (session_model, session_pct, session_reset, session_elapsed) =
+        optional(snap.session.as_ref(), GROUP_PRIMARY);
+    let (weekly_model, weekly_pct, weekly_reset, weekly_elapsed) =
+        optional(snap.weekly.as_ref(), GROUP_PRIMARY);
     let (tp_5h_model, tp_5h_pct, tp_5h_reset, tp_5h_elapsed) =
         optional(snap.third_party_session.as_ref(), GROUP_THIRD_PARTY);
     let (tp_wk_model, tp_wk_pct, tp_wk_reset, tp_wk_elapsed) =
@@ -78,30 +85,21 @@ pub fn build_placeholders(
 
     placeholders(vec![
         ("icon", "󰧑".to_string()),
-        ("vendor_short", "agy".to_string()),
+        (
+            "vendor_short",
+            VendorId::Antigravity.short_name().to_string(),
+        ),
         ("plan", snap.plan.clone()),
         // Naming the primary rows is what puts the native dropdown into its
         // grouped layout; no other vendor emits these.
-        ("session_model", GROUP_PRIMARY.to_string()),
-        ("weekly_model", GROUP_PRIMARY.to_string()),
-        ("session_pct", snap.session.utilization_pct.to_string()),
-        (
-            "session_reset",
-            countdown::format(snap.session.resets_at, now),
-        ),
-        (
-            "session_elapsed",
-            elapsed_pct(&snap.session, now, pace_tolerance).to_string(),
-        ),
-        ("weekly_pct", snap.weekly.utilization_pct.to_string()),
-        (
-            "weekly_reset",
-            countdown::format(snap.weekly.resets_at, now),
-        ),
-        (
-            "weekly_elapsed",
-            elapsed_pct(&snap.weekly, now, pace_tolerance).to_string(),
-        ),
+        ("session_model", session_model),
+        ("weekly_model", weekly_model),
+        ("session_pct", session_pct),
+        ("session_reset", session_reset),
+        ("session_elapsed", session_elapsed),
+        ("weekly_pct", weekly_pct),
+        ("weekly_reset", weekly_reset),
+        ("weekly_elapsed", weekly_elapsed),
         ("scoped_model", tp_5h_model),
         ("scoped_pct", tp_5h_pct),
         ("scoped_reset", tp_5h_reset),
@@ -282,8 +280,8 @@ mod tests {
         AntigravitySnapshot {
             plan: "Google AI Pro".into(),
             account: "acct:test".into(),
-            session: window(43, "2026-07-22T14:00:00Z", false),
-            weekly: window(8, "2026-07-28T17:39:58Z", true),
+            session: Some(window(43, "2026-07-22T14:00:00Z", false)),
+            weekly: Some(window(8, "2026-07-28T17:39:58Z", true)),
             third_party_session: Some(window(75, "2026-07-22T16:30:00Z", false)),
             third_party_weekly: Some(window(0, "2026-07-29T12:47:00Z", true)),
         }
@@ -383,8 +381,8 @@ mod tests {
     #[test]
     fn severity_tracks_the_worst_of_all_four_windows() {
         let mut snap = snapshot();
-        snap.session.utilization_pct = 0;
-        snap.weekly.utilization_pct = 0;
+        snap.session.as_mut().unwrap().utilization_pct = 0;
+        snap.weekly.as_mut().unwrap().utilization_pct = 0;
         snap.third_party_session = Some(window(0, "2026-07-22T16:30:00Z", false));
         snap.third_party_weekly = Some(window(0, "2026-07-29T12:47:00Z", true));
         assert_eq!(severity(&snap), PaceSeverity::Low);
@@ -443,5 +441,15 @@ mod tests {
             None,
         );
         assert_ne!(plain, paced, "pace marker should change the bars");
+    }
+
+    /// Antigravity keeps its opt-in marker through the stable `push_window`
+    /// and gains nothing else from the row helper.
+    #[test]
+    fn tooltip_rows_carry_no_pace_glyph() {
+        let tip = tooltip(&opts(), None);
+        for glyph in ['↑', '→', '↓'] {
+            assert!(!tip.contains(glyph), "{tip}");
+        }
     }
 }

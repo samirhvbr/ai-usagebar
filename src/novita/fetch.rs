@@ -4,7 +4,7 @@
 
 use std::time::Duration;
 
-use crate::cache::{Cache, MAX_STALE, acquire_lock_async};
+use crate::cache::{Cache, acquire_lock_async};
 use crate::error::{AppError, Result};
 use crate::usage::{NovitaSnapshot, finite_amount};
 use crate::vendor::{MAX_BODY_BYTES, read_body_capped};
@@ -28,13 +28,9 @@ impl Default for Endpoints {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct FetchOutcome {
-    pub snapshot: NovitaSnapshot,
-    pub stale: bool,
-    pub last_error: Option<(u16, String)>,
-    pub cache_age: Option<Duration>,
-}
+/// This vendor's [`Outcome`](crate::outcome::Outcome) — the shared shape,
+/// specialised to its snapshot.
+pub type FetchOutcome = crate::outcome::Outcome<NovitaSnapshot>;
 
 pub async fn fetch_snapshot(
     client: &reqwest::Client,
@@ -57,34 +53,24 @@ pub async fn fetch_snapshot(
             let snap = to_snapshot(balance)?;
             let bytes = serde_json::to_vec(&serde_json::json!({ "snapshot": serde_repr(&snap) }))?;
             cache.write_payload(&bytes)?;
-            Ok(FetchOutcome {
-                snapshot: snap,
-                stale: false,
-                last_error: None,
-                cache_age: Some(Duration::ZERO),
-            })
+            Ok(crate::outcome::Outcome::fresh(snap))
         }
         Err(e) if e.is_transient() => fallback_silent(cache, e),
         Err(AppError::Http { status, body }) => {
             cache.mark_stale();
-            cache.write_last_error(status, &body);
-            let diag = (status, body.clone());
+            let diag = cache.write_last_error(status, &body);
             fallback_with_error(cache, Some(diag), AppError::Http { status, body })
         }
         Err(e) => {
             cache.mark_stale();
-            cache.write_last_error(0, &e.to_string());
-            let diag = (0, e.to_string());
+            let diag = cache.write_last_error(0, &e.to_string());
             fallback_with_error(cache, Some(diag), e)
         }
     }
 }
 
 fn fallback_silent(cache: &Cache, original: AppError) -> Result<FetchOutcome> {
-    let Some(bytes) = cache.fallback_payload(MAX_STALE)? else {
-        return Err(original);
-    };
-    reuse_cache(&bytes, cache, true)
+    crate::outcome::fallback(cache, None, original, parse_cache)
 }
 
 /// On failure we show the last good figure with the error alongside it. With
@@ -95,24 +81,12 @@ fn fallback_with_error(
     last_error: Option<(u16, String)>,
     original: AppError,
 ) -> Result<FetchOutcome> {
-    let Some(bytes) = cache.fallback_payload(MAX_STALE)? else {
-        return Err(original);
-    };
-    let Ok(mut outcome) = reuse_cache(&bytes, cache, true) else {
-        return Err(original);
-    };
-    outcome.last_error = last_error;
-    Ok(outcome)
+    crate::outcome::fallback(cache, last_error, original, parse_cache)
 }
 
 fn reuse_cache(bytes: &[u8], cache: &Cache, stale: bool) -> Result<FetchOutcome> {
     let snap = parse_cache(bytes)?;
-    Ok(FetchOutcome {
-        snapshot: snap,
-        stale,
-        last_error: cache.read_last_error(),
-        cache_age: cache.payload_age(),
-    })
+    Ok(crate::outcome::Outcome::cached(snap, cache, stale))
 }
 
 fn serde_repr(snap: &NovitaSnapshot) -> serde_json::Value {
@@ -186,6 +160,51 @@ mod tests {
         let cache = Cache::at(td.path().join("novita"));
         cache.ensure_dir().unwrap();
         (td, cache)
+    }
+
+    /// The other half of the `401`-body fix. Deepseek's test covers the vendors
+    /// that passed the pair inline; these six built it into a `diag` local
+    /// first, which is why the original sweep missed them — same defect, one
+    /// variable name apart.
+    #[tokio::test]
+    async fn a_401_body_does_not_reach_the_outcome_when_a_cache_is_warm() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("GET", "/openapi/v1/billing/balance/detail")
+            .with_status(401)
+            .with_body("NOVITA user@example.test <credential>&token")
+            .create_async()
+            .await;
+
+        let (_td, cache) = cache_fixture();
+        let warm = serde_json::json!({
+            "snapshot": {
+                "available": 10.0,
+                "cash": 8.0,
+                "credit_limit": 2.0,
+                "outstanding": 0.0
+            }
+        });
+        cache.write_payload(warm.to_string().as_bytes()).unwrap();
+
+        let endpoints = Endpoints {
+            balance: format!("{}/openapi/v1/billing/balance/detail", server.url()),
+        };
+        let out = fetch_snapshot(
+            &reqwest::Client::new(),
+            "nv-test",
+            &cache,
+            &endpoints,
+            Duration::from_secs(0),
+        )
+        .await
+        .expect("a warm cache must still produce an outcome");
+
+        let (code, msg) = out.last_error.expect("the 401 must still be reported");
+        assert_eq!(code, 401);
+        assert_eq!(msg, crate::error::AUTH_FAILURE_MESSAGE);
+        assert!(!msg.contains("NOVITA"), "{msg}");
+        assert!(!msg.contains("<credential>"), "{msg}");
     }
 
     #[tokio::test]

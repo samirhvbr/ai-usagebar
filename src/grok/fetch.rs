@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use crate::cache::{Cache, MAX_STALE, acquire_lock_async};
+use crate::cache::{Cache, acquire_lock_async};
 use crate::error::{AppError, Result};
 use crate::usage::{GrokSnapshot, finite_amount};
 use crate::vendor::{MAX_BODY_BYTES, read_body_capped};
@@ -38,13 +38,9 @@ impl Endpoints {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct FetchOutcome {
-    pub snapshot: GrokSnapshot,
-    pub stale: bool,
-    pub last_error: Option<(u16, String)>,
-    pub cache_age: Option<Duration>,
-}
+/// This vendor's [`Outcome`](crate::outcome::Outcome) — the shared shape,
+/// specialised to its snapshot.
+pub type FetchOutcome = crate::outcome::Outcome<GrokSnapshot>;
 
 /// `management_key` is the xAI Management API key (distinct from the inference
 /// key). `team_id`, when set, skips the validation round-trip.
@@ -74,8 +70,7 @@ pub async fn fetch_snapshot(
         Err(e) if e.is_transient() => return fallback_silent(cache, &target, e),
         Err(e) => {
             cache.mark_stale();
-            cache.write_last_error(0, &e.to_string());
-            let diag = (0, e.to_string());
+            let diag = cache.write_last_error(0, &e.to_string());
             return fallback_with_error(cache, Some(diag), &target, e);
         }
     };
@@ -88,24 +83,17 @@ pub async fn fetch_snapshot(
                 "snapshot": { "balance": snap.balance },
             }))?;
             cache.write_payload(&bytes)?;
-            Ok(FetchOutcome {
-                snapshot: snap,
-                stale: false,
-                last_error: None,
-                cache_age: Some(Duration::ZERO),
-            })
+            Ok(crate::outcome::Outcome::fresh(snap))
         }
         Err(e) if e.is_transient() => fallback_silent(cache, &target, e),
         Err(AppError::Http { status, body }) => {
             cache.mark_stale();
-            cache.write_last_error(status, &body);
-            let diag = (status, body.clone());
+            let diag = cache.write_last_error(status, &body);
             fallback_with_error(cache, Some(diag), &target, AppError::Http { status, body })
         }
         Err(e) => {
             cache.mark_stale();
-            cache.write_last_error(0, &e.to_string());
-            let diag = (0, e.to_string());
+            let diag = cache.write_last_error(0, &e.to_string());
             fallback_with_error(cache, Some(diag), &target, e)
         }
     }
@@ -146,41 +134,27 @@ async fn resolve_team(
 }
 
 fn fallback_silent(cache: &Cache, target: &str, original: AppError) -> Result<FetchOutcome> {
-    let Some(bytes) = cache.fallback_payload(MAX_STALE)? else {
-        return Err(original);
-    };
-    reuse_cache(&bytes, cache, true, target)
+    crate::outcome::fallback(cache, None, original, |bytes| parse_cache(bytes, target))
 }
 
-/// On failure we show the last good figure with the error alongside it. With
-/// nothing usable cached there is nothing to show, so the **original** error is
-/// returned — a first run against an organization-scoped key must reach the
-/// user with its guidance intact, not as a generic "no usable cache".
+/// A cache we cannot attribute to this target is no better than no cache, so
+/// `outcome::fallback` returns `original` for both. That matters most on a
+/// first run against an organization-scoped key, whose guidance must reach the
+/// user intact.
 fn fallback_with_error(
     cache: &Cache,
     last_error: Option<(u16, String)>,
     target: &str,
     original: AppError,
 ) -> Result<FetchOutcome> {
-    let Some(bytes) = cache.fallback_payload(MAX_STALE)? else {
-        return Err(original);
-    };
-    // A cache we cannot attribute to this target is no better than no cache.
-    let Ok(mut outcome) = reuse_cache(&bytes, cache, true, target) else {
-        return Err(original);
-    };
-    outcome.last_error = last_error;
-    Ok(outcome)
+    crate::outcome::fallback(cache, last_error, original, |bytes| {
+        parse_cache(bytes, target)
+    })
 }
 
 fn reuse_cache(bytes: &[u8], cache: &Cache, stale: bool, target: &str) -> Result<FetchOutcome> {
     let snap = parse_cache(bytes, target)?;
-    Ok(FetchOutcome {
-        snapshot: snap,
-        stale,
-        last_error: cache.read_last_error(),
-        cache_age: cache.payload_age(),
-    })
+    Ok(crate::outcome::Outcome::cached(snap, cache, stale))
 }
 
 fn parse_cache(bytes: &[u8], target: &str) -> Result<GrokSnapshot> {

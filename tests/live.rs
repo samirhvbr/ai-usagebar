@@ -1,9 +1,10 @@
 //! Live API smoke test suite — DETECTS UNDOCUMENTED-ENDPOINT DRIFT.
 //!
-//! Hits the real Anthropic, OpenAI Codex, Z.AI, OpenRouter, and Kimi endpoints
-//! using credentials from your shell. Asserts only the *fields we depend on*
-//! so when a vendor renames or removes one, the failure points at the exact
-//! field rather than dumping the whole response.
+//! Hits the real vendor endpoints using credentials from your shell (API keys,
+//! or the local CLI/IDE session files for Cursor and Kiro CLI).
+//! Asserts only the *fields we depend on* so when a vendor renames or removes
+//! one, the failure points at the exact field rather than dumping the whole
+//! response.
 //!
 //! These tests are `#[ignore]` so plain `cargo test` doesn't hit external
 //! APIs (and won't fail on machines without creds). Run explicitly:
@@ -39,15 +40,36 @@
 //!   window are optional, so the smoke test validates their public fields only
 //!   when present; the snapshot does not expose raw wire duration/unit.
 //!   `kimi_live` skips when optional `KIMI_API_KEY` is unset.
+//! - **Kimi (subscription)**: reads the Kimi Code CLI's own OAuth session,
+//!   refreshing it (and writing the rotation back to the CLI's credential
+//!   file) when it is close to expiry, then asserts the same public snapshot
+//!   fields. `kimi_subscription_live` skips when the CLI is not logged in and
+//!   `KIMI_CODE_HOME` is unset.
+//! - **Cursor**: reads the session token from the local `state.vscdb`, then
+//!   asserts `premium_pct` is 0..=100 and a future `premium_reset_at` was
+//!   derived from `startOfMonth`. `cursor_live` skips when there is no Cursor
+//!   credential source (no state DB, no cursor-agent `auth.json`, and neither
+//!   `CURSOR_DB_PATH` nor `CURSOR_AGENT_AUTH_PATH` set).
+//! - **Kiro CLI**: reads the AWS SSO OIDC session from kiro-cli's local
+//!   `data.sqlite3`, then asserts the credit counters are non-negative and the
+//!   plan label is non-empty. `kiro_live` skips when there is no kiro-cli
+//!   install (no db and no `KIRO_DB_PATH`).
+//! - **SuperGrok**: asks the official Grok Build CLI's `x.ai/billing` ACP
+//!   extension, then asserts usage percent and plan. Set
+//!   `SUPERGROK_GROK_BINARY` to the trusted official executable.
 
 use std::time::Duration;
 
 use ai_usagebar::anthropic;
 use ai_usagebar::cache::Cache;
+use ai_usagebar::cursor;
 use ai_usagebar::error::AppError;
 use ai_usagebar::kimi;
+use ai_usagebar::kiro;
+use ai_usagebar::minimax;
 use ai_usagebar::openai;
 use ai_usagebar::openrouter;
+use ai_usagebar::supergrok;
 use ai_usagebar::zai;
 
 fn xdg_cache_for(test: &str) -> Cache {
@@ -153,13 +175,27 @@ async fn openai_live() {
     .expect("openai fetch should succeed against the real API");
 
     assert!(!out.snapshot.plan.is_empty(), "openai plan label empty");
-    assert_pct("openai.session", out.snapshot.session.utilization_pct);
-    assert_pct("openai.weekly", out.snapshot.weekly.utilization_pct);
+    assert!(
+        out.snapshot.session.is_some() || out.snapshot.weekly.is_some(),
+        "openai returned no 5h or 7d usage window"
+    );
+    if let Some(session) = out.snapshot.session.as_ref() {
+        assert_pct("openai.session", session.utilization_pct);
+    }
+    if let Some(weekly) = out.snapshot.weekly.as_ref() {
+        assert_pct("openai.weekly", weekly.utilization_pct);
+    }
     println!(
-        "✅ openai — plan={}, session={}%, weekly={}%, credits={:?}",
+        "✅ openai — plan={}, session={:?}%, weekly={:?}%, credits={:?}",
         out.snapshot.plan,
-        out.snapshot.session.utilization_pct,
-        out.snapshot.weekly.utilization_pct,
+        out.snapshot
+            .session
+            .as_ref()
+            .map(|window| window.utilization_pct),
+        out.snapshot
+            .weekly
+            .as_ref()
+            .map(|window| window.utilization_pct),
         out.snapshot.credits.map(|c| c.balance),
     );
 }
@@ -294,5 +330,356 @@ async fn kimi_live() {
         out.snapshot.window_limit,
         out.snapshot.window_remaining,
         out.snapshot.window_reset_at,
+    );
+}
+
+#[tokio::test]
+#[ignore = "live API; run with --ignored"]
+async fn kimi_subscription_live() {
+    // The subscription path has no API key — the credential is the OAuth
+    // session the Kimi Code CLI stored after its device-code login. So this
+    // test needs `kimi` installed and logged in (or `KIMI_CODE_HOME` pointing
+    // at a copy of that home) and skips otherwise, like `kiro_live`.
+    //
+    // It exercises the refresh too whenever the stored access token is inside
+    // its 2-minute buffer, which for a 15-minute token is most runs — and that
+    // rotation is written back to the CLI's own credential file, exactly as
+    // production does. Point `KIMI_CODE_HOME` at a copy if that matters to you.
+    let home = match std::env::var("KIMI_CODE_HOME") {
+        Ok(p) if !p.trim().is_empty() => std::path::PathBuf::from(p),
+        _ => kimi::oauth::default_home().expect("resolve home dir"),
+    };
+    let credentials = kimi::oauth::credentials_path_in(&home);
+    if !kimi::oauth::is_logged_in(&credentials) {
+        eprintln!(
+            "kimi_subscription_live: no Kimi Code CLI login at {} — skipping (run `kimi` and log in, or set KIMI_CODE_HOME)",
+            credentials.display()
+        );
+        return;
+    }
+
+    let region = kimi::oauth::read_region_marker(&home).unwrap_or(kimi::oauth::Region::MainlandCn);
+    let cache = xdg_cache_for("kimi-subscription");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .unwrap();
+    let out = kimi::fetch::fetch_snapshot_with_auth(
+        &client,
+        &kimi::fetch::Auth::KimiCode(kimi::fetch::KimiCodeAuth::in_home(&home)),
+        &cache,
+        &kimi::fetch::Endpoints::for_region(region),
+        Duration::from_secs(0),
+    )
+    .await
+    .expect("kimi subscription fetch should succeed against the real API");
+
+    assert_pct("kimi.weekly", out.snapshot.weekly_pct());
+    if out.snapshot.window_limit > 0 {
+        assert_pct("kimi.window", out.snapshot.window_pct());
+    }
+    // The refresh must never leave the CLI without a usable login.
+    assert!(
+        kimi::oauth::is_logged_in(&credentials),
+        "the Kimi Code CLI credential file must still hold a login afterwards"
+    );
+    println!(
+        "✅ kimi (subscription) — plan={:?}, weekly={} / {}, window={} / {}",
+        out.snapshot.plan,
+        out.snapshot.weekly_used,
+        out.snapshot.weekly_limit,
+        out.snapshot.window_used,
+        out.snapshot.window_limit,
+    );
+}
+
+#[tokio::test]
+#[ignore = "live API; run with --ignored"]
+async fn cursor_live() {
+    // Cursor has no API key — the credential is a session token, either the
+    // one the Cursor IDE wrote to its local state DB, or (headless machines
+    // with no IDE) the one the `cursor-agent` CLI wrote to its own auth.json.
+    // So this test needs one of the two installed (or `CURSOR_DB_PATH` /
+    // `CURSOR_AGENT_AUTH_PATH` pointing at a copy) and skips otherwise, the
+    // same way `kimi_live` skips without a key. Nothing to fetch on a CI box
+    // with neither.
+    let db_path = match std::env::var("CURSOR_DB_PATH") {
+        Ok(p) if !p.trim().is_empty() => std::path::PathBuf::from(p),
+        _ => cursor::db::default_db_path().expect("resolve platform config dir"),
+    };
+    let agent_auth_path = match std::env::var("CURSOR_AGENT_AUTH_PATH") {
+        Ok(p) if !p.trim().is_empty() => std::path::PathBuf::from(p),
+        _ => cursor::db::default_agent_auth_path().expect("resolve platform config dir"),
+    };
+    if !db_path.exists() && !agent_auth_path.exists() {
+        eprintln!(
+            "cursor_live: no Cursor state DB at {} and no cursor-agent auth at {} — skipping \
+             (sign in to the Cursor IDE or run `cursor-agent`, or set CURSOR_DB_PATH / \
+             CURSOR_AGENT_AUTH_PATH)",
+            db_path.display(),
+            agent_auth_path.display()
+        );
+        return;
+    }
+
+    let cache = xdg_cache_for("cursor");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .unwrap();
+    let endpoints = cursor::fetch::Endpoints::default();
+    let out = cursor::fetch_snapshot(
+        &client,
+        &db_path,
+        &agent_auth_path,
+        &cache,
+        &endpoints,
+        Duration::from_secs(0),
+    )
+    .await
+    .expect("cursor fetch should succeed against the real API");
+
+    // The fields the widget depends on: two pool percentages (>= 0; a pool can
+    // exceed 100 when over its included allowance, so only the low bound is
+    // asserted) and a future billing-cycle reset.
+    assert!(
+        out.snapshot.auto_pct >= 0 && out.snapshot.api_pct >= 0,
+        "cursor: negative pool percentage — shape changed? auto={} api={}",
+        out.snapshot.auto_pct,
+        out.snapshot.api_pct
+    );
+    assert!(!out.snapshot.plan.is_empty(), "cursor plan label empty");
+    assert!(
+        out.snapshot
+            .reset_at
+            .is_some_and(|r| r > chrono::Utc::now()),
+        "cursor: reset_at should be a future instant, got {:?}",
+        out.snapshot.reset_at
+    );
+    println!(
+        "✅ cursor — plan={}, Cursor Models {}%, Other Models {}%, total {}%, on-demand={}, reset {:?}",
+        out.snapshot.plan,
+        out.snapshot.auto_pct,
+        out.snapshot.api_pct,
+        out.snapshot.total_pct,
+        out.snapshot.on_demand_enabled,
+        out.snapshot.reset_at,
+    );
+}
+
+#[tokio::test]
+#[ignore = "live API; run with --ignored"]
+async fn kiro_live() {
+    // Kiro has no API key — the credential is the AWS SSO OIDC session
+    // kiro-cli wrote to its own local database after `kiro-cli login`. So this
+    // test needs kiro-cli installed and signed in (or `KIRO_DB_PATH` pointing
+    // at a copied `data.sqlite3`) and skips otherwise, like `cursor_live`.
+    let db_path = match std::env::var("KIRO_DB_PATH") {
+        Ok(p) if !p.trim().is_empty() => std::path::PathBuf::from(p),
+        _ => kiro::db::default_db_path().expect("resolve platform data dir"),
+    };
+    if !db_path.exists() {
+        eprintln!(
+            "kiro_live: no kiro-cli database at {} — skipping (run `kiro-cli login`, or set KIRO_DB_PATH)",
+            db_path.display()
+        );
+        return;
+    }
+
+    let cache = xdg_cache_for("kiro");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .unwrap();
+    let out = kiro::fetch_snapshot(&client, &db_path, &cache, Duration::from_secs(0))
+        .await
+        .expect("kiro fetch should succeed against the real API");
+
+    // The fields the widget depends on: non-negative credit counters, a
+    // non-empty plan label, and (when reported) a future reset.
+    assert!(
+        out.snapshot.used >= 0.0 && out.snapshot.limit >= 0.0,
+        "kiro: negative credit counter — shape changed? used={} limit={}",
+        out.snapshot.used,
+        out.snapshot.limit
+    );
+    assert!(!out.snapshot.plan.is_empty(), "kiro plan label empty");
+    if let Some(reset) = out.snapshot.reset_at {
+        assert!(
+            reset > chrono::Utc::now(),
+            "kiro: reset_at should be a future instant, got {reset:?}"
+        );
+    }
+    println!(
+        "✅ kiro — plan={}, credits {} / {} ({}%), reset {:?}",
+        out.snapshot.plan,
+        out.snapshot.used,
+        out.snapshot.limit,
+        out.snapshot.pct(),
+        out.snapshot.reset_at,
+    );
+}
+
+#[tokio::test]
+#[ignore = "live API; run with --ignored"]
+async fn supergrok_live() {
+    // Grok Build owns every auth mode and returns only billing data over ACP.
+    let binary = std::env::var_os("SUPERGROK_GROK_BINARY")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| ai_usagebar::config::Config::default().supergrok.grok_binary);
+    let auth_override = std::env::var_os("SUPERGROK_AUTH_PATH").map(std::path::PathBuf::from);
+    let config_override = std::env::var_os("SUPERGROK_CONFIG_PATH").map(std::path::PathBuf::from);
+    let scope_paths = supergrok::scope::ScopePaths::with_overrides(
+        auth_override.as_deref(),
+        config_override.as_deref(),
+    )
+    .expect("resolve Grok scope paths");
+    let cache = xdg_cache_for("supergrok");
+    let out = supergrok::fetch_snapshot(&binary, &scope_paths, &cache, Duration::ZERO)
+        .await
+        .expect("SuperGrok billing should succeed through official Grok Build ACP");
+
+    assert!(
+        out.snapshot.weekly_pct >= 0,
+        "supergrok: negative weekly_pct — shape changed? {}",
+        out.snapshot.weekly_pct
+    );
+    assert!(!out.snapshot.plan.is_empty(), "supergrok plan label empty");
+    if let Some(reset) = out.snapshot.reset_at {
+        assert!(
+            reset > chrono::Utc::now() - chrono::Duration::days(1),
+            "supergrok: reset_at looks implausibly old: {reset:?}"
+        );
+    }
+    println!(
+        "✅ supergrok — plan={}, {} {}%, prepaid {:?}, reset {:?}",
+        out.snapshot.plan,
+        out.snapshot.period.label(),
+        out.snapshot.weekly_pct,
+        out.snapshot.prepaid_balance,
+        out.snapshot.reset_at,
+    );
+}
+
+/// MiniMax Token Plan — optional: skipped unless a subscription key is present.
+///
+/// The endpoint answers HTTP 200 even for auth failures, so a green run here is
+/// what proves the in-band `base_resp.status_code` check is still doing its job:
+/// a wrong key surfaces as an error rather than an all-zero plan.
+#[tokio::test]
+#[ignore = "live API; run with --ignored"]
+async fn minimax_live() {
+    let Ok(api_key) = std::env::var("MINIMAX_API_KEY") else {
+        eprintln!("minimax_live: MINIMAX_API_KEY is unset — skipping optional MiniMax smoke test");
+        return;
+    };
+    if api_key.trim().is_empty() {
+        eprintln!("minimax_live: MINIMAX_API_KEY is empty — skipping optional MiniMax smoke test");
+        return;
+    }
+    let cache = xdg_cache_for("minimax");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .unwrap();
+    let endpoints = minimax::fetch::Endpoints::default();
+    let out = minimax::fetch_snapshot(
+        &client,
+        &api_key,
+        &cache,
+        &endpoints,
+        Duration::from_secs(0),
+    )
+    .await
+    .expect("minimax fetch should succeed against the real API");
+
+    assert_pct("minimax.session", out.snapshot.session.utilization_pct);
+    assert_pct("minimax.weekly", out.snapshot.weekly.utilization_pct);
+    // The interval length is read from the payload rather than assumed: it has
+    // been observed at both 4h and 5h on the same account. A non-positive one
+    // would divide the pace math by nothing.
+    assert!(
+        out.snapshot.session.window_duration > chrono::Duration::zero(),
+        "minimax: interval window has no length — payload shape changed?"
+    );
+    if let Some(v) = out.snapshot.video_session.as_ref() {
+        assert_pct("minimax.video", v.utilization_pct);
+    }
+    println!(
+        "✅ minimax: {} · session {}% · weekly {}% · video {:?}",
+        out.snapshot.plan,
+        out.snapshot.session.utilization_pct,
+        out.snapshot.weekly.utilization_pct,
+        out.snapshot
+            .video_session
+            .as_ref()
+            .map(|w| w.utilization_pct),
+    );
+}
+
+/// Command Code reuses whichever local agent harness is signed in, so this
+/// test needs no key of its own — it skips when nothing on the machine holds
+/// a credential.
+#[tokio::test]
+#[ignore]
+async fn commandcode_live() {
+    use ai_usagebar::commandcode;
+
+    let credential = match commandcode::creds::resolve(None) {
+        Ok(credential) => credential,
+        Err(error) => {
+            eprintln!("commandcode_live: {error} — skipping Command Code smoke test");
+            return;
+        }
+    };
+    let cache = xdg_cache_for("commandcode");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .unwrap();
+    let endpoints = commandcode::fetch::Endpoints::default();
+    let out = commandcode::fetch::fetch_snapshot(
+        &client,
+        &credential.token,
+        &cache,
+        &endpoints,
+        Duration::from_secs(0),
+    )
+    .await
+    .expect("command code fetch should succeed against the real API");
+
+    // The ledger is load-bearing; the windows are what the bar leads with.
+    assert!(
+        out.snapshot.five_hour.is_some()
+            || out.snapshot.weekly.is_some()
+            || out.snapshot.credits.is_some(),
+        "commandcode returned neither a window nor a ledger"
+    );
+    for (label, window) in [
+        ("commandcode.five_hour", out.snapshot.five_hour.as_ref()),
+        ("commandcode.weekly", out.snapshot.weekly.as_ref()),
+    ] {
+        if let Some(window) = window {
+            assert_pct(label, window.pct());
+            assert!(window.cap > 0.0, "{label} reported a non-positive cap");
+            assert!(
+                window.resets_at.is_some(),
+                "{label} lost its reset timestamp — the API sends a ms epoch"
+            );
+        }
+    }
+    println!(
+        "✅ command code — plan={:?}, 5h={:?}, weekly={:?}, credits={:?} of pool {:?}",
+        out.snapshot.plan,
+        out.snapshot
+            .five_hour
+            .as_ref()
+            .map(|w| (w.used, w.cap, w.pct())),
+        out.snapshot
+            .weekly
+            .as_ref()
+            .map(|w| (w.used, w.cap, w.pct())),
+        out.snapshot.credits.as_ref().map(|c| c.remaining()),
+        out.snapshot.credit_pool,
     );
 }

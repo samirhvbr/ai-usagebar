@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use crate::cache::{Cache, MAX_STALE, acquire_lock_async};
+use crate::cache::{Cache, acquire_lock_async};
 use crate::error::{AppError, Result};
 use crate::usage::OpenRouterSnapshot;
 
@@ -28,13 +28,9 @@ impl Default for Endpoints {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct FetchOutcome {
-    pub snapshot: OpenRouterSnapshot,
-    pub stale: bool,
-    pub last_error: Option<(u16, String)>,
-    pub cache_age: Option<Duration>,
-}
+/// This vendor's [`Outcome`](crate::outcome::Outcome) — the shared shape,
+/// specialised to its snapshot.
+pub type FetchOutcome = crate::outcome::Outcome<OpenRouterSnapshot>;
 
 /// Cache-aware fetch. Mirrors `anthropic::fetch::fetch_snapshot` semantics:
 /// fresh cache short-circuits; on failure, fall back to cache + mark stale.
@@ -65,53 +61,37 @@ pub async fn fetch_snapshot(
             });
             let bytes = serde_json::to_vec(&cache_repr)?;
             cache.write_payload(&bytes)?;
-            Ok(FetchOutcome {
-                snapshot: snap,
-                stale: false,
-                last_error: None,
-                cache_age: Some(Duration::ZERO),
-            })
+            Ok(crate::outcome::Outcome::fresh(snap))
         }
-        Err(e) if e.is_transient() => fallback_silent(cache),
+        Err(e) if e.is_transient() => fallback_silent(cache, e),
         Err(AppError::Http { status, body }) => {
             cache.mark_stale();
-            cache.write_last_error(status, &body);
-            fallback_with_error(cache, Some((status, body)))
+            let last_error = Some(cache.write_last_error(status, &body));
+            fallback_with_error(cache, last_error, AppError::Http { status, body })
         }
         Err(e) => {
             cache.mark_stale();
-            cache.write_last_error(0, &e.to_string());
-            fallback_with_error(cache, Some((0, e.to_string())))
+            let last_error = Some(cache.write_last_error(0, &e.to_string()));
+            fallback_with_error(cache, last_error, e)
         }
     }
 }
 
-fn fallback_silent(cache: &Cache) -> Result<FetchOutcome> {
-    let Some(bytes) = cache.fallback_payload(MAX_STALE)? else {
-        return Err(AppError::Transport(
-            "openrouter: no cache and network unreachable".into(),
-        ));
-    };
-    reuse_cache(bytes, cache, true)
+fn fallback_silent(cache: &Cache, original: AppError) -> Result<FetchOutcome> {
+    crate::outcome::fallback(cache, None, original, parse_cache)
 }
 
-fn fallback_with_error(cache: &Cache, last_error: Option<(u16, String)>) -> Result<FetchOutcome> {
-    let Some(bytes) = cache.fallback_payload(MAX_STALE)? else {
-        return Err(AppError::Other("openrouter: no usable cache".into()));
-    };
-    let mut outcome = reuse_cache(bytes, cache, true)?;
-    outcome.last_error = last_error;
-    Ok(outcome)
+fn fallback_with_error(
+    cache: &Cache,
+    last_error: Option<(u16, String)>,
+    original: AppError,
+) -> Result<FetchOutcome> {
+    crate::outcome::fallback(cache, last_error, original, parse_cache)
 }
 
 fn reuse_cache(bytes: Vec<u8>, cache: &Cache, stale: bool) -> Result<FetchOutcome> {
     let snap = parse_cache(&bytes)?;
-    Ok(FetchOutcome {
-        snapshot: snap,
-        stale,
-        last_error: cache.read_last_error(),
-        cache_age: cache.payload_age(),
-    })
+    Ok(crate::outcome::Outcome::cached(snap, cache, stale))
 }
 
 /// Cached money is required, not optional: a truncated or half-written payload
@@ -279,6 +259,43 @@ mod tests {
         assert!((out.snapshot.balance() - 74.5).abs() < 1e-9);
         assert_eq!(out.snapshot.label, "OpenRouter — prod");
         assert!(!out.stale);
+    }
+
+    /// With a cache to fall back on, the status rides along as `last_error`
+    /// and the user still sees a figure. With a *cold* cache there is no
+    /// figure, and the error is all the user gets — so it has to be the real
+    /// one. This returned `AppError::Other("openrouter: no usable cache")`
+    /// once, which reads as an internal problem on a first run where the
+    /// actual cause is a key that was never accepted.
+    #[tokio::test]
+    async fn an_http_error_with_no_cache_surfaces_the_status_not_a_cache_message() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("GET", "/api/v1/credits")
+            .with_status(401)
+            .with_body(r#"{"error":"unauthorized"}"#)
+            .create_async()
+            .await;
+
+        let (_td, cache) = cache_fixture();
+        let endpoints = Endpoints {
+            credits: format!("{}/api/v1/credits", server.url()),
+            key: format!("{}/api/v1/key", server.url()),
+        };
+        let err = fetch_snapshot(
+            &reqwest::Client::new(),
+            "sk-or-test",
+            &cache,
+            &endpoints,
+            Duration::from_secs(0),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(err, AppError::Http { status: 401, .. }),
+            "expected the 401 to survive, got {err:?}"
+        );
     }
 
     #[tokio::test]

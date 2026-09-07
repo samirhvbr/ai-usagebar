@@ -1,15 +1,22 @@
 //! Settings overlay — opened from the TUI by pressing `s`. Lets the user pick
-//! the primary vendor and paste an API key for any key-authenticated vendor
-//! (Z.AI, OpenRouter, DeepSeek, Kilo, Novita, Kimi, Grok) without hand-editing
-//! config.toml. Anthropic and OpenAI authenticate via their CLI's OAuth login,
-//! so they have no key field here.
+//! the primary vendor and paste a credential for any API-key-authenticated vendor
+//! (including Z.AI, Kimi, MiniMax, and the balance vendors) without hand-editing
+//! config.toml. Anthropic, OpenAI, GitHub Copilot, Cursor, Kiro, Antigravity, and
+//! Command Code authenticate through official or local product state, so they have
+//! no credential field here — there is nothing to paste, and a field would only
+//! imply otherwise. Kimi keeps
+//! its credential field because a platform key is still one of its two credentials, but
+//! a subscriber whose credential is the Kimi Code CLI login has nothing to paste
+//! and enables `[kimi]` in config.toml instead.
 //!
 //! Persistence uses `toml_edit` so the existing config keeps its comments,
 //! whitespace, and unrelated fields. Writing a key also flips that vendor's
 //! `enabled = true` (the opt-in vendors are disabled by default), so "paste the
-//! key and save" is all it takes. Files with inline keys are atomically written
+//! credential and save" is all it takes. Files with inline credentials are atomically written
 //! and `chmod 600`ed.
 
+use std::collections::BTreeMap;
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
 
 use ratatui::Frame;
@@ -18,6 +25,7 @@ use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
 use ratatui_bubbletea_theme::BubbleTheme;
+use serde::{Deserialize, Serialize};
 use toml_edit::{DocumentMut, value};
 
 use crate::config::Config;
@@ -26,14 +34,18 @@ use crate::theme::Theme;
 use crate::tui::style::bubble_theme;
 use crate::vendor::VendorId;
 
-/// A vendor that authenticates with an inline API key (vs. OAuth). The order of
-/// this table is the tab order of the key fields and the layout of the state's
-/// `keys` vec.
+/// A vendor that authenticates with an inline credential. The order of this
+/// table is the tab order of the credential fields and the layout of the
+/// state's `keys` vec.
 pub struct KeyVendor {
     pub id: VendorId,
     pub label: &'static str,
     pub env: &'static str,
     pub section: &'static str,
+    /// Config field that stores the credential (`api_key` for most vendors).
+    pub config_key: &'static str,
+    /// Human-readable name shown in the native settings form.
+    pub secret_label: &'static str,
     /// Extra hint after the env var (e.g. "management key"). Empty for none.
     pub note: &'static str,
 }
@@ -44,6 +56,8 @@ pub const KEY_VENDORS: &[KeyVendor] = &[
         label: "Anthropic API",
         env: "ANTHROPIC_ADMIN_KEY",
         section: "anthropic_api",
+        config_key: "api_key",
+        secret_label: "API key",
         note: "admin key — monthly spend",
     },
     KeyVendor {
@@ -51,6 +65,8 @@ pub const KEY_VENDORS: &[KeyVendor] = &[
         label: "Z.AI",
         env: "ZAI_API_KEY",
         section: "zai",
+        config_key: "api_key",
+        secret_label: "API key",
         note: "",
     },
     KeyVendor {
@@ -58,6 +74,8 @@ pub const KEY_VENDORS: &[KeyVendor] = &[
         label: "OpenRouter",
         env: "OPENROUTER_API_KEY",
         section: "openrouter",
+        config_key: "api_key",
+        secret_label: "API key",
         note: "",
     },
     KeyVendor {
@@ -65,6 +83,8 @@ pub const KEY_VENDORS: &[KeyVendor] = &[
         label: "DeepSeek",
         env: "DEEPSEEK_API_KEY",
         section: "deepseek",
+        config_key: "api_key",
+        secret_label: "API key",
         note: "",
     },
     KeyVendor {
@@ -72,6 +92,8 @@ pub const KEY_VENDORS: &[KeyVendor] = &[
         label: "Kimi",
         env: "KIMI_API_KEY",
         section: "kimi",
+        config_key: "api_key",
+        secret_label: "API key",
         note: "coding-plan usage",
     },
     KeyVendor {
@@ -79,6 +101,8 @@ pub const KEY_VENDORS: &[KeyVendor] = &[
         label: "Kilo",
         env: "KILO_API_KEY",
         section: "kilo",
+        config_key: "api_key",
+        secret_label: "API key",
         note: "",
     },
     KeyVendor {
@@ -86,6 +110,8 @@ pub const KEY_VENDORS: &[KeyVendor] = &[
         label: "Novita",
         env: "NOVITA_API_KEY",
         section: "novita",
+        config_key: "api_key",
+        secret_label: "API key",
         note: "",
     },
     KeyVendor {
@@ -93,6 +119,8 @@ pub const KEY_VENDORS: &[KeyVendor] = &[
         label: "Moonshot",
         env: "MOONSHOT_API_KEY",
         section: "moonshot",
+        config_key: "api_key",
+        secret_label: "API key",
         note: "account balance",
     },
     KeyVendor {
@@ -100,6 +128,8 @@ pub const KEY_VENDORS: &[KeyVendor] = &[
         label: "Grok",
         env: "XAI_MANAGEMENT_KEY",
         section: "grok",
+        config_key: "api_key",
+        secret_label: "API key",
         note: "management key, not the inference key",
     },
     KeyVendor {
@@ -107,14 +137,25 @@ pub const KEY_VENDORS: &[KeyVendor] = &[
         label: "MiniMax",
         env: "MINIMAX_API_KEY",
         section: "minimax",
+        config_key: "api_key",
+        secret_label: "API key",
         note: "Token Plan subscription key",
+    },
+    KeyVendor {
+        id: VendorId::OpenCodeGo,
+        label: "OpenCode Go",
+        env: "OPENCODE_GO_API_KEY",
+        section: "opencode-go",
+        config_key: "api_key",
+        secret_label: "API key",
+        note: "usage quota",
     },
 ];
 
-/// Read the inline `api_key` currently in config for a given section, so the
-/// field opens pre-filled (masked) when one is already set.
-fn config_inline_key<'a>(cfg: &'a Config, section: &str) -> Option<&'a str> {
-    match section {
+/// Read the inline credential currently in config, so the field opens
+/// pre-filled (masked) when one is already set.
+fn config_inline_key<'a>(cfg: &'a Config, vendor: &KeyVendor) -> Option<&'a str> {
+    match vendor.section {
         "anthropic_api" => cfg.anthropic_api.api_key.as_deref(),
         "zai" => cfg.zai.api_key.as_deref(),
         "openrouter" => cfg.openrouter.api_key.as_deref(),
@@ -125,6 +166,7 @@ fn config_inline_key<'a>(cfg: &'a Config, section: &str) -> Option<&'a str> {
         "moonshot" => cfg.moonshot.api_key.as_deref(),
         "grok" => cfg.grok.api_key.as_deref(),
         "minimax" => cfg.minimax.api_key.as_deref(),
+        "opencode-go" => cfg.opencode_go.api_key.as_deref(),
         _ => None,
     }
 }
@@ -268,16 +310,25 @@ impl SettingsState {
     pub fn from_config(cfg: &Config) -> Self {
         let keys = KEY_VENDORS
             .iter()
-            .map(|kv| KeyInput::from_config(config_inline_key(cfg, kv.section)))
+            .map(|kv| KeyInput::from_config(config_inline_key(cfg, kv)))
             .collect();
-        let primary_choices = cfg.enabled_vendors();
+        let mut primary_choices = cfg.enabled_vendors();
+        // Copilot credentials belong to GitHub CLI, so a login cannot write a
+        // local key that would also opt it in. Offer it explicitly instead:
+        // selecting it persists both the primary and `enabled = true`.
+        if !primary_choices.contains(&VendorId::Copilot) {
+            primary_choices.push(VendorId::Copilot);
+        }
         // A configured but disabled primary is ineffective. Display the first
         // enabled vendor instead; when none are enabled retain the historical
         // Anthropic fallback in memory without inventing a persisted primary.
         let primary = cfg
             .ui
             .primary
-            .filter(|vendor| primary_choices.contains(vendor))
+            .filter(|vendor| {
+                primary_choices.contains(vendor)
+                    && (*vendor != VendorId::Copilot || cfg.copilot.enabled)
+            })
             .or_else(|| primary_choices.first().copied())
             .unwrap_or_else(|| cfg.ui.primary.unwrap_or(VendorId::Anthropic));
         Self {
@@ -443,7 +494,7 @@ fn save_to_config_default(state: &SettingsState) -> Result<()> {
 }
 
 /// Same as `save_to_config_default` but with an explicit path — exposed for
-/// tests. Writing a non-empty key also sets that vendor's `enabled = true`.
+/// tests. Writing a non-empty credential also sets that vendor's `enabled = true`.
 pub fn save_to_path(state: &SettingsState, path: &Path) -> Result<()> {
     let original = match std::fs::read_to_string(path) {
         Ok(contents) => contents,
@@ -458,18 +509,32 @@ pub fn save_to_path(state: &SettingsState, path: &Path) -> Result<()> {
         })?
     };
 
-    // Do not write a disabled primary as a side effect of saving an API key.
-    // With no enabled vendors, leave any existing value alone so the legacy
-    // resolver's Anthropic fallback remains intact.
+    // Remove fields written by the short-lived inline Copilot-token design.
+    // GitHub CLI owns the OAuth credential now; retaining a secret this app
+    // neither reads nor supports would be misleading and unsafe.
+    if let Some(table) = doc
+        .get_mut("copilot")
+        .and_then(toml_edit::Item::as_table_mut)
+    {
+        table.remove("token");
+        table.remove("token_env");
+    }
+
+    // Only Copilot is deliberately offered before it is enabled: choosing it
+    // is the explicit opt-in after the GitHub CLI login. All other choices
+    // remain enabled-only, so no failed provider is persisted as primary.
     if state.primary_choices.contains(&state.primary) {
         set_string(&mut doc, "ui", "primary", state.primary.slug())?;
+        if state.primary == VendorId::Copilot {
+            set_bool(&mut doc, "copilot", "enabled", true)?;
+        }
     }
 
     for (i, kv) in KEY_VENDORS.iter().enumerate() {
         let Some(input) = state.keys.get(i) else {
             continue;
         };
-        update_key(&mut doc, kv.section, input)?;
+        update_key(&mut doc, kv, input)?;
     }
 
     let bytes = doc.to_string();
@@ -487,22 +552,26 @@ pub fn save_to_path(state: &SettingsState, path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Apply one key field to the document. Untouched fields are left alone; a
-/// field the user cleared is *removed*, so an inline secret can be deleted
-/// from the overlay rather than lingering in the file. Writing a non-empty key
-/// also opts the vendor in — the opt-in vendors would otherwise never fetch.
-fn update_key(doc: &mut DocumentMut, section: &str, input: &KeyInput) -> Result<()> {
+/// Apply one credential field to the document. Untouched fields are left
+/// alone; a field the user cleared is *removed*, so an inline secret can be
+/// deleted from the overlay rather than lingering in the file. Writing a
+/// non-empty credential also opts the vendor in — the opt-in vendors would
+/// otherwise never fetch.
+fn update_key(doc: &mut DocumentMut, vendor: &KeyVendor, input: &KeyInput) -> Result<()> {
     if !input.dirty {
         return Ok(());
     }
     if input.buf.is_empty() {
-        if let Some(table) = doc.get_mut(section).and_then(toml_edit::Item::as_table_mut) {
-            table.remove("api_key");
+        if let Some(table) = doc
+            .get_mut(vendor.section)
+            .and_then(toml_edit::Item::as_table_mut)
+        {
+            table.remove(vendor.config_key);
         }
         return Ok(());
     }
-    set_string(doc, section, "api_key", &input.buf)?;
-    set_bool(doc, section, "enabled", true)
+    set_string(doc, vendor.section, vendor.config_key, &input.buf)?;
+    set_bool(doc, vendor.section, "enabled", true)
 }
 
 /// Set or update a string field in a TOML section, preserving comments and
@@ -553,6 +622,250 @@ fn default_config_path() -> Result<PathBuf> {
         .ok_or_else(|| AppError::Other("could not resolve config dir".into()))
 }
 
+// ─── Native frontend bridge ───────────────────────────────────────────────
+
+/// Versioned, non-secret description consumed by native desktop frontends.
+/// Inline key values are deliberately represented only as booleans: a
+/// long-lived shell process never needs to receive credentials just to draw a
+/// settings form.
+#[derive(Debug, Serialize)]
+struct SettingsSnapshot {
+    schema_version: u8,
+    primary: String,
+    primary_choices: Vec<PrimaryChoice>,
+    keys: Vec<KeyStatus>,
+}
+
+#[derive(Debug, Serialize)]
+struct PrimaryChoice {
+    id: String,
+    label: String,
+}
+
+#[derive(Debug, Serialize)]
+struct KeyStatus {
+    id: String,
+    label: String,
+    environment: String,
+    secret_label: String,
+    note: String,
+    configured: bool,
+    inline_configured: bool,
+    environment_configured: bool,
+}
+
+/// Additive patch accepted on stdin by `ai-usagebar settings apply`.
+/// Missing keys remain byte-for-byte untouched. `clear` explicitly removes an
+/// inline key, matching the TUI overlay's existing empty-dirty-field behavior.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApplyRequest {
+    schema_version: u8,
+    primary: Option<String>,
+    #[serde(default)]
+    keys: BTreeMap<String, KeyMutation>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "action", rename_all = "lowercase", deny_unknown_fields)]
+enum KeyMutation {
+    Set { value: String },
+    Clear,
+}
+
+const SETTINGS_SCHEMA_VERSION: u8 = 1;
+const MAX_SETTINGS_REQUEST_BYTES: u64 = 64 * 1024;
+const MAX_API_KEY_BYTES: usize = 16 * 1024;
+
+fn configured_key_env<'a>(cfg: &'a Config, section: &str, fallback: &'a str) -> &'a str {
+    match section {
+        "anthropic_api" => &cfg.anthropic_api.api_key_env,
+        "zai" => &cfg.zai.api_key_env,
+        "openrouter" => &cfg.openrouter.api_key_env,
+        "deepseek" => &cfg.deepseek.api_key_env,
+        "kimi" => &cfg.kimi.api_key_env,
+        "kilo" => &cfg.kilo.api_key_env,
+        "novita" => &cfg.novita.api_key_env,
+        "moonshot" => &cfg.moonshot.api_key_env,
+        "grok" => &cfg.grok.api_key_env,
+        "minimax" => &cfg.minimax.api_key_env,
+        "opencode-go" => &cfg.opencode_go.api_key_env,
+        _ => fallback,
+    }
+}
+
+fn snapshot_from_config_with(
+    cfg: &Config,
+    environment_configured: impl Fn(&str) -> bool,
+) -> SettingsSnapshot {
+    let state = SettingsState::from_config(cfg);
+    let primary_choices = state
+        .primary_choices
+        .iter()
+        .map(|id| PrimaryChoice {
+            id: id.slug().to_string(),
+            label: id.display_name().to_string(),
+        })
+        .collect();
+    let keys = KEY_VENDORS
+        .iter()
+        .map(|vendor| {
+            let environment = configured_key_env(cfg, vendor.section, vendor.env);
+            let inline_configured = config_inline_key(cfg, vendor).is_some_and(|v| !v.is_empty());
+            let environment_configured = environment_configured(environment);
+            KeyStatus {
+                id: vendor.id.slug().to_string(),
+                label: vendor.label.to_string(),
+                environment: environment.to_string(),
+                secret_label: vendor.secret_label.to_string(),
+                note: vendor.note.to_string(),
+                configured: inline_configured || environment_configured,
+                inline_configured,
+                environment_configured,
+            }
+        })
+        .collect();
+    SettingsSnapshot {
+        schema_version: SETTINGS_SCHEMA_VERSION,
+        primary: state.primary.slug().to_string(),
+        primary_choices,
+        keys,
+    }
+}
+
+fn settings_snapshot_json(cfg: &Config) -> Result<String> {
+    Ok(serde_json::to_string(&snapshot_from_config_with(
+        cfg,
+        |environment| std::env::var_os(environment).is_some_and(|value| !value.is_empty()),
+    ))?)
+}
+
+#[cfg(test)]
+fn settings_snapshot_json_with(
+    cfg: &Config,
+    environment_configured: impl Fn(&str) -> bool,
+) -> Result<String> {
+    Ok(serde_json::to_string(&snapshot_from_config_with(
+        cfg,
+        environment_configured,
+    ))?)
+}
+
+fn vendor_from_slug(slug: &str) -> Option<VendorId> {
+    VendorId::all().iter().copied().find(|id| id.slug() == slug)
+}
+
+fn state_from_apply_request(cfg: &Config, raw: &str) -> Result<SettingsState> {
+    let request: ApplyRequest = serde_json::from_str(raw)?;
+    if request.schema_version != SETTINGS_SCHEMA_VERSION {
+        return Err(AppError::Other(format!(
+            "unsupported settings schema version {}",
+            request.schema_version
+        )));
+    }
+
+    let mut state = SettingsState::from_config(cfg);
+    if let Some(primary) = request.primary {
+        let id = vendor_from_slug(&primary)
+            .ok_or_else(|| AppError::Other(format!("unknown primary vendor {primary:?}")))?;
+        if !state.primary_choices.contains(&id) {
+            return Err(AppError::Other(format!(
+                "primary vendor {primary:?} is not enabled"
+            )));
+        }
+        state.primary = id;
+    }
+
+    for (id, mutation) in request.keys {
+        let index = KEY_VENDORS
+            .iter()
+            .position(|vendor| vendor.id.slug() == id)
+            .ok_or_else(|| AppError::Other(format!("unknown credential vendor {id:?}")))?;
+        let input = &mut state.keys[index];
+        match mutation {
+            KeyMutation::Set { value } => {
+                if value.is_empty() {
+                    return Err(AppError::Other(format!(
+                        "{} for {id:?} is empty; use the clear action to remove it",
+                        KEY_VENDORS[index].secret_label
+                    )));
+                }
+                if value.len() > MAX_API_KEY_BYTES {
+                    return Err(AppError::Other(format!(
+                        "{} for {id:?} exceeds {MAX_API_KEY_BYTES} bytes",
+                        KEY_VENDORS[index].secret_label
+                    )));
+                }
+                if value.chars().any(char::is_control) {
+                    return Err(AppError::Other(format!(
+                        "{} for {id:?} contains control characters",
+                        KEY_VENDORS[index].secret_label
+                    )));
+                }
+                input.buf = value;
+            }
+            KeyMutation::Clear => input.buf.clear(),
+        }
+        input.cursor = input.buf.chars().count();
+        input.dirty = true;
+        input.revealed = false;
+    }
+    Ok(state)
+}
+
+#[cfg(test)]
+fn apply_settings_json_to_path(cfg: &Config, raw: &str, path: &Path) -> Result<()> {
+    let state = state_from_apply_request(cfg, raw)?;
+    save_to_path(&state, path)
+}
+
+fn read_settings_request<R: BufRead>(reader: R) -> Result<String> {
+    let mut limited = reader.take(MAX_SETTINGS_REQUEST_BYTES + 1);
+    let mut bytes = Vec::new();
+    limited.read_until(b'\n', &mut bytes)?;
+    if bytes.len() as u64 > MAX_SETTINGS_REQUEST_BYTES {
+        return Err(AppError::Other(format!(
+            "settings request exceeds {MAX_SETTINGS_REQUEST_BYTES} bytes"
+        )));
+    }
+    if bytes.last() == Some(&b'\n') {
+        bytes.pop();
+        if bytes.last() == Some(&b'\r') {
+            bytes.pop();
+        }
+    }
+    String::from_utf8(bytes)
+        .map_err(|_| AppError::Other("settings request is not valid UTF-8".into()))
+}
+
+fn apply_settings_from_stdin() -> Result<()> {
+    let raw = read_settings_request(std::io::stdin().lock())?;
+    let cfg = Config::load()?;
+    let state = state_from_apply_request(&cfg, &raw)?;
+    save_to_config_default(&state)
+}
+
+/// Administrative settings bridge for native frontends. `show` never emits a
+/// secret; `apply` accepts its patch only over stdin so keys do not appear in
+/// argv or the process environment.
+pub fn run_cli(action: &crate::widget::cli::SettingsAction) -> i32 {
+    let result = match action {
+        crate::widget::cli::SettingsAction::Show => Config::load()
+            .and_then(|cfg| settings_snapshot_json(&cfg))
+            .map(|json| println!("{json}")),
+        crate::widget::cli::SettingsAction::Apply => {
+            apply_settings_from_stdin().map(|()| println!(r#"{{"ok":true}}"#))
+        }
+    };
+    match result {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("settings: {error}");
+            1
+        }
+    }
+}
+
 // ─── Render ────────────────────────────────────────────────────────────────
 
 /// Render the modal overlay over `area`.
@@ -571,14 +884,14 @@ pub fn render(f: &mut Frame, area: Rect, state: &SettingsState, theme: &Theme) {
         .constraints([Constraint::Min(0), Constraint::Length(1)])
         .split(inner);
 
-    // — Primary vendor + API keys header —
+    // — Primary vendor + credentials header —
     let mut lines: Vec<Line> = vec![
         section_header("Primary vendor", "shown first on the bar / TUI", &bubble),
         primary_line(state, &bubble),
         Line::from(""),
         section_header(
-            "API keys",
-            "pick a row, type the key, then Ctrl-S — Claude & OpenAI use CLI login",
+            "Credentials",
+            "pick a row, type the credential, then Ctrl-S — Claude & Codex use CLI login",
             &bubble,
         ),
     ];
@@ -634,7 +947,7 @@ fn section_header(title: &str, sub: &str, theme: &BubbleTheme) -> Line<'static> 
 
 fn primary_line(state: &SettingsState, theme: &BubbleTheme) -> Line<'static> {
     let focused = state.focus == Focus::Primary;
-    let name = vendor_label(state.primary).to_string();
+    let name = state.primary.display_name().to_string();
     if focused {
         Line::from(vec![
             theme.span("   "),
@@ -738,25 +1051,6 @@ fn save_line(focused: bool, theme: &BubbleTheme) -> Line<'static> {
     ])
 }
 
-fn vendor_label(v: VendorId) -> &'static str {
-    match v {
-        VendorId::Anthropic => "Anthropic",
-        VendorId::AnthropicApi => "Anthropic API",
-        VendorId::Openai => "OpenAI",
-        VendorId::Zai => "Z.AI",
-        VendorId::Openrouter => "OpenRouter",
-        VendorId::Deepseek => "DeepSeek",
-        VendorId::Kimi => "Kimi",
-        VendorId::Kilo => "Kilo",
-        VendorId::Novita => "Novita",
-        VendorId::Moonshot => "Moonshot",
-        VendorId::Grok => "Grok",
-        VendorId::Antigravity => "Antigravity",
-        VendorId::Shvia => "ShvIA",
-        VendorId::Minimax => "MiniMax",
-    }
-}
-
 /// Center a rectangle of `percent_x * percent_y` over `r`.
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
     let popup_h = (r.height * percent_y) / 100;
@@ -858,13 +1152,26 @@ mod tests {
     }
 
     #[test]
+    fn copilot_has_no_editable_credential_field() {
+        assert!(
+            !KEY_VENDORS
+                .iter()
+                .any(|vendor| vendor.id == VendorId::Copilot)
+        );
+    }
+
+    #[test]
     fn from_config_offers_enabled_vendors_only() {
         let cfg = Config::default();
         let s = SettingsState::from_config(&cfg);
-        assert_eq!(s.primary_choices, cfg.enabled_vendors());
-        // Opt-in vendors are disabled by default and must not be offered.
+        let mut expected = cfg.enabled_vendors();
+        expected.push(VendorId::Copilot);
+        assert_eq!(s.primary_choices, expected);
+        // API-key opt-in vendors are disabled by default and must not be
+        // offered. Copilot is the exception: choosing it enables it safely.
         assert!(!s.primary_choices.contains(&VendorId::Grok));
         assert!(s.primary_choices.contains(&s.primary));
+        assert!(s.primary_choices.contains(&VendorId::Copilot));
     }
 
     #[test]
@@ -978,6 +1285,10 @@ plan_tier = "pro"
 [openrouter]
 enabled = true
 api_key_env = "OPENROUTER_API_KEY"
+
+[[openrouter.accounts]]
+label = "work"
+api_key_env = "OPENROUTER_WORK_API_KEY"
 "##,
         ));
 
@@ -989,6 +1300,8 @@ api_key_env = "OPENROUTER_API_KEY"
         assert!(raw.contains("# pre-existing comment"));
         assert!(raw.contains("# tier comment"));
         assert!(raw.contains("api_key_env = \"ZAI_API_KEY\""));
+        assert!(raw.contains("[[openrouter.accounts]]"));
+        assert!(raw.contains("api_key_env = \"OPENROUTER_WORK_API_KEY\""));
         assert!(raw.contains("plan_tier = \"pro\""));
         assert!(raw.contains("primary = \"openrouter\""));
         assert!(raw.contains("api_key = \"zk2\""));
@@ -1086,6 +1399,16 @@ api_key_env = "OPENROUTER_API_KEY"
         s.primary_choices = vec![];
         handle_key(&mut s, KeyCode::Right, KeyModifiers::NONE);
         assert_eq!(s.primary, VendorId::Anthropic);
+    }
+
+    #[test]
+    fn disabled_copilot_is_offered_but_not_shown_as_the_current_primary() {
+        let mut cfg = Config::default();
+        cfg.ui.primary = Some(VendorId::Copilot);
+        let state = SettingsState::from_config(&cfg);
+
+        assert!(state.primary_choices.contains(&VendorId::Copilot));
+        assert_eq!(state.primary, VendorId::Anthropic);
     }
 
     #[test]
@@ -1270,5 +1593,166 @@ api_key_env = "OPENROUTER_API_KEY"
             default_config_path().unwrap(),
             crate::config::resolved_path().unwrap()
         );
+    }
+
+    #[test]
+    fn native_snapshot_reports_key_state_without_serializing_secrets() {
+        let mut cfg = Config::default();
+        cfg.zai.api_key = Some("never-leak-this-key".into());
+        cfg.zai.api_key_env = "CUSTOM_ZAI_KEY".into();
+        let raw = settings_snapshot_json_with(&cfg, |name| name == "CUSTOM_ZAI_KEY").unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+
+        assert_eq!(parsed["schema_version"], 1);
+        assert_eq!(parsed["primary"], "anthropic");
+        let zai = parsed["keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == "zai")
+            .unwrap();
+        assert_eq!(zai["configured"], true);
+        assert_eq!(zai["inline_configured"], true);
+        assert_eq!(zai["environment_configured"], true);
+        assert_eq!(zai["environment"], "CUSTOM_ZAI_KEY");
+        assert!(!raw.contains("never-leak-this-key"));
+        assert!(parsed.get("api_key").is_none());
+    }
+
+    #[test]
+    fn native_snapshot_offers_copilot_primary_without_a_token_field() {
+        let cfg = Config::default();
+        let raw = settings_snapshot_json_with(&cfg, |_| false).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(
+            parsed["primary_choices"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["id"] == "copilot")
+        );
+        assert!(
+            !parsed["keys"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["id"] == "copilot")
+        );
+    }
+
+    #[test]
+    fn native_key_only_patch_does_not_require_or_replace_primary() {
+        let cfg = Config::default();
+        let original_primary = SettingsState::from_config(&cfg).primary;
+        let request = serde_json::json!({
+            "schema_version": 1,
+            "keys": {"kimi": {"action": "set", "value": "new-kimi-key"}}
+        });
+
+        let state = state_from_apply_request(&cfg, &request.to_string()).unwrap();
+        assert_eq!(state.primary, original_primary);
+        let kimi_index = KEY_VENDORS
+            .iter()
+            .position(|vendor| vendor.id == VendorId::Kimi)
+            .unwrap();
+        assert!(state.keys[kimi_index].dirty);
+        assert_eq!(state.keys[kimi_index].buf, "new-kimi-key");
+    }
+
+    #[test]
+    fn native_patch_reuses_tui_persistence_and_preserves_existing_config() {
+        let (_dir, path) = temp_config(Some(
+            r#"# keep this comment
+[ui]
+primary = "anthropic"
+
+[zai]
+enabled = true
+api_key_env = "ZAI_API_KEY"
+plan_tier = "pro"
+
+[openrouter]
+enabled = true
+"#,
+        ));
+        let cfg = Config::load_from(&path).unwrap();
+        let request = serde_json::json!({
+            "schema_version": 1,
+            "primary": "openrouter",
+            "keys": {
+                "zai": {"action": "set", "value": "new-zai-key"}
+            }
+        });
+
+        apply_settings_json_to_path(&cfg, &request.to_string(), &path).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("# keep this comment"));
+        assert!(raw.contains("plan_tier = \"pro\""));
+        assert!(raw.contains("api_key_env = \"ZAI_API_KEY\""));
+        assert!(raw.contains("primary = \"openrouter\""));
+        assert!(raw.contains("api_key = \"new-zai-key\""));
+    }
+
+    #[test]
+    fn native_patch_distinguishes_clear_from_unchanged() {
+        let (_dir, path) = temp_config(Some(
+            "[zai]\nenabled = true\napi_key = \"remove-me\"\n\
+             [openrouter]\nenabled = true\napi_key = \"keep-me\"\n",
+        ));
+        let cfg = Config::load_from(&path).unwrap();
+        let request = serde_json::json!({
+            "schema_version": 1,
+            "primary": "zai",
+            "keys": {"zai": {"action": "clear"}}
+        });
+
+        apply_settings_json_to_path(&cfg, &request.to_string(), &path).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("remove-me"));
+        assert!(raw.contains("keep-me"));
+    }
+
+    #[test]
+    fn native_primary_selection_enables_copilot_without_writing_a_token() {
+        let (_dir, path) = temp_config(Some(
+            "[copilot]\nenabled = false\ntoken = \"legacy-value\"\ntoken_env = \"OLD_TOKEN\"\n",
+        ));
+        let cfg = Config::load_from(&path).unwrap();
+        let select = serde_json::json!({
+            "schema_version": 1,
+            "primary": "copilot"
+        });
+        apply_settings_json_to_path(&cfg, &select.to_string(), &path).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("enabled = true"));
+        assert!(raw.contains("primary = \"copilot\""));
+        assert!(!raw.contains("token ="));
+        assert!(!raw.contains("token_env ="));
+    }
+
+    #[test]
+    fn native_patch_errors_never_echo_key_values() {
+        let raw = serde_json::json!({
+            "schema_version": 1,
+            "primary": "anthropic",
+            "keys": {
+                "zai": {"action": "set", "value": "secret\nwith-control"}
+            }
+        })
+        .to_string();
+        let error = state_from_apply_request(&Config::default(), &raw)
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains("secret"));
+        assert!(error.contains("control characters"));
+    }
+
+    #[test]
+    fn native_patch_input_is_bounded_before_json_parsing() {
+        let oversized = vec![b'x'; MAX_SETTINGS_REQUEST_BYTES as usize + 1];
+        let error = read_settings_request(std::io::Cursor::new(oversized))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("exceeds"));
     }
 }

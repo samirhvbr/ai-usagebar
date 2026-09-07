@@ -76,7 +76,14 @@ impl NumericOrString {
 
 impl UsagesResponse {
     pub fn into_snapshot(self) -> Result<KimiSnapshot> {
-        let plan = self.user.and_then(|u| u.membership).and_then(|m| m.level);
+        // The raw membership enum ("LEVEL_INTERMEDIATE") is a wire value, not
+        // something to put on a status bar. `fetch` overwrites this with the
+        // vendor's own tier name from `/me` when that call succeeds.
+        let plan = self
+            .user
+            .and_then(|u| u.membership)
+            .and_then(|m| m.level)
+            .map(|level| humanize_membership_level(&level));
 
         let usage = self
             .usage
@@ -138,6 +145,60 @@ fn extract_block(block: UsageBlock) -> Result<(u64, u64, u64, Option<DateTime<Ut
     Ok((limit, used, remaining, reset))
 }
 
+/// The profile response from `/coding/v1/me`, read for exactly one field.
+///
+/// That endpoint also returns the account's email, phone, nickname, avatar and
+/// ids. **None of them are deserialized here** — serde drops unknown fields, so
+/// the personal data never enters a snapshot, the cache, or an error message.
+/// Keep it that way: the plan label is the only thing this vendor needs.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct UserInfoResponse {
+    /// The subscription tier's own name — "Andante", "Moderato",
+    /// "Allegretto", "Allegro". Kimi names its plans after tempo markings, so
+    /// this reads as a product name and not as a gamification badge.
+    user_level_name: Option<String>,
+}
+
+impl UserInfoResponse {
+    pub fn plan_label(&self) -> Option<String> {
+        self.user_level_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+    }
+}
+
+/// Make a raw membership enum readable when the vendor's own label is
+/// unavailable (`/me` unreachable, or an API key whose account has no coding
+/// profile). `LEVEL_INTERMEDIATE` → `Intermediate`.
+///
+/// Deliberately *not* a table mapping levels onto tier names: the enum-to-tier
+/// correspondence is not published anywhere, and inventing "Allegretto" for a
+/// level that might mean something else would put a wrong plan on screen with
+/// full confidence. Prettifying what the vendor said is the honest fallback.
+pub fn humanize_membership_level(level: &str) -> String {
+    let trimmed = level.trim();
+    let body = trimmed.strip_prefix("LEVEL_").unwrap_or(trimmed);
+    if body.is_empty() {
+        return trimmed.to_string();
+    }
+    body.split('_')
+        .filter(|word| !word.is_empty())
+        .map(|word| {
+            let mut chars = word.chars();
+            match chars.next() {
+                Some(first) => {
+                    first.to_uppercase().collect::<String>() + &chars.as_str().to_lowercase()
+                }
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Kimi documents the rolling window as 300 minutes. Accept only equivalent
 /// spellings used by protobuf/JSON gateways, not arbitrary duration units.
 fn is_five_hour_window(window: &Window) -> bool {
@@ -171,6 +232,52 @@ mod tests {
     use super::*;
 
     #[test]
+    fn membership_levels_are_humanized_not_invented() {
+        assert_eq!(
+            humanize_membership_level("LEVEL_INTERMEDIATE"),
+            "Intermediate"
+        );
+        assert_eq!(
+            humanize_membership_level("LEVEL_SUPER_ADVANCED"),
+            "Super Advanced"
+        );
+        // No LEVEL_ prefix, mixed case, and surrounding space still read well.
+        assert_eq!(humanize_membership_level("  basic  "), "Basic");
+        // Degenerate inputs are returned rather than turned into an empty label.
+        assert_eq!(humanize_membership_level("LEVEL_"), "LEVEL_");
+        assert_eq!(humanize_membership_level(""), "");
+    }
+
+    #[test]
+    fn the_profile_response_yields_only_the_tier_name() {
+        let raw = r#"{
+            "user_id": "u-1", "nickname": "someone", "email": "someone@example.com",
+            "phone": {"country_code": "55", "number": "999999999"},
+            "user_level": 25, "user_level_name": "Allegretto",
+            "domain_name": "DOMAIN_NEXUS"
+        }"#;
+        let me: UserInfoResponse = serde_json::from_str(raw).unwrap();
+        assert_eq!(me.plan_label(), Some("Allegretto".into()));
+        // The struct has no field to hold the personal data, so nothing else
+        // can leak into a snapshot or a Debug line.
+        let rendered = format!("{me:?}");
+        assert!(!rendered.contains("example.com"), "{rendered}");
+        assert!(!rendered.contains("999999999"), "{rendered}");
+    }
+
+    #[test]
+    fn a_blank_or_absent_tier_name_is_no_label() {
+        for raw in [
+            r#"{"user_level_name": ""}"#,
+            r#"{"user_level_name": "  "}"#,
+            "{}",
+        ] {
+            let me: UserInfoResponse = serde_json::from_str(raw).unwrap();
+            assert_eq!(me.plan_label(), None, "{raw}");
+        }
+    }
+
+    #[test]
     fn parses_representative_json_with_string_numbers() {
         let raw = r#"{
             "user": { "membership": { "level": "LEVEL_INTERMEDIATE" } },
@@ -186,7 +293,7 @@ mod tests {
             .unwrap()
             .into_snapshot()
             .unwrap();
-        assert_eq!(snap.plan, Some("LEVEL_INTERMEDIATE".into()));
+        assert_eq!(snap.plan, Some("Intermediate".into()));
         assert_eq!(snap.weekly_limit, 100);
         assert_eq!(snap.weekly_used, 26);
         assert_eq!(snap.weekly_remaining, 74);
@@ -215,7 +322,7 @@ mod tests {
             .unwrap()
             .into_snapshot()
             .unwrap();
-        assert_eq!(snap.plan, Some("LEVEL_ADVANCED".into()));
+        assert_eq!(snap.plan, Some("Advanced".into()));
         assert_eq!(snap.weekly_limit, 500);
         assert_eq!(snap.weekly_used, 123);
         assert_eq!(snap.weekly_remaining, 377);

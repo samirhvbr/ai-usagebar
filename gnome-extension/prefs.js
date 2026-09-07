@@ -10,8 +10,8 @@ import {ExtensionPreferences, gettext as _} from 'resource:///org/gnome/Shell/Ex
 
 // ── Vendor login / config ────────────────────────────────────────────────
 const VENDOR_AUTH = [
-    {id: 'anthropic', name: 'Anthropic (Claude)', kind: 'oauth', cli: 'claude', login: 'claude', pkg: '@anthropic-ai/claude-code'},
-    {id: 'openai', name: 'OpenAI (Codex)', kind: 'oauth', cli: 'codex', login: 'codex login', pkg: '@openai/codex'},
+    {id: 'anthropic', name: 'Claude', kind: 'oauth', cli: 'claude', login: 'claude', pkg: '@anthropic-ai/claude-code'},
+    {id: 'openai', name: 'Codex', kind: 'oauth', cli: 'codex', login: 'codex login', pkg: '@openai/codex'},
     // Local-server vendor: there is no separate credential or npm-installable
     // login helper. If `agy` exists we can open it; the app and IDE are equally
     // valid sources and are managed outside this extension.

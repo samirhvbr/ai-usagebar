@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Datelike, Utc};
 
-use crate::cache::{Cache, MAX_STALE, acquire_lock_async};
+use crate::cache::{Cache, acquire_lock_async};
 use crate::error::{AppError, Result};
 use crate::usage::{AnthropicApiSnapshot, finite_amount};
 use crate::vendor::{MAX_BODY_BYTES, read_body_capped};
@@ -38,13 +38,9 @@ impl Default for Endpoints {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct FetchOutcome {
-    pub snapshot: AnthropicApiSnapshot,
-    pub stale: bool,
-    pub last_error: Option<(u16, String)>,
-    pub cache_age: Option<Duration>,
-}
+/// This vendor's [`Outcome`](crate::outcome::Outcome) — the shared shape,
+/// specialised to its snapshot.
+pub type FetchOutcome = crate::outcome::Outcome<AnthropicApiSnapshot>;
 
 /// First instant of `now`'s calendar month, as an RFC-3339 UTC string.
 fn month_start_rfc3339(now: DateTime<Utc>) -> String {
@@ -133,18 +129,12 @@ pub async fn fetch_snapshot_at(
                 "snapshot": { "spent": snap.spent, "limit": snap.limit },
             }))?;
             cache.write_payload(&bytes)?;
-            Ok(FetchOutcome {
-                snapshot: snap,
-                stale: false,
-                last_error: None,
-                cache_age: Some(Duration::ZERO),
-            })
+            Ok(crate::outcome::Outcome::fresh(snap))
         }
         Err(e) if e.is_transient() => fallback_silent(cache, limit, &month, &target, e),
         Err(AppError::Http { status, body }) => {
             cache.mark_stale();
-            cache.write_last_error(status, &body);
-            let diag = (status, body.clone());
+            let diag = cache.write_last_error(status, &body);
             fallback_with_error(
                 cache,
                 Some(diag),
@@ -156,8 +146,7 @@ pub async fn fetch_snapshot_at(
         }
         Err(e) => {
             cache.mark_stale();
-            cache.write_last_error(0, &e.to_string());
-            let diag = (0, e.to_string());
+            let diag = cache.write_last_error(0, &e.to_string());
             fallback_with_error(cache, Some(diag), limit, &month, &target, e)
         }
     }
@@ -170,16 +159,18 @@ fn fallback_silent(
     target: &str,
     original: AppError,
 ) -> Result<FetchOutcome> {
-    let Some(bytes) = cache.fallback_payload(MAX_STALE)? else {
-        return Err(original);
-    };
-    reuse_cache(&bytes, cache, true, limit, month, target)
+    crate::outcome::fallback(cache, None, original, |bytes| {
+        cached_snapshot(bytes, limit, month, target)
+    })
 }
 
 /// On failure we show the last good figure with the error alongside it. With
 /// nothing usable cached there is nothing to show, so the **original** error is
 /// returned — a first-run 401/403 or schema error must reach the user with its
 /// Admin-key guidance intact, not as a generic "no usable cache".
+/// Last month's spend is not this month's: a payload that will not parse for
+/// `month` fails the closure, and `outcome::fallback` then reports the outage
+/// rather than showing the wrong month as current.
 fn fallback_with_error(
     cache: &Cache,
     last_error: Option<(u16, String)>,
@@ -188,16 +179,9 @@ fn fallback_with_error(
     target: &str,
     original: AppError,
 ) -> Result<FetchOutcome> {
-    let Some(bytes) = cache.fallback_payload(MAX_STALE)? else {
-        return Err(original);
-    };
-    // Last month's spend is not this month's, so during an outage it is better
-    // to report the error than to display the wrong month as current.
-    let Ok(mut outcome) = reuse_cache(&bytes, cache, true, limit, month, target) else {
-        return Err(original);
-    };
-    outcome.last_error = last_error;
-    Ok(outcome)
+    crate::outcome::fallback(cache, last_error, original, |bytes| {
+        cached_snapshot(bytes, limit, month, target)
+    })
 }
 
 fn reuse_cache(
@@ -208,15 +192,20 @@ fn reuse_cache(
     month: &str,
     target: &str,
 ) -> Result<FetchOutcome> {
-    // The cached spend is authoritative; the limit always comes from the
-    // current config so editing it takes effect without a refetch.
+    let snapshot = cached_snapshot(bytes, limit, month, target)?;
+    Ok(crate::outcome::Outcome::cached(snapshot, cache, stale))
+}
+
+/// The cached spend is authoritative; the limit always comes from the current
+/// config so editing it takes effect without a refetch.
+fn cached_snapshot(
+    bytes: &[u8],
+    limit: Option<f64>,
+    month: &str,
+    target: &str,
+) -> Result<AnthropicApiSnapshot> {
     let spent = parse_cached_spent(bytes, month, target)?;
-    Ok(FetchOutcome {
-        snapshot: AnthropicApiSnapshot { spent, limit },
-        stale,
-        last_error: cache.read_last_error(),
-        cache_age: cache.payload_age(),
-    })
+    Ok(AnthropicApiSnapshot { spent, limit })
 }
 
 fn parse_cached_spent(bytes: &[u8], month: &str, target: &str) -> Result<f64> {
