@@ -16,10 +16,22 @@ question that matters when merging the next one.
 | ShvIA's three windows in the macOS menu bar (today / week / capped month), instead of the 5h+weekly pair it does not have | `macos/ai-usagebar-menubar.swift` (`FORMAT` tail, `parse`) |
 | **"Status das APIs"** — a collapsible section listing every vendor's health, including the ones that are off or unconfigured | `macos/ai-usagebar-menubar.swift`, `gnome-extension/api-status-logic.js` + `extension.js` |
 | `format::compact_count` — the compact magnitude formatter the uncapped-window rows need | `src/format.rs` |
+| **The vendor catalog** — `ai-usagebar vendors --json`: every provider, how each authenticates, and whether it is enabled and credentialed here. What lets the section above carry no provider table | `src/catalog.rs`, `vendor.rs` (`AuthKind`, `auth_kind`/`api_key_env`/`login_command`), `config.rs` (`api_key_env_for`, `inline_api_key`) |
 
-Both features are written to upstream's own conventions and are candidates for
-PRs: the section answers something neither the dropdown nor the Overview does,
-and it is built on `usage --json` rather than on any vendor's cache layout.
+These are written to upstream's own conventions and are candidates for PRs.
+The strongest is the **catalog**, because it is upstream's own `CLAUDE.md` rule
+applied to the one table that had escaped it — "provider fetching, credentials,
+canonical product names … belong in Rust; do not add a complete provider-name
+table to a frontend". Both frontends had one, and both had drifted: the GNOME
+extension listed sixteen of twenty-one providers, and the macOS menu bar
+re-derived Claude's, Codex's, Cursor's and Antigravity's credential locations in
+Swift, hard-coding a Cursor default path that Rust already resolves. The section
+on top of it answers something neither the dropdown nor the Overview does, and
+is built on `usage --json` rather than on any vendor's cache layout.
+
+Pitch the catalog first and the section second: the catalog stands on its own
+as a fix to a stated invariant, and it is the part with no Portuguese UI copy
+to argue about.
 
 ## Was ours, is now upstream's
 

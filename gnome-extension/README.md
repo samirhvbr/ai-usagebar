@@ -157,11 +157,20 @@ with a health dot, its headline figure, and what to do when something is wrong:
 | hollow | `enabled = false` in `config.toml` |
 
 Click its header row to expand or collapse it (the state is the
-`api-status-expanded` setting). The figures come from one
-`ai-usagebar usage --json` sweep, which runs when the dropdown is opened with
-the section expanded — the binary walks every configured vendor and account
-there and reports each one's status, error and staleness, so the extension
-keeps no copy of any vendor's cache layout.
+`api-status-expanded` setting). Two binary calls feed it, and the extension
+knows no provider of its own:
+
+- **`ai-usagebar vendors --json`** — which providers exist, how each
+  authenticates, and whether each is enabled and credentialed. This is why the
+  list is complete: it is the binary's canonical vendor order, so a provider
+  added in Rust gets a row with no change here. An earlier version kept its own
+  table and listed sixteen of the twenty-one, which is the one failure a
+  "everything, including what's off" section cannot afford.
+- **`ai-usagebar usage --json`** — the figures, for the enabled providers. The
+  binary reports each one's status, error and staleness, so the extension keeps
+  no copy of any vendor's cache layout.
+
+Both run when the dropdown is opened with the section expanded.
 
 The decision table is pure and lives in `api-status-logic.js`, covered by
 `api-status-logic.test.mjs` (`make desktop-test`).

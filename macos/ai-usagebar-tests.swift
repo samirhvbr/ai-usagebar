@@ -769,16 +769,17 @@ func testShviaWindows() {
 // ─── "Status das APIs": the decision table ───────────────────────────────
 func testApiStatus() {
     print("API status rows")
-    let vendors = [
-        VendorAuth(id: "anthropic", name: "Claude", kind: "oauth", cli: "claude",
-                   login: "claude", pkg: "", env: ""),
-        VendorAuth(id: "shvia", name: "ShvIA", kind: "apikey", cli: "", login: "",
-                   pkg: "", env: "SHVIA_API_KEY"),
-        VendorAuth(id: "zai", name: "Z.AI", kind: "apikey", cli: "", login: "",
-                   pkg: "", env: "ZAI_API_KEY"),
-        VendorAuth(id: "grok", name: "Grok", kind: "apikey", cli: "", login: "",
-                   pkg: "", env: "XAI_MANAGEMENT_KEY"),
-    ]
+    // Catalog rows, as `vendors --json` reports them. `enabled` and
+    // `configured` ride on the row: the binary resolved both, so this side only
+    // decides how to draw the answer.
+    func vendor(_ id: String, _ name: String, kind: String = "apikey",
+                enabled: Bool = true, configured: Bool = true,
+                needsCredential: Bool = true, env: String = "",
+                login: String = "") -> VendorCatalogRow {
+        VendorCatalogRow(id: id, name: name, kind: kind, enabled: enabled,
+                         configured: configured, needsCredential: needsCredential,
+                         env: env, login: login)
+    }
     func entry(_ id: String, failed: Bool = false, error: String = "", stale: Bool = false,
                metrics: [ReportMetric] = [], texts: [ReportMetric] = []) -> UsageReportEntry {
         UsageReportEntry(id: id, name: id, plan: "", failed: failed, error: error,
@@ -795,9 +796,13 @@ func testApiStatus() {
         ]),
     ]
     let rows = apiStatusRows(
-        vendors: vendors,
-        enabled: { $0.id != "anthropic" },      // Claude turned off (the #148 workaround)
-        configured: { _ in true },
+        vendors: [
+            // Claude turned off (the #148 workaround).
+            vendor("anthropic", "Claude", kind: "oauth", enabled: false, login: "claude"),
+            vendor("shvia", "ShvIA", env: "SHVIA_API_KEY"),
+            vendor("zai", "Z.AI", env: "ZAI_API_KEY"),
+            vendor("grok", "Grok", env: "XAI_MANAGEMENT_KEY"),
+        ],
         report: report,
         reportRan: true)
 
@@ -813,31 +818,83 @@ func testApiStatus() {
 
     // Enabled but with no credential: the row says what is missing, per kind.
     let missing = apiStatusRows(
-        vendors: vendors,
-        enabled: { _ in true },
-        configured: { _ in false },
+        vendors: [
+            vendor("anthropic", "Claude", kind: "oauth", configured: false, login: "claude"),
+            vendor("shvia", "ShvIA", configured: false, env: "SHVIA_API_KEY"),
+            vendor("cursor", "Cursor", kind: "local", configured: false),
+        ],
         report: [:],
         reportRan: true)
     assertEqual(missing[0].detail, "sem login — rode `claude`", "OAuth vendor names its login")
     assertEqual(missing[1].detail, "sem chave (SHVIA_API_KEY)", "key vendor names its variable")
+    assertEqual(missing[2].detail, "não logado no app",
+                "a local vendor signs in somewhere this cannot name")
     assertEqual(missing[0].state, ApiState.warn, "unconfigured is a warning, not an error")
+
+    // Antigravity has no credential at all, so it is never missing one: with no
+    // sweep yet it is pending, not a warning about a key.
+    let agy = vendor("antigravity", "Antigravity", kind: "local", needsCredential: false)
+    assertEqual(missingCredentialHint(agy), "", "nothing to configure, nothing to demand")
+    let agyRows = apiStatusRows(vendors: [agy], report: [:], reportRan: true)
+    assertEqual(agyRows[0].detail, "sem dados", "it reports, or the sweep says why")
 
     // Before the first sweep, an enabled+configured vendor is pending — not
     // "no data", which would claim the sweep ran and found nothing.
-    let pending = apiStatusRows(
-        vendors: vendors,
-        enabled: { _ in true },
-        configured: { _ in true },
-        report: [:],
-        reportRan: false)
-    assertEqual(pending[1].detail, "…", "no sweep yet reads as pending")
-    let swept = apiStatusRows(
-        vendors: vendors,
-        enabled: { _ in true },
-        configured: { _ in true },
-        report: [:],
-        reportRan: true)
-    assertEqual(swept[1].detail, "sem dados", "a finished sweep that skipped it says so")
+    let ready = [vendor("shvia", "ShvIA", env: "SHVIA_API_KEY")]
+    let pending = apiStatusRows(vendors: ready, report: [:], reportRan: false)
+    assertEqual(pending[0].detail, "…", "no sweep yet reads as pending")
+    let swept = apiStatusRows(vendors: ready, report: [:], reportRan: true)
+    assertEqual(swept[0].detail, "sem dados", "a finished sweep that skipped it says so")
+
+    // No catalog yet: no rows, and nothing thrown.
+    assertEqual(apiStatusRows(vendors: [], report: report, reportRan: true).count, 0,
+                "an empty catalog draws an empty section")
+}
+
+func testVendorCatalogParsing() {
+    print("vendors --json parsing")
+    // The five providers the old hard-coded table never had are in the fixture
+    // deliberately: nothing here may filter a provider the binary reported.
+    let json = """
+    {"vendors":[
+      {"id":"anthropic","name":"Claude","short_name":"cld","kind":"oauth",
+       "enabled":true,"configured":false,"needs_credential":true,"env":"","login":"claude"},
+      {"id":"antigravity","name":"Antigravity","short_name":"agy","kind":"local",
+       "enabled":true,"configured":true,"needs_credential":false,"env":"","login":""},
+      {"id":"cursor","name":"Cursor","short_name":"cur","kind":"local",
+       "enabled":false,"configured":false,"needs_credential":true,"env":"","login":""},
+      {"id":"kiro","name":"Kiro","short_name":"kir","kind":"local",
+       "enabled":false,"configured":false,"needs_credential":true,"env":"",
+       "login":"kiro-cli login"},
+      {"id":"nous","name":"Nous Research","short_name":"nrs","kind":"oauth",
+       "enabled":false,"configured":false,"needs_credential":true,"env":"",
+       "login":"ai-usagebar auth nous login"},
+      {"id":"supergrok","name":"SuperGrok","short_name":"sgk","kind":"local",
+       "enabled":false,"configured":false,"needs_credential":true,"env":"","login":""}
+    ]}
+    """
+    let catalog = parseVendorCatalog(Data(json.utf8))
+    assertEqual(catalog.count, 6, "every reported provider survives parsing")
+    assertEqual(catalog[0].id, "anthropic", "the binary decides the order")
+    assertEqual(catalog[0].login, "claude", "and what fixes it")
+    assertEqual(catalog[1].needsCredential, false, "Antigravity has nothing to configure")
+    assertEqual(catalog[4].login, "ai-usagebar auth nous login", "Nous names its own flow")
+
+    // An older binary that omits the flag must not make this side start
+    // claiming providers need nothing.
+    let terse = parseVendorCatalog(Data(#"{"vendors":[{"id":"zai"}]}"#.utf8))
+    assertEqual(terse.count, 1, "an id is the only required field")
+    assertEqual(terse[0].needsCredential, true, "absent means it has a credential")
+    assertEqual(terse[0].name, "zai", "a nameless row falls back to its id")
+    assertEqual(terse[0].enabled, false, "and is not assumed on")
+
+    // Garbage never throws — the section degrades, it does not take the menu down.
+    assertEqual(parseVendorCatalog(Data("not json".utf8)).count, 0, "garbage yields no rows")
+    assertEqual(parseVendorCatalog(Data()).count, 0, "empty output yields no rows")
+    assertEqual(parseVendorCatalog(Data(#"{"vendors":"nope"}"#.utf8)).count, 0,
+                "a non-list yields no rows")
+    assertEqual(parseVendorCatalog(Data(#"{"vendors":[{"no_id":1}]}"#.utf8)).count, 0,
+                "a row with no id is skipped")
 }
 
 func testUsageReportParsing() {
@@ -912,6 +969,7 @@ struct TestRunner {
         testSystemIntegrations()
         testShviaWindows()
         testApiStatus()
+        testVendorCatalogParsing()
         testUsageReportParsing()
         if failures > 0 {
             print("\n\(failures) test(s) FAILED")

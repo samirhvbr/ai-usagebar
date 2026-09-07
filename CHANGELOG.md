@@ -55,7 +55,27 @@ Each release is also published at
   tested under Node in `gnome-extension/api-status-logic.test.mjs`. ShvIA also
   joins the extension's vendor picker and its Vendors preferences tab.
 
+### Fixed
+
+- **"Status das APIs" was missing five providers.** Both frontends kept their
+  own provider table, and both had drifted from Rust: the GNOME extension
+  listed sixteen of the twenty-one providers — Antigravity, Cursor, Kiro, Nous
+  Research and SuperGrok could never appear — and the macOS menu bar's own
+  table carried fourteen. In a section whose entire purpose is to be complete,
+  a silently absent provider is the one failure it cannot afford. Both now read
+  `vendors --json`, so the list is the binary's canonical vendor order and a
+  provider added in Rust appears with no frontend change.
+
 ### Changed
+
+- Both desktop frontends stopped re-deriving credentials. The GNOME extension
+  no longer carries a provider table, a copy of `Config::default`'s
+  enabled-by-default set, or a hand-written TOML reader for
+  `api_key`/`api_key_env`; the macOS menu bar no longer re-implements Claude's,
+  Codex's, Cursor's and Antigravity's credential locations in Swift, including a
+  hard-coded Cursor default path that Rust already resolves. The macOS
+  Preferences pane reads the same catalog as the section, so the two cannot
+  disagree about a provider on the same screen.
 
 - `KEY_VENDORS` no longer stores each provider's environment variable name: it
   comes from `VendorId::api_key_env`, and `Config::api_key_env_for` /

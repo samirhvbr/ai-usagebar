@@ -1130,30 +1130,101 @@ func reportHeadline(_ entry: UsageReportEntry) -> String {
     return entry.texts.first?.value ?? ""
 }
 
-/// What a vendor still needs before it can report anything.
-func missingCredentialHint(_ v: VendorAuth) -> String {
+/// One provider as `ai-usagebar vendors --json` describes it: what it is, how
+/// it authenticates, and whether it is switched on and credentialed. The
+/// binary owns all of that — this side had re-derived Claude's, Codex's,
+/// Cursor's and Antigravity's credential locations in Swift, and a provider
+/// added in Rust stayed invisible here until someone remembered to copy it.
+struct VendorCatalogRow: Equatable {
+    let id: String
+    let name: String
+    let kind: String
+    let enabled: Bool
+    let configured: Bool
+    /// False only for a provider with no credential at all (Antigravity), so a
+    /// frontend never offers to fix one that cannot be missing.
+    let needsCredential: Bool
+    let env: String
+    let login: String
+}
+
+/// Parse the catalog. Anything unreadable is an empty list, never a throw:
+/// with no catalog the section draws nothing rather than taking the menu down.
+func parseVendorCatalog(_ data: Data) -> [VendorCatalogRow] {
+    guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let vendors = root["vendors"] as? [[String: Any]]
+    else { return [] }
+    return vendors.compactMap { v -> VendorCatalogRow? in
+        guard let id = v["id"] as? String, !id.isEmpty else { return nil }
+        let name = v["name"] as? String
+        return VendorCatalogRow(
+            id: id,
+            name: (name?.isEmpty == false ? name! : id),
+            kind: v["kind"] as? String ?? "",
+            enabled: v["enabled"] as? Bool ?? false,
+            configured: v["configured"] as? Bool ?? false,
+            // Absent means "has a credential": an older binary must not make
+            // this side start claiming providers need nothing.
+            needsCredential: v["needs_credential"] as? Bool ?? true,
+            env: v["env"] as? String ?? "",
+            login: v["login"] as? String ?? "")
+    }
+}
+
+/// Run `ai-usagebar` and return whatever it wrote to stdout, bounded by
+/// `REFRESH_TIMEOUT`. The exit status is deliberately ignored: `usage` exits
+/// non-zero when every entry failed and still prints them, which is exactly
+/// what the section exists to show. Must be called off the main queue.
+func captureBinary(_ bin: String, _ arguments: [String]) -> Data {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: bin)
+    p.arguments = arguments
+    let pipe = Pipe()
+    p.standardOutput = pipe
+    p.standardError = FileHandle.nullDevice
+    let watchdog = DispatchWorkItem { if p.isRunning { p.terminate() } }
+    DispatchQueue.global(qos: .utility)
+        .asyncAfter(deadline: .now() + REFRESH_TIMEOUT, execute: watchdog)
+    var data = Data()
+    do {
+        try p.run()
+        data = pipe.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+    } catch { data = Data() }
+    watchdog.cancel()
+    return data
+}
+
+/// What a vendor still needs before it can report anything. The command and the
+/// variable both come from the catalog, so this says what the binary's own
+/// credential errors say.
+func missingCredentialHint(_ v: VendorCatalogRow) -> String {
+    if !v.needsCredential { return "" }
     if !v.login.isEmpty { return "sem login — rode `\(v.login)`" }
     if !v.env.isEmpty { return "sem chave (\(v.env))" }
+    if v.kind == "local" { return "não logado no app" }
     return "não configurado"
 }
 
-/// Build the section's rows. Pure: every piece of ambient state — what is
-/// enabled, what is configured, what the report said — is passed in, so the
-/// decision table is testable and the IO stays in the delegate.
+/// Build the section's rows. Pure: the catalog carries what is enabled and what
+/// is configured, the report carries the figures, so the decision table is
+/// testable and every piece of IO stays in the delegate.
+///
+/// The rows come out in the catalog's own order, which is the binary's
+/// canonical vendor order — so a provider added in Rust appears here with no
+/// change to this file.
 ///
 /// `reportRan` distinguishes "the sweep found nothing for this vendor" from
 /// "no sweep has finished yet", which are different things to tell someone.
-func apiStatusRows(vendors: [VendorAuth],
-                   enabled: (VendorAuth) -> Bool,
-                   configured: (VendorAuth) -> Bool,
+func apiStatusRows(vendors: [VendorCatalogRow],
                    report: [String: UsageReportEntry],
                    reportRan: Bool) -> [ApiStatusRow] {
     vendors.map { v in
         let row = { (state: ApiState, value: String, detail: String) in
             ApiStatusRow(id: v.id, name: v.name, state: state, value: value, detail: detail)
         }
-        guard enabled(v) else { return row(.off, "", "desativado") }
-        guard configured(v) else { return row(.warn, "", missingCredentialHint(v)) }
+        guard v.enabled else { return row(.off, "", "desativado") }
+        guard v.configured else { return row(.warn, "", missingCredentialHint(v)) }
         guard let entry = report[v.id] else {
             return reportRan ? row(.warn, "", "sem dados") : row(.warn, "", "…")
         }
@@ -1469,8 +1540,16 @@ struct VendorsSection: View {
         DispatchQueue.global(qos: .userInitiated).async {
             var conf: [String: Bool] = [:]
             var cli: [String: Bool] = [:]
+            // Ask the binary, so this pane and the "Status das APIs" section
+            // cannot disagree about the same provider on the same screen: the
+            // catalog honors `api_key_env` overrides and inline keys, which the
+            // local checks below read by hand. Those stay as the fallback for a
+            // machine with no binary on PATH yet.
+            let catalog = resolveBinary("ai-usagebar")
+                .map { parseVendorCatalog(captureBinary($0, ["vendors", "--json"])) } ?? []
+            for row in catalog { conf[row.id] = row.configured }
             for v in VENDOR_AUTH {
-                conf[v.id] = vendorConfigured(v)
+                if conf[v.id] == nil { conf[v.id] = vendorConfigured(v) }
                 // OAuth vendors need their CLI to log in; apikey vendors are
                 // configured via the TUI.
                 if v.kind == "oauth" { cli[v.id] = cliInstalled(v.cli) }
@@ -1872,6 +1951,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Last `usage --json` sweep, keyed by entry id. Empty until one finishes,
     /// which `apiReportRan` distinguishes from a sweep that found nothing.
     var lastApiReport: [String: UsageReportEntry] = [:]
+    /// Every provider the binary knows, from `vendors --json`. Empty until the
+    /// first sweep answers, and the section simply has no rows until then.
+    var lastVendorCatalog: [VendorCatalogRow] = []
     var apiReportRan = false
     var apiStatusFetchedAt = Date.distantPast
     var apiStatusInFlight = false
@@ -2251,9 +2333,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
         let rows = apiStatusRows(
-            vendors: VENDOR_AUTH,
-            enabled: vendorEnabled,
-            configured: vendorConfigured,
+            vendors: lastVendorCatalog,
             report: lastApiReport,
             reportRan: apiReportRan)
         for (i, row) in rows.enumerated() where i < apiStatusRowItems.count {
@@ -2292,35 +2372,26 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return out
     }
 
-    /// Fetch every configured vendor's usage in one sweep. Cache-first in the
+    /// Fetch the catalog and then the figures. Both are cache-first in the
     /// binary, so a repeat inside the TTL costs no network.
     func refreshApiStatus() {
         guard !apiStatusInFlight, let bin = resolveBinary("ai-usagebar") else { return }
         apiStatusInFlight = true
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            let p = Process()
-            p.executableURL = URL(fileURLWithPath: bin)
-            p.arguments = ["usage", "--json"]
-            let pipe = Pipe()
-            p.standardOutput = pipe
-            p.standardError = FileHandle.nullDevice
-            let watchdog = DispatchWorkItem { if p.isRunning { p.terminate() } }
-            DispatchQueue.global(qos: .utility)
-                .asyncAfter(deadline: .now() + REFRESH_TIMEOUT, execute: watchdog)
-            var data = Data()
-            do {
-                try p.run()
-                data = pipe.fileHandleForReading.readDataToEndOfFile()
-                p.waitUntilExit()
-            } catch { data = Data() }
-            watchdog.cancel()
+            // The catalog answers which providers exist and which are usable;
+            // it reads config and the filesystem and never the network.
+            let catalog = parseVendorCatalog(captureBinary(bin, ["vendors", "--json"]))
             // `usage` exits non-zero when *every* entry failed, and still
             // prints them — that is exactly the case this section exists to
             // show, so the payload is parsed regardless of the exit status.
+            let data = captureBinary(bin, ["usage", "--json"])
             let entries = parseUsageReport(data)
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.apiStatusInFlight = false
+                // An unreadable catalog keeps the previous one: better a stale
+                // row list than an empty section.
+                if !catalog.isEmpty { self.lastVendorCatalog = catalog }
                 if !entries.isEmpty || !data.isEmpty {
                     self.lastApiReport = Dictionary(
                         entries.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })

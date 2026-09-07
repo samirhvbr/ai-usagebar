@@ -1,36 +1,63 @@
 import assert from 'node:assert/strict';
-import {API_VENDORS, apiStatusRows, configApiKeyEnv, configHasApiKey, configVendorEnabled,
-    missingCredentialHint, oneLine, parseUsageReport, reportHeadline, rowStatus,
-    tomlHeaderIs} from './api-status-logic.js';
+import {apiStatusRows, missingCredentialHint, oneLine, parseUsageReport,
+    parseVendorCatalog, reportHeadline, rowStatus} from './api-status-logic.js';
 
-// ─── TOML reading ────────────────────────────────────────────────────────
-assert.equal(tomlHeaderIs('[zai]', 'zai'), true);
-assert.equal(tomlHeaderIs('[zai] # a note', 'zai'), true);
-// The caller trims before asking, so a leading space is not this function's job.
-assert.equal(tomlHeaderIs('  [zai]', 'zai'), false);
-assert.equal(tomlHeaderIs('[zai]  ', 'zai'), true);
-assert.equal(tomlHeaderIs('[zai.accounts]', 'zai'), false);
-assert.equal(tomlHeaderIs('enabled = true', 'zai'), false);
+// ─── vendors --json ──────────────────────────────────────────────────────
+//
+// The catalog replaced a table that lived in this file. It listed sixteen of
+// the binary's twenty-one providers, so the five below could never appear in a
+// section whose whole purpose is to be complete. They are in the fixture for
+// that reason: nothing here may filter a provider the binary reported.
+const CATALOG = JSON.stringify({
+    vendors: [
+        {id: 'anthropic', name: 'Claude', short_name: 'cld', kind: 'oauth',
+         enabled: true, configured: false, needs_credential: true, env: '', login: 'claude'},
+        {id: 'shvia', name: 'ShvIA', short_name: 'shv', kind: 'apikey',
+         enabled: true, configured: true, needs_credential: true, env: 'SHVIA_API_KEY', login: ''},
+        {id: 'zai', name: 'Z.AI', short_name: 'zai', kind: 'apikey',
+         enabled: true, configured: true, needs_credential: true, env: 'ZAI_API_KEY', login: ''},
+        {id: 'openrouter', name: 'OpenRouter', short_name: 'opr', kind: 'apikey',
+         enabled: true, configured: true, needs_credential: true, env: 'OPENROUTER_API_KEY', login: ''},
+        {id: 'kimi', name: 'Kimi', short_name: 'kmi', kind: 'apikey',
+         enabled: true, configured: false, needs_credential: true, env: 'KIMI_API_KEY', login: 'kimi'},
+        {id: 'grok', name: 'Grok', short_name: 'grk', kind: 'apikey',
+         enabled: false, configured: false, needs_credential: true, env: 'XAI_MANAGEMENT_KEY', login: ''},
+        {id: 'antigravity', name: 'Antigravity', short_name: 'agy', kind: 'local',
+         enabled: true, configured: true, needs_credential: false, env: '', login: ''},
+        {id: 'cursor', name: 'Cursor', short_name: 'cur', kind: 'local',
+         enabled: false, configured: false, needs_credential: true, env: '', login: ''},
+        {id: 'kiro', name: 'Kiro', short_name: 'kir', kind: 'local',
+         enabled: false, configured: false, needs_credential: true, env: '', login: 'kiro-cli login'},
+        {id: 'nous', name: 'Nous Research', short_name: 'nrs', kind: 'oauth',
+         enabled: false, configured: false, needs_credential: true, env: '',
+         login: 'ai-usagebar auth nous login'},
+        {id: 'supergrok', name: 'SuperGrok', short_name: 'sgk', kind: 'local',
+         enabled: false, configured: false, needs_credential: true, env: '', login: ''},
+    ],
+});
 
-// The four core vendors are on unless the config turns them off; everything
-// key-authenticated is opt-in — the same table as Config::default.
-assert.equal(configVendorEnabled('', 'anthropic'), true);
-assert.equal(configVendorEnabled('', 'zai'), true);
-assert.equal(configVendorEnabled('', 'shvia'), false);
-assert.equal(configVendorEnabled('', 'grok'), false);
-assert.equal(configVendorEnabled('[shvia]\nenabled = true\n', 'shvia'), true);
-assert.equal(configVendorEnabled('[anthropic]\nenabled = false\n', 'anthropic'), false);
-// A key that merely starts with "enabled" is not `enabled`.
-assert.equal(configVendorEnabled('[anthropic]\nenabled_extra = false\n', 'anthropic'), true);
-// Only the vendor's own section counts.
-assert.equal(configVendorEnabled('[zai]\nenabled = false\n[shvia]\nenabled = true\n', 'shvia'), true);
+const catalog = parseVendorCatalog(CATALOG);
+assert.equal(catalog.length, 11);
+assert.equal(catalog[0].id, 'anthropic', 'the binary decides the order');
+assert.equal(catalog[0].login, 'claude');
+assert.equal(catalog[1].env, 'SHVIA_API_KEY');
+assert.equal(catalog.find(v => v.id === 'antigravity').needsCredential, false);
+// The five the old hard-coded table never had.
+for (const id of ['antigravity', 'cursor', 'kiro', 'nous', 'supergrok'])
+    assert.ok(catalog.some(v => v.id === id), `${id} must survive parsing`);
 
-assert.equal(configHasApiKey('[shvia]\napi_key = "shvia_x"\n', 'shvia'), true);
-assert.equal(configHasApiKey('[shvia]\napi_key = ""\n', 'shvia'), false);
-assert.equal(configHasApiKey('[shvia]\n# api_key = "shvia_x"\n', 'shvia'), false);
-assert.equal(configHasApiKey('[zai]\napi_key = "z"\n', 'shvia'), false);
-assert.equal(configApiKeyEnv('[shvia]\napi_key_env = "MY_KEY"\n', 'shvia'), 'MY_KEY');
-assert.equal(configApiKeyEnv('[shvia]\n', 'shvia'), null);
+// Absent `needs_credential` means "has one" — an older binary must not make a
+// frontend start claiming providers need nothing.
+assert.equal(parseVendorCatalog('{"vendors":[{"id":"zai"}]}')[0].needsCredential, true);
+assert.equal(parseVendorCatalog('{"vendors":[{"id":"zai"}]}')[0].name, 'zai',
+    'a nameless row falls back to its id rather than rendering blank');
+assert.equal(parseVendorCatalog('{"vendors":[{"id":"zai"}]}')[0].enabled, false);
+
+// Garbage never throws — the section degrades, it does not take the menu down.
+assert.deepEqual(parseVendorCatalog('not json'), []);
+assert.deepEqual(parseVendorCatalog(''), []);
+assert.deepEqual(parseVendorCatalog('{"vendors":"nope"}'), []);
+assert.deepEqual(parseVendorCatalog('{"vendors":[{"no_id":1},null,7]}'), []);
 
 // ─── usage --json ────────────────────────────────────────────────────────
 const REPORT = JSON.stringify({
@@ -72,7 +99,7 @@ assert.equal(report.openrouter.stale, true);
 // Account ids keep the report's own `<vendor>@<label>` shape.
 assert.ok(Object.prototype.hasOwnProperty.call(report, 'anthropic@work'));
 
-const shvia = API_VENDORS.find(v => v.id === 'shvia');
+const shvia = catalog.find(v => v.id === 'shvia');
 
 // A vendor with no gauge at all still has a headline: ShvIA's windows are
 // uncapped on some plans, so they report a used count and no ratio.
@@ -91,7 +118,7 @@ const uncapped = parseUsageReport(JSON.stringify({
 }));
 assert.equal(uncapped.shvia.texts.length, 2, 'unlabelled continuation rows are not headlines');
 assert.equal(reportHeadline(uncapped.shvia), '0 used · unlimited');
-assert.equal(rowStatus(shvia, {enabled: true, configured: true, entry: uncapped.shvia, reportRan: true}).state, 'ok');
+assert.equal(rowStatus(shvia, {entry: uncapped.shvia, reportRan: true}).state, 'ok');
 
 // Garbage never throws — the section degrades, it does not take the menu down.
 assert.deepEqual(parseUsageReport('not json'), {});
@@ -103,44 +130,68 @@ assert.equal(oneLine('line one\nline two'), 'line one line two');
 assert.equal(oneLine('x'.repeat(60), 10), `${'x'.repeat(9)}…`);
 
 // ─── The row decision table ──────────────────────────────────────────────
-const anthropic = API_VENDORS.find(v => v.id === 'anthropic');
+//
+// `enabled` and `configured` now ride on the vendor row: the binary resolved
+// them, so this side only decides how to draw the answer.
+const off = catalog.find(v => v.id === 'grok');
+const anthropic = catalog.find(v => v.id === 'anthropic');
+const noKey = catalog.find(v => v.id === 'kimi');
+const agy = catalog.find(v => v.id === 'antigravity');
+const app = catalog.find(v => v.id === 'cursor');
 
-assert.deepEqual(rowStatus(shvia, {enabled: false, configured: true, reportRan: true}),
+assert.deepEqual(rowStatus(off, {reportRan: true}),
     {state: 'off', value: '', detail: 'desativado'});
-assert.deepEqual(rowStatus(shvia, {enabled: true, configured: false, reportRan: true}),
-    {state: 'warn', value: '', detail: 'sem API key — SHVIA_API_KEY'});
-assert.deepEqual(rowStatus(anthropic, {enabled: true, configured: false, reportRan: true}),
+assert.deepEqual(rowStatus(noKey, {reportRan: true}),
+    {state: 'warn', value: '', detail: 'não logado — kimi'});
+assert.deepEqual(rowStatus(anthropic, {reportRan: true}),
     {state: 'warn', value: '', detail: 'não logado — claude'});
+// A provider with no login command and no variable is signed in somewhere this
+// cannot name: its own app.
+assert.deepEqual(rowStatus({...app, enabled: true}, {reportRan: true}),
+    {state: 'warn', value: '', detail: 'não logado no app'});
 assert.deepEqual(
-    rowStatus(shvia, {enabled: true, configured: true, entry: report.shvia, reportRan: true}),
+    rowStatus(shvia, {entry: report.shvia, reportRan: true}),
     {state: 'ok', value: '63%', detail: ''});
 assert.deepEqual(
-    rowStatus(shvia, {enabled: true, configured: true, entry: report.zai, reportRan: true}),
+    rowStatus(shvia, {entry: report.zai, reportRan: true}),
     {state: 'error', value: '', detail: 'HTTP 401 Authentication failed'});
 // A stale entry still shows the last figure it had — that is the point of a cache.
-const stale = rowStatus(shvia, {enabled: true, configured: true, entry: report.openrouter, reportRan: true});
+const stale = rowStatus(shvia, {entry: report.openrouter, reportRan: true});
 assert.equal(stale.state, 'warn');
 assert.equal(stale.value, '$12.34');
 // Pending is not "sem dados": one says no sweep has run, the other that a
 // sweep ran and skipped this vendor.
-assert.equal(rowStatus(shvia, {enabled: true, configured: true, reportRan: false}).detail, '…');
-assert.equal(rowStatus(shvia, {enabled: true, configured: true, reportRan: true}).detail, 'sem dados');
+assert.equal(rowStatus(shvia, {reportRan: false}).detail, '…');
+assert.equal(rowStatus(shvia, {reportRan: true}).detail, 'sem dados');
 
-// Every vendor gets a row, on or off — that is what the section is for.
-const rows = apiStatusRows({
-    enabled: v => v.id !== 'anthropic',
-    configured: v => ['shvia', 'zai', 'openrouter'].includes(v.id),
-    report,
-    reportRan: true,
-});
-assert.equal(rows.length, API_VENDORS.length);
-assert.equal(rows.find(r => r.id === 'anthropic').state, 'off');
+// Antigravity has no credential at all, so it is never "missing" one: with the
+// section open and no sweep yet it is pending, not a warning about a key.
+assert.equal(missingCredentialHint(agy), '');
+assert.equal(rowStatus(agy, {reportRan: true}).detail, 'sem dados');
+
+// ─── The section ─────────────────────────────────────────────────────────
+//
+// Every provider the binary reported gets a row, on or off. This is the guard
+// the old table failed: the count comes from the catalog, so a provider added
+// in Rust appears here with no change to this file.
+const rows = apiStatusRows({vendors: catalog, report, reportRan: true});
+assert.equal(rows.length, catalog.length);
+assert.deepEqual(rows.map(r => r.id), catalog.map(v => v.id), 'the catalog order is kept');
+assert.equal(rows.find(r => r.id === 'grok').state, 'off');
 assert.equal(rows.find(r => r.id === 'shvia').value, '63%');
 assert.equal(rows.find(r => r.id === 'zai').state, 'error');
 assert.equal(rows.find(r => r.id === 'kimi').state, 'warn');   // enabled, no key
+assert.equal(rows.find(r => r.id === 'supergrok').state, 'off');
+assert.equal(rows.find(r => r.id === 'anthropic').detail, 'não logado — claude');
 
-// Every vendor in the table can say what it is missing.
-for (const v of API_VENDORS)
-    assert.ok(missingCredentialHint(v).length > 0, `${v.id} has no hint`);
+// No catalog yet: no rows, and nothing thrown.
+assert.deepEqual(apiStatusRows({vendors: [], report, reportRan: true}), []);
+assert.deepEqual(apiStatusRows({report, reportRan: false}), []);
+
+// Every provider that needs a credential can say what it is missing.
+for (const v of catalog) {
+    if (v.needsCredential)
+        assert.ok(missingCredentialHint(v).length > 0, `${v.id} has no hint`);
+}
 
 console.log('api-status-logic: all assertions passed');

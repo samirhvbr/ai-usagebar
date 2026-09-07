@@ -54,18 +54,27 @@ wrong, what to do about it:
 It is collapsed by default and toggled from its own header row, or from
 **Preferências… → Status das APIs**.
 
-The figures come from one `ai-usagebar usage --json` sweep — the binary already
-walks every configured vendor and account there, and reports each one's status,
-error and staleness. That sweep runs when the menu is opened with the section
-expanded; **Preferências…** can also put it on a background interval, which is
-off by default because it talks to every provider you have configured.
+Two binary calls feed it. `ai-usagebar vendors --json` is the catalog — which
+providers exist, how each authenticates, and whether each is enabled and
+credentialed — so the list is the binary's canonical vendor order and a provider
+added in Rust gets a row with no change here. `ai-usagebar usage --json` brings
+the figures: the binary already walks every configured vendor and account and
+reports each one's status, error and staleness. Only the second one talks to a
+provider; the catalog reads config and the filesystem.
 
-Antigravity has no credential file to check, so the Vendors pane treats it as
-**configured** once it finds any of Antigravity 2.0/IDE/`agy`'s state
-directories (`~/.gemini/{antigravity,antigravity-cli,antigravity-ide}`) — the
-binary itself discovers whichever local server is actually reachable
-(Antigravity 2.0, the IDE, or an interactive `agy` session) via `lsof` at fetch
-time, so one of those must be running for quota to load.
+Both run when the menu is opened with the section expanded; **Preferências…**
+can also put it on a background interval, which is off by default because the
+usage sweep talks to every provider you have configured.
+
+Antigravity has no credential of any kind, so the catalog reports it with
+`needs_credential: false` and neither surface draws it as missing one: there is
+no file, no key and no login to offer. The binary discovers whichever local
+server is actually reachable (Antigravity 2.0, the IDE, or an interactive `agy`
+session) via `lsof` at fetch time, so one of those must be *running* for quota
+to load — an idle install reports an error, not a missing credential. With no
+binary on `PATH` yet, the Vendors pane falls back to looking for any of the
+three products' state directories
+(`~/.gemini/{antigravity,antigravity-cli,antigravity-ide}`).
 
 ## Requirements
 

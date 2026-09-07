@@ -20,8 +20,8 @@ import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 import {barMarkup, colorForPct, disambiguateTags, field, FIELD, FORMAT, hasUsageWindows, integer,
     isGrouped, markerElapsed, plainTextFromPango, selectPools,
     splitFormatOutput} from './marker-logic.js';
-import {API_VENDORS, apiStatusRows, configApiKeyEnv, configHasApiKey,
-    configVendorEnabled, parseUsageReport} from './api-status-logic.js';
+import {apiStatusRows, parseUsageReport,
+    parseVendorCatalog} from './api-status-logic.js';
 
 const ROLE = 'ai-usagebar';
 
@@ -78,6 +78,9 @@ class AiUsageBarIndicator extends PanelMenu.Button {
         this._apiBusy = false;
         this._apiFetchedAt = 0;
         this._apiRows = [];
+        // Every provider the binary knows, from `vendors --json`. Empty until
+        // the first sweep answers; the section simply has no rows until then.
+        this._apiCatalog = [];
         this._apiCancellable = null;
         this._apiProc = null;
 
@@ -540,64 +543,48 @@ class AiUsageBarIndicator extends PanelMenu.Button {
         this.menu.addMenuItem(header);
         this._apiHeader = header;
 
-        // One slot per known vendor; the list is per vendor, not per account,
-        // so it never grows.
-        this._apiRows = API_VENDORS.map(() => {
-            const item = new PopupMenu.PopupBaseMenuItem({reactive: false, can_focus: false});
-            const vbox = new St.BoxLayout({
-                orientation: Clutter.Orientation.VERTICAL,
-                x_expand: true,
-                style_class: 'aiub-api-row',
-            });
-            const head = new St.BoxLayout({x_expand: true});
-            const dotL = new St.Label({style_class: 'aiub-api-dot'});
-            const nameL = new St.Label({x_expand: true, style_class: 'aiub-row-name'});
-            const valL = new St.Label({style_class: 'aiub-row-val'});
-            head.add_child(dotL);
-            head.add_child(nameL);
-            head.add_child(valL);
-            const detailL = new St.Label({style_class: 'aiub-api-detail'});
-            vbox.add_child(head);
-            vbox.add_child(detailL);
-            item.add_child(vbox);
-            item.visible = false;
-            this.menu.addMenuItem(item);
-            return {item, dotL, nameL, valL, detailL};
-        });
+        // Rows are built on demand: how many there are is the catalog's answer,
+        // and it arrives after the menu does.
+        this._apiRows = [];
         this._renderApiStatus();
     }
 
-    // Which vendors are on and which have a credential. The report cannot say:
-    // it only lists what the binary actually fetched.
-    _apiLocalState() {
-        // Same resolution prefs.js uses: the platform config dir honors
-        // $XDG_CONFIG_HOME, and hard-coding ~/.config reported "no key" for
-        // keys that were in fact configured. The legacy path stays as the
-        // fallback, which the binary also accepts.
-        const xdg = `${GLib.get_user_config_dir()}/ai-usagebar/config.toml`;
-        const path = GLib.file_test(xdg, GLib.FileTest.EXISTS)
-            ? xdg
-            : `${GLib.get_home_dir()}/.config/ai-usagebar/config.toml`;
-        let text = '';
-        try {
-            const [ok, bytes] = GLib.file_get_contents(path);
-            if (ok)
-                text = new TextDecoder().decode(bytes);
-        } catch (e) {
-            // No config yet: every default applies, which is a valid answer.
+    // One row's widgets. The list is per provider, not per account, so the
+    // pool only ever grows to the catalog's length.
+    _makeApiRow() {
+        const item = new PopupMenu.PopupBaseMenuItem({reactive: false, can_focus: false});
+        const vbox = new St.BoxLayout({
+            orientation: Clutter.Orientation.VERTICAL,
+            x_expand: true,
+            style_class: 'aiub-api-row',
+        });
+        const head = new St.BoxLayout({x_expand: true});
+        const dotL = new St.Label({style_class: 'aiub-api-dot'});
+        const nameL = new St.Label({x_expand: true, style_class: 'aiub-row-name'});
+        const valL = new St.Label({style_class: 'aiub-row-val'});
+        head.add_child(dotL);
+        head.add_child(nameL);
+        head.add_child(valL);
+        const detailL = new St.Label({style_class: 'aiub-api-detail'});
+        vbox.add_child(head);
+        vbox.add_child(detailL);
+        item.add_child(vbox);
+        item.visible = false;
+        return {item, dotL, nameL, valL, detailL};
+    }
+
+    // Grow the pool to `count`, inserting each row directly under the section
+    // header. Position matters: the separator and the action items were added
+    // after the section, so an appended row would land below them.
+    _ensureApiRows(count) {
+        while (this._apiRows.length < count) {
+            const ui = this._makeApiRow();
+            const at = this.menu._getMenuItems().indexOf(this._apiHeader);
+            if (at < 0)
+                return;
+            this.menu.addMenuItem(ui.item, at + 1 + this._apiRows.length);
+            this._apiRows.push(ui);
         }
-        const home = GLib.get_home_dir();
-        return {
-            enabled: v => configVendorEnabled(text, v.id),
-            configured: v => {
-                if (v.creds && GLib.file_test(`${home}/${v.creds}`, GLib.FileTest.EXISTS))
-                    return true;
-                const envName = configApiKeyEnv(text, v.id) || v.env;
-                if (envName && (GLib.getenv(envName) ?? '') !== '')
-                    return true;
-                return configHasApiKey(text, v.id);
-            },
-        };
     }
 
     _renderApiStatus() {
@@ -617,13 +604,12 @@ class AiUsageBarIndicator extends PanelMenu.Button {
             error: colors.critical,
             off: DIM,
         };
-        const local = this._apiLocalState();
         const rows = apiStatusRows({
-            enabled: local.enabled,
-            configured: local.configured,
+            vendors: this._apiCatalog,
             report: this._apiReport,
             reportRan: this._apiReportRan,
         });
+        this._ensureApiRows(rows.length);
         rows.forEach((row, i) => {
             const ui = this._apiRows[i];
             if (!ui)
@@ -641,25 +627,54 @@ class AiUsageBarIndicator extends PanelMenu.Button {
             this._apiRows[i].item.visible = false;
     }
 
-    // One `ai-usagebar usage --json` sweep. Cache-first in the binary, so a
-    // repeat inside the TTL costs no network.
+    // Two calls, because they answer different questions and only one of them
+    // can be slow: `vendors --json` is the catalog (config plus the
+    // filesystem, no network), `usage --json` the figures. Both are
+    // cache-first in the binary, so a repeat inside the TTL costs no network.
     _refreshApiStatus() {
         if (this._apiBusy)
             return;
         this._apiBusy = true;
         const bin = resolveBinary(this._settings);
+        this._captureJson([bin, 'vendors', '--json'], out => {
+            const catalog = parseVendorCatalog(out || '');
+            // An unreadable catalog keeps the previous one: better a stale row
+            // list than an empty section.
+            if (catalog.length > 0)
+                this._apiCatalog = catalog;
+        }, () => {
+            this._renderApiStatus();
+            this._captureJson([bin, 'usage', '--json'], out => {
+                const report = parseUsageReport(out || '');
+                if (Object.keys(report).length > 0 || (out ?? '').trim() !== '') {
+                    this._apiReport = report;
+                    this._apiReportRan = true;
+                    this._apiFetchedAt = GLib.get_monotonic_time() / 1000000;
+                }
+            }, () => {
+                this._apiBusy = false;
+                this._renderApiStatus();
+            });
+        });
+    }
+
+    // One bounded `ai-usagebar` capture. `onText` receives stdout whatever the
+    // exit status — `usage` exits non-zero when EVERY entry failed and still
+    // prints them, which is exactly what this section exists to show. `done`
+    // always runs, so a failed call cannot leave the section busy for ever.
+    _captureJson(argv, onText, done) {
         const cancellable = new Gio.Cancellable();
         this._apiCancellable = cancellable;
         let proc;
         try {
             proc = new Gio.Subprocess({
-                argv: [bin, 'usage', '--json'],
+                argv,
                 flags: Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE,
             });
             proc.init(cancellable);
         } catch (e) {
-            this._apiBusy = false;
             this._apiCancellable = null;
+            done();
             return;
         }
         this._apiProc = proc;
@@ -671,7 +686,6 @@ class AiUsageBarIndicator extends PanelMenu.Button {
             return GLib.SOURCE_REMOVE;
         });
         proc.communicate_utf8_async(null, cancellable, (p, res) => {
-            this._apiBusy = false;
             GLib.source_remove(timeoutId);
             if (this._apiCancellable === cancellable)
                 this._apiCancellable = null;
@@ -679,19 +693,11 @@ class AiUsageBarIndicator extends PanelMenu.Button {
                 this._apiProc = null;
             try {
                 const [, out] = p.communicate_utf8_finish(res);
-                // `usage` exits non-zero when EVERY entry failed, and still
-                // prints them — which is exactly what this section exists to
-                // show, so the payload is read regardless of the exit status.
-                const report = parseUsageReport(out || '');
-                if (Object.keys(report).length > 0 || (out ?? '').trim() !== '') {
-                    this._apiReport = report;
-                    this._apiReportRan = true;
-                    this._apiFetchedAt = GLib.get_monotonic_time() / 1000000;
-                }
+                onText(out);
             } catch (e) {
-                // A cancelled or unreadable sweep leaves the previous rows up.
+                // A cancelled or unreadable call leaves the previous rows up.
             }
-            this._renderApiStatus();
+            done();
         });
     }
 
