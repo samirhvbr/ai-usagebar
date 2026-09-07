@@ -11,6 +11,17 @@ Each release is also published at
 
 ### Added
 
+- **`ai-usagebar vendors --json`** — the provider catalog: one row per
+  provider with how it authenticates (`oauth` / `apikey` / `local`), whether
+  config has it `enabled`, whether this machine holds the credential it needs
+  (`configured`), the environment variable it reads (honoring an `api_key_env`
+  override), and the `login` command that fixes it. It contacts nothing.
+  `usage --json` reports only *enabled* providers, so the switched-off and the
+  never-credentialed were exactly the rows a "is anything broken?" list could
+  not describe; this is the answer for them. `needs_credential` is `false` only
+  for Antigravity, which has no credential to be missing, so a frontend never
+  offers to fix one that cannot be.
+
 - **ShvIA** is supported as a vendor, selectable with `--vendor shvia` and
   enabled with `[shvia]` in config. It reads a self-hosted, OpenAI-compatible
   gateway's `{base_url}/api/v1/usage` and shows its three rolling windows —
@@ -43,6 +54,15 @@ Each release is also published at
   same `usage --json` sweep and the same decision table — which is pure and
   tested under Node in `gnome-extension/api-status-logic.test.mjs`. ShvIA also
   joins the extension's vendor picker and its Vendors preferences tab.
+
+### Changed
+
+- `KEY_VENDORS` no longer stores each provider's environment variable name: it
+  comes from `VendorId::api_key_env`, and `Config::api_key_env_for` /
+  `Config::inline_api_key` replaced two private helpers that matched on a
+  section *string* with a `_ =>` fallback arm — where a new key vendor nobody
+  added would silently read the wrong default and report as unconfigured for
+  ever. Both match on `VendorId`, so that case now fails to compile.
 
 ## [1.12.0] — 2026-09-06
 
