@@ -4,7 +4,7 @@
 the next update can tell, without reading 60 commits, what is ours and what is
 merely older.
 
-Base: **upstream v1.10.0**. `Cargo.toml` keeps upstream's version number, with
+Base: **upstream v1.12.0**. `Cargo.toml` keeps upstream's version number, with
 no fork suffix — the number answers "which upstream is this", which is the
 question that matters when merging the next one.
 
@@ -32,6 +32,15 @@ along:
 - The macOS menu bar app and the GNOME extension themselves, including the
   per-vendor Overview mode, which covers most of what the fork's original
   "Status das APIs" panel was built to show.
+
+Upstream's KDE plasmoid (v1.12.0) now draws one card per vendor off the same
+`usage --json` report, and its tab strip deliberately keeps a failing vendor
+visible — "hiding an errored vendor is what made it impossible to tell 'not
+configured' from 'configured and broken'". That is the same question this
+fork's section answers, so the section's remaining margin is narrower than it
+was: it is the vendors `usage --json` never reports at all, because they are
+switched off or have no credential yet. Pitch a PR on that, not on health
+display in general.
 
 ## Updating to a newer upstream
 
