@@ -10,6 +10,7 @@
 // Gate: pure-logic regression coverage for the review fixes.
 
 import Foundation
+import AppKit
 
 private var failures = 0
 
@@ -951,6 +952,53 @@ func testUsageReportParsing() {
                 String(repeating: "x", count: 9) + "…", "long text is truncated")
 }
 
+func testApiStatusMenuCapacity() {
+    let menu = NSMenu()
+    let header = NSMenuItem()
+    let footer = NSMenuItem()
+    menu.addItem(header)
+    menu.addItem(footer)
+    var items: [NSMenuItem] = []
+    ensureApiStatusRows(2, menu: menu, header: header, items: &items)
+    ensureApiStatusRows(40, menu: menu, header: header, items: &items)
+    assertEqual(items.count, 40, "account rows can exceed the vendor count")
+    assertEqual(menu.index(of: footer), 41, "new account slots stay inside the status section")
+    assertEqual(items.allSatisfy { !$0.isEnabled && $0.isHidden }, true, "new slots start hidden and noninteractive")
+    ensureApiStatusRows(1, menu: menu, header: header, items: &items)
+    assertEqual(items.count, 40, "smaller reports reuse existing slots")
+    ensureApiStatusRows(40, menu: menu, header: header, items: &items)
+    assertEqual(menu.numberOfItems, 42, "repeated refreshes do not duplicate slots")
+}
+
+func testApiStatusNamedAccounts() {
+    let json = #"{"entries":[{"id":"anthropic@work","display_name":"Claude · work","error":"HTTP 401"},{"id":"anthropic@personal","display_name":"Claude · personal","metrics":[{"label":"Weekly","percent":21,"value":"21%"}]},{"id":"openrouter@team","display_name":"OpenRouter · team","stale":true,"metrics":[{"label":"Balance","percent":0,"value":"$12"}]},{"id":"openai@work","display_name":"Codex · work","metrics":[{"label":"Weekly","percent":30,"value":"30%"}]},{"id":"anthropic-other@ignored"}]}"#
+    let report = Dictionary(uniqueKeysWithValues: parseUsageReport(Data(json.utf8)).map { ($0.id, $0) })
+    func vendor(_ id: String, enabled: Bool = true) -> VendorCatalogRow {
+        VendorCatalogRow(id: id, name: id, kind: "oauth", enabled: enabled, configured: false,
+                         needsCredential: true, env: "", login: "login")
+    }
+    let rows = apiStatusRows(vendors: [vendor("anthropic"), vendor("openrouter"), vendor("openai")],
+                             report: report, reportRan: true)
+    assertEqual(rows.map { $0.id }, ["anthropic@personal", "anthropic@work", "openrouter@team", "openai@work"],
+                "accounts expand in catalog order without a phantom default")
+    // Index-free checks make regressions fail cleanly rather than crash.
+    assertEqual(rows.first { $0.id == "anthropic@personal" }?.name, "Claude · personal", "account name is retained")
+    assertEqual(rows.first { $0.id == "anthropic@personal" }?.value, "21%", "account works without default credentials")
+    assertEqual(rows.first { $0.id == "anthropic@personal" }?.state, .ok, "healthy account stays healthy")
+    assertEqual(rows.first { $0.id == "anthropic@work" }?.state, .error, "failing account stays visible")
+    assertEqual(rows.first { $0.id == "openrouter@team" }?.state, .warn, "stale account warns")
+    assertEqual(rows.first { $0.id == "openrouter@team" }?.value, "$12", "stale account keeps balance")
+    let off = apiStatusRows(vendors: [vendor("anthropic", enabled: false)], report: report, reportRan: true)
+    assertEqual(off.map { $0.id }, ["anthropic"], "disabled vendor collapses stale account rows")
+    assertEqual(off.first?.state, .off, "disabled vendor stays off")
+    var withDefault = report
+    let entry = parseUsageReport(Data(#"{"entries":[{"id":"anthropic","error":"Default login expired"}]}"#.utf8))[0]
+    withDefault[entry.id] = entry
+    let combined = apiStatusRows(vendors: [vendor("anthropic")], report: withDefault, reportRan: true)
+    assertEqual(combined.map { $0.id }, ["anthropic", "anthropic@personal", "anthropic@work"], "default stays alongside named accounts when reported")
+    assertEqual(combined.first?.detail, "Default login expired", "report error takes precedence over missing default credential")
+}
+
 @main
 struct TestRunner {
     static func main() {
@@ -968,6 +1016,8 @@ struct TestRunner {
         testAccountStatus()
         testSystemIntegrations()
         testShviaWindows()
+        testApiStatusMenuCapacity()
+        testApiStatusNamedAccounts()
         testApiStatus()
         testVendorCatalogParsing()
         testUsageReportParsing()

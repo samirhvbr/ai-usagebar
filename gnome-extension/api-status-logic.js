@@ -1,4 +1,4 @@
-// Pure logic for the dropdown's "Status das APIs" section — a row per vendor
+// Pure logic for the dropdown's "Status das APIs" section — rows per vendor/account
 // with a health state, including the vendors that are switched off or have no
 // credential yet. The GNOME counterpart of the macOS menu bar panel of the
 // same name.
@@ -155,7 +155,7 @@ export function missingCredentialHint(vendor) {
 export function rowStatus(vendor, ctx) {
     if (!vendor.enabled)
         return {state: 'off', value: '', detail: 'desativado'};
-    if (!vendor.configured)
+    if (!ctx.entry && !vendor.configured)
         return {state: 'warn', value: '', detail: missingCredentialHint(vendor)};
     const entry = ctx.entry;
     if (!entry) {
@@ -172,12 +172,22 @@ export function rowStatus(vendor, ctx) {
 }
 
 // The whole section, in one call: the rows to draw, in the catalog's own order
-// — which is the binary's canonical vendor order, so a provider added in Rust
+// — grouped in the binary's canonical vendor order, so a provider added in Rust
 // appears here with no change to this file.
 export function apiStatusRows({vendors, report, reportRan}) {
-    return (vendors ?? []).map(v => ({
-        id: v.id,
-        name: v.name,
-        ...rowStatus(v, {entry: (report ?? {})[v.id], reportRan}),
-    }));
+    return (vendors ?? []).flatMap(v => {
+        // Report entries are authoritative for account health. The catalog's
+        // credential flag describes the default login, not each named account.
+        const entries = v.enabled ? Object.values(report ?? {})
+            .filter(e => e.id === v.id || e.id.startsWith(`${v.id}@`))
+            .sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0) : [];
+        if (entries.length === 0) {
+            return [{id: v.id, name: v.name, ...rowStatus(v, {reportRan})}];
+        }
+        return entries.map(entry => ({
+            id: entry.id,
+            name: entry.id === v.id ? v.name : entry.name,
+            ...rowStatus(v, {entry, reportRan}),
+        }));
+    });
 }

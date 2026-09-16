@@ -57,6 +57,11 @@ Each release is also published at
 
 ### Fixed
 
+- **Named accounts in Status das APIs.** macOS and GNOME now show each reported
+  account's usage and health instead of looking up only the default provider
+  id. Named accounts remain visible without default credentials; disabled
+  providers stay collapsed, and the macOS menu grows to fit all account rows.
+
 - **"Status das APIs" was missing five providers.** Both frontends kept their
   own provider table, and both had drifted from Rust: the GNOME extension
   listed sixteen of the twenty-one providers — Antigravity, Cursor, Kiro, Nous

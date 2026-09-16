@@ -145,6 +145,13 @@ segments, one per pool, at the same width as a single-pool vendor.
 
 ## Status das APIs
 
+Each reported named account gets its own row, grouped by provider and sorted
+by account id, with its own usage, error, or stale-cache warning. A default
+account appears only when the usage report includes it; missing default-login
+credentials do not hide named-account results. Disabled providers keep one
+“desativado” row, and providers with no reported entries keep their setup or
+“sem dados” hint.
+
 A collapsible section at the bottom of the dropdown listing **every** vendor
 the extension knows — including the ones switched off or missing a credential —
 with a health dot, its headline figure, and what to do when something is wrong:

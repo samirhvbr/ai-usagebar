@@ -1019,7 +1019,7 @@ func entryDisplayName(_ id: String) -> String {
 //
 // The dropdown shows one vendor at a time and the Overview shows every
 // *working* one; neither answers "is anything broken, and what do I have to
-// do about it". This section does: a row per vendor the selector knows —
+// do about it". This section does: rows per vendor/account the binary reports —
 // including the ones that are off or have no credential — with a health state
 // and its headline figure.
 //
@@ -1219,22 +1219,46 @@ func missingCredentialHint(_ v: VendorCatalogRow) -> String {
 func apiStatusRows(vendors: [VendorCatalogRow],
                    report: [String: UsageReportEntry],
                    reportRan: Bool) -> [ApiStatusRow] {
-    vendors.map { v in
-        let row = { (state: ApiState, value: String, detail: String) in
-            ApiStatusRow(id: v.id, name: v.name, state: state, value: value, detail: detail)
+    vendors.flatMap { v -> [ApiStatusRow] in
+        let fallback = { (state: ApiState, detail: String) in
+            [ApiStatusRow(id: v.id, name: v.name, state: state, value: "", detail: detail)]
         }
-        guard v.enabled else { return row(.off, "", "desativado") }
-        guard v.configured else { return row(.warn, "", missingCredentialHint(v)) }
-        guard let entry = report[v.id] else {
-            return reportRan ? row(.warn, "", "sem dados") : row(.warn, "", "…")
+        guard v.enabled else { return fallback(.off, "desativado") }
+        let entries = report.values.filter { $0.id == v.id || $0.id.hasPrefix(v.id + "@") }
+            .sorted { $0.id < $1.id }
+        // The catalog describes the default credential, not named-account
+        // credentials. A reported account's health takes precedence.
+        guard !entries.isEmpty else {
+            if !v.configured { return fallback(.warn, missingCredentialHint(v)) }
+            return fallback(.warn, reportRan ? "sem dados" : "…")
         }
-        if entry.failed {
-            return row(.error, "", entry.error.isEmpty ? "erro" : entry.error)
+        return entries.map { entry in
+            let row = { (state: ApiState, value: String, detail: String) in
+                ApiStatusRow(id: entry.id, name: entry.id == v.id ? v.name : entry.name,
+                             state: state, value: value, detail: detail)
+            }
+            if entry.failed {
+                return row(.error, "", entry.error.isEmpty ? "erro" : oneLine(entry.error, max: 52))
+            }
+            let value = reportHeadline(entry)
+            return entry.stale
+                ? row(.warn, value, "cache — a última atualização falhou")
+                : row(.ok, value, "")
         }
-        let value = reportHeadline(entry)
-        return entry.stale
-            ? row(.warn, value, "cache — a última atualização falhou")
-            : row(.ok, value, "")
+    }
+}
+
+/// Account expansion can exceed the initial vendor-sized menu pool.
+func ensureApiStatusRows(_ count: Int, menu: NSMenu, header: NSMenuItem,
+                         items: inout [NSMenuItem]) {
+    let start = menu.index(of: header)
+    guard start >= 0 else { return }
+    while items.count < count {
+        let item = NSMenuItem()
+        item.isEnabled = false
+        item.isHidden = true
+        menu.insertItem(item, at: start + 1 + items.count)
+        items.append(item)
     }
 }
 
@@ -2271,8 +2295,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         apiStatusHeaderItem.action = #selector(toggleApiStatus)
         apiStatusHeaderItem.target = self
         menu.addItem(apiStatusHeaderItem)
-        // One slot per known vendor. Unlike the Overview rows this list never
-        // grows: it is per vendor, not per account.
+        // Initial slots; account expansion grows this pool when rendering.
         for _ in VENDOR_AUTH {
             let it = NSMenuItem()
             it.isEnabled = false
@@ -2336,12 +2359,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             vendors: lastVendorCatalog,
             report: lastApiReport,
             reportRan: apiReportRan)
+        if let menu = apiStatusHeaderItem.menu {
+            ensureApiStatusRows(rows.count, menu: menu, header: apiStatusHeaderItem,
+                                items: &apiStatusRowItems)
+        }
         for (i, row) in rows.enumerated() where i < apiStatusRowItems.count {
             let item = apiStatusRowItems[i]
             item.isHidden = false
             item.attributedTitle = apiStatusRowTitle(row, appearance: appearance)
         }
-        for i in rows.count..<apiStatusRowItems.count { apiStatusRowItems[i].isHidden = true }
+        for item in apiStatusRowItems.dropFirst(rows.count) { item.isHidden = true }
     }
 
     /// `<glyph> <name padded> <value>` on the first line, the reason dimmed
