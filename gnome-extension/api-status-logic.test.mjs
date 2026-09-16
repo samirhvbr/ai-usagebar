@@ -176,13 +176,13 @@ assert.equal(rowStatus(agy, {reportRan: true}).detail, 'sem dados');
 // in Rust appears here with no change to this file.
 const rows = apiStatusRows({vendors: catalog, report, reportRan: true});
 assert.equal(rows.length, catalog.length);
-assert.deepEqual(rows.map(r => r.id), catalog.map(v => v.id), 'the catalog order is kept');
+assert.deepEqual(rows.map(r => r.id.split('@')[0]), catalog.map(v => v.id), 'the catalog order is kept');
 assert.equal(rows.find(r => r.id === 'grok').state, 'off');
 assert.equal(rows.find(r => r.id === 'shvia').value, '63%');
 assert.equal(rows.find(r => r.id === 'zai').state, 'error');
 assert.equal(rows.find(r => r.id === 'kimi').state, 'warn');   // enabled, no key
 assert.equal(rows.find(r => r.id === 'supergrok').state, 'off');
-assert.equal(rows.find(r => r.id === 'anthropic').detail, 'não logado — claude');
+assert.equal(rows.find(r => r.id === 'anthropic@work').state, 'ok');
 
 // No catalog yet: no rows, and nothing thrown.
 assert.deepEqual(apiStatusRows({vendors: [], report, reportRan: true}), []);
@@ -193,5 +193,34 @@ for (const v of catalog) {
     if (v.needsCredential)
         assert.ok(missingCredentialHint(v).length > 0, `${v.id} has no hint`);
 }
+
+// Named entries have independent credentials and health, even when the
+// default account has no credential. Desktop uses the same report id format.
+const accounts = parseUsageReport(JSON.stringify({entries: [
+    {id: 'anthropic@work', display_name: 'Claude · work', error: 'HTTP 401'},
+    {id: 'anthropic@personal', display_name: 'Claude · personal', metrics: [{label: 'Weekly', percent: 21, value: '21%'}]},
+    {id: 'openrouter@team', display_name: 'OpenRouter · team', stale: true, metrics: [{label: 'Balance', percent: 0, value: '$12'}]},
+    {id: 'openai@work', display_name: 'Codex · work', metrics: [{label: 'Weekly', percent: 30, value: '30%'}]},
+    {id: 'anthropic-other@ignored', display_name: 'Wrong vendor'},
+]}));
+const accountVendors = [anthropic,
+    {...anthropic, id: 'openrouter', name: 'OpenRouter'},
+    {...anthropic, id: 'openai', name: 'Codex'}];
+const accountRows = apiStatusRows({vendors: accountVendors, report: accounts, reportRan: true});
+assert.deepEqual(accountRows.map(r => r.id), ['anthropic@personal', 'anthropic@work', 'openrouter@team', 'openai@work']);
+assert.equal(accountRows[0].name, 'Claude · personal');
+assert.equal(accountRows[0].value, '21%');
+assert.equal(accountRows[0].state, 'ok');
+assert.equal(accountRows[1].state, 'error');
+assert.equal(accountRows[1].detail, 'HTTP 401');
+assert.equal(accountRows[2].state, 'warn');
+assert.equal(accountRows[2].value, '$12');
+assert.equal(accountRows[3].value, '30%');
+assert.deepEqual(apiStatusRows({vendors: [{...anthropic, enabled: false}], report: accounts, reportRan: true})
+    .map(r => [r.id, r.state]), [['anthropic', 'off']]);
+const withDefault = {...accounts, ...parseUsageReport(JSON.stringify({entries: [{id: 'anthropic', error: 'Default login expired'}]}))};
+assert.deepEqual(apiStatusRows({vendors: [anthropic], report: withDefault, reportRan: true}).map(r => r.id),
+    ['anthropic', 'anthropic@personal', 'anthropic@work']);
+assert.equal(apiStatusRows({vendors: [anthropic], report: withDefault, reportRan: true})[0].detail, 'Default login expired');
 
 console.log('api-status-logic: all assertions passed');
