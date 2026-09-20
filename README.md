@@ -346,8 +346,8 @@ rather than silently querying the wrong URL.
 
 `enabled = true` is what makes a vendor fetch. Anthropic API, GitHub Copilot,
 DeepSeek, Kimi, Kilo, Novita, Moonshot, Grok, SuperGrok, Grok Bot, Antigravity,
-Cursor, MiniMax, and Kiro CLI all default to **disabled** so that existing
-installs are unaffected until you opt in. Use either method:
+Cursor, MiniMax, Kiro CLI, and ShvIA all default to **disabled** so that
+existing installs are unaffected until you opt in. Use either method:
 
 - Use the gear or `s` in the Omarchy panel, or run
   `ai-usagebar-tui` and press `s`. Saving a non-empty API key sets that vendor's
@@ -874,6 +874,11 @@ Run `make smoke` to check live response shapes.
 
 For Ollama Cloud setup (Bearer key from ollama.com/settings/keys), see the
 [Ollama integration guide](docs/ollama-setup.md).
+
+ShvIA is a self-hosted, OpenAI-compatible gateway: set `SHVIA_API_KEY` (or an
+inline `[shvia] api_key`) and, unless you are on the default deployment, point
+`[shvia] base_url` at your own. See
+[configuration](docs/configuration.md#shvia-self-hosted-gateway).
 
 ## Format placeholders
 

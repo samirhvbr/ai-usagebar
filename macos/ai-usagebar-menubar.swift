@@ -87,8 +87,12 @@ let POINT_CRITICAL_MIN = 10
 // populated — and the `aapi_*` fields (23-26) carry the Anthropic API headline
 // plus its spend-vs-limit bar. `cursor_total_pct` (27) is followed by the
 // Antigravity-only fourth-window fields (28-30) and the Z.AI MCP-tools pool
-// (31-33), which fills that same fourth-window slot. A final literal sentinel
-// absorbs the widget's stale suffix, preserving these fields.
+// (31-33), which fills that same fourth-window slot. ShvIA's today/month
+// windows (50-55) plus its week headline (56) close the list: it has three
+// rolling windows and no 5h/weekly pair, and the headline strings — not the
+// percentages — say whether a window exists and whether it has a ceiling. A
+// final literal sentinel absorbs the widget's stale suffix, preserving these
+// fields.
 let FORMAT = "{plan};;{session_pct};;{session_reset};;{weekly_pct};;{weekly_reset};;" +
              "{sonnet_pct};;{sonnet_reset};;{extra_pct};;{extra_spent};;{extra_limit};;" +
              "{scoped_model};;{scoped_pct};;{scoped_reset};;" +
@@ -102,7 +106,9 @@ let FORMAT = "{plan};;{session_pct};;{session_reset};;{weekly_pct};;{weekly_rese
              "{copilot_completions_pct};;{copilot_reset};;" +
              "{sgk_period};;{minimax_video_pct};;{minimax_video_reset};;" +
              "{minimax_video_elapsed};;{minimax_video_weekly_pct};;{minimax_video_weekly_reset};;{minimax_video_weekly_elapsed};;" +
-             "{copilot_chat_limit};;{copilot_completions_limit};;{copilot_premium_limit}"
+             "{copilot_chat_limit};;{copilot_completions_limit};;{copilot_premium_limit};;" +
+             "{shvia_today};;{shvia_today_reset};;{shvia_today_elapsed};;" +
+             "{shvia_month};;{shvia_month_reset};;{shvia_month_elapsed};;{shvia_week}"
 
 let FORMAT_WITH_SENTINEL = FORMAT + ";;__aiub_end__"
 
@@ -608,6 +614,21 @@ func parse(_ text: String, vendor: String) -> Snapshot? {
     // aliases (session = Cursor Models, weekly = Other Models — both real, not
     // time windows), so relabel those bars rather than call them "Session"/
     // "Weekly". Every other vendor keeps the default time-window labels.
+    // ShvIA reports a headline string per window rather than a bare percentage:
+    // "42%" for a capped window, a raw used count ("12.3k") for one with no
+    // ceiling, and "—" for a window the gateway did not report. Only the capped
+    // case is a bar — the other two would paint a 0% row that means the
+    // opposite of what they say.
+    func shviaWindow(_ headlineIndex: Int, _ resetIndex: Int, _ elapsedIndex: Int) -> Window? {
+        let headline = t(headlineIndex)
+        guard headline.hasSuffix("%"), let pct = Int(headline.dropLast()),
+              (0...100).contains(pct) else { return nil }
+        let reset = t(resetIndex)
+        return Window(
+            pct: pct,
+            reset: reset,
+            elapsed: markerElapsed(reset: reset, elapsed: n(elapsedIndex)))
+    }
     let isCursor = vendor == "cursor"
     var sessionWindow = quotaWindow(1, 2, 13)
     let weeklyWindow: Window?
@@ -675,6 +696,16 @@ func parse(_ text: String, vendor: String) -> Snapshot? {
         weeklyTag = "7d"
         sessionLabel = "Gemini 5h"
         weeklyLabel = "Gemini Weekly"
+    case "shvia":
+        // Three rolling windows, no 5h/weekly pair: today rides the session
+        // slot, week the weekly one, and the month takes the fourth-window
+        // slot below when it has a ceiling to draw.
+        sessionWindow = shviaWindow(50, 51, 52)
+        weeklyWindow = shviaWindow(56, 4, 14)
+        sessionTag = "24h"
+        weeklyTag = "7d"
+        sessionLabel = "Today"
+        weeklyLabel = "Week"
     default:
         weeklyWindow = quotaWindow(3, 4, 14)
         sessionTag = "5h"
@@ -696,6 +727,11 @@ func parse(_ text: String, vendor: String) -> Snapshot? {
         // must not grow a phantom 0% row.
         secondaryWeekly = mcp
         secondaryWeeklyLabel = "MCP tools (monthly)"
+    } else if vendor == "shvia", let month = shviaWindow(53, 54, 55) {
+        // ShvIA's month window rides the same fourth-window slot, when it has a
+        // ceiling to draw.
+        secondaryWeekly = month
+        secondaryWeeklyLabel = "Month (30d)"
     } else if vendor == "minimax", isReported(t(45)), let vw = quotaWindow(44, 45, 46) {
         secondaryWeekly = vw
         secondaryWeeklyLabel = "Video Weekly"

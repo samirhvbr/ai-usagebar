@@ -499,6 +499,50 @@ func testParserBalances() {
     assertNil(kiro?.weekly, "kiro suppresses duplicate weekly window")
 }
 
+// ─── ShvIA: three rolling windows, not a 5h/weekly pair ──────────────────
+//
+// The headline strings — not the percentages — decide what is a bar: an
+// uncapped window reports a used count ("12.3k") and an absent one "—", and
+// both would otherwise paint a 0% row that reads as "nothing used".
+func testShviaWindows() {
+    print("ShvIA windows")
+    func fields(_ set: [Int: String]) -> [String] {
+        (0...56).map { set[$0] ?? "" }
+    }
+    // today 42%, week 50%, month uncapped.
+    let s = snapshot(FORMAT, vendor: "shvia", fields: fields([
+        0: "ShvIA",
+        3: "50", 4: "3d",              // {weekly_pct} / {weekly_reset} alias the week
+        50: "42%", 51: "8h",           // shvia_today headline + reset
+        53: "12.3k", 54: "9d",         // shvia_month: uncapped
+        56: "50%",                     // shvia_week headline
+    ]))
+    assertEqual(s?.session?.pct, 42, "today window takes the session slot")
+    assertEqual(s?.sessionLabel, "Today", "session slot is relabelled")
+    assertEqual(s?.sessionTag, "24h", "today is a 24h window, not 5h")
+    assertEqual(s?.weekly?.pct, 50, "week window from the aliased fields")
+    assertEqual(s?.weeklyLabel, "Week", "weekly slot is relabelled")
+    assertNil(s?.secondaryWeekly, "an uncapped month draws no bar")
+    assertEqual(s?.hasUsageWindows, true, "ShvIA is a quota vendor, not balance-only")
+
+    // A capped month fills the fourth-window slot.
+    let capped = snapshot(FORMAT, vendor: "shvia", fields: fields([
+        0: "ShvIA", 3: "50", 4: "3d", 50: "42%", 51: "8h",
+        53: "77%", 54: "9d", 56: "50%",
+    ]))
+    assertEqual(capped?.secondaryWeekly?.pct, 77, "capped month takes the fourth slot")
+    assertEqual(capped?.secondaryWeeklyLabel, "Month (30d)", "fourth slot is labelled")
+
+    // A gateway reporting only the week: the other slots stay empty rather
+    // than showing 0%.
+    let weekOnly = snapshot(FORMAT, vendor: "shvia", fields: fields([
+        0: "ShvIA", 3: "10", 4: "2d", 50: "—", 53: "—", 56: "10%",
+    ]))
+    assertEqual(weekOnly?.weekly?.pct, 10, "week is present")
+    assertNil(weekOnly?.session, "an unreported today draws no bar")
+    assertNil(weekOnly?.secondaryWeekly, "an unreported month draws no bar")
+}
+
 // ─── Run ─────────────────────────────────────────────────────────────────
 func testOverviewHeadline() {
     print("overview headline (cursor combined, rate-limit worst window)")
@@ -1106,6 +1150,7 @@ struct TestRunner {
         testRingArc()
         testTomlParsing()
         testParserBalances()
+        testShviaWindows()
         testOverviewHeadline()
         testVendorCycle()
         testClaudeAccounts()

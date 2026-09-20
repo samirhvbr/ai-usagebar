@@ -882,6 +882,30 @@ async fn build_outcome(client: &Client, config: &Config, tab: &TabId) -> Result<
             .await?;
             Ok(outcome.into())
         }
+        VendorId::Shvia => {
+            let api_key = crate::config::resolve_api_key(
+                "ShvIA",
+                &config.shvia.api_key_env,
+                config.shvia.api_key.as_deref(),
+            )?;
+            let cache = crate::cache::Cache::for_vendor("shvia")?;
+            let endpoints = match config.shvia.base_url.as_deref() {
+                Some(url) if !url.trim().is_empty() => {
+                    crate::shvia::fetch::Endpoints::from_base_url(url.trim())
+                }
+                _ => crate::shvia::fetch::Endpoints::default(),
+            };
+            let outcome = crate::shvia::fetch_snapshot(
+                client,
+                &api_key,
+                &cache,
+                &endpoints,
+                DEFAULT_TTL,
+                config.shvia.plan.as_deref(),
+            )
+            .await?;
+            Ok(outcome.into())
+        }
     }
 }
 

@@ -148,6 +148,14 @@ pub const KEY_VENDORS: &[KeyVendor] = &[
         secret_label: "API key",
         note: "ollama.com/settings/keys",
     },
+    KeyVendor {
+        id: VendorId::Shvia,
+        label: "ShvIA",
+        section: VendorId::Shvia.config_section(),
+        config_key: "api_key",
+        secret_label: "API key",
+        note: "self-hosted gateway",
+    },
 ];
 
 /// Which control has keyboard focus. `Key(i)` indexes into [`KEY_VENDORS`].

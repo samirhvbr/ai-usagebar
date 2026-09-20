@@ -26,6 +26,11 @@ The selector dynamically discovers **all providers** that ship in the binary via
   (session, weekly, and monthly pools).
 - **Included-usage pools:** Cursor (Cursor Models and Other Models, both reset
   on the billing cycle).
+- **Rolling windows (today / week / month):** ShvIA, a self-hosted gateway.
+  Its windows have no 5h/weekly pair, so today takes the session slot, the week
+  the weekly one, and a capped month the fourth-window slot. An uncapped window
+  reports a used count with no bar — a 0% gauge would read as the opposite of
+  "no ceiling".
 - **Balance-only:** OpenRouter, DeepSeek, Kimi, Kilo, Novita, Moonshot, Grok
   (xAI), and Anthropic API. These have no 5h/weekly quota windows, so the app
   shows their balance/credits in the header (`cr <amount>`) and suppresses the
