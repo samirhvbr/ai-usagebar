@@ -153,6 +153,24 @@ pub fn clamp_pct(v: f64) -> u16 {
     }
 }
 
+/// Compact integer magnitude — `999` stays `999`, `12345` → `12.3k`,
+/// `2_400_000` → `2.4M`.
+///
+/// For counts, not money: [`money`] and [`usd`] own currency formatting. This
+/// is what a token count collapses to when it has to share a row with a label,
+/// which is every place an unlimited window reports what it consumed and has
+/// no percentage to show instead.
+pub fn compact_count(n: i64) -> String {
+    let abs = n.unsigned_abs();
+    if abs >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if abs >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
 pub fn local_time_hm(when: DateTime<Utc>) -> String {
     when.with_timezone(&Local).format("%H:%M").to_string()
 }
@@ -359,6 +377,14 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compact_count_scales_by_magnitude() {
+        assert_eq!(compact_count(999), "999");
+        assert_eq!(compact_count(12_345), "12.3k");
+        assert_eq!(compact_count(2_400_000), "2.4M");
+        assert_eq!(compact_count(-12_345), "-12.3k");
+    }
 
     fn pm(pairs: &[(&'static str, &str)]) -> HashMap<&'static str, String> {
         placeholders(pairs.iter().map(|(k, v)| (*k, v.to_string())))

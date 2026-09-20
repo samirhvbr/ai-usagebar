@@ -25,6 +25,7 @@ ai-usagebar-tui --config ./config.test.toml
 #                         # | moonshot | grok | supergrok | grokbot | antigravity | cursor
 #                         # | minimax | kiro | nous | opencode-go | commandcode
 #                         # | orcarouter | modelstudio | lyceum | devin
+#                         # | shvia
 
 [context]
 enabled = false           # opt in, then press c in ai-usagebar-tui
@@ -429,6 +430,31 @@ one the Codex CLI, desktop app and IDE extension use. See "Switch Codex" in
 [claude-accounts.md](claude-accounts.md). Once every login is named, set
 `[openai] show_default_account = false` so the active account is not listed a
 second time as the unnamed default.
+
+### ShvIA (self-hosted gateway)
+
+ShvIA is the one vendor whose endpoint is not a product: it is a self-hosted,
+OpenAI-compatible gateway, so the deployment's address is configuration rather
+than a constant.
+
+```toml
+[shvia]
+enabled = false
+api_key_env = "SHVIA_API_KEY"   # checked first; if set + non-empty, used
+# api_key = "shvia_..."         # used if SHVIA_API_KEY is unset; chmod 600 the file!
+# base_url = "https://gateway.example.com"  # no trailing path
+# plan = "ShvIA Gateway"        # display-only label in the tooltip header
+```
+
+The key is sent as `Authorization: Bearer <key>` — with the prefix, unlike
+Z.AI's. `base_url` names the gateway only; `/api/v1/usage` is appended, and a
+trailing slash is tolerated. Omit it to use the default deployment compiled
+into `shvia::fetch::DEFAULT_BASE_URL`.
+
+The endpoint answers with three rolling windows — `today`, `week` and `month` —
+each carrying `used`, `limit`, `remaining` and `reset_at`. A `limit` of `-1`
+means the window is uncapped: it renders the used count instead of a bar, and
+contributes no percentage to the vendor's severity.
 
 ### Explicitly enable a provider
 

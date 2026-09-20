@@ -335,6 +335,8 @@ mod tests {
             VendorId::Openrouter => MacosMirror::Slot("or_balance"),
             VendorId::Supergrok => MacosMirror::Slot("sgk_period"),
             VendorId::Zai => MacosMirror::Slot("zai_mcp_pct"),
+            // Fork-only: today/month/week headlines at the end of the FORMAT.
+            VendorId::Shvia => MacosMirror::Slot("shvia_today"),
             // Vendors whose shape is a plain session and/or weekly window, which
             // the bar already renders from the generic placeholders. Verified:
             // each of these emits the core tokens listed here.

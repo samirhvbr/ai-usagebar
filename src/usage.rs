@@ -469,6 +469,7 @@ pub enum VendorSnapshot {
     /// that fetched it holds the `CustomProviderConfig`, and the cache
     /// directory is keyed by its `id`.
     Custom(crate::custom::types::CustomSnapshot),
+    Shvia(ShviaSnapshot),
 }
 
 impl VendorSnapshot {
@@ -947,6 +948,74 @@ pub struct OllamaSnapshot {
 pub struct OllamaModelUsage {
     pub name: String,
     pub request_count: u64,
+}
+
+/// ShvIA — a self-hosted OpenAI-compatible gateway exposing three rolling
+/// usage windows (today / week / month) via `/api/v1/usage`. Each window
+/// reports a raw `used` count plus an optional `limit` (where `-1` means
+/// unlimited) and an optional pre-computed `remaining`.
+///
+/// Unlike [`ZaiSnapshot`] (which only carries a `% used` per window), ShvIA
+/// reports the raw token counts, so a [`ShviaWindow`] keeps them — that lets
+/// the renderer show the used count verbatim when a window is unlimited, where
+/// there is no ratio to draw a bar from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShviaSnapshot {
+    /// Plan / gateway label shown in the tooltip header.
+    pub plan: String,
+    pub today: Option<ShviaWindow>,
+    pub week: Option<ShviaWindow>,
+    pub month: Option<ShviaWindow>,
+}
+
+/// A single ShvIA usage window. `limit == -1` (or `limit <= 0`) is treated as
+/// "unlimited" — [`ShviaWindow::is_unlimited`] returns `true` and
+/// [`ShviaWindow::utilization_pct`] returns `0`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShviaWindow {
+    pub used: i64,
+    /// `-1` means unlimited.
+    pub limit: i64,
+    /// Pre-computed remaining from the API; `None` when unlimited / unreported.
+    pub remaining: Option<i64>,
+    pub resets_at: Option<DateTime<Utc>>,
+    /// Nominal length of the window, for pacing math. The gateway reports only
+    /// the reset instant, so this is the cadence the window is named for —
+    /// 1d / 7d / 30d. The month window is the one approximation: a calendar
+    /// month is 28-31 days, which moves the elapsed-fraction by at most a few
+    /// points, well inside the default pacing tolerance.
+    pub window_duration: chrono::Duration,
+}
+
+impl ShviaWindow {
+    /// `true` when the window has no enforced ceiling (`limit == -1`, or any
+    /// non-positive limit).
+    pub fn is_unlimited(&self) -> bool {
+        self.limit <= 0
+    }
+
+    /// Integer percent of the limit consumed (0..=100). Returns 0 for
+    /// unlimited windows (there is no meaningful ratio).
+    pub fn utilization_pct(&self) -> i32 {
+        if self.is_unlimited() {
+            return 0;
+        }
+        (((self.used as f64) / (self.limit as f64)) * 100.0)
+            .round()
+            .clamp(0.0, 100.0) as i32
+    }
+
+    /// The canonical window every shared renderer speaks — the tooltip's
+    /// `push_window`, the panel projection, and the pacing math. `None` for an
+    /// unlimited window: a bar drawn from a ratio that does not exist would
+    /// read as "0% used" rather than "no ceiling".
+    pub fn as_usage_window(&self) -> Option<UsageWindow> {
+        (!self.is_unlimited()).then(|| UsageWindow {
+            utilization_pct: self.utilization_pct(),
+            resets_at: self.resets_at,
+            window_duration: self.window_duration,
+        })
+    }
 }
 
 /// OpenRouter — credit balance + lifetime/daily/weekly/monthly usage from

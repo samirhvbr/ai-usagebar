@@ -108,6 +108,11 @@ The selector dynamically discovers **all providers** that ship in the binary via
   from the Devin CLI).
 - **Included-usage pools:** Cursor (Cursor Models and Other Models, both reset
   on the billing cycle).
+- **Rolling windows (today / week / month):** ShvIA, a self-hosted gateway.
+  Its windows have no 5h/weekly pair, so today takes the session slot, the week
+  the weekly one, and a capped month the fourth-window slot. An uncapped window
+  reports a used count with no bar — a 0% gauge would read as the opposite of
+  "no ceiling".
 - **Balance-only:** OpenRouter, DeepSeek, DeepInfra, Kimi, Kilo, Novita,
   Moonshot, Grok (xAI), Lyceum, and Anthropic API. These have no 5h/weekly
   quota windows, so the app

@@ -187,6 +187,7 @@ pub enum VendorId {
     ModelStudio,
     Lyceum,
     Devin,
+    Shvia,
 }
 
 /// How a provider authenticates. Drives what a frontend offers a provider that
@@ -244,6 +245,7 @@ impl VendorId {
             VendorId::ModelStudio => "modelstudio",
             VendorId::Lyceum => "lyceum",
             VendorId::Devin => "devin",
+            VendorId::Shvia => "shvia",
         }
     }
 
@@ -279,6 +281,7 @@ impl VendorId {
             VendorId::ModelStudio => "Model Studio",
             VendorId::Lyceum => "Lyceum",
             VendorId::Devin => "Devin",
+            VendorId::Shvia => "ShvIA",
         }
     }
 
@@ -317,6 +320,7 @@ impl VendorId {
             VendorId::ModelStudio => VendorId::ModelStudio.short_name(),
             VendorId::Lyceum => VendorId::Lyceum.short_name(),
             VendorId::Devin => VendorId::Devin.short_name(),
+            VendorId::Shvia => VendorId::Shvia.short_name(),
         }
     }
 
@@ -353,6 +357,7 @@ impl VendorId {
             VendorId::ModelStudio => "mst",
             VendorId::Lyceum => "lyc",
             VendorId::Devin => "dvn",
+            VendorId::Shvia => "shv",
         }
     }
 
@@ -392,6 +397,7 @@ impl VendorId {
             VendorId::ModelStudio => "modelstudio",
             VendorId::Lyceum => "lyceum",
             VendorId::Devin => "devin",
+            VendorId::Shvia => "shvia",
         }
     }
 
@@ -421,7 +427,8 @@ impl VendorId {
             | VendorId::OpenCodeGo
             | VendorId::Ollama
             | VendorId::OrcaRouter
-            | VendorId::Lyceum => AuthKind::ApiKey,
+            | VendorId::Lyceum
+            | VendorId::Shvia => AuthKind::ApiKey,
             // No credential of their own: another local product's session is
             // the login. Antigravity has no credential file at all (the binary
             // probes whichever local server answers), Cursor and Kiro read the
@@ -461,6 +468,7 @@ impl VendorId {
             VendorId::Ollama => "OLLAMA_API_KEY",
             VendorId::OrcaRouter => "ORCAROUTER_API_KEY",
             VendorId::Lyceum => "LYCEUM_API_KEY",
+            VendorId::Shvia => "SHVIA_API_KEY",
             // OAuth-first, with an environment override for CI and headless
             // use. Neither name is configurable, so neither has an
             // `api_key_env` field in its config section.
@@ -527,7 +535,8 @@ impl VendorId {
             | VendorId::OpenCodeGo
             | VendorId::Ollama
             | VendorId::OrcaRouter
-            | VendorId::Lyceum => "Add an API key in Settings, then Refresh.",
+            | VendorId::Lyceum
+            | VendorId::Shvia => "Add an API key in Settings, then Refresh.",
         }
     }
 
@@ -562,7 +571,8 @@ impl VendorId {
             | VendorId::OpenCodeGo
             | VendorId::Ollama
             | VendorId::OrcaRouter
-            | VendorId::Lyceum => "",
+            | VendorId::Lyceum
+            | VendorId::Shvia => "",
         }
     }
 
@@ -602,6 +612,7 @@ impl VendorId {
             VendorId::ModelStudio,
             VendorId::Lyceum,
             VendorId::Devin,
+            VendorId::Shvia,
         ]
     }
 

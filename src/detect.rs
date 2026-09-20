@@ -109,6 +109,7 @@ pub fn has_local_credentials(vendor: VendorId, config: &Config) -> bool {
         VendorId::Devin => crate::devin::credentials_path(&config.devin)
             .map(|path| path.is_file())
             .unwrap_or(false),
+        VendorId::Shvia => key_present(config, vendor),
     }
 }
 

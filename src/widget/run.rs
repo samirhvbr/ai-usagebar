@@ -33,6 +33,7 @@ use crate::openai;
 use crate::openrouter;
 use crate::orcarouter;
 use crate::pango::escape;
+use crate::shvia;
 use crate::supergrok;
 use crate::theme::Theme;
 use crate::vendor::{HTTP_CLIENT_TIMEOUT, RenderOpts, VendorId, VendorOutcome};
@@ -176,6 +177,7 @@ async fn build_output(cli: &Cli) -> Result<WaybarOutput> {
         Vendor::Lyceum => lyceum_output(cli, &config).await,
         Vendor::ModelStudio => modelstudio_output(cli, &config).await,
         Vendor::Devin => devin_output(cli, &config).await,
+        Vendor::Shvia => shvia_output(cli, &config).await,
     }
 }
 
@@ -301,6 +303,45 @@ async fn commandcode_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> 
 /// `ollama` daemon at 127.0.0.1:11434 has no quota route and is never
 /// contacted; the Ed25519 key the CLI keeps in `~/.ollama/id_ed25519` is a
 /// registry credential, not a quota one, and is never read.
+async fn shvia_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
+    let api_key = crate::config::resolve_api_key(
+        "ShvIA",
+        &config.shvia.api_key_env,
+        config.shvia.api_key.as_deref(),
+    )?;
+    let client = http_client()?;
+    let cache = vendor_cache(cli, "shvia")?;
+    let endpoints = match config.shvia.base_url.as_deref() {
+        Some(url) if !url.trim().is_empty() => shvia::fetch::Endpoints::from_base_url(url.trim()),
+        _ => shvia::fetch::Endpoints::default(),
+    };
+    let outcome = match shvia::fetch_snapshot(
+        &client,
+        &api_key,
+        &cache,
+        &endpoints,
+        DEFAULT_TTL,
+        config.shvia.plan.as_deref(),
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) if error.is_transient() => {
+            return Ok(WaybarOutput::loading(cli.icon.as_deref()));
+        }
+        Err(error) => return Err(error),
+    };
+    let snapshot = outcome.snapshot.clone();
+    let vendor_outcome: VendorOutcome = outcome.into();
+    Ok(shvia::vendor::render(
+        &vendor_outcome,
+        &snapshot,
+        &theme_from_cli(cli),
+        &RenderOpts::from_cli(cli),
+        Utc::now(),
+    ))
+}
+
 async fn ollama_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
     let api_key = crate::config::resolve_api_key(
         "Ollama",

@@ -75,6 +75,7 @@ pub struct Config {
     pub devin: DevinConfig,
     /// Quota-threshold desktop notifications (`[notifications]`).
     pub notifications: NotificationsConfig,
+    pub shvia: ShviaConfig,
     /// User-defined providers, one `[[custom]]` table each.
     pub custom: Vec<CustomProviderConfig>,
 }
@@ -1663,6 +1664,40 @@ impl Default for MoonshotConfig {
     }
 }
 
+/// ShvIA — a self-hosted OpenAI-compatible gateway. Unlike every other vendor
+/// here the endpoint is not a public product, so `base_url` is part of the
+/// configuration rather than a constant.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ShviaConfig {
+    pub enabled: bool,
+    /// Env var name to read the key from (env wins over `api_key`).
+    pub api_key_env: String,
+    /// Inline key (fallback when the env var is unset). Saving a config that
+    /// carries one chmods the file to 600, like every other inline credential.
+    pub api_key: Option<String>,
+    /// Base URL of the gateway (no trailing path). The usage endpoint
+    /// `/api/v1/usage` is appended automatically; `None` uses the default
+    /// deployment in `shvia::fetch::DEFAULT_BASE_URL`.
+    pub base_url: Option<String>,
+    /// Optional plan / gateway label — display-only (tooltip header).
+    pub plan: Option<String>,
+}
+
+impl Default for ShviaConfig {
+    fn default() -> Self {
+        // Opt-in like every other key-authenticated vendor: a gateway that
+        // rejects an absent key is not a useful default-on panel row.
+        Self {
+            enabled: false,
+            api_key_env: "SHVIA_API_KEY".to_string(),
+            api_key: None,
+            base_url: None,
+            plan: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct GrokConfig {
@@ -2334,6 +2369,7 @@ impl Config {
             self.orcarouter.api_key.as_deref(),
             self.lyceum.api_key.as_deref(),
             self.antigravity.oauth_client_secret.as_deref(),
+            self.shvia.api_key.as_deref(),
         ]
         .into_iter()
         .chain(
@@ -2436,6 +2472,7 @@ impl Config {
             VendorId::ModelStudio => self.modelstudio.enabled,
             VendorId::Lyceum => self.lyceum.enabled,
             VendorId::Devin => self.devin.enabled,
+            VendorId::Shvia => self.shvia.enabled,
         }
     }
 
@@ -2462,6 +2499,7 @@ impl Config {
             VendorId::Ollama => &self.ollama.api_key_env,
             VendorId::OrcaRouter => &self.orcarouter.api_key_env,
             VendorId::Lyceum => &self.lyceum.api_key_env,
+            VendorId::Shvia => &self.shvia.api_key_env,
             // Fixed names: OAuth-first providers whose environment override is
             // not user-renameable, and the providers with no key at all.
             VendorId::Anthropic
@@ -2499,6 +2537,7 @@ impl Config {
             VendorId::Ollama => self.ollama.api_key.as_deref(),
             VendorId::OrcaRouter => self.orcarouter.api_key.as_deref(),
             VendorId::Lyceum => self.lyceum.api_key.as_deref(),
+            VendorId::Shvia => self.shvia.api_key.as_deref(),
             VendorId::Anthropic
             | VendorId::Openai
             | VendorId::Copilot
