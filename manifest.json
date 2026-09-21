@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "akitaonrails.ai-usagebar",
   "name": "AI Usage",
-  "version": "1.11.0",
+  "version": "1.20.2",
   "author": "AkitaOnRails",
   "license": "MIT",
-  "description": "Multi-provider AI plan usage and balances in a native Omarchy Quattro panel.",
+  "description": "Multi-provider AI plan usage and balances in a native Omarchy Quattro panel. Needs the ai-usagebar binary as well as this plugin: omarchy pkg aur add ai-usagebar-bin",
   "kinds": [
     "bar-widget"
   ],
@@ -15,7 +15,7 @@
   },
   "barWidget": {
     "displayName": "AI Usage",
-    "description": "Usage windows, reset countdowns, balances, and provider switching for every provider configured in ai-usagebar.",
+    "description": "Usage windows, reset countdowns, balances, and provider switching for every provider configured in ai-usagebar. This is the display frontend only — install the binary with omarchy pkg aur add ai-usagebar-bin.",
     "category": "AI",
     "aliases": [
       "ai-usage",
@@ -28,7 +28,9 @@
       "provider": "",
       "refreshIntervalSec": 300,
       "showValue": true,
-      "showProvider": false
+      "showProvider": false,
+      "showAll": false,
+      "barWindow": "auto"
     },
     "schema": [
       {
@@ -60,6 +62,26 @@
         "label": "Show provider name",
         "description": "Show the selected provider's short code (cld, gpt, zai, agy) before the usage value, the way Waybar's {vendor_short} does. Off by default.",
         "defaultValue": false
+      },
+      {
+        "key": "showAll",
+        "type": "boolean",
+        "label": "Show all providers",
+        "description": "Show every configured provider's icon and usage in the top bar at once, instead of cycling one at a time. Off by default.",
+        "defaultValue": false
+      },
+      {
+        "key": "barWindow",
+        "type": "enum",
+        "label": "Top bar usage window",
+        "description": "Which quota window the top bar shows. Auto keeps the highest percent; 5-hour pins the session/rolling window; weekly pins the 7-day window; monthly pins the monthly pool where one exists. Falls back to highest when a vendor lacks the pinned window.",
+        "options": [
+          "auto",
+          "session",
+          "weekly",
+          "monthly"
+        ],
+        "defaultValue": "auto"
       }
     ]
   }

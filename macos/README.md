@@ -15,11 +15,16 @@ A single Swift file (`NSStatusItem` + `NSAttributedString`); no Xcode project.
 
 ## Vendor scope
 
-The selector supports **thirteen vendors** that ship in the binary:
+The selector dynamically discovers **all providers** that ship in the binary via `ai-usagebar vendors --json`:
 
-- **Rate-limit windows (5h / weekly):** Claude, Codex,
-  Z.AI (GLM), and Google Antigravity (two independent pools — Gemini, and
-  Claude & GPT OSS — each with its own 5h/weekly pair).
+- **Rate-limit windows (session / weekly / monthly):** Claude, Codex,
+  Z.AI (GLM), Google Antigravity (two independent pools — Gemini, and
+  Claude & GPT OSS — each with its own 5h/weekly pair), MiniMax (chat and video
+  pools, each with 5h/weekly tracking), GitHub Copilot (premium finite pool,
+  with unlimited chat and completions reported cleanly), SuperGrok, Kiro,
+  Nous Research, OpenCode Go (session, weekly, and monthly pools), Command Code
+  (session, weekly, and monthly pools), and Grok Bot (weekly included-usage
+  pool from the Grok Bot desktop app).
 - **Included-usage pools:** Cursor (Cursor Models and Other Models, both reset
   on the billing cycle).
 - **Balance-only:** OpenRouter, DeepSeek, Kimi, Kilo, Novita, Moonshot, Grok
@@ -28,8 +33,9 @@ The selector supports **thirteen vendors** that ship in the binary:
   session/weekly rows. Anthropic API additionally renders a spend-vs-limit
   bar when a monthly limit is configured.
 
-Only **enabled** vendors appear in the selector. The opt-in vendors (DeepSeek,
-Kimi, Kilo, Novita, Moonshot, Grok, Anthropic API, Cursor, Antigravity) default
+The app uses `ai-usagebar vendors --json` as its canonical metadata source so
+vendor availability, authentication status, and CLI requirements always match the
+backend without duplicated static tables. Only **enabled** vendors appear in the selector. The opt-in vendors default
 to disabled in the Rust config, matching `src/config.rs`; set
 `[vendor].enabled = true` (or save an API key via the TUI) to turn one on.
 
@@ -57,7 +63,7 @@ cd macos
 ./ai-usagebar-menubar &    # appears in the menu bar (no Dock icon)
 ```
 
-Start at login — toggle **Preferências… → Sistema → "Iniciar no login"** in the
+Start at login — toggle **Preferences… → System → "Start at login"** in the
 app, or from the shell:
 
 ```bash
@@ -80,10 +86,11 @@ Settings persist in `UserDefaults` and apply **live, no rebuild**.
 | Show percentage/value | on | numeric value next to each bar |
 | Show bars | on | off = numbers only |
 | Show pace marker | on | persisted `showMeta`; draws the elapsed-time marker only when the window has reset and elapsed output |
+| Show reset time instead of a countdown | off | persisted `showResetClock`; shows *when* a window resets as a wall-clock time — a date once the reset is past today — following the system's 12h/24h convention |
 | Bar width | 8 | cells per menu-bar bar (4–20) |
 | Colors (low/mid/high/critical/empty) | One Dark | bar color per severity (≥90 / ≥75 / ≥50 / else) |
 | Refresh interval | 30 s | 5–3600 |
-| Vendor | anthropic | selectors: only enabled vendors (see [Vendor scope](#vendor-scope)). Claude, Codex, and Z.AI expose session/weekly windows — Z.AI adds its monthly MCP-tools pool as a fourth row when the account has one; balance-only vendors show a credit balance instead. |
+| Vendor | anthropic | selectors: only enabled vendors (see [Vendor scope](#vendor-scope)). Vendors expose rate-limit windows (session, weekly, monthly, or video pools); balance-only vendors show a credit balance instead. |
 | Binary path | auto | empty = `~/.cargo/bin`, Homebrew, then `PATH` |
 | Global vendor shortcut | on | **⌥⌘\\** cycles every configured vendor/account and Overview; turns itself back off if macOS cannot register it |
 | Global compact shortcut | on | **⌥⌘E** toggles Overview between mini bars and compact text; turns itself back off if unavailable |
@@ -96,7 +103,7 @@ TUI. Requesting `anthropic` includes every configured named Claude account.
 In Overview mode, each dropdown row is a **checkbox**: click it to drop that
 provider from the always-visible top-bar summary (checkmark = shown; unchecked +
 dimmed = hidden). Hidden providers stay listed so you can re-enable them, and the
-choice persists. Jumping to a provider's detail view is via the *Trocar vendor*
+choice persists. Jumping to a provider's detail view is via the *Switch provider*
 submenu / ⌥⌘\ (the Overview row click toggles visibility instead).
 
 The Preferences window needs **macOS 12+** (the menu bar itself works on
@@ -114,7 +121,7 @@ reset (including a displayed `—`) retain their row but do not draw a marker.
 
 ## Indicator style
 
-The "Estilo do indicador" preference chooses between **block bars** (`░█`, the
+The "Indicator style" preference chooses between **block bars** (`░█`, the
 default) and a **ring** (`○`) drawn with `NSBezierPath` (AppKit). The ring paints
 the usage fraction as a severity-colored arc over a faint track, with the same
 pace marker as the block bar: calm fill from 12 o'clock up to the lesser of the
@@ -126,12 +133,12 @@ be invisible) and `COLOR_EMPTY` on light ones.
 
 ## Quick vendor switch
 
-A **"Trocar vendor"** submenu in the dropdown (between "Atualizar agora" /
-"Abrir TUI" and "Preferências…") lists only configured vendors, with a
+A **"Switch provider"** submenu in the dropdown (between "Refresh now" /
+"Open TUI" and "Preferences…") lists only configured vendors, with a
 checkmark on the active one.
 Selecting one switches immediately, without opening Preferences.
 The global **⌥⌘\\** shortcut performs the same cycle from any app; disable it
-under Preferências → Atalho if that chord belongs to another application.
+under Preferences → Shortcut if that chord belongs to another application.
 
 ## Multiple Claude accounts
 
@@ -175,6 +182,18 @@ ai-usagebar account switch work --desktop   # quits and reopens Claude.app
 
 See the main README's *Switching the active Claude account* for the full story.
 
+## Multiple Codex accounts
+
+Entries from `[[openai.accounts]]` appear as “Codex · label” in the provider
+submenu, Preferences, Overview, and the vendor-cycle shortcut. Each is fetched
+with `--vendor openai --account <label>`; Rust resolves its `codex_auth_path`
+and keeps its cache separate. Named accounts do not require a default Codex
+login. Disabling `[openai]` hides all its accounts.
+
+Setting `[ui] overview_vendors = ["openai"]` includes all configured Codex
+accounts. Each Overview checkbox still controls that account's visibility.
+Selecting an entry changes whose usage is displayed, not the active Codex login.
+
 ## Multiple OpenRouter accounts
 
 Entries from `[[openrouter.accounts]]` appear as separate menu choices and use
@@ -197,3 +216,15 @@ Runs `ai-usagebar --vendor <v> --format '{plan};;{session_pct};;…'`, parses th
 Waybar JSON (`{text, …}`), and draws the bars as colored `NSAttributedString`s
 in the status item and the dropdown. The subprocess runs **off the main thread**
 (`DispatchQueue.global` → back to `.main` for UI), so the UI never blocks.
+
+### Enable a connected provider
+
+Preferences → Vendors shows **Disabled** even when a credential is available.
+Click **Enable** to include the provider in usage reporting; if it still needs
+a credential, the row then offers its usual sign-in or configuration action.
+Enabling does not sign in, switch accounts, or change the selected provider.
+The menu reloads the configuration automatically.
+
+This requires a binary supporting `ai-usagebar settings enable <vendor>`.
+If enabling fails, Preferences shows an error and keeps the provider state
+from the catalog. Update the binary if it does not recognize the command.

@@ -7,8 +7,8 @@ use chrono::Utc;
 use reqwest::Client;
 
 use crate::cache::DEFAULT_TTL;
-use crate::config::Config;
-use crate::error::Result;
+use crate::config::{Config, CustomProviderConfig};
+use crate::error::{AppError, Result};
 use crate::theme::Theme;
 use crate::vendor::{VendorId, VendorOutcome};
 
@@ -21,7 +21,13 @@ use crate::vendor::{VendorId, VendorOutcome};
 pub enum TabState {
     Loading,
     Ready(Box<ReadyTab>),
-    Error(String),
+    Error {
+        message: String,
+        /// Vendor plan already known from credentials when the quota fetch
+        /// failed (Claude OAuth `subscriptionType`). Absent when the vendor
+        /// has no plan without a snapshot.
+        plan: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -36,14 +42,49 @@ pub struct ReadyTab {
     pub fetched_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// Where a tab's usage comes from: a built-in vendor, or a user-declared
+/// `[[custom]]` HTTP provider. A custom tab carries its own display names so
+/// the TUI and the report never need the config again just to label it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum TabSource {
+    Builtin(VendorId),
+    Custom {
+        id: String,
+        name: String,
+        short_name: String,
+    },
+}
+
+impl TabState {
+    pub fn error(message: impl AsRef<str>) -> Self {
+        Self::error_with_plan(message, None)
+    }
+
+    pub fn error_with_plan(message: impl AsRef<str>, plan: Option<String>) -> Self {
+        let plan = plan.and_then(|plan| {
+            let cleaned = crate::display::sanitize_untrusted_field(plan.trim());
+            if cleaned.is_empty() || cleaned.eq_ignore_ascii_case("unknown") {
+                None
+            } else {
+                Some(cleaned)
+            }
+        });
+        Self::Error {
+            message: message.as_ref().to_string(),
+            plan,
+        }
+    }
+}
+
 /// Identity of one TUI tab. Usually a whole vendor; Claude and OpenRouter can
 /// also name a configured account. `account: None` is a plain vendor tab or
 /// that vendor's default account.
 /// `desktop` marks an account whose usage comes from the Claude Desktop app's
 /// own token rather than a `claude` CLI credential.
+/// Custom providers never carry an account or a desktop flag.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TabId {
-    pub vendor: VendorId,
+    pub source: TabSource,
     pub account: Option<String>,
     pub desktop: bool,
 }
@@ -52,7 +93,7 @@ impl TabId {
     /// A plain vendor tab (default account for Anthropic).
     pub fn vendor(vendor: VendorId) -> Self {
         Self {
-            vendor,
+            source: TabSource::Builtin(vendor),
             account: None,
             desktop: false,
         }
@@ -66,7 +107,7 @@ impl TabId {
     /// A named account for a vendor that supports account arrays.
     pub fn account_for(vendor: VendorId, label: impl Into<String>) -> Self {
         Self {
-            vendor,
+            source: TabSource::Builtin(vendor),
             account: Some(label.into()),
             desktop: false,
         }
@@ -76,9 +117,31 @@ impl TabId {
     /// own token store (a saved `~/.claude-acc/profiles/<label>` account).
     pub fn desktop_account(label: impl Into<String>) -> Self {
         Self {
-            vendor: VendorId::Anthropic,
+            source: TabSource::Builtin(VendorId::Anthropic),
             account: Some(label.into()),
             desktop: true,
+        }
+    }
+
+    /// A user-declared `[[custom]]` provider tab.
+    pub fn custom(spec: &CustomProviderConfig) -> Self {
+        Self {
+            source: TabSource::Custom {
+                id: spec.id.clone(),
+                name: spec.name.clone(),
+                short_name: spec.short_name.clone(),
+            },
+            account: None,
+            desktop: false,
+        }
+    }
+
+    /// The built-in vendor behind this tab; `None` for a custom provider.
+    /// (Named `vendor_id` because `TabId::vendor` is the constructor.)
+    pub fn vendor_id(&self) -> Option<VendorId> {
+        match &self.source {
+            TabSource::Builtin(vendor) => Some(*vendor),
+            TabSource::Custom { .. } => None,
         }
     }
 }
@@ -154,6 +217,10 @@ fn build_tabs(config: &Config, desktop_labels: &[String]) -> Vec<TabId> {
         } else {
             tabs.push(TabId::vendor(vendor));
         }
+    }
+    // Custom providers follow every built-in vendor, in config order.
+    for spec in config.enabled_custom() {
+        tabs.push(TabId::custom(spec));
     }
     tabs
 }
@@ -266,7 +333,7 @@ impl App {
     }
 
     pub fn active_vendor(&self) -> Option<VendorId> {
-        self.tabs_meta.get(self.active).map(|t| t.vendor)
+        self.tabs_meta.get(self.active).and_then(TabId::vendor_id)
     }
 
     /// Replace the tab set — used after a Settings save reloads config, so
@@ -331,7 +398,7 @@ impl App {
         // become the normal Error state because there is no data to preserve.
         if was_refreshing
             && let TabState::Ready(ready) = &mut self.tabs[index]
-            && let TabState::Error(message) = state
+            && let TabState::Error { message, .. } = state
         {
             ready.stale = true;
             ready.last_error = Some((0, message));
@@ -345,7 +412,7 @@ impl App {
     /// since it precedes any of that vendor's account tabs).
     pub fn select_primary(&mut self, primary: Option<VendorId>) {
         if let Some(p) = primary
-            && let Some(idx) = self.tabs_meta.iter().position(|t| t.vendor == p)
+            && let Some(idx) = self.tabs_meta.iter().position(|t| t.vendor_id() == Some(p))
         {
             self.active = idx;
             self.overview = false;
@@ -382,6 +449,8 @@ impl App {
 
     /// Tabs the Overview should list: `overview_vendors` filtered against the
     /// live tab set (preserving the config order), or all tabs when unset.
+    /// The filter names built-in vendors only, so a configured list excludes
+    /// every custom provider tab; the unset default includes them.
     pub fn overview_tabs(&self) -> Vec<usize> {
         match &self.overview_vendors {
             None => (0..self.tabs_meta.len()).collect(),
@@ -391,7 +460,7 @@ impl App {
                     self.tabs_meta
                         .iter()
                         .enumerate()
-                        .filter(move |(_, t)| t.vendor == *v)
+                        .filter(move |(_, t)| t.vendor_id() == Some(*v))
                         .map(|(i, _)| i)
                 })
                 .collect(),
@@ -420,12 +489,31 @@ pub async fn refresh_one(client: &Client, config: &Config, tab: &TabId) -> TabSt
                 fetched_at,
             }))
         }
-        Err(e) => TabState::Error(crate::display::sanitize_untrusted_field(&e.user_message())),
+        Err(e) => TabState::error_with_plan(
+            crate::display::sanitize_untrusted_field(&e.user_message()),
+            e.plan().map(str::to_string),
+        ),
     }
 }
 
 async fn build_outcome(client: &Client, config: &Config, tab: &TabId) -> Result<VendorOutcome> {
-    match tab.vendor {
+    let vendor = match &tab.source {
+        TabSource::Builtin(vendor) => *vendor,
+        TabSource::Custom { id, .. } => {
+            // A custom provider owns its TTL and its cache slot; the cache is
+            // keyed by the provider id under one shared `custom` vendor dir.
+            let spec = config.custom_by_id(id).ok_or_else(|| {
+                AppError::Other(format!("custom provider {id} is not configured"))
+            })?;
+            let api_key = spec.resolve_api_key()?;
+            let cache = crate::cache::Cache::for_vendor_account("custom", id)?;
+            let outcome =
+                crate::custom::fetch_snapshot(client, spec, &api_key, &cache, spec.cache_ttl())
+                    .await?;
+            return Ok(outcome.into());
+        }
+    };
+    match vendor {
         VendorId::Anthropic => {
             // A named account resolves to its own file + `anthropic/<label>`
             // cache, shared with the widget via `account_target` (#14/#17).
@@ -685,9 +773,32 @@ async fn build_outcome(client: &Client, config: &Config, tab: &TabId) -> Result<
             Ok(outcome.into())
         }
         VendorId::Antigravity => {
-            // No credentials: the local Antigravity server is the source.
+            // No API key: the local Antigravity server is the source, and the
+            // saved Google session stands in while nothing is running.
             let cache = crate::cache::Cache::for_vendor("antigravity")?;
-            let outcome = crate::antigravity::fetch_snapshot(client, &cache, DEFAULT_TTL).await?;
+            let oauth = crate::antigravity::cloud::OauthClient::from_config(
+                config.antigravity.oauth_client_id.as_deref(),
+                config.antigravity.oauth_client_secret.as_deref(),
+            );
+            let outcome =
+                crate::antigravity::fetch_snapshot(client, &cache, DEFAULT_TTL, oauth.as_ref())
+                    .await?;
+            Ok(outcome.into())
+        }
+        VendorId::Grokbot => {
+            // The desktop app's own session is the login; refreshed pairs
+            // persist only inside the vendor cache.
+            let creds = crate::grokbot::resolve_credentials(&config.grokbot)?;
+            let cache = crate::cache::Cache::for_vendor("grokbot")?;
+            let endpoints = crate::grokbot::fetch::Endpoints::default();
+            let outcome = crate::grokbot::fetch::fetch_snapshot_with(
+                client,
+                &creds,
+                &cache,
+                &endpoints,
+                DEFAULT_TTL,
+            )
+            .await?;
             Ok(outcome.into())
         }
         VendorId::Cursor => {
@@ -776,6 +887,25 @@ async fn build_outcome(client: &Client, config: &Config, tab: &TabId) -> Result<
             .await?;
             Ok(outcome.into())
         }
+        VendorId::Ollama => {
+            let api_key = crate::config::resolve_api_key(
+                "Ollama",
+                &config.ollama.api_key_env,
+                config.ollama.api_key.as_deref(),
+            )?;
+            let cache = crate::cache::Cache::for_vendor("ollama")?;
+            let endpoints = crate::ollama::fetch::Endpoints::default();
+            let outcome = crate::ollama::fetch_snapshot(
+                client,
+                &api_key,
+                &config.ollama.plan,
+                &cache,
+                &endpoints,
+                DEFAULT_TTL,
+            )
+            .await?;
+            Ok(outcome.into())
+        }
     }
 }
 
@@ -800,7 +930,7 @@ pub fn refresh_stagger(tabs: &[TabId], step: Duration) -> Vec<Duration> {
     let mut anthropic_seen: u32 = 0;
     tabs.iter()
         .map(|tab| {
-            if tab.vendor == VendorId::Anthropic {
+            if tab.vendor_id() == Some(VendorId::Anthropic) {
                 let delay = step * anthropic_seen;
                 anthropic_seen += 1;
                 delay
@@ -986,7 +1116,7 @@ mod tests {
         // No [[anthropic.accounts]] → one tab per enabled vendor, unchanged.
         let config = Config::default();
         let tabs = tabs_from_config(&config);
-        let vendors: Vec<VendorId> = tabs.iter().map(|t| t.vendor).collect();
+        let vendors: Vec<VendorId> = tabs.iter().filter_map(TabId::vendor_id).collect();
         assert_eq!(vendors, config.enabled_vendors());
         assert!(tabs.iter().all(|t| t.account.is_none()));
     }
@@ -1157,7 +1287,7 @@ mod tests {
             Theme::default(),
         );
         app.active = 2; // "personal"
-        app.tabs[0] = TabState::Error("old".into());
+        app.tabs[0] = TabState::error("old");
         let old_tab = app.tabs_meta[0].clone();
         assert!(app.begin_refresh(&old_tab));
 
@@ -1198,7 +1328,7 @@ mod tests {
         assert!(!app.apply_refresh(
             old_generation,
             &TabId::vendor(VendorId::Anthropic),
-            TabState::Error("old result".into()),
+            TabState::error("old result"),
         ));
         assert!(matches!(app.tabs[0], TabState::Loading));
     }
@@ -1211,7 +1341,7 @@ mod tests {
         assert!(!app.apply_refresh(
             generation,
             &TabId::vendor(VendorId::Openai),
-            TabState::Error("wrong tab".into()),
+            TabState::error("wrong tab"),
         ));
         assert!(matches!(app.tabs[0], TabState::Loading));
     }
@@ -1228,9 +1358,9 @@ mod tests {
         // not a stale positional index.
         app.tabs_meta.swap(0, 1);
         app.tabs.swap(0, 1);
-        assert!(app.apply_refresh(generation, &anthropic, TabState::Error("ready".into())));
+        assert!(app.apply_refresh(generation, &anthropic, TabState::error("ready")));
         assert!(matches!(app.tabs[0], TabState::Loading));
-        assert!(matches!(&app.tabs[1], TabState::Error(message) if message == "ready"));
+        assert!(matches!(&app.tabs[1], TabState::Error { message, .. } if message == "ready"));
         assert!(!app.is_refreshing(&anthropic));
     }
 
@@ -1281,13 +1411,11 @@ mod tests {
         assert!(app.is_refreshing(&tab));
         assert!(matches!(app.tabs[0], TabState::Loading));
 
-        assert!(app.apply_refresh(
-            app.tab_generation,
-            &tab,
-            TabState::Error("not signed in".into()),
-        ));
+        assert!(app.apply_refresh(app.tab_generation, &tab, TabState::error("not signed in"),));
         assert!(!app.is_refreshing(&tab));
-        assert!(matches!(&app.tabs[0], TabState::Error(message) if message == "not signed in"));
+        assert!(
+            matches!(&app.tabs[0], TabState::Error { message, .. } if message == "not signed in")
+        );
     }
 
     #[test]
@@ -1315,11 +1443,7 @@ mod tests {
         app.tabs[0] = ready_at(fetched_at);
 
         assert!(app.begin_refresh(&tab));
-        assert!(app.apply_refresh(
-            app.tab_generation,
-            &tab,
-            TabState::Error("refresh failed".into()),
-        ));
+        assert!(app.apply_refresh(app.tab_generation, &tab, TabState::error("refresh failed"),));
         assert!(!app.is_refreshing(&tab));
         match &app.tabs[0] {
             TabState::Ready(ready) => {
@@ -1345,7 +1469,7 @@ mod tests {
         app.set_tabs(vec![tab.clone()]);
         assert!(app.begin_refresh(&tab));
 
-        assert!(!app.apply_refresh(old_generation, &tab, TabState::Error("old result".into()),));
+        assert!(!app.apply_refresh(old_generation, &tab, TabState::error("old result"),));
         assert!(app.is_refreshing(&tab));
         assert!(matches!(app.tabs[0], TabState::Loading));
     }
@@ -1385,6 +1509,101 @@ mod tests {
         assert_eq!(
             app.active_tab_id(),
             Some(&TabId::vendor(VendorId::Anthropic))
+        );
+    }
+
+    fn custom_spec(id: &str, enabled: bool) -> CustomProviderConfig {
+        CustomProviderConfig {
+            id: id.into(),
+            name: "My Tool".into(),
+            short_name: "myt".into(),
+            enabled,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn custom_providers_get_tabs_after_every_builtin() {
+        let config = Config {
+            custom: vec![custom_spec("mytool", true), custom_spec("other", true)],
+            ..Default::default()
+        };
+        let tabs = tabs_from_config(&config);
+        let builtin_count = config.enabled_vendors().len();
+        assert_eq!(tabs.len(), builtin_count + 2);
+        assert!(
+            tabs[..builtin_count]
+                .iter()
+                .all(|t| matches!(t.source, TabSource::Builtin(_)))
+        );
+        assert_eq!(tabs[builtin_count], TabId::custom(&config.custom[0]));
+        assert_eq!(tabs[builtin_count + 1], TabId::custom(&config.custom[1]));
+        assert_eq!(
+            tabs[builtin_count].source,
+            TabSource::Custom {
+                id: "mytool".into(),
+                name: "My Tool".into(),
+                short_name: "myt".into(),
+            }
+        );
+        assert!(tabs[builtin_count].account.is_none());
+        assert!(!tabs[builtin_count].desktop);
+        assert_eq!(tabs[builtin_count].vendor_id(), None);
+    }
+
+    #[test]
+    fn disabled_custom_provider_has_no_tab() {
+        let config = Config {
+            custom: vec![custom_spec("mytool", false)],
+            ..Default::default()
+        };
+        let tabs = tabs_from_config(&config);
+        assert!(
+            tabs.iter()
+                .all(|t| matches!(t.source, TabSource::Builtin(_)))
+        );
+        assert_eq!(tabs.len(), config.enabled_vendors().len());
+    }
+
+    #[test]
+    fn custom_tabs_are_listed_by_the_default_overview_but_not_by_a_vendor_filter() {
+        let spec = custom_spec("mytool", true);
+        let mut app = App::with_theme(
+            vec![
+                TabId::vendor(VendorId::Anthropic),
+                TabId::custom(&spec),
+                TabId::vendor(VendorId::Openai),
+            ],
+            Theme::default(),
+        );
+        assert_eq!(app.overview_tabs(), vec![0, 1, 2]);
+
+        // `overview_vendors` names VendorIds only, so the custom tab drops out.
+        app.overview_vendors = Some(vec![VendorId::Openai, VendorId::Anthropic]);
+        assert_eq!(app.overview_tabs(), vec![2, 0]);
+    }
+
+    #[test]
+    fn a_custom_active_tab_has_no_vendor_and_never_staggers() {
+        let spec = custom_spec("mytool", true);
+        let tabs = vec![
+            TabId::vendor(VendorId::Anthropic),
+            TabId::custom(&spec),
+            TabId::account("work"),
+        ];
+        let mut app = App::with_theme(tabs.clone(), Theme::default());
+        app.active = 1;
+        assert_eq!(app.active_vendor(), None);
+        assert_eq!(app.active_tab_id(), Some(&TabId::custom(&spec)));
+
+        // select_primary never lands on a custom tab.
+        app.select_primary(Some(VendorId::Anthropic));
+        assert_eq!(app.active, 0);
+
+        let step = Duration::from_millis(800);
+        assert_eq!(
+            refresh_stagger(&tabs, step),
+            vec![Duration::ZERO, Duration::ZERO, step]
         );
     }
 }

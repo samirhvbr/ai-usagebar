@@ -1,10 +1,10 @@
 //! Settings overlay — opened from the TUI by pressing `s`. Lets the user pick
 //! the primary vendor and paste a credential for any API-key-authenticated vendor
 //! (including Z.AI, Kimi, MiniMax, and the balance vendors) without hand-editing
-//! config.toml. Anthropic, OpenAI, GitHub Copilot, Cursor, Kiro, Antigravity, and
-//! Command Code authenticate through official or local product state, so they have
-//! no credential field here — there is nothing to paste, and a field would only
-//! imply otherwise. Kimi keeps
+//! config.toml. Anthropic, OpenAI, GitHub Copilot, Cursor, Kiro, Antigravity,
+//! Grok Bot, and Command Code authenticate through official or local product
+//! state, so they have no credential field here — there is nothing to paste,
+//! and a field would only imply otherwise. Kimi keeps
 //! its credential field because a platform key is still one of its two credentials, but
 //! a subscriber whose credential is the Kimi Code CLI login has nothing to paste
 //! and enables `[kimi]` in config.toml instead.
@@ -28,7 +28,9 @@ use ratatui_bubbletea_theme::BubbleTheme;
 use serde::{Deserialize, Serialize};
 use toml_edit::{DocumentMut, value};
 
-use crate::config::Config;
+use crate::config::{
+    Config, is_valid_env_var_name, read_config_document, set_bool, write_config_document,
+};
 use crate::error::{AppError, Result};
 use crate::theme::Theme;
 use crate::tui::style::bubble_theme;
@@ -40,7 +42,6 @@ use crate::vendor::VendorId;
 pub struct KeyVendor {
     pub id: VendorId,
     pub label: &'static str,
-    pub env: &'static str,
     pub section: &'static str,
     /// Config field that stores the credential (`api_key` for most vendors).
     pub config_key: &'static str,
@@ -54,8 +55,7 @@ pub const KEY_VENDORS: &[KeyVendor] = &[
     KeyVendor {
         id: VendorId::AnthropicApi,
         label: "Anthropic API",
-        env: "ANTHROPIC_ADMIN_KEY",
-        section: "anthropic_api",
+        section: VendorId::AnthropicApi.config_section(),
         config_key: "api_key",
         secret_label: "API key",
         note: "admin key — monthly spend",
@@ -63,8 +63,7 @@ pub const KEY_VENDORS: &[KeyVendor] = &[
     KeyVendor {
         id: VendorId::Zai,
         label: "Z.AI",
-        env: "ZAI_API_KEY",
-        section: "zai",
+        section: VendorId::Zai.config_section(),
         config_key: "api_key",
         secret_label: "API key",
         note: "",
@@ -72,8 +71,7 @@ pub const KEY_VENDORS: &[KeyVendor] = &[
     KeyVendor {
         id: VendorId::Openrouter,
         label: "OpenRouter",
-        env: "OPENROUTER_API_KEY",
-        section: "openrouter",
+        section: VendorId::Openrouter.config_section(),
         config_key: "api_key",
         secret_label: "API key",
         note: "",
@@ -81,8 +79,7 @@ pub const KEY_VENDORS: &[KeyVendor] = &[
     KeyVendor {
         id: VendorId::Deepseek,
         label: "DeepSeek",
-        env: "DEEPSEEK_API_KEY",
-        section: "deepseek",
+        section: VendorId::Deepseek.config_section(),
         config_key: "api_key",
         secret_label: "API key",
         note: "",
@@ -90,8 +87,7 @@ pub const KEY_VENDORS: &[KeyVendor] = &[
     KeyVendor {
         id: VendorId::Kimi,
         label: "Kimi",
-        env: "KIMI_API_KEY",
-        section: "kimi",
+        section: VendorId::Kimi.config_section(),
         config_key: "api_key",
         secret_label: "API key",
         note: "coding-plan usage",
@@ -99,8 +95,7 @@ pub const KEY_VENDORS: &[KeyVendor] = &[
     KeyVendor {
         id: VendorId::Kilo,
         label: "Kilo",
-        env: "KILO_API_KEY",
-        section: "kilo",
+        section: VendorId::Kilo.config_section(),
         config_key: "api_key",
         secret_label: "API key",
         note: "",
@@ -108,8 +103,7 @@ pub const KEY_VENDORS: &[KeyVendor] = &[
     KeyVendor {
         id: VendorId::Novita,
         label: "Novita",
-        env: "NOVITA_API_KEY",
-        section: "novita",
+        section: VendorId::Novita.config_section(),
         config_key: "api_key",
         secret_label: "API key",
         note: "",
@@ -117,8 +111,7 @@ pub const KEY_VENDORS: &[KeyVendor] = &[
     KeyVendor {
         id: VendorId::Moonshot,
         label: "Moonshot",
-        env: "MOONSHOT_API_KEY",
-        section: "moonshot",
+        section: VendorId::Moonshot.config_section(),
         config_key: "api_key",
         secret_label: "API key",
         note: "account balance",
@@ -126,8 +119,7 @@ pub const KEY_VENDORS: &[KeyVendor] = &[
     KeyVendor {
         id: VendorId::Grok,
         label: "Grok",
-        env: "XAI_MANAGEMENT_KEY",
-        section: "grok",
+        section: VendorId::Grok.config_section(),
         config_key: "api_key",
         secret_label: "API key",
         note: "management key, not the inference key",
@@ -135,8 +127,7 @@ pub const KEY_VENDORS: &[KeyVendor] = &[
     KeyVendor {
         id: VendorId::Minimax,
         label: "MiniMax",
-        env: "MINIMAX_API_KEY",
-        section: "minimax",
+        section: VendorId::Minimax.config_section(),
         config_key: "api_key",
         secret_label: "API key",
         note: "Token Plan subscription key",
@@ -144,32 +135,20 @@ pub const KEY_VENDORS: &[KeyVendor] = &[
     KeyVendor {
         id: VendorId::OpenCodeGo,
         label: "OpenCode Go",
-        env: "OPENCODE_GO_API_KEY",
-        section: "opencode-go",
+        section: VendorId::OpenCodeGo.config_section(),
         config_key: "api_key",
         secret_label: "API key",
         note: "usage quota",
     },
+    KeyVendor {
+        id: VendorId::Ollama,
+        label: "Ollama Cloud",
+        section: VendorId::Ollama.config_section(),
+        config_key: "api_key",
+        secret_label: "API key",
+        note: "ollama.com/settings/keys",
+    },
 ];
-
-/// Read the inline credential currently in config, so the field opens
-/// pre-filled (masked) when one is already set.
-fn config_inline_key<'a>(cfg: &'a Config, vendor: &KeyVendor) -> Option<&'a str> {
-    match vendor.section {
-        "anthropic_api" => cfg.anthropic_api.api_key.as_deref(),
-        "zai" => cfg.zai.api_key.as_deref(),
-        "openrouter" => cfg.openrouter.api_key.as_deref(),
-        "deepseek" => cfg.deepseek.api_key.as_deref(),
-        "kimi" => cfg.kimi.api_key.as_deref(),
-        "kilo" => cfg.kilo.api_key.as_deref(),
-        "novita" => cfg.novita.api_key.as_deref(),
-        "moonshot" => cfg.moonshot.api_key.as_deref(),
-        "grok" => cfg.grok.api_key.as_deref(),
-        "minimax" => cfg.minimax.api_key.as_deref(),
-        "opencode-go" => cfg.opencode_go.api_key.as_deref(),
-        _ => None,
-    }
-}
 
 /// Which control has keyboard focus. `Key(i)` indexes into [`KEY_VENDORS`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -308,9 +287,23 @@ pub struct SettingsState {
 
 impl SettingsState {
     pub fn from_config(cfg: &Config) -> Self {
+        Self::from_config_with(cfg, |name| {
+            std::env::var_os(name).is_some_and(|v| !v.is_empty())
+        })
+    }
+
+    /// [`Self::from_config`] with an injected environment lookup.
+    ///
+    /// The overlay offers a key-only vendor whose env var is already exported,
+    /// so a user need not hand-edit `config.toml` to select it. That is a read
+    /// of ambient state, which a test must never depend on: the AUR `check()`
+    /// runs `cargo test` during `makepkg`, so a test that branched on the real
+    /// environment would fail the install for anyone who exports, say,
+    /// `OLLAMA_API_KEY`. Tests pass their own lookup here.
+    pub fn from_config_with(cfg: &Config, env_set: impl Fn(&str) -> bool) -> Self {
         let keys = KEY_VENDORS
             .iter()
-            .map(|kv| KeyInput::from_config(config_inline_key(cfg, kv)))
+            .map(|kv| KeyInput::from_config(cfg.inline_api_key(kv.id)))
             .collect();
         let mut primary_choices = cfg.enabled_vendors();
         // Copilot credentials belong to GitHub CLI, so a login cannot write a
@@ -318,6 +311,23 @@ impl SettingsState {
         // selecting it persists both the primary and `enabled = true`.
         if !primary_choices.contains(&VendorId::Copilot) {
             primary_choices.push(VendorId::Copilot);
+        }
+        // Key-only vendors are opt-in: without an inline `api_key` and with
+        // the env var empty, the fetch would fail on the first cycle. A user
+        // who already exported the env var (e.g. `OLLAMA_API_KEY`) and wants
+        // to flip `enabled = true` from inside the TUI has to be able to
+        // select the vendor here — otherwise they'd have to hand-edit
+        // `config.toml`, which is the workflow this overlay exists to avoid.
+        // We treat a non-empty env var as a sufficient signal of reachability.
+        for kv in KEY_VENDORS {
+            if primary_choices.contains(&kv.id) {
+                continue;
+            }
+            let env = cfg.api_key_env_for(kv.id);
+            let exported = is_valid_env_var_name(env) && env_set(env);
+            if cfg.inline_api_key(kv.id).is_some() || exported {
+                primary_choices.push(kv.id);
+            }
         }
         // A configured but disabled primary is ineffective. Display the first
         // enabled vendor instead; when none are enabled retain the historical
@@ -496,18 +506,7 @@ fn save_to_config_default(state: &SettingsState) -> Result<()> {
 /// Same as `save_to_config_default` but with an explicit path — exposed for
 /// tests. Writing a non-empty credential also sets that vendor's `enabled = true`.
 pub fn save_to_path(state: &SettingsState, path: &Path) -> Result<()> {
-    let original = match std::fs::read_to_string(path) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(error) => return Err(AppError::io_at(path, error)),
-    };
-    let mut doc: DocumentMut = if original.trim().is_empty() {
-        DocumentMut::new()
-    } else {
-        original.parse().map_err(|e: toml_edit::TomlError| {
-            AppError::Other(format!("config.toml not parseable: {e}"))
-        })?
-    };
+    let mut doc = read_config_document(path)?;
 
     // Remove fields written by the short-lived inline Copilot-token design.
     // GitHub CLI owns the OAuth credential now; retaining a secret this app
@@ -521,12 +520,18 @@ pub fn save_to_path(state: &SettingsState, path: &Path) -> Result<()> {
     }
 
     // Only Copilot is deliberately offered before it is enabled: choosing it
-    // is the explicit opt-in after the GitHub CLI login. All other choices
-    // remain enabled-only, so no failed provider is persisted as primary.
+    // is the explicit opt-in after the GitHub CLI login. The env-only key
+    // vendors (any `KEY_VENDORS` entry whose credential the user reached via
+    // `OLLAMA_API_KEY` or another env var) are also offered before they are
+    // enabled, and selecting them is the explicit opt-in for that vendor —
+    // otherwise a user could pick a vendor in the overlay and the fetch
+    // would still fail because `enabled = false`. Every other choice remains
+    // enabled-only, so no failed provider is persisted as primary.
     if state.primary_choices.contains(&state.primary) {
         set_string(&mut doc, "ui", "primary", state.primary.slug())?;
-        if state.primary == VendorId::Copilot {
-            set_bool(&mut doc, "copilot", "enabled", true)?;
+        if state.primary == VendorId::Copilot || KEY_VENDORS.iter().any(|kv| kv.id == state.primary)
+        {
+            set_bool(&mut doc, state.primary.config_section(), "enabled", true)?;
         }
     }
 
@@ -537,19 +542,7 @@ pub fn save_to_path(state: &SettingsState, path: &Path) -> Result<()> {
         update_key(&mut doc, kv, input)?;
     }
 
-    let bytes = doc.to_string();
-    crate::cache::atomic_write(path, bytes.as_bytes())?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Ok(meta) = std::fs::metadata(path) {
-            let mut perms = meta.permissions();
-            perms.set_mode(0o600);
-            let _ = std::fs::set_permissions(path, perms);
-        }
-    }
-    Ok(())
+    write_config_document(path, &doc)
 }
 
 /// Apply one credential field to the document. Untouched fields are left
@@ -577,25 +570,6 @@ fn update_key(doc: &mut DocumentMut, vendor: &KeyVendor, input: &KeyInput) -> Re
 /// Set or update a string field in a TOML section, preserving comments and
 /// formatting of unaffected nodes.
 fn set_string(doc: &mut DocumentMut, section: &str, key: &str, new_value: &str) -> Result<()> {
-    let table = doc
-        .entry(section)
-        .or_insert_with(toml_edit::table)
-        .as_table_mut()
-        .ok_or_else(|| AppError::Other(format!("config.toml: [{section}] is not a table")))?;
-
-    if let Some(item) = table.get_mut(key)
-        && let Some(v) = item.as_value_mut()
-    {
-        *v = toml_edit::Value::from(new_value);
-        v.decor_mut().set_prefix(" ");
-        return Ok(());
-    }
-    table.insert(key, value(new_value));
-    Ok(())
-}
-
-/// Same as [`set_string`] for a boolean field.
-fn set_bool(doc: &mut DocumentMut, section: &str, key: &str, new_value: bool) -> Result<()> {
     let table = doc
         .entry(section)
         .or_insert_with(toml_edit::table)
@@ -677,23 +651,6 @@ const SETTINGS_SCHEMA_VERSION: u8 = 1;
 const MAX_SETTINGS_REQUEST_BYTES: u64 = 64 * 1024;
 const MAX_API_KEY_BYTES: usize = 16 * 1024;
 
-fn configured_key_env<'a>(cfg: &'a Config, section: &str, fallback: &'a str) -> &'a str {
-    match section {
-        "anthropic_api" => &cfg.anthropic_api.api_key_env,
-        "zai" => &cfg.zai.api_key_env,
-        "openrouter" => &cfg.openrouter.api_key_env,
-        "deepseek" => &cfg.deepseek.api_key_env,
-        "kimi" => &cfg.kimi.api_key_env,
-        "kilo" => &cfg.kilo.api_key_env,
-        "novita" => &cfg.novita.api_key_env,
-        "moonshot" => &cfg.moonshot.api_key_env,
-        "grok" => &cfg.grok.api_key_env,
-        "minimax" => &cfg.minimax.api_key_env,
-        "opencode-go" => &cfg.opencode_go.api_key_env,
-        _ => fallback,
-    }
-}
-
 fn snapshot_from_config_with(
     cfg: &Config,
     environment_configured: impl Fn(&str) -> bool,
@@ -710,8 +667,8 @@ fn snapshot_from_config_with(
     let keys = KEY_VENDORS
         .iter()
         .map(|vendor| {
-            let environment = configured_key_env(cfg, vendor.section, vendor.env);
-            let inline_configured = config_inline_key(cfg, vendor).is_some_and(|v| !v.is_empty());
+            let environment = cfg.api_key_env_for(vendor.id);
+            let inline_configured = cfg.inline_api_key(vendor.id).is_some();
             let environment_configured = environment_configured(environment);
             KeyStatus {
                 id: vendor.id.slug().to_string(),
@@ -845,11 +802,28 @@ fn apply_settings_from_stdin() -> Result<()> {
     save_to_config_default(&state)
 }
 
+/// Explicit user opt-in, unlike discovery which respects an existing false.
+fn enable_vendor_at(path: &Path, vendor: VendorId) -> Result<()> {
+    let mut doc = read_config_document(path)?;
+    let before = doc.to_string();
+    set_bool(&mut doc, vendor.config_section(), "enabled", true)?;
+    if doc.to_string() != before {
+        write_config_document(path, &doc)?;
+    }
+    Ok(())
+}
+
 /// Administrative settings bridge for native frontends. `show` never emits a
 /// secret; `apply` accepts its patch only over stdin so keys do not appear in
 /// argv or the process environment.
 pub fn run_cli(action: &crate::widget::cli::SettingsAction) -> i32 {
     let result = match action {
+        crate::widget::cli::SettingsAction::Enable { vendor } => default_config_path()
+            .and_then(|path| enable_vendor_at(&path, vendor.to_id()))
+            .map(|()| {
+                crate::waybar::request_refresh();
+                println!(r#"{{"ok":true}}"#);
+            }),
         crate::widget::cli::SettingsAction::Show => Config::load()
             .and_then(|cfg| settings_snapshot_json(&cfg))
             .map(|json| println!("{json}")),
@@ -972,10 +946,11 @@ fn key_row(kv: &KeyVendor, input: &KeyInput, focused: bool, theme: &BubbleTheme)
     let value = value_text(input, focused);
 
     // Env / status suffix: env-var name, whether an env override is set, note.
-    let env_set = std::env::var(kv.env)
+    let env_name = kv.id.api_key_env();
+    let env_set = std::env::var(env_name)
         .map(|v| !v.is_empty())
         .unwrap_or(false);
-    let mut suffix = format!("   {}", kv.env);
+    let mut suffix = format!("   {env_name}");
     if env_set {
         suffix.push_str(" · env set (overrides)");
     }
@@ -1079,6 +1054,35 @@ mod tests {
         KEY_VENDORS.iter().position(|kv| kv.id == id).unwrap()
     }
 
+    #[test]
+    fn explicit_enable_preserves_other_settings_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let original = "# keep me\n[anthropic]\nenabled = false # intentional\n[openrouter]\napi_key = \"test-key\"\nenabled = false\n";
+        std::fs::write(&path, original).unwrap();
+        enable_vendor_at(&path, VendorId::Anthropic).unwrap();
+        let expected = original.replacen("enabled = false", "enabled = true", 1);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+        enable_vendor_at(&path, VendorId::Anthropic).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+    }
+
+    #[test]
+    fn explicit_enable_creates_missing_config_and_rejects_malformed_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested/config.toml");
+        enable_vendor_at(&path, VendorId::Anthropic).unwrap();
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("enabled = true")
+        );
+        let broken = "[anthropic\n";
+        std::fs::write(&path, broken).unwrap();
+        assert!(enable_vendor_at(&path, VendorId::Anthropic).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), broken);
+    }
+
     fn blank_state(primary: VendorId) -> SettingsState {
         SettingsState {
             focus: Focus::Primary,
@@ -1160,10 +1164,30 @@ mod tests {
         );
     }
 
+    /// The exported-env-var path is real behaviour and deserves a test of its
+    /// own — just not one that reads the machine it runs on.
+    #[test]
+    fn a_key_vendor_with_its_env_var_exported_is_offered() {
+        let cfg = Config::default();
+        let env = cfg.api_key_env_for(VendorId::Ollama).to_string();
+
+        let without = SettingsState::from_config_with(&cfg, |_| false);
+        assert!(!without.primary_choices.contains(&VendorId::Ollama));
+
+        let with = SettingsState::from_config_with(&cfg, |name| name == env);
+        assert!(
+            with.primary_choices.contains(&VendorId::Ollama),
+            "a key vendor whose env var is exported must be selectable: {:?}",
+            with.primary_choices
+        );
+    }
+
     #[test]
     fn from_config_offers_enabled_vendors_only() {
         let cfg = Config::default();
-        let s = SettingsState::from_config(&cfg);
+        // No ambient environment: this must not depend on whether the machine
+        // running `cargo test` happens to export OLLAMA_API_KEY or friends.
+        let s = SettingsState::from_config_with(&cfg, |_| false);
         let mut expected = cfg.enabled_vendors();
         expected.push(VendorId::Copilot);
         assert_eq!(s.primary_choices, expected);

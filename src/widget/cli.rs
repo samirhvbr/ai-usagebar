@@ -23,7 +23,12 @@ Output modes:
     in a terminal Does The Right Thing.
   - --watch N: like --pretty but refreshes every N seconds, clearing the screen
     between ticks. Useful while iterating on `--format` or `--tooltip-format`.
-  - --json: force JSON output even when stdout is a TTY (for scripting)."
+  - --json: force JSON output even when stdout is a TTY (for scripting).
+  - --config PATH: read and write an alternate config file instead of the
+    default `%APPDATA%/ai-usagebar/config.toml` (Windows) or
+    `~/.config/ai-usagebar/config.toml`. Accepted in any position, before or
+    after the subcommand; the file must already exist, and Settings saves
+    write back to it."
 )]
 pub struct Cli {
     /// Which vendor to query. When omitted, reads `[ui] primary` from
@@ -144,7 +149,33 @@ pub enum Command {
     },
 
     /// Quota and time-to-reset for every configured vendor and account.
+    ///
+    /// Exits 0 after printing a complete document, even when every entry
+    /// carries its own error. Non-zero only when the document cannot be
+    /// produced (missing or unreadable `--config`, unparseable TOML, no
+    /// vendors enabled, or a runtime/bootstrap failure).
     Usage {
+        /// Machine-readable output.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Turn on vendors whose credentials already exist on this machine
+    /// (local files, keychains, saved keys, env vars; never the network).
+    Detect {
+        /// Re-check every vendor, not only the ones never seen before.
+        #[arg(long)]
+        all: bool,
+        /// Machine-readable output.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Every provider ai-usagebar knows: how each authenticates, whether it is
+    /// switched on, and whether this machine has the credential it needs.
+    /// Unlike `usage`, this lists the switched-off and the never-configured —
+    /// it contacts nothing and is the catalog a frontend lists providers from.
+    Vendors {
         /// Machine-readable output.
         #[arg(long)]
         json: bool,
@@ -181,6 +212,12 @@ pub enum NousAuthAction {
 
 #[derive(clap::Subcommand, Debug, Clone)]
 pub enum SettingsAction {
+    /// Explicitly enable one provider, preserving other settings and credentials.
+    Enable {
+        #[arg(value_enum)]
+        vendor: Vendor,
+    },
+
     /// Print a non-secret JSON settings description.
     Show,
 
@@ -291,6 +328,7 @@ pub enum Vendor {
     Moonshot,
     Grok,
     Supergrok,
+    Grokbot,
     Antigravity,
     Cursor,
     Minimax,
@@ -302,6 +340,7 @@ pub enum Vendor {
     #[value(name = "commandcode")]
     CommandCode,
     Shvia,
+    Ollama,
 }
 
 impl Vendor {
@@ -320,6 +359,7 @@ impl Vendor {
             Vendor::Moonshot => crate::vendor::VendorId::Moonshot,
             Vendor::Grok => crate::vendor::VendorId::Grok,
             Vendor::Supergrok => crate::vendor::VendorId::Supergrok,
+            Vendor::Grokbot => crate::vendor::VendorId::Grokbot,
             Vendor::Antigravity => crate::vendor::VendorId::Antigravity,
             Vendor::Cursor => crate::vendor::VendorId::Cursor,
             Vendor::Minimax => crate::vendor::VendorId::Minimax,
@@ -328,6 +368,7 @@ impl Vendor {
             Vendor::OpenCodeGo => crate::vendor::VendorId::OpenCodeGo,
             Vendor::CommandCode => crate::vendor::VendorId::CommandCode,
             Vendor::Shvia => crate::vendor::VendorId::Shvia,
+            Vendor::Ollama => crate::vendor::VendorId::Ollama,
         }
     }
 }
@@ -413,6 +454,7 @@ fn id_to_vendor(id: crate::vendor::VendorId) -> Vendor {
         crate::vendor::VendorId::Moonshot => Vendor::Moonshot,
         crate::vendor::VendorId::Grok => Vendor::Grok,
         crate::vendor::VendorId::Supergrok => Vendor::Supergrok,
+        crate::vendor::VendorId::Grokbot => Vendor::Grokbot,
         crate::vendor::VendorId::Antigravity => Vendor::Antigravity,
         crate::vendor::VendorId::Cursor => Vendor::Cursor,
         crate::vendor::VendorId::Minimax => Vendor::Minimax,
@@ -421,6 +463,7 @@ fn id_to_vendor(id: crate::vendor::VendorId) -> Vendor {
         crate::vendor::VendorId::OpenCodeGo => Vendor::OpenCodeGo,
         crate::vendor::VendorId::CommandCode => Vendor::CommandCode,
         crate::vendor::VendorId::Shvia => Vendor::Shvia,
+        crate::vendor::VendorId::Ollama => Vendor::Ollama,
     }
 }
 
@@ -450,6 +493,22 @@ mod tests {
     use clap::{Parser, error::ErrorKind};
 
     #[test]
+    fn settings_enable_requires_a_known_vendor() {
+        assert!(matches!(
+            Cli::try_parse_from(["ai-usagebar", "settings", "enable", "anthropic"])
+                .unwrap()
+                .command,
+            Some(Command::Settings {
+                action: SettingsAction::Enable {
+                    vendor: Vendor::Anthropic
+                }
+            })
+        ));
+        assert!(Cli::try_parse_from(["ai-usagebar", "settings", "enable", "unknown"]).is_err());
+        assert!(Cli::try_parse_from(["ai-usagebar", "settings", "enable"]).is_err());
+    }
+
+    #[test]
     fn version_flags_report_the_crate_version() {
         let expected = format!("ai-usagebar {}\n", env!("CARGO_PKG_VERSION"));
 
@@ -465,6 +524,49 @@ mod tests {
     fn usage_subcommand_parses_machine_readable_mode() {
         let cli = Cli::parse_from(["ai-usagebar", "usage", "--json"]);
         assert!(matches!(cli.command, Some(Command::Usage { json: true })));
+    }
+
+    #[test]
+    fn usage_help_states_complete_document_exits_zero() {
+        let err = Cli::try_parse_from(["ai-usagebar", "usage", "--help"])
+            .expect_err("help exits through clap's display path");
+        assert_eq!(err.kind(), ErrorKind::DisplayHelp);
+        let help = err.to_string();
+        assert!(
+            help.contains("Exits 0 after printing a complete document"),
+            "{help}"
+        );
+        assert!(
+            help.contains("even when every entry") && help.contains("error"),
+            "{help}"
+        );
+        assert!(
+            help.contains("Non-zero only when the document cannot be produced"),
+            "{help}"
+        );
+    }
+
+    #[test]
+    fn detect_subcommand_parses_its_flags_and_takes_no_widget_flags() {
+        let bare = Cli::parse_from(["ai-usagebar", "detect"]);
+        assert!(matches!(
+            bare.command,
+            Some(Command::Detect {
+                all: false,
+                json: false
+            })
+        ));
+
+        let full = Cli::parse_from(["ai-usagebar", "detect", "--all", "--json"]);
+        assert!(matches!(
+            full.command,
+            Some(Command::Detect {
+                all: true,
+                json: true
+            })
+        ));
+
+        assert!(Cli::try_parse_from(["ai-usagebar", "--vendor", "kimi", "detect"]).is_err());
     }
 
     #[test]
@@ -665,6 +767,21 @@ mod tests {
         let cli = Cli::parse_from(["ai-usagebar", "--vendor", "kimi"]);
         assert_eq!(cli.vendor, Some(Vendor::Kimi));
         assert_eq!(cli.vendor.unwrap().to_id(), crate::vendor::VendorId::Kimi);
+    }
+
+    #[test]
+    fn vendor_grokbot_parses_to_grokbot_variant() {
+        let cli = Cli::parse_from(["ai-usagebar", "--vendor", "grokbot"]);
+        assert_eq!(cli.vendor, Some(Vendor::Grokbot));
+        assert_eq!(
+            cli.vendor.unwrap().to_id(),
+            crate::vendor::VendorId::Grokbot
+        );
+        // …and back, for the persisted-state resolver.
+        assert_eq!(
+            id_to_vendor(crate::vendor::VendorId::Grokbot),
+            Vendor::Grokbot
+        );
     }
 
     #[test]
