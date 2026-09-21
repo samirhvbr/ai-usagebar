@@ -20,8 +20,9 @@ import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 import {barMarkup, colorForDelta, colorForPct, disambiguateTags, field, FIELD, FORMAT, hasUsageWindows,
     integer, isGrouped, MARKER, markerElapsed, plainTextFromPango, selectPools,
     splitFormatOutput} from './marker-logic.js';
-import {API_VENDORS, configApiKeyEnv, configHasApiKey, configVendorEnabled,
-    extractSnapshot, parseLastError, rowStatus} from './api-status-logic.js';
+import {apiVendorRows, configApiKeyEnv, configHasApiKey, configVendorEnabled,
+    extractSnapshot, parseLastError, rowStatus,
+    splitVendorSetting} from './api-status-logic.js';
 
 const ROLE = 'ai-usagebar';
 
@@ -157,7 +158,7 @@ class AiUsageBarIndicator extends PanelMenu.Button {
         // Collapsible "Status das APIs": one row per configured vendor with a
         // health state derived from the binary's on-disk cache — no network
         // calls; it mirrors the last fetch (port of the macOS menu bar section).
-        this._buildApiSection();
+        this._buildApiSection(apiVendorRows(this._readConfigText(), GLib.get_home_dir()));
 
         const tuiItem = new PopupMenu.PopupMenuItem('Abrir TUI');
         tuiItem.connect('activate', () => this._openTui());
@@ -172,7 +173,7 @@ class AiUsageBarIndicator extends PanelMenu.Button {
     // A native collapsible submenu; each visible row reads the vendor's
     // on-disk cache (usage.json age + .last_error) and the config — pure
     // local disk, no network. The only network path is "Verificar todas".
-    _buildApiSection() {
+    _buildApiSection(rows, position) {
         this._apiSection = new PopupMenu.PopupSubMenuMenuItem('Status das APIs', false);
 
         const subhead = new PopupMenu.PopupBaseMenuItem({reactive: false, can_focus: false});
@@ -181,7 +182,8 @@ class AiUsageBarIndicator extends PanelMenu.Button {
         this._apiSection.menu.addMenuItem(subhead);
 
         this._apiRows = [];
-        for (const vendor of API_VENDORS) {
+        this._apiRowKeys = rows.map(vendor => vendor.key);
+        for (const vendor of rows) {
             const item = new PopupMenu.PopupBaseMenuItem({reactive: false, can_focus: false});
             // One line: dot, name, then value and age in right-aligned columns.
             // The age label carries a min-width so the values line up across
@@ -208,7 +210,9 @@ class AiUsageBarIndicator extends PanelMenu.Button {
         this._apiCheckItem.connect('activate', () => this._checkAllApis());
         this._apiSection.menu.addMenuItem(this._apiCheckItem);
 
-        this.menu.addMenuItem(this._apiSection);
+        // A rebuild re-inserts where the old section sat, or the section
+        // would jump below "Abrir TUI"/"Settings".
+        this.menu.addMenuItem(this._apiSection, position);
         // Populate lazily: reading ~11 tiny local files is cheap, but there is
         // no reason to do it before the section is first expanded.
         this._apiSection.menu.connect('open-state-changed', (_m, open) => {
@@ -241,6 +245,45 @@ class AiUsageBarIndicator extends PanelMenu.Button {
         }
     }
 
+    _readConfigText() {
+        return this._readFileText(
+            `${GLib.get_user_config_dir()}/ai-usagebar/config.toml`);
+    }
+
+    // Rebuild the rows when the config's account list changed under us —
+    // adding `[[anthropic.accounts]]` should show up on the next open, not
+    // after a shell restart. Returns the rows when they still match, and
+    // `null` once a rebuild is queued: the caller is usually inside the
+    // section's own `open-state-changed`, and destroying the section during
+    // its emission is not worth the risk, so the swap happens on the next
+    // idle and renders itself.
+    _syncApiRows(configText) {
+        if (!this._apiSection)
+            return null;
+        const rows = apiVendorRows(configText, GLib.get_home_dir());
+        const keys = rows.map(row => row.key);
+        if (this._apiRowKeys?.length === keys.length &&
+            this._apiRowKeys.every((key, i) => key === keys[i]))
+            return rows;
+        if (this._apiRebuildId)
+            return null;
+        this._apiRebuildId = GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
+            this._apiRebuildId = 0;
+            if (!this._apiSection)
+                return GLib.SOURCE_REMOVE;
+            const position = this.menu._getMenuItems().indexOf(this._apiSection);
+            const wasOpen = this._apiSection.menu.isOpen;
+            this._apiSection.destroy();
+            this._apiSection = null;
+            this._buildApiSection(rows, position >= 0 ? position : undefined);
+            if (wasOpen)
+                this._apiSection.menu.open(false);
+            this._refreshApiSection();
+            return GLib.SOURCE_REMOVE;
+        });
+        return null;
+    }
+
     // The effective API-key env var: the config's per-vendor `api_key_env`
     // override wins (resolve_api_key in the binary checks it first), else the
     // vendor's default. Used for both the configured check and the row hint.
@@ -249,8 +292,10 @@ class AiUsageBarIndicator extends PanelMenu.Button {
     }
 
     _vendorConfigured(vendor, configText) {
-        if (vendor.kind === 'oauth')
-            return GLib.file_test(`${GLib.get_home_dir()}/${vendor.creds}`, GLib.FileTest.EXISTS);
+        if (vendor.kind === 'oauth') {
+            const creds = vendor.credsPath ?? `${GLib.get_home_dir()}/${vendor.creds}`;
+            return GLib.file_test(creds, GLib.FileTest.EXISTS);
+        }
         const envName = this._vendorEnvName(vendor, configText);
         const env = envName ? GLib.getenv(envName) : null;
         if (env && env.trim())
@@ -261,8 +306,9 @@ class AiUsageBarIndicator extends PanelMenu.Button {
     _refreshApiSection() {
         if (!this._apiRows)
             return;
-        const configText = this._readFileText(
-            `${GLib.get_user_config_dir()}/ai-usagebar/config.toml`);
+        const configText = this._readConfigText();
+        if (!this._syncApiRows(configText))
+            return;
         const cacheBase = `${GLib.get_user_cache_dir()}/ai-usagebar`;
         const colors = this._colors();
         const stateColor = {low: colors.low, ok: colors.low, warn: colors.mid,
@@ -282,7 +328,7 @@ class AiUsageBarIndicator extends PanelMenu.Button {
                 continue;
             shownAny = true;
 
-            const dir = `${cacheBase}/${v.id}`;
+            const dir = `${cacheBase}/${v.cacheDir ?? v.id}`;
             const lastError = parseLastError(this._readFileText(`${dir}/.last_error`));
             const ageSecs = this._fileAgeSecs(`${dir}/usage.json`);
             let snap = null;
@@ -294,7 +340,7 @@ class AiUsageBarIndicator extends PanelMenu.Button {
                     // corrupt cache → no headline; the state ladder still works
                 }
             }
-            const activePcts = v.id === activeVendor && this._data?.hasUsageWindows
+            const activePcts = v.key === activeVendor && this._data?.hasUsageWindows
                 ? {session: this._data.session.pct, weekly: this._data.weekly.pct}
                 : null;
 
@@ -322,8 +368,7 @@ class AiUsageBarIndicator extends PanelMenu.Button {
     _checkAllApis(silent = false) {
         if (!this._apiRows)
             return;
-        const configText = this._readFileText(
-            `${GLib.get_user_config_dir()}/ai-usagebar/config.toml`);
+        const configText = this._readConfigText();
         const bin = resolveBinary(this._settings);
         const targets = this._apiRows
             .map(r => r.vendor)
@@ -340,7 +385,10 @@ class AiUsageBarIndicator extends PanelMenu.Button {
         for (const v of targets) {
             let proc;
             try {
-                proc = Gio.Subprocess.new([bin, '--vendor', v.id, '--json'],
+                const argv = v.account
+                    ? [bin, '--vendor', v.id, '--account', v.account, '--json']
+                    : [bin, '--vendor', v.id, '--json'];
+                proc = Gio.Subprocess.new(argv,
                     Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE);
             } catch (e) {
                 pending -= 1;
@@ -509,8 +557,12 @@ class AiUsageBarIndicator extends PanelMenu.Button {
         // Captured for THIS attempt: the setting can change while we wait, and
         // a late result must not be rendered as if it belonged to the vendor
         // now selected.
-        const vendor = this._settings.get_string('vendor') || 'anthropic';
-        const argv = [bin, '--vendor', vendor, '--format', FORMAT];
+        // `anthropic@claude-me` puts a named account on the panel; the
+        // binary takes the label as its own flag.
+        const {vendor, account} = splitVendorSetting(this._settings.get_string('vendor'));
+        const argv = account
+            ? [bin, '--vendor', vendor, '--account', account, '--format', FORMAT]
+            : [bin, '--vendor', vendor, '--format', FORMAT];
         const cancellable = new Gio.Cancellable();
         this._refreshCancellable = cancellable;
 
@@ -819,6 +871,10 @@ class AiUsageBarIndicator extends PanelMenu.Button {
         if (this._refreshTimeoutId) {
             GLib.source_remove(this._refreshTimeoutId);
             this._refreshTimeoutId = 0;
+        }
+        if (this._apiRebuildId) {
+            GLib.source_remove(this._apiRebuildId);
+            this._apiRebuildId = 0;
         }
         if (this._refreshCancellable)
             this._refreshCancellable.cancel();

@@ -8,6 +8,21 @@ import GLib from 'gi://GLib';
 
 import {ExtensionPreferences, gettext as _} from 'resource:///org/gnome/Shell/Extensions/js/extensions/prefs.js';
 
+import {configAnthropicAccounts} from './api-status-logic.js';
+
+// config.toml as text, or null when it isn't there yet. The vendor picker
+// reads the account labels out of it; the binary remains the authority on
+// everything else in that file.
+function readConfigText() {
+    try {
+        const [ok, bytes] = GLib.file_get_contents(
+            `${GLib.get_user_config_dir()}/ai-usagebar/config.toml`);
+        return ok ? new TextDecoder().decode(bytes) : null;
+    } catch (e) {
+        return null;
+    }
+}
+
 // ── Vendor login / config ────────────────────────────────────────────────
 const VENDOR_AUTH = [
     {id: 'anthropic', name: 'Claude', kind: 'oauth', cli: 'claude', login: 'claude', pkg: '@anthropic-ai/claude-code'},
@@ -288,8 +303,14 @@ export default class AiUsageBarPrefs extends ExtensionPreferences {
         settings.bind('api-refresh-interval', apiInterval, 'value', Gio.SettingsBindFlags.DEFAULT);
         data.add(apiInterval);
 
-        const vendorList = ['anthropic', 'openai', 'zai', 'openrouter', 'deepseek', 'antigravity',
-            'minimax'];
+        // Each configured `[[anthropic.accounts]]` label is its own choice
+        // (`anthropic@<label>`): with two Claude subscriptions on one machine,
+        // plain `anthropic` is the ambient ~/.claude login, which a
+        // CLAUDE_CONFIG_DIR setup may never sign into.
+        const accounts = configAnthropicAccounts(readConfigText(), GLib.get_home_dir())
+            .map(({label}) => `anthropic@${label}`);
+        const vendorList = ['anthropic', ...accounts, 'openai', 'zai', 'openrouter',
+            'deepseek', 'antigravity', 'minimax'];
         const vendor = new Adw.ComboRow({
             title: _('Vendor'),
             subtitle: _('anthropic, antigravity e minimax expõem as janelas de 5h + semanal'),

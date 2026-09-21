@@ -20,6 +20,18 @@ Each release is also published at
   Omarchy and the Windows tray draw Grok Bot's own head-and-eyes logomark
   (`grokbot.svg`) instead of sharing Grok's mark.
 
+- **The GNOME extension knows about named Anthropic accounts.** Every row and
+  every fetch used to aim at the single default credential slot, so a machine
+  watching two Claude subscriptions through `[[anthropic.accounts]]` could see
+  neither: the panel showed `~/.claude`, which a `CLAUDE_CONFIG_DIR` setup may
+  never sign into. The "Status das APIs" section now lists one row per
+  configured account — reading that account's own cache
+  (`anthropic/<label>`) and credential file — and refreshes each through
+  `--account`. The vendor picker offers the accounts as `anthropic@<label>`,
+  which is what puts one on the panel. Adding an account to `config.toml`
+  shows up on the section's next open rather than after a shell restart.
+  (GNOME extension 0.3.0)
+
 ### Changed
 
 - **ShvIA is now opt-in** (`[shvia] enabled = false`), matching every other

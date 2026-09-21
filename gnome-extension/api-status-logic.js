@@ -313,3 +313,128 @@ export function rowStatus(vendor, ctx) {
     }
     return {state: 'warn', detail: 'sem dados — use “Verificar todas”', age: ''};
 }
+
+// ── Named Anthropic accounts ──────────────────────────────────────────────
+// `[[anthropic.accounts]]` is how one machine watches two Claude
+// subscriptions at once, and the panel used to know nothing about it: every
+// row and every fetch aimed at the single default slot, which on a
+// `CLAUDE_CONFIG_DIR` setup is a directory the user may never log into.
+
+// The `[[anthropic.accounts]]` entries, in config order. An entry is a
+// `label` + `credentials_path` pair; both are required by the binary, so an
+// entry missing either is skipped rather than half-shown. `~` is expanded
+// against `home` (the binary's `expand_paths` does the same).
+export function configAnthropicAccounts(text, home) {
+    if (!text)
+        return [];
+    const out = [];
+    let entry = null;
+    const flush = () => {
+        if (entry?.label && entry.credentialsPath)
+            out.push(entry);
+        entry = null;
+    };
+    for (const raw of text.split('\n')) {
+        const line = raw.trim();
+        if (line.startsWith('[')) {
+            flush();
+            // Only the array-of-tables header opens an entry; `[anthropic]`
+            // and any other section closes the previous one. The header is
+            // doubly bracketed, so it is matched as the `[anthropic.accounts]`
+            // token inside one more pair of brackets.
+            if (tomlHeaderIs(line, '[anthropic.accounts]'))
+                entry = {label: '', credentialsPath: ''};
+            continue;
+        }
+        if (!entry || line.startsWith('#'))
+            continue;
+        const label = /^label\s*=\s*["']([^"']+)["']/.exec(line);
+        if (label) {
+            entry.label = label[1];
+            continue;
+        }
+        const path = /^credentials_path\s*=\s*["']([^"']+)["']/.exec(line);
+        if (path)
+            entry.credentialsPath = expandTilde(path[1], home);
+    }
+    flush();
+    return out;
+}
+
+// `~/x` → `<home>/x`. Only a leading `~/` (or a bare `~`) counts, exactly
+// like the binary's `expand_tilde`: `~user/x` is not a path it resolves.
+export function expandTilde(path, home) {
+    if (!home || path === '~')
+        return path === '~' && home ? home : path;
+    return path.startsWith('~/') ? `${home}/${path.slice(2)}` : path;
+}
+
+// `[anthropic] show_default_account = false` hides the ambient
+// `~/.claude`/Keychain login, which is what a fully account-managed setup
+// wants. Defaults to true, like the binary.
+export function configShowDefaultAccount(text) {
+    if (!text)
+        return true;
+    let inSection = false;
+    for (const raw of text.split('\n')) {
+        const line = raw.trim();
+        if (line.startsWith('[')) {
+            inSection = tomlHeaderIs(line, 'anthropic');
+            continue;
+        }
+        if (inSection && /^show_default_account\s*=/.test(line)) {
+            const val = line.slice(line.indexOf('=') + 1).trim().toLowerCase();
+            if (val.startsWith('false'))
+                return false;
+            if (val.startsWith('true'))
+                return true;
+        }
+    }
+    return true;
+}
+
+// The rows the section shows: [`API_VENDORS`] with its single `anthropic`
+// entry expanded into one row per named account. Each row carries the two
+// things that differ per account — the credential file that proves it is
+// logged in, and the cache subdirectory the binary writes it to
+// (`anthropic/<label>`, from `Cache::for_vendor_account`) — so the renderer
+// stays a loop over rows.
+//
+// `key` is the row's identity: the plain vendor id, or `anthropic@<label>`,
+// which is also what the `vendor` setting stores to put an account on the
+// panel. The default row is dropped when the config hides it, but never when
+// it is the only Claude there is — Anthropic does not lose its row to a
+// config typo.
+export function apiVendorRows(text, home) {
+    const accounts = configAnthropicAccounts(text, home);
+    const rows = [];
+    for (const vendor of API_VENDORS) {
+        if (vendor.id !== 'anthropic') {
+            rows.push({...vendor, key: vendor.id});
+            continue;
+        }
+        if (!accounts.length || configShowDefaultAccount(text))
+            rows.push({...vendor, key: vendor.id});
+        for (const account of accounts) {
+            rows.push({
+                ...vendor,
+                key: `${vendor.id}@${account.label}`,
+                account: account.label,
+                name: `${vendor.name} · ${account.label}`,
+                creds: '',
+                credsPath: account.credentialsPath,
+                cacheDir: `${vendor.id}/${account.label}`,
+            });
+        }
+    }
+    return rows;
+}
+
+// Split a `vendor` setting value into the arguments the binary takes.
+// `anthropic@work` → `--vendor anthropic --account work`.
+export function splitVendorSetting(value) {
+    const at = (value ?? '').indexOf('@');
+    if (at <= 0)
+        return {vendor: value || 'anthropic', account: null};
+    return {vendor: value.slice(0, at), account: value.slice(at + 1) || null};
+}

@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
-import {API_VENDORS, balanceDisplay, configApiKeyEnv, configHasApiKey,
-    configMonthlyLimit, configVendorEnabled, extractSnapshot, fmtAge,
-    parseLastError, quotaDisplay, rowStatus, shortHttpError,
-    tomlHeaderIs} from './api-status-logic.js';
+import {API_VENDORS, apiVendorRows, balanceDisplay, configAnthropicAccounts,
+    configApiKeyEnv, configHasApiKey, configMonthlyLimit,
+    configShowDefaultAccount, configVendorEnabled, expandTilde, extractSnapshot,
+    fmtAge, parseLastError, quotaDisplay, rowStatus, shortHttpError,
+    splitVendorSetting, tomlHeaderIs} from './api-status-logic.js';
 
 // ── tomlHeaderIs ──────────────────────────────────────────────────────────
 assert.equal(tomlHeaderIs('[zai]', 'zai'), true);
@@ -176,3 +177,78 @@ assert.deepEqual(
     {state: 'ok', detail: '4h 12% · 7d 34%', age: '20s'});
 
 console.log('api-status-logic: all assertions passed');
+
+// ── named Anthropic accounts ──────────────────────────────────────────────
+const ACCOUNTS_CFG = `
+[ui]
+primary = "anthropic"
+
+[anthropic]
+show_default_account = false
+
+[[anthropic.accounts]]
+label = "claude-me"
+credentials_path = "~/.claude-pessoal/.credentials.json"
+
+[[anthropic.accounts]]
+label = "claude-b3"
+credentials_path = "/home/s/.claude-blue3/.credentials.json"
+
+[minimax]
+enabled = true
+`;
+
+assert.deepEqual(configAnthropicAccounts(ACCOUNTS_CFG, '/home/s'), [
+    {label: 'claude-me', credentialsPath: '/home/s/.claude-pessoal/.credentials.json'},
+    {label: 'claude-b3', credentialsPath: '/home/s/.claude-blue3/.credentials.json'},
+]);
+assert.deepEqual(configAnthropicAccounts(null, '/home/s'), []);
+// An entry missing either half is not a usable account.
+assert.deepEqual(
+    configAnthropicAccounts('[[anthropic.accounts]]\nlabel = "x"\n', '/home/s'), []);
+assert.deepEqual(
+    configAnthropicAccounts('[[anthropic.accounts]]\ncredentials_path = "/c.json"\n', '/home/s'),
+    []);
+// `[minimax]` after the last entry must not swallow the entry before it.
+assert.equal(configAnthropicAccounts(ACCOUNTS_CFG, '/home/s').length, 2);
+
+assert.equal(expandTilde('~/a/b', '/home/s'), '/home/s/a/b');
+assert.equal(expandTilde('/abs/a', '/home/s'), '/abs/a');
+assert.equal(expandTilde('~user/a', '/home/s'), '~user/a'); // not a path the binary expands
+assert.equal(expandTilde('~', '/home/s'), '/home/s');
+
+assert.equal(configShowDefaultAccount(ACCOUNTS_CFG), false);
+assert.equal(configShowDefaultAccount('[anthropic]\n'), true);  // default
+assert.equal(configShowDefaultAccount(null), true);
+// The key belongs to [anthropic]; the same line under another section is not it.
+assert.equal(configShowDefaultAccount('[openai]\nshow_default_account = false\n'), true);
+
+const rows = apiVendorRows(ACCOUNTS_CFG, '/home/s');
+const claudes = rows.filter(r => r.id === 'anthropic');
+assert.deepEqual(claudes.map(r => r.key), ['anthropic@claude-me', 'anthropic@claude-b3']);
+assert.equal(claudes[0].cacheDir, 'anthropic/claude-me');
+assert.equal(claudes[0].credsPath, '/home/s/.claude-pessoal/.credentials.json');
+assert.equal(claudes[0].kind, 'oauth');           // still an OAuth row
+assert.match(claudes[0].name, /claude-me$/);
+// Every other vendor keeps exactly one row, keyed by its plain id.
+assert.equal(rows.filter(r => r.id === 'openai').length, 1);
+assert.equal(rows.find(r => r.id === 'openai').key, 'openai');
+assert.equal(rows.length, API_VENDORS.length + 1); // anthropic → 2 accounts, default hidden
+
+// Accounts plus the default slot shown: three Claude rows.
+const withDefault = apiVendorRows(
+    ACCOUNTS_CFG.replace('show_default_account = false', 'show_default_account = true'),
+    '/home/s');
+assert.deepEqual(withDefault.filter(r => r.id === 'anthropic').map(r => r.key),
+    ['anthropic', 'anthropic@claude-me', 'anthropic@claude-b3']);
+
+// No accounts configured: the list is untouched, default row included.
+assert.deepEqual(apiVendorRows('[anthropic]\nshow_default_account = false\n', '/home/s')
+    .filter(r => r.id === 'anthropic').map(r => r.key), ['anthropic']);
+
+assert.deepEqual(splitVendorSetting('anthropic@claude-me'),
+    {vendor: 'anthropic', account: 'claude-me'});
+assert.deepEqual(splitVendorSetting('openai'), {vendor: 'openai', account: null});
+assert.deepEqual(splitVendorSetting(''), {vendor: 'anthropic', account: null});
+assert.deepEqual(splitVendorSetting('@stray'), {vendor: '@stray', account: null});
+assert.deepEqual(splitVendorSetting('anthropic@'), {vendor: 'anthropic', account: null});
