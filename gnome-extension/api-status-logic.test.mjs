@@ -247,8 +247,24 @@ assert.deepEqual(apiVendorRows('[anthropic]\nshow_default_account = false\n', '/
     .filter(r => r.id === 'anthropic').map(r => r.key), ['anthropic']);
 
 assert.deepEqual(splitVendorSetting('anthropic@claude-me'),
-    {vendor: 'anthropic', account: 'claude-me'});
-assert.deepEqual(splitVendorSetting('openai'), {vendor: 'openai', account: null});
-assert.deepEqual(splitVendorSetting(''), {vendor: 'anthropic', account: null});
-assert.deepEqual(splitVendorSetting('@stray'), {vendor: '@stray', account: null});
-assert.deepEqual(splitVendorSetting('anthropic@'), {vendor: 'anthropic', account: null});
+    {selection: 'anthropic@claude-me', vendor: 'anthropic', account: 'claude-me'});
+assert.deepEqual(splitVendorSetting('openai'),
+    {selection: 'openai', vendor: 'openai', account: null});
+assert.deepEqual(splitVendorSetting(''),
+    {selection: 'anthropic', vendor: 'anthropic', account: null});
+assert.deepEqual(splitVendorSetting('@stray'),
+    {selection: '@stray', vendor: '@stray', account: null});
+assert.deepEqual(splitVendorSetting('anthropic@'),
+    {selection: 'anthropic@', vendor: 'anthropic', account: null});
+
+// `selection` is the value the setting holds, so a fetch can tell "the user
+// picked something else" from "same selection, split into flags". Comparing
+// the setting against `vendor` instead discarded every account result and
+// stranded the panel on its placeholder.
+for (const value of ['anthropic', 'anthropic@claude-me', 'openai', 'anthropic@',
+    '@stray', '']) {
+    const {selection} = splitVendorSetting(value);
+    assert.equal(selection, value || 'anthropic');
+    // Idempotent: re-splitting its own selection yields the same parts.
+    assert.deepEqual(splitVendorSetting(selection), splitVendorSetting(value));
+}

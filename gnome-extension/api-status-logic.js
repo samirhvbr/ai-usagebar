@@ -430,11 +430,23 @@ export function apiVendorRows(text, home) {
     return rows;
 }
 
-// Split a `vendor` setting value into the arguments the binary takes.
+// Split a `vendor` setting value into the arguments the binary takes:
 // `anthropic@work` → `--vendor anthropic --account work`.
+//
+// `selection` comes back too, and it is not decoration. A pending fetch is
+// discarded when the setting no longer matches the value it started with, and
+// the only value that can be compared with the setting is the setting's own —
+// `vendor` alone never equals `anthropic@work`, so a guard written against it
+// throws away every result an account ever produces and the panel keeps its
+// placeholder. Returning the identity next to the parts is what stops a
+// caller from having to reconstruct it.
 export function splitVendorSetting(value) {
-    const at = (value ?? '').indexOf('@');
+    const selection = value || 'anthropic';
+    const at = selection.indexOf('@');
     if (at <= 0)
-        return {vendor: value || 'anthropic', account: null};
-    return {vendor: value.slice(0, at), account: value.slice(at + 1) || null};
+        return {selection, vendor: selection, account: null};
+    const account = selection.slice(at + 1);
+    return account
+        ? {selection, vendor: selection.slice(0, at), account}
+        : {selection, vendor: selection.slice(0, at), account: null};
 }

@@ -556,10 +556,16 @@ class AiUsageBarIndicator extends PanelMenu.Button {
         const bin = resolveBinary(this._settings);
         // Captured for THIS attempt: the setting can change while we wait, and
         // a late result must not be rendered as if it belonged to the vendor
-        // now selected.
+        // now selected. `selection` is the setting's own value, which is what
+        // the completion callback re-reads to decide that — comparing the
+        // *split* vendor against it would never match for an account
+        // (`anthropic` ≠ `anthropic@claude-me`) and would discard every
+        // result, leaving the panel on its placeholder for ever.
         // `anthropic@claude-me` puts a named account on the panel; the
-        // binary takes the label as its own flag.
-        const {vendor, account} = splitVendorSetting(this._settings.get_string('vendor'));
+        // binary takes the label as its own flag, and `selection` is the
+        // setting's own value the callback below compares against.
+        const {selection, vendor, account} =
+            splitVendorSetting(this._settings.get_string('vendor'));
         const argv = account
             ? [bin, '--vendor', vendor, '--account', account, '--format', FORMAT]
             : [bin, '--vendor', vendor, '--format', FORMAT];
@@ -630,7 +636,7 @@ class AiUsageBarIndicator extends PanelMenu.Button {
                     return;
                 // The selection may have changed while this ran even without a
                 // newer attempt (the change is queued as `_refreshPending`).
-                if ((this._settings.get_string('vendor') || 'anthropic') !== vendor)
+                if ((this._settings.get_string('vendor') || 'anthropic') !== selection)
                     return;
                 if ((!out || !out.trim()) && !p.get_successful()) {
                     this._setError('ai-usagebar falhou', err || '');
