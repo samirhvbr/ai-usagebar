@@ -31,7 +31,16 @@ Each release is also published at
   shows. Empty (the default) keeps the single-provider panel exactly as it
   was. A selected provider that is switched off in `config.toml` gets a muted
   segment rather than vanishing, and a provider with neither a 5h nor a 7d
-  window shows its first window instead of nothing. (GNOME extension 0.4.0)
+  window shows its first window instead of nothing.
+
+  Segments are tagged with the account label, less whatever prefix it shares
+  with the other selected labels — `claude-me` and `claude-b3` next to each
+  other read `me` and `b3`, where the repeated half says nothing and the panel
+  has the least room to spell it out. Derived from the selection, so a
+  `work`/`personal` pair keeps both names whole, the prefix is cut at a
+  separator (never `e`/`x` out of `claude-me`/`claude-mx`), a single selected
+  account keeps the name its owner gave it, and labels from different
+  providers cannot collapse onto the same tag. (GNOME extension 0.4.0)
 
 - **The GNOME extension knows about named Anthropic accounts.** Every row and
   every fetch used to aim at the single default credential slot, so a machine

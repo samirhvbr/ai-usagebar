@@ -222,15 +222,64 @@ export function windowTag(secs) {
     return `${Math.round(n / 60)}m`;
 }
 
+// The account label inside a report id, or '' for a plain provider.
+export function entryLabel(id) {
+    const text = String(id ?? '');
+    const at = text.indexOf('@');
+    return at > 0 && at < text.length - 1 ? text.slice(at + 1) : '';
+}
+
+// Labels a person keeps on one machine tend to share a word that says nothing
+// once they sit next to each other: `claude-me` and `claude-b3` differ in the
+// last part only, and the panel is the one place with no room to spell out
+// what both halves already say. So the prefix every selected label shares is
+// dropped — `me`, `b3` — which is the inverse of `disambiguateTags`: that one
+// widens pool tags until they differ, this one narrows account tags while they
+// still do.
+//
+// Derived, never a list of names here: a `work`/`personal` pair shares nothing
+// and keeps both labels in full. Four conditions keep it from eating meaning:
+//
+//   - at least two labels, or there is no shared prefix to discover and the
+//     one label keeps the name its owner gave it;
+//   - the prefix is trimmed back to a separator, so `claude-me`/`claude-mx`
+//     become `me`/`mx` and never `e`/`x`;
+//   - every label must survive it with something left;
+//   - labels from every selected provider go in together, so two providers
+//     with parallel labels (`claude-me`, `codex-me`) share nothing to strip
+//     and cannot collapse into the same tag.
+export function commonLabelPrefix(ids) {
+    const labels = (ids ?? []).map(entryLabel).filter(label => label);
+    if (labels.length < 2)
+        return '';
+    let prefix = labels[0];
+    for (const label of labels.slice(1)) {
+        let i = 0;
+        while (i < prefix.length && i < label.length && prefix[i] === label[i])
+            i++;
+        prefix = prefix.slice(0, i);
+        if (!prefix)
+            return '';
+    }
+    // Back to the last separator inside the shared part, inclusive.
+    const cut = Math.max(prefix.lastIndexOf('-'), prefix.lastIndexOf('_'),
+        prefix.lastIndexOf('.'), prefix.lastIndexOf(':'), prefix.lastIndexOf(' '));
+    if (cut < 0)
+        return '';
+    prefix = prefix.slice(0, cut + 1);
+    return labels.every(label => label.length > prefix.length) ? prefix : '';
+}
+
 // How a segment names its entry: the account label when the id carries one
 // (`anthropic@claude-b3` → `claude-b3`, the name the user chose in
-// config.toml), otherwise the report's own short name (`gpt`). Never a table
-// of vendor ids — that is what `short_name` is in the report for.
-export function entryTag(entry) {
+// config.toml), less any prefix it shares with the other selected labels,
+// otherwise the report's own short name (`gpt`). Never a table of vendor ids —
+// that is what `short_name` is in the report for.
+export function entryTag(entry, prefix = '') {
     const id = String(entry?.id ?? '');
-    const at = id.indexOf('@');
-    if (at > 0 && at < id.length - 1)
-        return id.slice(at + 1);
+    const label = entryLabel(id);
+    if (label)
+        return prefix && label.startsWith(prefix) ? label.slice(prefix.length) : label;
     return entry?.short_name || id;
 }
 
@@ -272,14 +321,17 @@ export function entryMetrics(entry, windows) {
 // this project keeps in Rust.
 export function panelSegments(report, ids, windows) {
     const entries = Array.isArray(report?.entries) ? report.entries : [];
+    // From the selection, not from what rendered: a tag that shifts because
+    // one account failed this minute would be worse than a long one.
+    const prefix = commonLabelPrefix(ids);
     const out = [];
     for (const id of ids ?? []) {
         const entry = entries.find(e => e?.id === id);
         if (!entry) {
-            out.push({id, tag: entryTag({id}), status: 'absent'});
+            out.push({id, tag: entryTag({id}, prefix), status: 'absent'});
             continue;
         }
-        const tag = entryTag(entry);
+        const tag = entryTag(entry, prefix);
         if (entry.status === 'error' || (!entry.metrics?.length && entry.error)) {
             out.push({id, tag, status: 'error', error: entry.error || ''});
             continue;

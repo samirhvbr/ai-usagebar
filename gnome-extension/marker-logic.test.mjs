@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
-import {barMarkup, colorForDelta, disambiguateTags, entryMetrics, entryTag, field, FIELD, FORMAT,
-    hasUsageWindows, integer, isGrouped, markerElapsed, panelSegments, pickPool,
-    plainTextFromPango, poolAvailable, poolTag, selectPools, SESSION_SECS,
-    splitFormatOutput, WEEKLY_SECS, windowTag} from './marker-logic.js';
+import {barMarkup, colorForDelta, commonLabelPrefix, disambiguateTags, entryLabel, entryMetrics,
+    entryTag, field, FIELD, FORMAT, hasUsageWindows, integer, isGrouped, markerElapsed,
+    panelSegments, pickPool, plainTextFromPango, poolAvailable, poolTag, selectPools,
+    SESSION_SECS, splitFormatOutput, WEEKLY_SECS, windowTag} from './marker-logic.js';
 
 const colors = {low: 'low', mid: 'mid', high: 'high', critical: 'critical', empty: 'empty'};
 const visibleCells = markup => markup.replace(/<[^>]+>/g, '');
@@ -144,9 +144,44 @@ assert.equal(windowTag(90), '2m');       // rounds to the nearest minute
 assert.equal(windowTag(0), '');
 assert.equal(windowTag(null), '');
 
+assert.equal(entryLabel('anthropic@claude-b3'), 'claude-b3');
+assert.equal(entryLabel('openai'), '');
+assert.equal(entryLabel('anthropic@'), '');
+assert.equal(entryLabel('@x'), '');
+assert.equal(entryLabel(null), '');
+
+// ── shared label prefix ───────────────────────────────────────────────────
+// Labels kept on one machine repeat a word that says nothing once they sit
+// side by side, and the panel is where that costs the most room.
+assert.equal(commonLabelPrefix(['anthropic@claude-me', 'anthropic@claude-b3', 'openai']),
+    'claude-');
+// Nothing shared: both names stay whole.
+assert.equal(commonLabelPrefix(['anthropic@work', 'anthropic@personal']), '');
+// One label has no shared prefix to discover, so it keeps its owner's name.
+assert.equal(commonLabelPrefix(['anthropic@claude-me', 'openai']), '');
+assert.equal(commonLabelPrefix([]), '');
+assert.equal(commonLabelPrefix(null), '');
+// Trimmed to a separator: never `e`/`x` out of `claude-me`/`claude-mx`.
+assert.equal(commonLabelPrefix(['a@claude-me', 'a@claude-mx']), 'claude-');
+assert.equal(commonLabelPrefix(['a@dev1', 'a@dev2']), '');
+// Every label must survive with something left.
+assert.equal(commonLabelPrefix(['a@claude', 'a@claude-me']), '');
+assert.equal(commonLabelPrefix(['a@x-', 'a@x-me']), '');
+// Other separators are boundaries too.
+assert.equal(commonLabelPrefix(['a@claude_me', 'a@claude_b3']), 'claude_');
+assert.equal(commonLabelPrefix(['a@claude me', 'a@claude b3']), 'claude ');
+// Parallel labels under different providers share nothing, so two entries
+// cannot collapse onto the same tag.
+assert.equal(commonLabelPrefix(['anthropic@claude-me', 'openai@codex-me']), '');
+
 // The account label names the segment; a plain vendor falls back to the
 // report's own short name, never to a table kept here.
 assert.equal(entryTag({id: 'anthropic@claude-b3', short_name: 'cld'}), 'claude-b3');
+assert.equal(entryTag({id: 'anthropic@claude-b3', short_name: 'cld'}, 'claude-'), 'b3');
+// A prefix the label does not carry is not applied blindly.
+assert.equal(entryTag({id: 'anthropic@work', short_name: 'cld'}, 'claude-'), 'work');
+// A provider's short name is never trimmed — it is not a label.
+assert.equal(entryTag({id: 'openai', short_name: 'gpt'}, 'gp'), 'gpt');
 assert.equal(entryTag({id: 'openai', short_name: 'gpt'}), 'gpt');
 assert.equal(entryTag({id: 'openai'}), 'openai');          // no short name in the report
 assert.equal(entryTag({id: 'anthropic@', short_name: 'cld'}), 'cld'); // empty label
@@ -194,10 +229,18 @@ const REPORT = {entries: [CLAUDE, {...CLAUDE, id: 'anthropic@claude-b3',
 const weekly = panelSegments(REPORT,
     ['anthropic@claude-me', 'anthropic@claude-b3', 'openai'], {weekly: true});
 assert.deepEqual(weekly.map(s => [s.tag, s.window, s.pct, s.status]), [
-    ['claude-me', '7d', 95, 'ready'],
-    ['claude-b3', '7d', 16, 'ready'],
+    ['me', '7d', 95, 'ready'],
+    ['b3', '7d', 16, 'ready'],
     ['gpt', '7d', 5, 'ready'],
 ]);
+// The prefix comes from the selection, so a tag does not grow back when the
+// account next to it fails or is switched off.
+assert.deepEqual(panelSegments({entries: [REPORT.entries[0]]},
+    ['anthropic@claude-me', 'anthropic@claude-b3'], {weekly: true})
+    .map(s => [s.tag, s.status]), [['me', 'ready'], ['b3', 'absent']]);
+// One account selected keeps its full name: nothing to compare it against.
+assert.equal(panelSegments(REPORT, ['anthropic@claude-me'], {weekly: true})[0].tag,
+    'claude-me');
 // Selection order is display order, not report order.
 assert.deepEqual(panelSegments(REPORT, ['openai', 'anthropic@claude-me'], {weekly: true})
     .map(s => s.tag), ['gpt', 'claude-me']);
@@ -213,6 +256,9 @@ assert.deepEqual(panelSegments(REPORT, ['minimax'], {weekly: true}),
     [{id: 'minimax', tag: 'minimax', status: 'absent'}]);
 assert.deepEqual(panelSegments(REPORT, ['anthropic@gone'], {weekly: true}),
     [{id: 'anthropic@gone', tag: 'gone', status: 'absent'}]);
+// Selection order is display order for the tags too.
+assert.deepEqual(panelSegments(REPORT, ['anthropic@claude-b3', 'anthropic@claude-me'],
+    {weekly: true}).map(s => s.tag), ['b3', 'me']);
 
 // Percentages are clamped and rounded the way the bar expects.
 assert.equal(panelSegments({entries: [{id: 'x', metrics: [
