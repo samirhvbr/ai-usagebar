@@ -18,8 +18,8 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 import {barMarkup, colorForDelta, colorForPct, disambiguateTags, field, FIELD, FORMAT, hasUsageWindows,
-    integer, isGrouped, MARKER, markerElapsed, plainTextFromPango, selectPools,
-    splitFormatOutput} from './marker-logic.js';
+    integer, isGrouped, MARKER, markerElapsed, panelSegments, plainTextFromPango,
+    selectPools, splitFormatOutput} from './marker-logic.js';
 import {apiVendorRows, configApiKeyEnv, configHasApiKey, configVendorEnabled,
     extractSnapshot, parseLastError, rowStatus,
     splitVendorSetting} from './api-status-logic.js';
@@ -74,6 +74,10 @@ class AiUsageBarIndicator extends PanelMenu.Button {
         this._refreshProc = null;
         this._refreshToken = 0;
         this._apiCheckToken = 0;
+        this._report = null;        // aggregate `usage --json`, for the multi-entry panel
+        this._reportToken = 0;
+        this._reportCancellable = null;
+        this._reportProc = null;
         this._rows = {};
 
         // Panel: one markup label holds tags + percentages + bars.
@@ -96,7 +100,7 @@ class AiUsageBarIndicator extends PanelMenu.Button {
             'bar-width', 'show-percent', 'show-bars', 'show-session',
             'show-weekly', 'show-extra', 'color-low', 'color-mid',
             'color-high', 'color-critical', 'color-empty',
-            'panel-pools', 'panel-auto-threshold',
+            'panel-pools', 'panel-auto-threshold', 'panel-entries',
         ];
         this._viewIds = viewKeys.map(k =>
             this._settings.connect(`changed::${k}`, () => this._render()));
@@ -108,6 +112,8 @@ class AiUsageBarIndicator extends PanelMenu.Button {
         this._sourceIds = [
             this._settings.connect('changed::vendor', () => this._refresh()),
             this._settings.connect('changed::binary-path', () => this._refresh()),
+            // A newly selected entry has no figure in the report we hold.
+            this._settings.connect('changed::panel-entries', () => this._refreshReport()),
         ];
 
         this.menu.connect('open-state-changed', (_m, open) => {
@@ -553,6 +559,10 @@ class AiUsageBarIndicator extends PanelMenu.Button {
         this._busy = true;
         const token = ++this._refreshToken;
 
+        // The panel's own source when entries are selected; the fetch below
+        // still runs, because the dropdown's detail comes from `--format`.
+        this._refreshReport();
+
         const bin = resolveBinary(this._settings);
         // Captured for THIS attempt: the setting can change while we wait, and
         // a late result must not be rendered as if it belonged to the vendor
@@ -658,6 +668,59 @@ class AiUsageBarIndicator extends PanelMenu.Button {
         });
     }
 
+    // The ids the panel draws side by side. Empty means the classic
+    // single-provider panel, driven by the `vendor` key.
+    _panelEntryIds() {
+        return this._settings.get_strv('panel-entries').filter(id => id);
+    }
+
+    // The aggregate report — one entry per provider AND per named account,
+    // which is the only source that can put two Claude accounts and a Codex
+    // on the panel at once. One process per refresh regardless of how many
+    // entries are selected; each entry still honors the binary's own cache
+    // TTL, so this is no more network than the single-provider panel.
+    _refreshReport() {
+        if (!this._panelEntryIds().length) {
+            this._report = null;
+            return;
+        }
+        const bin = resolveBinary(this._settings);
+        const token = ++this._reportToken;
+        const cancellable = new Gio.Cancellable();
+        let proc;
+        try {
+            proc = new Gio.Subprocess({
+                argv: [bin, 'usage', '--json'],
+                flags: Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE,
+            });
+            proc.init(cancellable);
+        } catch (e) {
+            return; // the single-provider path already reports a missing binary
+        }
+        if (this._reportCancellable)
+            this._reportCancellable.cancel();
+        this._reportCancellable = cancellable;
+        this._reportProc = proc;
+        proc.communicate_utf8_async(null, cancellable, (p, res) => {
+            try {
+                const [, out] = p.communicate_utf8_finish(res);
+                if (this._reportCancellable === cancellable)
+                    this._reportCancellable = null;
+                if (this._reportProc === p)
+                    this._reportProc = null;
+                if (this._reportToken !== token)
+                    return;
+                // `usage` exits 0 with per-entry errors inside the document,
+                // so a parse is the only real verdict here.
+                this._report = JSON.parse(out || '');
+                this._render();
+            } catch (e) {
+                if (this._reportToken === token)
+                    this._report = null;
+            }
+        });
+    }
+
     _consume(stdout) {
         let data;
         try {
@@ -713,13 +776,63 @@ class AiUsageBarIndicator extends PanelMenu.Button {
     }
 
     // Redraw both the panel and the dropdown from cached data + settings.
+    // The two halves have separate sources when entries are selected: the
+    // panel draws the report, the dropdown keeps the `vendor` key's detail,
+    // so a panel full of accounts does not depend on that one fetch landing.
     _render() {
+        const colors = this._colors();
+        const ids = this._panelEntryIds();
+        if (ids.length)
+            this._renderPanelEntries(ids, colors);
         const d = this._data;
         if (!d)
             return;
-        const colors = this._colors();
-        this._renderPanel(d, colors);
+        if (!ids.length)
+            this._renderPanel(d, colors);
         this._renderDropdown(d, colors);
+    }
+
+    // One segment per selected entry per selected window, in selection order.
+    // Everything shown comes from the report: the label, the window length,
+    // the percentage and the error text. A selected entry that is switched off
+    // in config.toml still gets a muted segment, because a silently missing
+    // one reads as a bug in the extension.
+    _renderPanelEntries(ids, colors) {
+        if (!this._report)
+            return;
+        const w = Math.max(4, Math.min(20, this._settings.get_int('bar-width')));
+        const showPct = this._settings.get_boolean('show-percent');
+        const showBars = this._settings.get_boolean('show-bars');
+        const windows = {
+            session: this._settings.get_boolean('show-session'),
+            weekly: this._settings.get_boolean('show-weekly'),
+        };
+        const parts = [];
+        for (const s of panelSegments(this._report, ids, windows)) {
+            const tag = `<span foreground="${DIM}">${esc(s.tag)}${
+                s.window ? ` ${esc(s.window)}` : ''}</span>`;
+            if (s.status === 'error') {
+                parts.push(`${tag} <span foreground="${colors.critical}">⚠</span>`);
+                continue;
+            }
+            if (s.status === 'absent' || s.pct == null) {
+                parts.push(`${tag} <span foreground="${DIM}">—</span>`);
+                continue;
+            }
+            const toks = [tag];
+            // Pacing markers are absent on purpose: the report states elapsed
+            // only inside prose, and deriving it here is Rust's job.
+            if (showPct || !showBars)
+                toks.push(`<span foreground="${colorForPct(s.pct, colors)}">${esc(s.value) ||
+                    `${s.pct}%`}</span>`);
+            if (showBars)
+                toks.push(barMarkup(s.pct, w, colors, null));
+            if (s.stale)
+                toks.push(`<span foreground="${DIM}">⏸</span>`);
+            parts.push(toks.join(' '));
+        }
+        const gap = `<span foreground="${DIM}">   </span>`;
+        this._label.clutter_text.set_markup(parts.join(gap) || ' ');
     }
 
     _renderPanel(d, colors) {
@@ -881,6 +994,16 @@ class AiUsageBarIndicator extends PanelMenu.Button {
         if (this._apiRebuildId) {
             GLib.source_remove(this._apiRebuildId);
             this._apiRebuildId = 0;
+        }
+        if (this._reportCancellable) {
+            this._reportCancellable.cancel();
+            this._reportCancellable = null;
+        }
+        if (this._reportProc) {
+            try {
+                this._reportProc.force_exit();
+            } catch (e) {}
+            this._reportProc = null;
         }
         if (this._refreshCancellable)
             this._refreshCancellable.cancel();

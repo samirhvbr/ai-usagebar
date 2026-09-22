@@ -191,3 +191,116 @@ export function barMarkup(pct, width, colors, elapsed) {
         `<span foreground="${over}">${'█'.repeat(postFilled)}</span>` +
         `<span foreground="${colors.empty}">${'░'.repeat(postEmpty)}</span>`;
 }
+
+// ── Multi-entry panel ─────────────────────────────────────────────────────
+// The panel above shows one vendor at a time, driven by `--format`. A machine
+// with two Claude subscriptions and a Codex wants all three weeklies side by
+// side instead, which is what the aggregate `usage --json` report already
+// carries — one entry per vendor *and per named account*. These helpers turn
+// that report into panel segments; the report stays the authority on labels,
+// windows, order and severity, exactly as it is for the KDE and Omarchy
+// frontends.
+
+// The two windows the panel's show-session / show-weekly settings name. They
+// are the window *lengths* Rust reports, so no vendor id appears here: any
+// provider with a 5h or 7d window is matched by the same rule.
+export const SESSION_SECS = 18000;
+export const WEEKLY_SECS = 604800;
+
+// A short tag for a window length, for the provider whose windows are neither
+// of the two above (a calendar-month quota, say) and would otherwise have no
+// segment at all. Whole days and hours only — the report has no window that is
+// not a round number of either.
+export function windowTag(secs) {
+    const n = Number(secs);
+    if (!Number.isFinite(n) || n <= 0)
+        return '';
+    if (n % 86400 === 0)
+        return `${n / 86400}d`;
+    if (n % 3600 === 0)
+        return `${n / 3600}h`;
+    return `${Math.round(n / 60)}m`;
+}
+
+// How a segment names its entry: the account label when the id carries one
+// (`anthropic@claude-b3` → `claude-b3`, the name the user chose in
+// config.toml), otherwise the report's own short name (`gpt`). Never a table
+// of vendor ids — that is what `short_name` is in the report for.
+export function entryTag(entry) {
+    const id = String(entry?.id ?? '');
+    const at = id.indexOf('@');
+    if (at > 0 && at < id.length - 1)
+        return id.slice(at + 1);
+    return entry?.short_name || id;
+}
+
+// One metric per enabled window, in `windows` order, first match wins: a
+// Claude account reports "Weekly (7d)" before its "Fable (7d)", and the panel
+// wants the account's weekly, not both. An entry with no metric in any enabled
+// window falls back to its first metric, tagged with that metric's own window,
+// so selecting a monthly-quota provider shows a figure instead of nothing.
+export function entryMetrics(entry, windows) {
+    const metrics = Array.isArray(entry?.metrics) ? entry.metrics : [];
+    const wanted = [];
+    if (windows?.session)
+        wanted.push(SESSION_SECS);
+    if (windows?.weekly)
+        wanted.push(WEEKLY_SECS);
+    const picked = [];
+    for (const secs of wanted) {
+        const metric = metrics.find(m => Number(m?.window_secs) === secs);
+        if (metric)
+            picked.push(metric);
+    }
+    if (picked.length)
+        return picked;
+    return metrics.length && wanted.length ? [metrics[0]] : [];
+}
+
+// The panel's segments for the selected entry ids, in the order the user
+// selected them. Every selected id yields exactly one status:
+//
+//   'ready'   a figure to draw (`pct`, `value`, `tag`, `window`)
+//   'error'   the entry reported a failure — its own text, not a guess
+//   'absent'  selected but not in the report: switched off in config.toml, or
+//             a label that no longer exists. Shown, muted, rather than
+//             silently dropped, which is indistinguishable from a bug.
+//
+// `stale` rides along so the renderer can mark a figure the binary served from
+// cache. Pacing markers do not: the report states elapsed only inside prose
+// (`detail`), and deriving a number from prose in a frontend is exactly what
+// this project keeps in Rust.
+export function panelSegments(report, ids, windows) {
+    const entries = Array.isArray(report?.entries) ? report.entries : [];
+    const out = [];
+    for (const id of ids ?? []) {
+        const entry = entries.find(e => e?.id === id);
+        if (!entry) {
+            out.push({id, tag: entryTag({id}), status: 'absent'});
+            continue;
+        }
+        const tag = entryTag(entry);
+        if (entry.status === 'error' || (!entry.metrics?.length && entry.error)) {
+            out.push({id, tag, status: 'error', error: entry.error || ''});
+            continue;
+        }
+        for (const metric of entryMetrics(entry, windows)) {
+            // A report number or nothing. `Number(null)` is 0, and a missing
+            // percentage drawn as a confident 0% bar is the one reading this
+            // project refuses everywhere else.
+            const raw = metric?.percent;
+            const pct = typeof raw === 'number' && Number.isFinite(raw)
+                ? Math.max(0, Math.min(100, Math.round(raw)))
+                : null;
+            out.push({
+                id, tag, status: 'ready',
+                window: windowTag(metric?.window_secs),
+                pct,
+                value: String(metric?.value ?? ''),
+                label: String(metric?.label ?? ''),
+                stale: !!entry.stale,
+            });
+        }
+    }
+    return out;
+}

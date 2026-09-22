@@ -312,12 +312,55 @@ export default class AiUsageBarPrefs extends ExtensionPreferences {
         const vendorList = ['anthropic', ...accounts, 'openai', 'zai', 'openrouter',
             'deepseek', 'antigravity', 'minimax'];
         const vendor = new Adw.ComboRow({
-            title: _('Vendor'),
+            title: _('Vendor (detalhe no menu)'),
             subtitle: _('anthropic, antigravity e minimax expõem as janelas de 5h + semanal'),
             model: Gtk.StringList.new(vendorList),
         });
         bindCombo(settings, 'vendor', vendor, vendorList);
         data.add(vendor);
+
+        // Multi-entry panel: one switch per id, so two Claude accounts and a
+        // Codex can share the top bar. Nothing selected keeps the classic
+        // panel, which follows the Vendor row above.
+        const entries = new Adw.ExpanderRow({
+            title: _('No painel, lado a lado'),
+            subtitle: _('Nada marcado = só o vendor acima. O que aparece em cada '
+                + 'entrada segue os interruptores de 5h / semanal abaixo'),
+        });
+        const entrySwitches = new Map();
+        const syncEntrySubtitle = () => {
+            const on = settings.get_strv('panel-entries').filter(id => id);
+            entries.subtitle = on.length
+                ? on.join(', ')
+                : _('Nada marcado = só o vendor acima. O que aparece em cada '
+                    + 'entrada segue os interruptores de 5h / semanal abaixo');
+        };
+        for (const id of vendorList) {
+            const row = new Adw.SwitchRow({title: id});
+            entrySwitches.set(id, row);
+            row.connect('notify::active', () => {
+                // Rebuild from the switches so the stored order is the list's
+                // order, which is the panel's display order.
+                const picked = vendorList.filter(v => entrySwitches.get(v).active);
+                const current = settings.get_strv('panel-entries');
+                if (picked.length !== current.length ||
+                    picked.some((v, i) => v !== current[i]))
+                    settings.set_strv('panel-entries', picked);
+                syncEntrySubtitle();
+            });
+            entries.add_row(row);
+        }
+        const syncEntrySwitches = () => {
+            const on = new Set(settings.get_strv('panel-entries'));
+            for (const [id, row] of entrySwitches) {
+                if (row.active !== on.has(id))
+                    row.active = on.has(id);
+            }
+            syncEntrySubtitle();
+        };
+        syncEntrySwitches();
+        settings.connect('changed::panel-entries', syncEntrySwitches);
+        data.add(entries);
 
         const binPath = new Adw.EntryRow({title: _('Binary path (empty = auto)')});
         settings.bind('binary-path', binPath, 'text', Gio.SettingsBindFlags.DEFAULT);

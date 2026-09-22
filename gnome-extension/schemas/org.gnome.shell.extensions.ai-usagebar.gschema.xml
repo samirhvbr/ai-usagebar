@@ -98,6 +98,12 @@
       <summary>Color of the empty part of the bar</summary>
     </key>
 
+    <key name="panel-entries" type="as">
+      <default>[]</default>
+      <summary>Providers and accounts the panel shows side by side</summary>
+      <description>Each id is a row of the aggregate report: a vendor ('openai') or a named Anthropic account ('anthropic@claude-b3'). With one or more ids here the panel draws a segment per id, in this order, for each window show-session/show-weekly selects, and the 'vendor' key only chooses whose detail the dropdown shows. Empty (the default) keeps the single-provider panel driven by 'vendor'.</description>
+    </key>
+
     <key name="panel-pools" type="s">
       <choices>
         <choice value="both"/>

@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
-import {barMarkup, colorForDelta, disambiguateTags, field, FIELD, FORMAT, hasUsageWindows, integer,
-    isGrouped, markerElapsed, pickPool, plainTextFromPango, poolAvailable, poolTag,
-    selectPools, splitFormatOutput} from './marker-logic.js';
+import {barMarkup, colorForDelta, disambiguateTags, entryMetrics, entryTag, field, FIELD, FORMAT,
+    hasUsageWindows, integer, isGrouped, markerElapsed, panelSegments, pickPool,
+    plainTextFromPango, poolAvailable, poolTag, selectPools, SESSION_SECS,
+    splitFormatOutput, WEEKLY_SECS, windowTag} from './marker-logic.js';
 
 const colors = {low: 'low', mid: 'mid', high: 'high', critical: 'critical', empty: 'empty'};
 const visibleCells = markup => markup.replace(/<[^>]+>/g, '');
@@ -132,5 +133,103 @@ for (const [pct, elapsed, expected] of [[25, 50, 'low'], [50, 50, 'mid'], [75, 5
 assert.equal(visibleCells(barMarkup(50, 8, colors, 0)).length, 8);
 assert.equal(visibleCells(barMarkup(50, 8, colors, 100)).length, 8);
 assert.ok(!barMarkup(50, 8, colors, markerElapsed('—', 0)).includes('│'));
+
+// ── multi-entry panel ─────────────────────────────────────────────────────
+assert.equal(windowTag(SESSION_SECS), '5h');
+assert.equal(windowTag(WEEKLY_SECS), '7d');
+assert.equal(windowTag(86400), '1d');
+assert.equal(windowTag(2678400), '31d');
+assert.equal(windowTag(14400), '4h');
+assert.equal(windowTag(90), '2m');       // rounds to the nearest minute
+assert.equal(windowTag(0), '');
+assert.equal(windowTag(null), '');
+
+// The account label names the segment; a plain vendor falls back to the
+// report's own short name, never to a table kept here.
+assert.equal(entryTag({id: 'anthropic@claude-b3', short_name: 'cld'}), 'claude-b3');
+assert.equal(entryTag({id: 'openai', short_name: 'gpt'}), 'gpt');
+assert.equal(entryTag({id: 'openai'}), 'openai');          // no short name in the report
+assert.equal(entryTag({id: 'anthropic@', short_name: 'cld'}), 'cld'); // empty label
+assert.equal(entryTag({id: '@x', short_name: 'cld'}), 'cld');         // no vendor half
+
+const CLAUDE = {
+    id: 'anthropic@claude-me', short_name: 'cld', status: 'ready', stale: false,
+    metrics: [
+        {label: 'Session (5h)', percent: 4, value: '4%', window_secs: SESSION_SECS},
+        {label: 'Weekly (7d)', percent: 95, value: '95%', window_secs: WEEKLY_SECS},
+        {label: 'Fable (7d)', percent: 1, value: '1%', window_secs: WEEKLY_SECS},
+    ],
+};
+const CODEX = {
+    id: 'openai', short_name: 'gpt', status: 'ready', stale: true,
+    metrics: [{label: 'Codex weekly', percent: 5, value: '5%', window_secs: WEEKLY_SECS}],
+};
+const CURSOR = {
+    id: 'cursor', short_name: 'cur', status: 'ready',
+    metrics: [{label: 'Cursor Models', percent: 0, value: '0%', window_secs: 2678400}],
+};
+
+// First match per window: the account's own weekly, not its Fable weekly too.
+assert.deepEqual(entryMetrics(CLAUDE, {weekly: true}).map(m => m.label), ['Weekly (7d)']);
+assert.deepEqual(entryMetrics(CLAUDE, {session: true, weekly: true}).map(m => m.label),
+    ['Session (5h)', 'Weekly (7d)']);
+// Windows are asked for in session-then-weekly order regardless of report order.
+assert.deepEqual(entryMetrics({metrics: [CLAUDE.metrics[1], CLAUDE.metrics[0]]},
+    {session: true, weekly: true}).map(m => m.label), ['Session (5h)', 'Weekly (7d)']);
+// Codex has no 5h window: asking for both yields only what it has.
+assert.deepEqual(entryMetrics(CODEX, {session: true, weekly: true}).map(m => m.label),
+    ['Codex weekly']);
+// Neither window: the first metric stands in, so the entry is never invisible.
+assert.deepEqual(entryMetrics(CURSOR, {weekly: true}).map(m => m.label), ['Cursor Models']);
+// No window enabled at all is not a fallback case — it is "draw nothing".
+assert.deepEqual(entryMetrics(CLAUDE, {}), []);
+assert.deepEqual(entryMetrics({metrics: []}, {weekly: true}), []);
+assert.deepEqual(entryMetrics(undefined, {weekly: true}), []);
+
+const REPORT = {entries: [CLAUDE, {...CLAUDE, id: 'anthropic@claude-b3',
+    metrics: [{label: 'Weekly (7d)', percent: 16, value: '16%', window_secs: WEEKLY_SECS}]},
+    CODEX,
+    {id: 'zai', short_name: 'zai', status: 'error', error: 'no API key', metrics: []}]};
+
+const weekly = panelSegments(REPORT,
+    ['anthropic@claude-me', 'anthropic@claude-b3', 'openai'], {weekly: true});
+assert.deepEqual(weekly.map(s => [s.tag, s.window, s.pct, s.status]), [
+    ['claude-me', '7d', 95, 'ready'],
+    ['claude-b3', '7d', 16, 'ready'],
+    ['gpt', '7d', 5, 'ready'],
+]);
+// Selection order is display order, not report order.
+assert.deepEqual(panelSegments(REPORT, ['openai', 'anthropic@claude-me'], {weekly: true})
+    .map(s => s.tag), ['gpt', 'claude-me']);
+// Staleness rides along for the renderer to mark.
+assert.equal(weekly[2].stale, true);
+assert.equal(weekly[0].stale, false);
+
+// An entry that failed keeps its own error text; one not in the report at all
+// is reported as absent rather than silently dropped.
+assert.deepEqual(panelSegments(REPORT, ['zai'], {weekly: true}),
+    [{id: 'zai', tag: 'zai', status: 'error', error: 'no API key'}]);
+assert.deepEqual(panelSegments(REPORT, ['minimax'], {weekly: true}),
+    [{id: 'minimax', tag: 'minimax', status: 'absent'}]);
+assert.deepEqual(panelSegments(REPORT, ['anthropic@gone'], {weekly: true}),
+    [{id: 'anthropic@gone', tag: 'gone', status: 'absent'}]);
+
+// Percentages are clamped and rounded the way the bar expects.
+assert.equal(panelSegments({entries: [{id: 'x', metrics: [
+    {percent: 142.6, window_secs: WEEKLY_SECS}]}]}, ['x'], {weekly: true})[0].pct, 100);
+assert.equal(panelSegments({entries: [{id: 'x', metrics: [
+    {percent: -3, window_secs: WEEKLY_SECS}]}]}, ['x'], {weekly: true})[0].pct, 0);
+// A missing or non-numeric percentage stays null: a 0% bar would claim the
+// window is untouched.
+for (const percent of [null, undefined, '95', NaN, {}])
+    assert.equal(panelSegments({entries: [{id: 'x', metrics: [
+        {percent, window_secs: WEEKLY_SECS}]}]}, ['x'], {weekly: true})[0].pct, null,
+    `percent ${JSON.stringify(percent)} must not read as a figure`);
+
+// Garbage in: an empty selection, or no report at all, draws nothing.
+assert.deepEqual(panelSegments(REPORT, [], {weekly: true}), []);
+assert.deepEqual(panelSegments(null, ['openai'], {weekly: true}),
+    [{id: 'openai', tag: 'openai', status: 'absent'}]);
+assert.deepEqual(panelSegments(REPORT, null, {weekly: true}), []);
 
 console.log('marker logic tests passed');

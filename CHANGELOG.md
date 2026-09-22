@@ -20,6 +20,19 @@ Each release is also published at
   Omarchy and the Windows tray draw Grok Bot's own head-and-eyes logomark
   (`grokbot.svg`) instead of sharing Grok's mark.
 
+- **The GNOME panel can show several providers and accounts side by side.**
+  It drew one provider at a time, so two Claude subscriptions and a Codex
+  could not share the top bar — the thing the macOS menu bar and the KDE
+  plasmoid already do. `panel-entries` takes any number of report ids
+  (`anthropic@claude-b3`, `openai`, …) and the panel draws a segment per id
+  per selected window, in that order, from a single aggregate `usage --json`
+  — the report stays the authority on labels, window lengths, order and
+  severity. The `vendor` key then only chooses whose detail the dropdown
+  shows. Empty (the default) keeps the single-provider panel exactly as it
+  was. A selected provider that is switched off in `config.toml` gets a muted
+  segment rather than vanishing, and a provider with neither a 5h nor a 7d
+  window shows its first window instead of nothing. (GNOME extension 0.4.0)
+
 - **The GNOME extension knows about named Anthropic accounts.** Every row and
   every fetch used to aim at the single default credential slot, so a machine
   watching two Claude subscriptions through `[[anthropic.accounts]]` could see
