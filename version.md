@@ -30,6 +30,19 @@ Where this fork's CI runs: [`docs/ci.md`](docs/ci.md).
 Newest first. Each `##` heading is literally the commit subject. The upstream's
 own changelog, where it has one, is left alone: it is their record, not ours.
 
+## 0.1.0 - docs/ci.md says where this fork's CI runs
+
+The fleet's CI machine is open to every repository since 07/10/2026, this
+one included. The rule arrives in a file of **our own** rather than in the
+upstream's `CLAUDE.md` or `README.md`: a file they do not have never
+conflicts on a sync, and their agent context is theirs.
+
+This repository is **public**, so the page says the part that is not
+optional: fork pull request approval has to be on before any job of this
+repository runs on that machine. A public repository on a self-hosted
+runner without it executes a stranger's pull request with effective root
+inside the office network.
+
 ## 0.1.0 - the fork gets a version of its own, and the upstream point it sits on
 
 Until now this repository had no version of ours at all. It is a fork we own and
