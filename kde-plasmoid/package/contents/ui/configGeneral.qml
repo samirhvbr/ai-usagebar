@@ -138,6 +138,7 @@ KCM.SimpleKCM {
             onActivated: page.cfg_vendor = model[currentIndex]
             delegate: QQC2.ItemDelegate {
                 required property var modelData
+                required property int index
                 width: currentVendorCombo.width
                 text: page.labelFor(modelData)
                 highlighted: currentVendorCombo.highlightedIndex === index

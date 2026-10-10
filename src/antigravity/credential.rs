@@ -17,12 +17,10 @@
 //! source is available, the caller gets `Ok(None)` and can produce its own
 //! "no session" message.
 
-use std::fmt::Write as _;
 use std::path::Path;
 
 use base64::Engine as _;
 use chrono::{DateTime, Utc};
-use sha2::{Digest, Sha256};
 
 use crate::error::{AppError, Result};
 
@@ -114,7 +112,8 @@ pub fn parse_keyring_blob(raw: &str) -> Result<StoredToken> {
         .iter()
         .filter_map(|key| token.get(key))
         .find_map(parse_expiry);
-    let fingerprint = fingerprint_of(refresh_token.as_deref().unwrap_or(&access_token));
+    let fingerprint =
+        crate::cache::fingerprint_of(refresh_token.as_deref().unwrap_or(&access_token));
 
     Ok(StoredToken {
         access_token,
@@ -159,15 +158,6 @@ fn epoch_to_datetime(epoch: f64) -> Option<DateTime<Utc>> {
         return None;
     }
     DateTime::from_timestamp_millis(millis as i64)
-}
-
-fn fingerprint_of(secret: &str) -> String {
-    let digest = Sha256::digest(secret.as_bytes());
-    let mut hex = String::with_capacity(16);
-    for byte in digest.iter().take(8) {
-        let _ = write!(hex, "{byte:02x}");
-    }
-    hex
 }
 
 /// The raw blob from the OS keyring or Antigravity CLI token file, or `None`
@@ -438,7 +428,7 @@ mod tests {
         let a = parse_keyring_blob(r#"{"access_token":"at-1"}"#).unwrap();
         let b = parse_keyring_blob(r#"{"access_token":"at-2"}"#).unwrap();
         assert_ne!(a.fingerprint, b.fingerprint);
-        assert_eq!(a.fingerprint, fingerprint_of("at-1"));
+        assert_eq!(a.fingerprint, crate::cache::fingerprint_of("at-1"));
     }
 
     #[test]

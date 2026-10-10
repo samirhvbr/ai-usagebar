@@ -7,8 +7,19 @@ use std::path::{Path, PathBuf};
 use crate::anthropic::cli_account::{self, CliSwitchOpts, CliSwitchOutcome, KeychainStore};
 use crate::claude_desktop::{self, Paths, SwitchOpts, SwitchPlan};
 use crate::config::Config;
+use crate::display::{sanitize_untrusted_line, sanitize_untrusted_path};
 use crate::error::{AppError, Result};
 use crate::widget::cli::AccountAction;
+
+/// An error or note as one terminal-safe line.
+///
+/// Every message `account` prints reaches the terminal verbatim, and an
+/// `AppError::Other` is whatever text its constructor assembled — a path, an
+/// account label, a subprocess's stderr. Render through this at the `println!`
+/// rather than trusting each constructor to have remembered.
+fn printable(value: &dyn std::fmt::Display) -> String {
+    sanitize_untrusted_line(&value.to_string())
+}
 
 struct Registered {
     config_path: PathBuf,
@@ -38,9 +49,15 @@ pub fn run(action: &AccountAction) -> i32 {
             desktop,
             email,
             yes,
+            codex,
+            adopt_current,
         } => {
             if *desktop {
                 add_desktop(label, email.as_deref(), *yes)
+            } else if *codex {
+                add_codex(label, !no_login, *adopt_current)
+            } else if *adopt_current {
+                adopt_claude(label)
             } else {
                 add(label, !no_login)
             }
@@ -48,6 +65,7 @@ pub fn run(action: &AccountAction) -> i32 {
         AccountAction::Status { json } => status(*json),
         AccountAction::Switch {
             label,
+            codex,
             desktop,
             cli,
             dry_run,
@@ -59,6 +77,7 @@ pub fn run(action: &AccountAction) -> i32 {
             delete_conflict,
         } => switch(&SwitchArgs {
             label,
+            codex: *codex,
             desktop: *desktop,
             cli: *cli,
             dry_run: *dry_run,
@@ -71,6 +90,325 @@ pub fn run(action: &AccountAction) -> i32 {
                 keep_backups: *keep_backups,
             },
         }),
+        AccountAction::MergeHistory {
+            data_dir,
+            from,
+            dry_run,
+        } => merge_history(data_dir, from, *dry_run),
+    }
+}
+
+/// Resolve as far as the filesystem allows, so a trailing slash, a `..`, or a
+/// symlinked home cannot disguise one directory as another. Falls back to the
+/// nearest existing ancestor plus the remainder, because the profile directory
+/// may not exist yet on a first run.
+fn resolved(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| {
+        let mut rest = Vec::new();
+        let mut cursor = path;
+        loop {
+            match (std::fs::canonicalize(cursor), cursor.parent()) {
+                (Ok(base), _) => {
+                    let mut out = base;
+                    for part in rest.iter().rev() {
+                        out.push(part);
+                    }
+                    return out;
+                }
+                (Err(_), Some(parent)) => {
+                    if let Some(name) = cursor.file_name() {
+                        rest.push(name.to_os_string());
+                    }
+                    cursor = parent;
+                }
+                (Err(_), None) => return path.to_path_buf(),
+            }
+        }
+    })
+}
+
+/// Whether a Claude Desktop app is live on this exact profile.
+///
+/// Matched on the process's own `--user-data-dir` argument, which is unique
+/// per profile. Never on the app name or bundle id: every side-by-side copy
+/// keeps `CFBundleName = "Claude"` (Electron derives its helper-app names from
+/// it), so a name match would conflate all of them and the original.
+fn profile_in_use(data_dir: &Path) -> bool {
+    let Ok(output) = std::process::Command::new("/bin/ps")
+        .args(["-Awwo", "command"])
+        .output()
+    else {
+        // Fail closed: if we cannot tell, do not write into a profile that may
+        // have a second writer.
+        return true;
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    let candidates = [data_dir.to_path_buf(), resolved(data_dir)];
+    ps_shows_user_data_dir(&text, &candidates)
+}
+
+/// Whether `ps` output shows a process launched against one of `candidates`.
+///
+/// `ps` prints arguments space-separated and unquoted, so a profile path
+/// containing a space cannot be recovered by splitting a line on whitespace.
+/// Doing that truncates the argument and reports a LIVE profile as idle — a
+/// guard failing in the one direction that permits the corruption it exists to
+/// prevent. So match the whole expected argument, and treat a prefix match as
+/// in-use so the remaining ambiguity fails closed.
+fn ps_shows_user_data_dir(text: &str, candidates: &[PathBuf]) -> bool {
+    candidates
+        .iter()
+        .map(|dir| format!("--user-data-dir={}", dir.display()))
+        .any(|needle| {
+            text.lines().any(|line| {
+                line.match_indices(&needle).any(|(at, _)| {
+                    line[at + needle.len()..]
+                        .chars()
+                        .next()
+                        .is_none_or(char::is_whitespace)
+                })
+            })
+        })
+}
+
+/// A directory is a Claude Desktop profile if the app's own config lives in
+/// it. Used to keep unrelated sibling directories out of the source set.
+fn looks_like_profile(dir: &Path) -> bool {
+    dir.join("config.json").is_file()
+}
+
+/// Whether a profile holds any history at all — at least one
+/// `<account>/<org>` directory under its session root.
+///
+/// A profile the app has merely opened once already has a `config.json`, so
+/// `looks_like_profile` alone keeps abandoned and never-signed-in profiles in
+/// the default source set, where they contribute nothing and appear in every
+/// report as noise. Named `--from` sources are not filtered: asking for a
+/// specific source and being told it is empty is information.
+fn has_history(dir: &Path) -> bool {
+    let root = dir.join("claude-code-sessions");
+    let Ok(accounts) = std::fs::read_dir(&root) else {
+        return false;
+    };
+    accounts.flatten().any(|account| {
+        std::fs::read_dir(account.path())
+            .is_ok_and(|mut orgs| orgs.any(|org| org.is_ok_and(|org| org.path().is_dir())))
+    })
+}
+
+/// Every other profile this machine knows: the default one, plus any sibling
+/// of the target. The launcher should not have to know the topology, and a
+/// sibling copy that has since gained history becomes a source automatically.
+fn default_sources(target: &Path, default_profile: &Path) -> Vec<PathBuf> {
+    let wanted = resolved(target);
+    let mut out: Vec<PathBuf> = Vec::new();
+    let mut push = |dir: PathBuf| {
+        if resolved(&dir) != wanted
+            && looks_like_profile(&dir)
+            && has_history(&dir)
+            && !out.iter().any(|seen| resolved(seen) == resolved(&dir))
+        {
+            out.push(dir);
+        }
+    };
+    push(default_profile.to_path_buf());
+    if let Some(parent) = target.parent()
+        && let Ok(entries) = std::fs::read_dir(parent)
+    {
+        let mut siblings: Vec<PathBuf> = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir())
+            .collect();
+        siblings.sort();
+        for sibling in siblings {
+            push(sibling);
+        }
+    }
+    out
+}
+
+/// Merge every account's history into whichever account `data_dir` is signed
+/// into. Additive, and never for the default profile.
+fn merge_history(data_dir: &Path, from: &[PathBuf], dry_run: bool) -> i32 {
+    let config = config_or_default();
+    let paths = match Paths::for_data_dir(data_dir.to_path_buf(), &config.anthropic) {
+        Ok(paths) => paths,
+        Err(error) => {
+            eprintln!("error: {}", printable(&error));
+            return 1;
+        }
+    };
+
+    let Ok(default_paths) = Paths::resolve(&config.anthropic) else {
+        eprintln!("error: cannot determine the default Claude Desktop profile");
+        return 1;
+    };
+    if resolved(&paths.data_dir) == resolved(&default_paths.data_dir) {
+        eprintln!(
+            "error: {} is the default Claude Desktop profile — use `account switch` for it.\n       \
+             This command is for relocated profiles launched with --user-data-dir.",
+            sanitize_untrusted_path(&paths.data_dir)
+        );
+        return 1;
+    }
+    if !paths.available() {
+        eprintln!(
+            "error: no Claude Desktop profile at {}",
+            sanitize_untrusted_path(&paths.data_dir)
+        );
+        return 1;
+    }
+    // A dry run writes nothing, so it is the one mode worth having while the
+    // app is open — that is how you inspect a live profile without quitting it.
+    if !dry_run && profile_in_use(&paths.data_dir) {
+        eprintln!(
+            "error: a Claude Desktop app is running on {} — quit it first.\n       \
+             Two writers on one profile is how history gets corrupted.",
+            sanitize_untrusted_path(&paths.data_dir)
+        );
+        return 1;
+    }
+
+    let _lock = if !dry_run {
+        match crate::cache::acquire_lock(
+            &paths.account_switch_lock(),
+            claude_desktop::ACCOUNT_LOCK_TIMEOUT,
+        ) {
+            Ok(lock) => Some(lock),
+            Err(error) => {
+                eprintln!("error: {}", printable(&error));
+                return 1;
+            }
+        }
+    } else {
+        None
+    };
+
+    let (account_uuid, org_uuid) = match claude_desktop::history_target(&paths) {
+        Ok(target) => target,
+        Err(error) => {
+            eprintln!("error: {}", printable(&error));
+            return 1;
+        }
+    };
+
+    let explicit = !from.is_empty();
+    let sources = if explicit {
+        from.to_vec()
+    } else {
+        default_sources(&paths.data_dir, &default_paths.data_dir)
+    };
+
+    println!(
+        "Merge history    into {}",
+        sanitize_untrusted_path(&paths.data_dir)
+    );
+    for source in &sources {
+        println!("  from            {}", sanitize_untrusted_path(source));
+    }
+    if sources.is_empty() {
+        println!("  from            (no other profile found)");
+    }
+    // An explicitly named source that is not a profile is a mistake worth
+    // failing on, not a silently empty contribution.
+    let mut bad_sources = false;
+    for source in &sources {
+        if explicit && !looks_like_profile(source) {
+            eprintln!(
+                "error: {} is not a Claude Desktop profile (no config.json)",
+                sanitize_untrusted_path(source)
+            );
+            bad_sources = true;
+        }
+    }
+    if bad_sources {
+        return 1;
+    }
+
+    let staged = claude_desktop::stage_history_sources(
+        &paths,
+        &sources,
+        org_uuid.as_deref().map(|org| (account_uuid.as_str(), org)),
+        dry_run,
+    );
+    println!(
+        "  staged          {} index(es), {} registry(ies) from other profiles{}",
+        staged.sessions,
+        staged.registries,
+        if dry_run { " (would place)" } else { "" }
+    );
+
+    let plan = match claude_desktop::plan_history_merge(&paths) {
+        Ok(plan) => plan,
+        Err(error) => {
+            eprintln!("error: {}", printable(&error));
+            return 1;
+        }
+    };
+
+    println!(
+        "  account         {}",
+        sanitize_untrusted_line(&plan.account_uuid)
+    );
+    match &plan.org_uuid {
+        Some(org) => println!("  org             {}", sanitize_untrusted_line(org)),
+        None => println!("  org             none yet — nothing to merge into"),
+    }
+    println!(
+        "  sessions        {} new, {} updated",
+        plan.sessions.copied.len(),
+        plan.sessions.updated.len()
+    );
+    if let Some(scheduled) = &plan.scheduled {
+        println!(
+            "  schedules       {} added, {} updated, {} kept as conflicts",
+            scheduled.added, scheduled.updated, scheduled.conflicts
+        );
+    }
+
+    if dry_run {
+        if staged.sessions > 0 || staged.registries > 0 {
+            println!(
+                "  note            the sessions/schedules counts above are PRE-staging; the \
+                 union runs after those {} index(es) land",
+                staged.sessions
+            );
+        }
+        println!("  (dry run — nothing was changed)");
+        return 0;
+    }
+    if plan.is_empty() {
+        println!("  already up to date");
+        return 0;
+    }
+    let code = match claude_desktop::apply_history_merge(&paths, &plan) {
+        Ok(notes) => {
+            for note in &notes {
+                println!("  note: {}", sanitize_untrusted_line(note));
+            }
+            println!("  merged");
+            0
+        }
+        Err(error) => {
+            eprintln!("error: {}", printable(&error));
+            1
+        }
+    };
+    // Loud, and non-zero: a source we could not read is history that did not
+    // arrive. Reporting it as a successful merge is the failure that hides.
+    if staged.unreadable.is_empty() {
+        code
+    } else {
+        eprintln!(
+            "WARNING: {} source path(s) could not be read, so their history was NOT merged:",
+            staged.unreadable.len()
+        );
+        for path in &staged.unreadable {
+            eprintln!("  skipped  {}", sanitize_untrusted_path(path));
+        }
+        eprintln!("         This merge is incomplete. Re-run once those are readable.");
+        1
     }
 }
 
@@ -79,7 +417,10 @@ pub fn run(action: &AccountAction) -> i32 {
 /// status can safely fall back to the conventional account locations.
 fn config_or_default() -> Config {
     Config::load().unwrap_or_else(|error| {
-        eprintln!("ai-usagebar account: using defaults, config.toml did not parse: {error}");
+        eprintln!(
+            "ai-usagebar account: using defaults, config.toml did not parse: {}",
+            printable(&error)
+        );
         Config::default()
     })
 }
@@ -220,6 +561,7 @@ fn status(json: bool) -> i32 {
     let report = serde_json::json!({
         "desktop": desktop,
         "cli": cli,
+        "codex": codex_status(&config),
         "usage_accounts": usage_accounts,
     });
     if json {
@@ -228,6 +570,56 @@ fn status(json: bool) -> i32 {
     }
     print_status(&report);
     0
+}
+
+/// The `codex` half of `account status --json`: which `[[openai.accounts]]`
+/// entry `~/.codex/auth.json` belongs to. Public so the tray reads the same
+/// answer the CLI prints.
+pub fn codex_status(config: &Config) -> serde_json::Value {
+    let default = config.openai.resolve_auth_path(None).ok();
+    let accounts = &config.openai.accounts;
+    let active = default
+        .as_deref()
+        .and_then(|default| crate::openai::account::resolve_active_label(default, accounts));
+    let rows: Vec<serde_json::Value> = accounts
+        .iter()
+        .map(|account| {
+            serde_json::json!({
+                "label": account.label,
+                "codex_auth_path": account.codex_auth_path,
+                "signed_in": default.as_deref().is_some_and(|default| {
+                    crate::openai::account::has_login(default, accounts, account)
+                }),
+                "active": Some(&account.label) == active.as_ref(),
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "default_path": default,
+        "active_label": active,
+        "accounts": rows,
+    })
+}
+
+/// The file `account switch --codex` moves logins into: the Codex CLI's
+/// default. A `[openai] codex_auth_path` pointing anywhere else only changes
+/// what ai-usagebar reads, so moving logins there would not change the account
+/// Codex uses; the switch refuses rather than report a switch that did not
+/// happen.
+fn codex_switch_slot(config: &Config) -> Result<PathBuf> {
+    codex_switch_slot_with(config, crate::openai::creds::default_path()?)
+}
+
+fn codex_switch_slot_with(config: &Config, codex_default: PathBuf) -> Result<PathBuf> {
+    match &config.openai.codex_auth_path {
+        Some(path) if *path != codex_default => Err(AppError::Credentials(format!(
+            "[openai] codex_auth_path points at {}, not the {} the Codex CLI, desktop app and \
+             IDE extension use; remove it to switch Codex accounts",
+            sanitize_untrusted_path(path),
+            sanitize_untrusted_path(&codex_default)
+        ))),
+        _ => Ok(codex_default),
+    }
 }
 
 fn print_status(report: &serde_json::Value) {
@@ -299,6 +691,40 @@ fn status_lines(report: &serde_json::Value) -> Vec<String> {
                 .to_string(),
         );
     }
+
+    let codex = report["codex"]["accounts"]
+        .as_array()
+        .map_or(&[][..], Vec::as_slice);
+    if !codex.is_empty() {
+        out.push(String::new());
+        out.push(format!(
+            "Codex            {}",
+            sanitize_untrusted_line(
+                report["codex"]["default_path"]
+                    .as_str()
+                    .unwrap_or("~/.codex/auth.json")
+            )
+        ));
+        for account in codex {
+            out.push(format!(
+                "  {:<12} {:<28}{}",
+                sanitize_untrusted_line(account["label"].as_str().unwrap_or("?")),
+                if account["signed_in"].as_bool().unwrap_or(false) {
+                    "signed in"
+                } else {
+                    "not signed in"
+                },
+                active_tag(&account["active"]),
+            ));
+        }
+        if report["codex"]["active_label"].is_null() {
+            out.push(
+                "  note: ~/.codex belongs to no account listed here; register it with \
+                 `ai-usagebar account add <label> --codex --adopt-current`."
+                    .to_string(),
+            );
+        }
+    }
     out
 }
 
@@ -323,14 +749,15 @@ fn active_tag(value: &serde_json::Value) -> &'static str {
 /// obtain a second account's credential is to sign it out and have the user
 /// sign back in as the account being saved.
 fn add_desktop(label: &str, email: Option<&str>, assume_yes: bool) -> i32 {
+    let shown = sanitize_untrusted_line(label);
     if let Err(error) = crate::config::validate_account_label(label) {
-        eprintln!("ai-usagebar account add: {error}");
+        eprintln!("ai-usagebar account add: {}", printable(&error));
         return 1;
     }
     let config = match config_for_mutation(Config::load()) {
         Ok(config) => config,
         Err(error) => {
-            eprintln!("ai-usagebar account add: {error}");
+            eprintln!("ai-usagebar account add: {}", printable(&error));
             return 1;
         }
     };
@@ -339,12 +766,12 @@ fn add_desktop(label: &str, email: Option<&str>, assume_yes: bool) -> i32 {
         Ok(paths) => {
             eprintln!(
                 "ai-usagebar account add: no Claude Desktop app data at {} (macOS only)",
-                paths.data_dir.display()
+                sanitize_untrusted_path(&paths.data_dir)
             );
             return 1;
         }
         Err(error) => {
-            eprintln!("ai-usagebar account add: {error}");
+            eprintln!("ai-usagebar account add: {}", printable(&error));
             return 1;
         }
     };
@@ -353,7 +780,7 @@ fn add_desktop(label: &str, email: Option<&str>, assume_yes: bool) -> i32 {
     let active = claude_desktop::active_account_uuid(&paths.config_json())
         .and_then(|uuid| claude_desktop::label_for_uuid(&profiles, &uuid).map(str::to_string));
 
-    println!("Capturing a Claude Desktop account as {label:?}.");
+    println!("Capturing a Claude Desktop account as {shown:?}.");
     println!("  The app will close and reopen at its login screen, where you sign in as the");
     println!("  account you want to save. Nothing else on this machine is touched.");
     match &active {
@@ -362,7 +789,7 @@ fn add_desktop(label: &str, email: Option<&str>, assume_yes: bool) -> i32 {
         ),
         None => println!(
             "  Your current login is copied to {} first and restored if you cancel.",
-            paths.prelogin_dir().display()
+            sanitize_untrusted_path(&paths.prelogin_dir())
         ),
     }
     if !assume_yes && !confirm("  Close Claude and start the login?") {
@@ -386,11 +813,11 @@ fn add_desktop(label: &str, email: Option<&str>, assume_yes: bool) -> i32 {
         &mut notes,
     );
     for note in &notes {
-        println!("  note: {note}");
+        println!("  note: {}", printable(&note));
     }
     match outcome {
         Err(error) => {
-            eprintln!("ai-usagebar account add: {error}");
+            eprintln!("ai-usagebar account add: {}", printable(&error));
             1
         }
         Ok(claude_desktop::capture::CaptureOutcome::TimedOut) => {
@@ -428,6 +855,8 @@ fn add_desktop(label: &str, email: Option<&str>, assume_yes: bool) -> i32 {
 
 struct SwitchArgs<'a> {
     label: &'a str,
+    /// Switch the Codex login instead of either Claude identity.
+    codex: bool,
     desktop: bool,
     cli: bool,
     dry_run: bool,
@@ -443,10 +872,13 @@ fn switch(args: &SwitchArgs) -> i32 {
     let config = match config_for_mutation(Config::load()) {
         Ok(config) => config,
         Err(error) => {
-            eprintln!("ai-usagebar account switch: {error}");
+            eprintln!("ai-usagebar account switch: {}", printable(&error));
             return 1;
         }
     };
+    if args.codex {
+        return switch_codex(&config, args);
+    }
     // Neither flag means both surfaces. A label that only exists on one side is
     // then a skip, not a failure: the two namespaces are independent and may
     // legitimately hold different sets of accounts.
@@ -459,7 +891,7 @@ fn switch(args: &SwitchArgs) -> i32 {
             Ok(true) => acted = true,
             Ok(false) => {}
             Err(error) => {
-                eprintln!("ai-usagebar account switch: {error}");
+                eprintln!("ai-usagebar account switch: {}", printable(&error));
                 failed = true;
             }
         }
@@ -472,7 +904,7 @@ fn switch(args: &SwitchArgs) -> i32 {
             Ok(true) => acted = true,
             Ok(false) => {}
             Err(error) => {
-                eprintln!("ai-usagebar account switch: {error}");
+                eprintln!("ai-usagebar account switch: {}", printable(&error));
                 failed = true;
             }
         }
@@ -497,7 +929,7 @@ fn switch_desktop(config: &Config, args: &SwitchArgs, tolerant: bool) -> Result<
         if !tolerant {
             return Err(AppError::Other(format!(
                 "no Claude Desktop app data at {} (macOS only)",
-                paths.data_dir.display()
+                sanitize_untrusted_path(&paths.data_dir)
             )));
         }
         return Ok(false);
@@ -513,7 +945,7 @@ fn switch_desktop(config: &Config, args: &SwitchArgs, tolerant: bool) -> Result<
     let plan = match claude_desktop::plan_switch(&paths, args.label, args.opts.clone()) {
         Ok(plan) => plan,
         Err(error) if tolerant => {
-            println!("Claude Desktop   skipped: {error}");
+            println!("Claude Desktop   skipped: {}", printable(&error));
             return Ok(false);
         }
         Err(error) => return Err(error),
@@ -541,7 +973,7 @@ fn switch_desktop(config: &Config, args: &SwitchArgs, tolerant: bool) -> Result<
 
     let notes = claude_desktop::apply_switch(&paths, &plan, &claude_desktop::app::DesktopApp)?;
     for note in &notes {
-        println!("  note: {note}");
+        println!("  note: {}", printable(&note));
     }
     println!(
         "  switched — the app is reopening as {:?}.",
@@ -780,7 +1212,10 @@ fn plan_lines(plan: &SwitchPlan) -> Vec<String> {
         out.push("  remote bridge   clear (a stale session id breaks /remote-control)".to_string());
     }
     if !plan.archive_members.is_empty() {
-        out.push(format!("  rollback        {}", plan.archive.display()));
+        out.push(format!(
+            "  rollback        {}",
+            sanitize_untrusted_path(&plan.archive)
+        ));
     }
     out
 }
@@ -826,6 +1261,11 @@ fn switch_cli(config: &Config, args: &SwitchArgs, tolerant: bool) -> Result<bool
             println!("  (dry run — nothing was changed)");
         }
         CliSwitchOutcome::Switched { outgoing } => {
+            // Same reason as the Codex switch: the unnamed account's cache is
+            // keyed by the default login slot, which now holds someone else.
+            if let Ok(cache) = crate::cache::Cache::for_vendor("anthropic") {
+                cache.forget();
+            }
             print_cli_capture(outgoing.as_deref());
             println!(
                 "  switched — plain `claude` now signs in as {:?}.",
@@ -838,7 +1278,10 @@ fn switch_cli(config: &Config, args: &SwitchArgs, tolerant: bool) -> Result<bool
 
 fn print_cli_capture(outgoing: Option<&str>) {
     match outgoing {
-        Some(label) => println!("  saving          {label}'s credential back into its own account"),
+        Some(label) => println!(
+            "  saving          {}'s credential back into its own account",
+            sanitize_untrusted_line(label)
+        ),
         None => println!("  saving          nothing to save (--force discarded the live login)"),
     }
 }
@@ -870,25 +1313,32 @@ fn ask(prompt: &str) -> Option<String> {
 }
 
 fn add(label: &str, login: bool) -> i32 {
+    let shown = sanitize_untrusted_line(label);
     let registration = match register(label) {
         Ok(registration) => registration,
         Err(error) => {
-            eprintln!("ai-usagebar account: could not add {label:?}: {error}");
+            eprintln!(
+                "ai-usagebar account: could not add {shown:?}: {}",
+                printable(&error)
+            );
             return 1;
         }
     };
 
     if registration.already_existed {
         println!(
-            "Claude account {label:?} is already configured in {}.",
-            registration.config_path.display()
+            "Claude account {shown:?} is already configured in {}.",
+            sanitize_untrusted_path(&registration.config_path)
         );
     } else {
         println!(
-            "Added Claude account {label:?} to {}.",
-            registration.config_path.display()
+            "Added Claude account {shown:?} to {}.",
+            sanitize_untrusted_path(&registration.config_path)
         );
-        println!("  credentials_path = {}", registration.credential_display);
+        println!(
+            "  credentials_path = {}",
+            sanitize_untrusted_line(&registration.credential_display)
+        );
     }
     if !registration.anthropic_enabled {
         println!("  note: [anthropic] is disabled; set enabled = true for this account to appear.");
@@ -901,7 +1351,7 @@ fn add(label: &str, login: bool) -> i32 {
                 "Automatic login requires this account's credentials_path to end in \
                  .credentials.json; it currently points to {}. Update that entry or \
                  keep managing its credential file manually.",
-                registration.credential_file.display()
+                sanitize_untrusted_path(&registration.credential_file)
             );
             return 1;
         }
@@ -951,7 +1401,8 @@ fn add(label: &str, login: bool) -> i32 {
             // clobber config edits made while the interactive command ran.
             if let Err(error) = restamp_config(&registration.config_path) {
                 eprintln!(
-                    "warning: login finished, but config.toml could not be touched for live reload: {error}"
+                    "warning: login finished, but config.toml could not be touched for live reload: {}",
+                    printable(&error)
                 );
             }
             println!();
@@ -981,12 +1432,17 @@ enum LoginOutcome {
     NotFound,
 }
 
-fn login_claude_account(account_dir: &Path) -> LoginOutcome {
+fn claude_login_command(account_dir: &Path) -> std::process::Command {
     let mut command = std::process::Command::new("claude");
     command.env("CLAUDE_CONFIG_DIR", account_dir);
     for var in crate::vendor::vendor_secret_env_vars_to_remove(&[]) {
         command.env_remove(var);
     }
+    command
+}
+
+fn login_claude_account(account_dir: &Path) -> LoginOutcome {
+    let mut command = claude_login_command(account_dir);
 
     match command.status() {
         Ok(status) if status.success() => LoginOutcome::Ok,
@@ -1016,7 +1472,9 @@ fn register_at(config_path: &Path, label: &str, home: Option<&Path>) -> Result<R
         toml_edit::DocumentMut::new()
     } else {
         original.parse().map_err(|error: toml_edit::TomlError| {
-            AppError::Other(format!("config.toml is not valid TOML: {error}"))
+            let summary =
+                crate::config::toml_error_summary(&original, error.span(), error.message());
+            AppError::Other(format!("config.toml is not valid TOML: {summary}"))
         })?
     };
 
@@ -1073,6 +1531,281 @@ fn register_at(config_path: &Path, label: &str, home: Option<&Path>) -> Result<R
         already_existed,
         anthropic_enabled,
     })
+}
+
+/// `account switch --codex`: move a Codex login into `~/.codex/auth.json`.
+fn switch_codex(config: &Config, args: &SwitchArgs) -> i32 {
+    use crate::openai::account::{SwitchOpts as CodexSwitchOpts, SwitchOutcome, switch_account};
+
+    let outcome = codex_switch_slot(config).and_then(|default| {
+        switch_account(
+            &default,
+            &config.openai.accounts,
+            args.label,
+            CodexSwitchOpts {
+                force: args.force,
+                dry_run: args.dry_run,
+            },
+        )
+    });
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            eprintln!("ai-usagebar account switch: {}", printable(&error));
+            return 1;
+        }
+    };
+    let shown = sanitize_untrusted_line(args.label);
+    println!("Codex            → {shown}");
+    match outcome {
+        SwitchOutcome::AlreadyActive => {
+            println!("  already the active Codex login; nothing to do");
+        }
+        SwitchOutcome::WouldSwitch { outgoing } => {
+            print_cli_capture(outgoing.as_deref());
+            println!("  (dry run — nothing was changed)");
+        }
+        SwitchOutcome::Switched { outgoing } => {
+            // The unnamed account's cache is keyed by the default slot, not by
+            // who is signed in there, so it now holds the previous login's
+            // usage. Named accounts keep their own caches.
+            if let Ok(cache) = crate::cache::Cache::for_vendor("openai") {
+                cache.forget();
+            }
+            print_cli_capture(outgoing.as_deref());
+            println!(
+                "  switched — the Codex CLI, desktop app and IDE extension now sign in as {shown:?}; \
+                 restart any Codex session that was already open."
+            );
+        }
+    }
+    0
+}
+
+struct RegisteredCodex {
+    config_path: PathBuf,
+    auth_path: PathBuf,
+    display: String,
+    already_existed: bool,
+}
+
+/// `account add <label> --codex`: register the account, then either adopt the
+/// live `~/.codex` login or sign a new one in under the account's own
+/// `CODEX_HOME`.
+fn add_codex(label: &str, login: bool, adopt: bool) -> i32 {
+    let shown = sanitize_untrusted_line(label);
+    let config_path = crate::config::resolved_path().or_else(crate::config::default_path);
+    let home = crate::cache::home_dir();
+    let registration = match (config_path, home) {
+        (Some(config_path), Ok(home)) => register_codex_at(&config_path, label, &home),
+        (None, _) => Err(AppError::Other(
+            "could not resolve a config.toml path (no home directory?)".into(),
+        )),
+        (_, Err(error)) => Err(error),
+    };
+    let registration = match registration {
+        Ok(registration) => registration,
+        Err(error) => {
+            eprintln!(
+                "ai-usagebar account: could not add Codex account {shown:?}: {}",
+                printable(&error)
+            );
+            return 1;
+        }
+    };
+    if registration.already_existed {
+        println!(
+            "Codex account {shown:?} is already configured in {}.",
+            sanitize_untrusted_path(&registration.config_path)
+        );
+    } else {
+        println!(
+            "Added Codex account {shown:?} to {}.",
+            sanitize_untrusted_path(&registration.config_path)
+        );
+        println!(
+            "  codex_auth_path = {}",
+            sanitize_untrusted_line(&registration.display)
+        );
+    }
+    println!();
+
+    let codex_home = registration
+        .auth_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    if adopt {
+        let adopted = Config::load_from(&registration.config_path).and_then(|config| {
+            let default = codex_switch_slot(&config)?;
+            let account = config
+                .openai
+                .accounts
+                .iter()
+                .find(|account| account.label == label)
+                .ok_or_else(|| AppError::Other(format!("{label:?} vanished from config.toml")))?;
+            crate::openai::account::adopt_current(&default, &config.openai.accounts, account)
+        });
+        return match adopted {
+            Ok(()) => {
+                println!(
+                    "The current Codex login is now {shown:?}; `account switch <label> --codex` \
+                     saves it here before switching away."
+                );
+                0
+            }
+            Err(error) => {
+                eprintln!(
+                    "ai-usagebar account: could not adopt the current Codex login: {}",
+                    printable(&error)
+                );
+                1
+            }
+        };
+    }
+    let login_command = format!(
+        "CODEX_HOME='{}' codex login",
+        sanitize_untrusted_path(&codex_home).replace('\'', "'\\''")
+    );
+    if !login {
+        println!("Sign in later with:\n\n  {login_command}\n");
+        return 0;
+    }
+    println!("Opening `codex login` for {shown:?}; your default Codex login is untouched.");
+    println!();
+    let mut command = codex_login_command(&codex_home);
+    match command.status() {
+        Ok(status) if status.success() => {
+            let _ = restamp_config(&registration.config_path);
+            0
+        }
+        Ok(status) => {
+            eprintln!(
+                "`codex login` exited with status {}. The account remains registered; retry with:\n\n  {login_command}\n",
+                status.code().unwrap_or(-1)
+            );
+            1
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!(
+                "`codex` was not found on PATH. The account remains registered; sign in with:\n\n  {login_command}\n"
+            );
+            1
+        }
+        Err(error) => {
+            eprintln!("could not start `codex login`: {}", printable(&error));
+            1
+        }
+    }
+}
+
+fn codex_login_command(codex_home: &Path) -> std::process::Command {
+    let mut command = std::process::Command::new("codex");
+    command.arg("login").env("CODEX_HOME", codex_home);
+    for var in crate::vendor::vendor_secret_env_vars_to_remove(&[]) {
+        command.env_remove(var);
+    }
+    command
+}
+
+fn register_codex_at(config_path: &Path, label: &str, home: &Path) -> Result<RegisteredCodex> {
+    let original = match std::fs::read_to_string(config_path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(AppError::io_at(config_path, error)),
+    };
+    let mut doc: toml_edit::DocumentMut = if original.trim().is_empty() {
+        toml_edit::DocumentMut::new()
+    } else {
+        original.parse().map_err(|error: toml_edit::TomlError| {
+            let summary =
+                crate::config::toml_error_summary(&original, error.span(), error.message());
+            AppError::Other(format!("config.toml is not valid TOML: {summary}"))
+        })?
+    };
+    let existing = if config_path.exists() {
+        Config::load_from(config_path)?
+            .openai
+            .accounts
+            .into_iter()
+            .find(|account| account.label == label)
+    } else {
+        None
+    };
+    let already_existed = existing.is_some();
+    let auth_path = existing.map_or_else(
+        || crate::config::default_codex_auth_path(home, label),
+        |account| account.codex_auth_path,
+    );
+    let display = crate::config::tildify(&auth_path, home);
+    if !already_existed {
+        crate::config::add_openai_account_to_doc(&mut doc, label, &display)?;
+        let dir = auth_path
+            .parent()
+            .ok_or_else(|| AppError::Other("codex_auth_path has no parent directory".into()))?;
+        if !dir.exists() {
+            std::fs::create_dir_all(dir).map_err(|error| AppError::io_at(dir, error))?;
+            restrict_account_dir(dir)?;
+        }
+        crate::cache::atomic_write(config_path, doc.to_string().as_bytes())?;
+    }
+    Ok(RegisteredCodex {
+        config_path: config_path.to_path_buf(),
+        auth_path,
+        display,
+        already_existed,
+    })
+}
+
+/// `account add <label> --adopt-current`: register a Claude account for the
+/// login plain `claude` already uses, without signing in again.
+fn adopt_claude(label: &str) -> i32 {
+    let shown = sanitize_untrusted_line(label);
+    let registration = match register(label) {
+        Ok(registration) => registration,
+        Err(error) => {
+            eprintln!(
+                "ai-usagebar account: could not add {shown:?}: {}",
+                printable(&error)
+            );
+            return 1;
+        }
+    };
+    if !registration.already_existed {
+        println!(
+            "Added Claude account {shown:?} to {}.",
+            sanitize_untrusted_path(&registration.config_path)
+        );
+    }
+    let adopted = Config::load_from(&registration.config_path).and_then(|config| {
+        let accounts = config.anthropic.all_accounts();
+        let account = accounts
+            .iter()
+            .find(|account| account.label == label)
+            .ok_or_else(|| AppError::Other(format!("{label:?} vanished from config.toml")))?;
+        cli_account::adopt_current(
+            &cli_account::home_claude_json()?,
+            &accounts,
+            account,
+            &KeychainStore,
+        )
+    });
+    match adopted {
+        Ok(()) => {
+            println!(
+                "The current `claude` login is now {shown:?}; `account switch <label>` saves it \
+                 here before switching away."
+            );
+            0
+        }
+        Err(error) => {
+            eprintln!(
+                "ai-usagebar account: could not adopt the current Claude login: {}",
+                printable(&error)
+            );
+            1
+        }
+    }
 }
 
 fn restamp_config(path: &Path) -> Result<()> {
@@ -1176,6 +1909,19 @@ mod tests {
         assert!(out.contains("restore this account's cookies"), "{out}");
         assert!(
             out.contains("rollback        /archives/rollback.tar"),
+            "{out}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plan_lines_sanitizes_untrusted_archive_path() {
+        let mut plan = plan_fixture();
+        plan.archive = PathBuf::from("/archives/\x1b[2Krollback.tar");
+        let out = plan_lines(&plan).join("\n");
+        assert!(!out.contains('\u{1b}'), "escape sequence leaked: {out}");
+        assert!(
+            out.contains("rollback        /archives/[2Krollback.tar"),
             "{out}"
         );
     }
@@ -1435,6 +2181,68 @@ mod tests {
         assert!(written.contains("credentials_path = \"~/accounts/work/.credentials.json\""));
     }
 
+    #[test]
+    fn codex_registration_uses_a_codex_home_per_account() {
+        let temporary = tempfile::TempDir::new().unwrap();
+        let config_path = temporary.path().join("config.toml");
+        let registration = register_codex_at(&config_path, "work", temporary.path()).unwrap();
+
+        assert!(!registration.already_existed);
+        assert_eq!(
+            registration.auth_path,
+            temporary.path().join(".codex-work/auth.json")
+        );
+        assert!(temporary.path().join(".codex-work").is_dir());
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        assert!(written.contains("[[openai.accounts]]"), "{written}");
+        assert!(
+            written.contains("codex_auth_path = \"~/.codex-work/auth.json\""),
+            "{written}"
+        );
+
+        let again = register_codex_at(&config_path, "work", temporary.path()).unwrap();
+        assert!(again.already_existed);
+        assert_eq!(std::fs::read_to_string(&config_path).unwrap(), written);
+    }
+
+    #[test]
+    fn a_codex_switch_only_targets_the_file_codex_reads() {
+        let codex_default = PathBuf::from("/home/me/.codex/auth.json");
+        let mut config = Config::default();
+        assert_eq!(
+            codex_switch_slot_with(&config, codex_default.clone()).unwrap(),
+            codex_default
+        );
+        config.openai.codex_auth_path = Some(codex_default.clone());
+        assert_eq!(
+            codex_switch_slot_with(&config, codex_default.clone()).unwrap(),
+            codex_default
+        );
+        config.openai.codex_auth_path = Some(PathBuf::from("/tmp/mirror/auth.json"));
+        let error = codex_switch_slot_with(&config, codex_default).unwrap_err();
+        assert!(error.to_string().contains("codex_auth_path"), "{error}");
+    }
+
+    #[test]
+    fn status_lines_list_codex_accounts_and_flag_an_unmanaged_login() {
+        let report = serde_json::json!({
+            "desktop": null,
+            "cli": {"accounts": [], "active_label": null},
+            "codex": {
+                "default_path": "/home/me/.codex/auth.json",
+                "active_label": null,
+                "accounts": [{"label": "work", "signed_in": true, "active": false}],
+            },
+        });
+        let lines = status_lines(&report).join("\n");
+        assert!(
+            lines.contains("Codex            /home/me/.codex/auth.json"),
+            "{lines}"
+        );
+        assert!(lines.contains("work"), "{lines}");
+        assert!(lines.contains("--adopt-current"), "{lines}");
+    }
+
     #[cfg(unix)]
     #[test]
     fn registration_restricts_the_account_directory() {
@@ -1505,5 +2313,133 @@ mod tests {
             std::fs::read_to_string(path).unwrap(),
             "# edited while login ran\n"
         );
+    }
+
+    /// A profile path with a SPACE in it must still register as in use.
+    ///
+    /// The first version of this guard split the `ps` line on whitespace,
+    /// which truncated `.../Claude Accounts/work` to `.../Claude` and
+    /// reported every running copy as idle — the guard failing OPEN, which
+    /// permits the two-writer corruption it exists to prevent.
+    #[test]
+    fn a_running_profile_whose_path_contains_a_space_reads_as_in_use() {
+        let dir = PathBuf::from("/Users/x/Library/Application Support/Claude Accounts/work");
+        let ps = "/Applications/Claude Work.app/Contents/MacOS/Claude \
+--user-data-dir=/Users/x/Library/Application Support/Claude Accounts/work\n";
+        assert!(super::ps_shows_user_data_dir(ps, &[dir]));
+    }
+
+    /// A sibling profile sharing a prefix must not be mistaken for this one.
+    #[test]
+    fn a_sibling_profile_with_a_longer_name_is_not_this_profile() {
+        let dir = PathBuf::from("/Users/x/Library/Application Support/Claude Accounts/work");
+        let ps = "/Applications/Claude X.app/Contents/MacOS/Claude \
+--user-data-dir=/Users/x/Library/Application Support/Claude Accounts/work2\n";
+        assert!(!super::ps_shows_user_data_dir(ps, &[dir]));
+    }
+
+    #[test]
+    fn an_idle_profile_reads_as_not_in_use() {
+        let dir = PathBuf::from("/Users/x/Library/Application Support/Claude Accounts/personal");
+        let ps = "/Applications/Claude.app/Contents/MacOS/Claude\n/bin/zsh -l\n";
+        assert!(!super::ps_shows_user_data_dir(ps, &[dir]));
+    }
+
+    /// `account` prints reach the terminal verbatim, so a print must not take
+    /// a path from `Path::display` — it escapes nothing — nor an error or note
+    /// interpolated bare, whose text is whatever its constructor assembled.
+    /// Paths go through `sanitize_untrusted_path`, messages through `printable`.
+    ///
+    /// Scoped to prints: a bare `.display()` is the correct call when the
+    /// string is read by a program, as with the `--user-data-dir=` needle.
+    #[test]
+    fn no_account_print_interpolates_raw_display() {
+        let file = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/account.rs");
+        let source = std::fs::read_to_string(&file).expect("readable account.rs");
+        let body = crate::guard::production_code(&source);
+        // `println!(` also covers `eprintln!(`, and `print!(` covers `eprint!(`.
+        let sites: Vec<String> = ["println!(", "print!("]
+            .into_iter()
+            .flat_map(|opener| crate::guard::calls(&body, opener))
+            .filter(|call| {
+                [".display()", "{error}", "{note}"]
+                    .iter()
+                    .any(|needle| call.contains(needle))
+            })
+            .map(|call| call.replace('\n', " "))
+            .collect();
+        assert!(
+            sites.is_empty(),
+            "an account CLI print reaches the terminal verbatim; render its path with \
+             `sanitize_untrusted_path` and its error or note with `printable`. \
+             Found: {sites:#?}"
+        );
+    }
+
+    #[test]
+    fn printable_renders_an_error_as_one_terminal_safe_line() {
+        let error = AppError::Other("bad \x1b[2Kpath\nRESTORED: 0 files\u{202e}".to_string());
+        assert_eq!(printable(&error), "bad [2Kpath RESTORED: 0 files");
+    }
+
+    #[test]
+    fn codex_login_command_scrubs_vendor_secret_env_vars() {
+        let home = Path::new("/tmp/codex-home");
+        let command = codex_login_command(home);
+        assert_eq!(command.get_program(), "codex");
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args, vec!["login"]);
+        let configured: BTreeMap<_, _> = command
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|s| s.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            configured.get("CODEX_HOME").and_then(|v| v.as_deref()),
+            Some(home.to_str().unwrap())
+        );
+        for var in crate::vendor::vendor_secret_env_vars_to_remove(&[]) {
+            assert_eq!(
+                configured.get(var),
+                Some(&None),
+                "expected {var} to be scrubbed from codex login command"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_login_command_scrubs_vendor_secret_env_vars() {
+        let dir = Path::new("/tmp/claude-dir");
+        let command = claude_login_command(dir);
+        assert_eq!(command.get_program(), "claude");
+        let configured: BTreeMap<_, _> = command
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|s| s.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            configured
+                .get("CLAUDE_CONFIG_DIR")
+                .and_then(|v| v.as_deref()),
+            Some(dir.to_str().unwrap())
+        );
+        for var in crate::vendor::vendor_secret_env_vars_to_remove(&[]) {
+            assert_eq!(
+                configured.get(var),
+                Some(&None),
+                "expected {var} to be scrubbed from claude login command"
+            );
+        }
     }
 }

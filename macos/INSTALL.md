@@ -3,12 +3,36 @@
 A step-by-step guide to get the 5h / weekly usage bars into your macOS menu
 bar. For configuration and how it works, see [README.md](README.md).
 
-## Prerequisites
+## Install a release
+
+Download the macOS archive for your Mac from [Releases](https://github.com/akitaonrails/ai-usagebar/releases)
+(`aarch64` for Apple Silicon, `x86_64` for Intel). Extract it, move **AI Usage.app**
+to `/Applications`, and open the app. No Rust or Node is
+needed for a release. Claude and Codex reuse their existing CLI sign-ins.
+
+Use the **.app**, rather than the bare `ai-usagebar-tray` executable: its bundle
+identity lets macOS and menu-bar managers recognize it. In particular, Hidden
+Bar's macOS 27 native visibility mode inventories application bundles; a bare
+tray is omitted and can disappear even on the visible side of its arrow.
+The archive still includes standalone executables for CLI use.
+
+Use `/Applications` when running Hidden Bar on macOS 27. Hidden Bar also has
+a [reported issue with apps in `~/Applications`](https://github.com/dwarvesf/hidden/issues/446#issuecomment-5931939658),
+even when they have a bundle identity and sit on the visible side of its arrow.
+
+When moving from a bare tray, quit it first. In the app, turn **Launch at Login**
+off and back on so the LaunchAgent points inside the installed bundle. Then
+expand Hidden Bar, place AI Usage on the desired side, and collapse again.
+
+## Build from source
+
+### Prerequisites
 
 | Need | How |
 |---|---|
-| **Command Line Tools** (for `swiftc`) | `xcode-select --install` |
-| **`ai-usagebar` binary** | `cargo install ai-usagebar` (lands in `~/.cargo/bin`) |
+| **Rust** (`rustc` 1.90+) | `rustup` |
+| **Node.js 20+** | first tray build runs `npm ci` in `windows/popover/` |
+| **Python 3** | creates the application bundle |
 | **Claude logged in once** | run `claude` once — its OAuth creds go to the login **Keychain**, which ai-usagebar reads automatically |
 
 ## Step by step
@@ -17,93 +41,92 @@ bar. For configuration and how it works, see [README.md](README.md).
 
 ```bash
 git clone git@github.com:akitaonrails/ai-usagebar.git
-cd ai-usagebar/macos
-# (already cloned? just `git pull` and cd into macos/)
+cd ai-usagebar
 ```
 
-### 2. Install the binary (skip if you already have it)
-
-```bash
-cargo install ai-usagebar
-ai-usagebar --vendor anthropic --pretty   # quick smoke test — should print bars
-```
-
-### 3. Log in to Claude once (if you haven't)
+### 2. Log in to Claude once (if you haven't)
 
 ```bash
 claude        # authenticates; creds land in the login Keychain
 ```
 
-### 4. Build the app
+### 3. Build and run the tray
 
 ```bash
-./build.sh    # runs: swiftc -O -parse-as-library ai-usagebar-menubar.swift -o ai-usagebar-menubar
+cargo build --release
+python3 macos/package-app.py target/release "dist/AI Usage.app" \
+  "$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
+# Quit an existing copy first; use Finder to replace it if already installed.
+mv "dist/AI Usage.app" /Applications/
+open "/Applications/AI Usage.app"
 ```
 
-### 5. Run it
+It appears in the menu bar next to the clock (no Dock icon). Left-click opens
+the dashboard; right-click opens the same panel. Refresh and Settings are in
+the panel header; Detect Providers, Open TUI, Start at Login, and Quit are in
+Options or Settings.
+
+Quit the old Swift `ai-usagebar-menubar` first if it is still running, or you
+will see two status items.
+
+### 4. Start automatically at login
+
+Popover **Settings → Launch at Login**. That
+writes `~/Library/LaunchAgents/com.akitaonrails.ai-usagebar-tray.plist`.
+
+### 5. Verify it's running
 
 ```bash
-./ai-usagebar-menubar &
-```
-
-It appears in the menu bar next to the clock (no Dock icon). Click it for the
-dropdown: usage rows (Session / Weekly / Sonnet / Extra for rate-limit vendors,
-or a credit balance for balance-only vendors), a **"Switch provider"** submenu to
-switch vendors quickly, and Preferences.
-
-### 6. Start automatically at login
-
-The easiest way is the **Preferences… → System → "Start at login"** toggle in
-the app itself — it installs (or removes) the LaunchAgent for you, no Terminal
-needed. It takes effect at your next login.
-
-Or do it from the shell:
-
-```bash
-./install-agent.sh
-```
-
-Either way installs a LaunchAgent at
-`~/Library/LaunchAgents/com.akitaonrails.ai-usagebar-menubar.plist` with
-`RunAtLoad`, so the app starts on every login. It is not kept alive after you
-choose **Quit**.
-
-### 7. Verify it's running
-
-```bash
-launchctl list | grep ai-usagebar          # shows the agent
-pgrep -lf ai-usagebar-menubar               # shows the process
+pgrep -lf ai-usagebar-tray
 ```
 
 ## Managing it
 
-**Update to a newer version**
+**Update**
+
+A tray in a writable application bundle (such as `/Applications/AI Usage.app`)
+or copied somewhere of your own (such as `~/.local/bin`) updates
+itself: it checks GitHub once an hour, and Options → Check for Updates asks
+right away. When a release ships a macOS binary for your Mac, Install
+downloads it, verifies its SHA-256, swaps it in place and restarts the tray;
+nothing is compiled. The CLI and TUI beside the tray are replaced too, but only
+if they are already there as plain files. Settings → Updates chooses
+Automatic, Notify me or Off.
+
+The tray leaves itself alone, and offers the release page instead, when
+another tool owns the file — a Homebrew or Nix install, a link into place, or
+a copy running straight from cargo's `target/` directory — when it may not
+write its directory, and when a release has no macOS binary. Run from the
+source tree, it follows the tree; rebuild:
 
 ```bash
 git pull
-cd macos && ./build.sh
-launchctl unload ~/Library/LaunchAgents/com.akitaonrails.ai-usagebar-menubar.plist
-launchctl load   ~/Library/LaunchAgents/com.akitaonrails.ai-usagebar-menubar.plist
+cargo build --release
+# Quit the running tray, package a new .app as above into a fresh output
+# directory, then replace your installed copy and open it again.
 ```
 
-**Stop / uninstall the auto-start**
+**Stop / uninstall auto-start**
+
+Turn **Launch at Login** off, or:
 
 ```bash
-launchctl unload ~/Library/LaunchAgents/com.akitaonrails.ai-usagebar-menubar.plist
-rm ~/Library/LaunchAgents/com.akitaonrails.ai-usagebar-menubar.plist
+rm ~/Library/LaunchAgents/com.akitaonrails.ai-usagebar-tray.plist
 ```
 
-**Change settings** — open **Preferences** from the menu bar dropdown (or
-press **⌘,**): toggles for which bars, color pickers, vendor, interval, bar
-width, and binary path. Changes apply live and persist (no rebuild). The
-Preferences window needs macOS 12+.
+**Change settings** from the popover: Options → Settings. Use the General,
+Providers, Menu, Preferences, and Alerts tabs for refresh and shortcut,
+provider order and stars, menu-bar display, language and appearance, and
+system notifications.
 
 ## Troubleshooting
 
 | Symptom | Fix |
 |---|---|
-| `swiftc: command not found` | `xcode-select --install`, then re-run `./build.sh` |
-| Menu bar shows `⚠ ai` | the binary wasn't found — `cargo install ai-usagebar`, or set its path; it's searched in `~/.cargo/bin`, `/opt/homebrew/bin`, `/usr/local/bin`, then `PATH` |
-| Menu bar shows `Loading…` and never updates | run `claude` once so creds exist; test with `ai-usagebar --vendor anthropic --pretty` |
-| macOS blocks the binary (Gatekeeper) | it's your own local build — launching from Terminal / LaunchAgent is fine; if Finder blocks it, right-click → **Open** once |
-| Bars look dim on a light menu bar | bar colors are tuned for dark mode; tweak `COLOR_*` constants and rebuild |
+| `npm` missing during `cargo build` | install Node.js 20+ |
+| Popover is empty / stub page | `npm ci && npm run build` in `windows/popover/`, then rebuild the tray |
+| Clicking the icon opens a menu instead of the popover | the WKWebView could not be built, so the status item falls back to a bare Refresh / Quit menu (#249). Quit it from that menu, rebuild, and check the error printed at launch |
+| Two status items | quit `ai-usagebar-menubar` (legacy Swift dropdown) |
+| Hidden Bar hides the tray even outside its hidden section on macOS 27 | launch **AI Usage.app** from `/Applications`, update Launch at Login as above, then expand Hidden Bar, Command-drag AI Usage to the right of its arrow, and collapse it again |
+| No usage in the glyph | star metrics in Settings → Providers (max two per provider); turn on Chart Icon Only in the Menu tab |
+| macOS blocks the binary (Gatekeeper) | local build — launch from Terminal; if Finder blocks it, right-click → **Open** once |

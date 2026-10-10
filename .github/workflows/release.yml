@@ -74,6 +74,96 @@ jobs:
             "$(grep -m1 'pkgver = ' packaging/aur/.SRCINFO | awk '{print $3}')" "$version"
           check ".SRCINFO-bin pkgver" \
             "$(grep -m1 'pkgver = ' packaging/aur/.SRCINFO-bin | awk '{print $3}')" "$version"
+
+          check_pkgbuild_checksum_parity() {
+            local file="$1"
+            (
+              unset "${!source@}" "${!sha256sums@}" 2>/dev/null || true
+              # shellcheck disable=SC1090
+              source "$file"
+              local sub_fail=0
+              local suffixes=()
+              for v in ${!source@}; do
+                suffixes+=("${v#source}")
+              done
+              for v in ${!sha256sums@}; do
+                local sfx="${v#sha256sums}"
+                local seen=0
+                if [ "${#suffixes[@]}" -gt 0 ]; then
+                  for s in "${suffixes[@]}"; do
+                    if [ "$s" = "$sfx" ]; then seen=1; break; fi
+                  done
+                fi
+                if [ "$seen" -eq 0 ]; then suffixes+=("$sfx"); fi
+              done
+              if [ "${#suffixes[@]}" -eq 0 ]; then
+                echo "::error::$file declares no source or sha256sums arrays"
+                exit 1
+              fi
+              for sfx in "${suffixes[@]}"; do
+                local src_var="source$sfx"
+                local sha_var="sha256sums$sfx"
+                local src_len=0
+                local sha_len=0
+                if declare -p "$src_var" &>/dev/null; then
+                  eval "src_len=\${#$src_var[@]}"
+                fi
+                if declare -p "$sha_var" &>/dev/null; then
+                  eval "sha_len=\${#$sha_var[@]}"
+                fi
+                if [ "$src_len" -ne "$sha_len" ]; then
+                  echo "::error::$file: $src_var ($src_len elements) and $sha_var ($sha_len elements) differ in length"
+                  sub_fail=1
+                fi
+              done
+              exit "$sub_fail"
+            ) || fail=1
+          }
+
+          check_srcinfo_checksum_parity() {
+            local file="$1"
+            (
+              local sub_fail=0
+              local keys
+              keys=$(grep -E "^[[:space:]]*(source|sha256sums)(_[a-zA-Z0-9_]+)?[[:space:]]*=" "$file" \
+                | awk -F"=" '{print $1}' | tr -d " \t" | sort -u)
+              local suffixes=()
+              for k in $keys; do
+                local sfx=""
+                if [[ "$k" =~ ^source(_.*)$ ]]; then
+                  sfx="${BASH_REMATCH[1]}"
+                elif [[ "$k" =~ ^sha256sums(_.*)$ ]]; then
+                  sfx="${BASH_REMATCH[1]}"
+                fi
+                local seen=0
+                if [ "${#suffixes[@]}" -gt 0 ]; then
+                  for s in "${suffixes[@]}"; do
+                    if [ "$s" = "$sfx" ]; then seen=1; break; fi
+                  done
+                fi
+                if [ "$seen" -eq 0 ]; then suffixes+=("$sfx"); fi
+              done
+              for sfx in "${suffixes[@]}"; do
+                local src_key="source$sfx"
+                local sha_key="sha256sums$sfx"
+                local src_count
+                src_count=$(grep -c -E "^[[:space:]]*$src_key[[:space:]]*=" "$file" || true)
+                local sha_count
+                sha_count=$(grep -c -E "^[[:space:]]*$sha_key[[:space:]]*=" "$file" || true)
+                if [ "$src_count" -ne "$sha_count" ]; then
+                  echo "::error::$file: $src_key ($src_count lines) and $sha_key ($sha_count lines) differ in count"
+                  sub_fail=1
+                fi
+              done
+              exit "$sub_fail"
+            ) || fail=1
+          }
+
+          check_pkgbuild_checksum_parity packaging/aur/PKGBUILD
+          check_pkgbuild_checksum_parity packaging/aur/PKGBUILD-bin
+          check_srcinfo_checksum_parity packaging/aur/.SRCINFO
+          check_srcinfo_checksum_parity packaging/aur/.SRCINFO-bin
+
           jq -e . packaging/scoop/ai-usagebar.json >/dev/null \
             || { echo "::error::packaging/scoop/ai-usagebar.json is not valid JSON"; fail=1; }
           check "Scoop manifest version" \
@@ -107,6 +197,21 @@ jobs:
             target: x86_64-pc-windows-msvc
             artifact: ai-usagebar-windows-x86_64
             builder: cargo
+          # macOS: the tray plus CLI/TUI for both architectures, built on the
+          # Apple Silicon runner (x86_64 cross-compiles with the same Xcode).
+          # Like Windows, each binary is also published bare as
+          # `{bin}-macos-{arch}` with a `.sha256` sidecar — the names the
+          # tray's self-updater asks for (`update::asset_name`).
+          - os: macos-15
+            target: aarch64-apple-darwin
+            artifact: ai-usagebar-macos-aarch64
+            arch: aarch64
+            builder: cargo
+          - os: macos-15
+            target: x86_64-apple-darwin
+            artifact: ai-usagebar-macos-x86_64
+            arch: x86_64
+            builder: cargo
 
     runs-on: ${{ matrix.os }}
 
@@ -133,7 +238,7 @@ jobs:
 
       - name: Install cross (aarch64 cross-compile via Docker)
         if: runner.os == 'Linux' && matrix.builder == 'cross'
-        uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375 # v2.87.12
+        uses: taiki-e/install-action@183e4297cca2404691e9380e1307288dced5c82a # v2.87.25
         with:
           tool: cross
 
@@ -191,6 +296,8 @@ jobs:
         shell: pwsh
         run: |
           node gnome-extension/marker-logic.test.mjs
+          node gnome-extension/layout.test.mjs
+          node gnome-extension/report-model.test.mjs
           node kde-plasmoid/plasmoid-logic.test.mjs
           node windows/popover/popover.test.mjs
 
@@ -203,6 +310,21 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: cargo build --release --target ${{ matrix.target }} --locked
+
+      # #229: v1.21.0 shipped a tray whose popover was the no-npm stub because
+      # build.rs's npm probe could not spawn the .cmd shim. The probe is fixed,
+      # and this guard makes the failure loud forever: an artifact carrying the
+      # placeholder text must never publish.
+      - name: "Guard: tray must embed the dashboard, not the stub (Windows)"
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $exe = 'target/${{ matrix.target }}/release/ai-usagebar-tray.exe'
+          if (Select-String -Path $exe -Pattern 'popover dist missing' -Quiet) {
+            Write-Host "::error::$exe embeds the placeholder popover — build.rs took the no-npm stub path (#229)"
+            exit 1
+          }
+          Write-Host "$exe embeds the real dashboard"
 
       # One zip for humans, plus the three bare exes with `.sha256` sidecars
       # for the tray's self-updater. Sidecars use the `sha256sum` layout
@@ -238,11 +360,68 @@ jobs:
           Write-Sidecar "$artifact.zip"
           Remove-Item -Recurse -Force $stage
 
+      # --- macOS ---------------------------------------------------------
+      # build.rs runs `npm run build` for the tray popover on macOS too.
+      - name: Set up Node (macOS; the tray popover is a Vite build)
+        if: runner.os == 'macOS'
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: windows/popover/package-lock.json
+
+      - name: Install popover dependencies (macOS)
+        if: runner.os == 'macOS'
+        working-directory: windows/popover
+        run: npm ci
+
+      - name: Test (macOS; native arch only)
+        if: runner.os == 'macOS' && matrix.arch == 'aarch64'
+        run: cargo test --release --target ${{ matrix.target }} --locked
+
+      - name: Build release binaries (macOS)
+        if: runner.os == 'macOS'
+        run: cargo build --release --target ${{ matrix.target }} --locked
+
+      - name: "Guard: tray must embed the dashboard, not the stub (macOS)"
+        if: runner.os == 'macOS'
+        run: |
+          exe=target/${{ matrix.target }}/release/ai-usagebar-tray
+          if grep -q 'popover dist missing' "$exe"; then
+            echo "::error::$exe embeds the placeholder popover — build.rs took the no-npm stub path (#229)"
+            exit 1
+          fi
+          echo "$exe embeds the real dashboard"
+
+      # A tarball for humans, plus the three bare binaries with `sha256sum`
+      # layout sidecars for the self-updater, same contract as Windows.
+      - name: Package tarball, bare binaries and SHA256 sidecars (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          bins=target/${{ matrix.target }}/release
+          sidecar() { echo "$(shasum -a 256 "$1" | awk '{print $1}')  $1" > "$1.sha256"; cat "$1.sha256"; }
+          STAGE=$(mktemp -d)
+          for bin in ai-usagebar-tray ai-usagebar ai-usagebar-tui; do
+            cp "$bins/$bin" "$STAGE/"
+            cp "$bins/$bin" "$bin-macos-${{ matrix.arch }}"
+            sidecar "$bin-macos-${{ matrix.arch }}"
+          done
+          python3 -m unittest discover -s macos -p 'test_package_app.py'
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+          python3 macos/package-app.py "$bins" "$STAGE/AI Usage.app" "$version"
+          plutil -lint "$STAGE/AI Usage.app/Contents/Info.plist"
+          cp LICENSE README.md config.example.toml "$STAGE/"
+          tar czf ${{ matrix.artifact }}.tar.gz -C "$STAGE" .
+          sidecar ${{ matrix.artifact }}.tar.gz
+          rm -rf "$STAGE"
+
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ matrix.artifact }}
           # Linux produces the tarball pair; Windows the zip, the bare exes
-          # and their sidecars. Missing globs are fine (one OS each).
+          # and their sidecars; macOS the tarball and the bare binaries.
+          # Missing globs are fine (one OS each).
           if-no-files-found: error
           path: |
             ${{ matrix.artifact }}.tar.gz
@@ -251,6 +430,10 @@ jobs:
             ${{ matrix.artifact }}.zip.sha256
             *-windows-x86_64.exe
             *-windows-x86_64.exe.sha256
+            *-macos-aarch64
+            *-macos-aarch64.sha256
+            *-macos-x86_64
+            *-macos-x86_64.sha256
 
   release:
     needs: [verify-version, build]
@@ -317,6 +500,20 @@ jobs:
             echo
             echo "Unzip ai-usagebar-windows-x86_64.zip anywhere and run ai-usagebar-tray.exe (the zip also carries ai-usagebar.exe and ai-usagebar-tui.exe). The bare *-windows-x86_64.exe assets are what the tray's self-updater downloads; they are not needed by hand."
             echo
+            echo "### macOS"
+            echo
+            echo '```bash'
+            echo "# Apple Silicon; use ai-usagebar-macos-x86_64.tar.gz on an Intel Mac"
+            echo "curl -fLO https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/ai-usagebar-macos-aarch64.tar.gz"
+            echo "tar xzf ai-usagebar-macos-aarch64.tar.gz './AI Usage.app'"
+            echo '# Quit an existing copy first; use Finder to replace it if already installed.'
+            echo 'mv "AI Usage.app" /Applications/'
+            echo 'open "/Applications/AI Usage.app"'
+            echo '```'
+            echo
+            echo "The menu-bar tray updates itself from later releases (Settings → Updates). The bare *-macos-* assets are what it downloads; they are not needed by hand."
+            echo "Launch the .app so macOS and menu-bar managers can identify it. When migrating from a bare executable, quit it first and toggle Launch at Login off and on in the app to update the saved path."
+            echo
             echo "## Checksums (SHA256)"
             echo '```'
             # Every sidecar: the Linux tarballs, the Windows zip, and the
@@ -331,20 +528,104 @@ jobs:
             fi
           } > body.md
 
+      # Opt-in PGP signing (#257). Without the GPG_PRIVATE_KEY secret this
+      # pair of steps is skipped and the release is byte-for-byte what it
+      # was before. The presence probe mirrors the AUR/Scoop secret checks:
+      # the secrets context is not readable from a step `if:`, so a prior
+      # step exports the verdict. The key still travels via env indirection
+      # (never inline `${{ }}` expansion into the script) and the passphrase
+      # reaches gpg on stdin — never in argv.
+      - name: Check GPG signing key presence
+        id: gpg_key
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+        run: |
+          if [ -z "$GPG_PRIVATE_KEY" ]; then
+            echo "set=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "set=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Sign release artifacts (opt-in)
+        if: steps.gpg_key.outputs.set == 'true'
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+          RELEASE_TAG: ${{ inputs.ref || github.ref_name }}
+        run: |
+          set -euo pipefail
+          umask 077
+          keyfile="${RUNNER_TEMP}/signing-key.asc"
+          printf '%s\n' "$GPG_PRIVATE_KEY" > "$keyfile"
+          gpg --batch --import "$keyfile"
+          rm -f "$keyfile"
+          keyid=$(gpg --list-secret-keys --with-colons | awk -F: '/^sec/{print $5; exit}')
+          fingerprint=$(gpg --list-secret-keys --with-colons "$keyid" | awk -F: '/^fpr/{print $10; exit}')
+          echo "Signing as ${fingerprint}"
+
+          # Detached ASCII signatures for every downloadable artifact. The
+          # .sha256 sidecars stay unsigned on purpose: they are derived
+          # data, and a tampered sidecar makes the checksum check fail
+          # closed against the signed artifact itself. A passphraseless
+          # key must NOT take the --passphrase-fd path: gpg reads the
+          # empty line and fails with "No passphrase given" (the v1.28.0
+          # first-run failure), so the fd-0 loopback is only wired when a
+          # passphrase actually exists.
+          sign() {
+            if [ -n "${GPG_PASSPHRASE:-}" ]; then
+              gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 \
+                --detach-sign --armor --output "$1.sig" "$1" <<<"$GPG_PASSPHRASE"
+            else
+              gpg --batch --yes --pinentry-mode loopback \
+                --detach-sign --armor --output "$1.sig" "$1"
+            fi
+          }
+          shopt -s nullglob
+          for f in artifacts/*.tar.gz artifacts/*.zip artifacts/*.exe \
+                   artifacts/*-macos-aarch64 artifacts/*-macos-x86_64; do
+            sign "$f"
+          done
+
+          # The public key rides along so verification needs no keyserver.
+          gpg --armor --export "$keyid" > artifacts/ai-usagebar-signing-key.asc
+
+          {
+            echo
+            echo "## Verifying signatures"
+            echo
+            echo '```bash'
+            echo "curl -fsSL -O https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/ai-usagebar-signing-key.asc"
+            echo "gpg --import ai-usagebar-signing-key.asc   # ${fingerprint}"
+            echo "curl -fsSL -O https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/ai-usagebar-linux-x86_64.tar.gz.sig"
+            echo "gpg --verify ai-usagebar-linux-x86_64.tar.gz.sig ai-usagebar-linux-x86_64.tar.gz"
+            echo '```'
+          } >> body.md
+
       - name: Create / update GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_REF: ${{ inputs.ref || github.ref_name }}
         run: |
           TAG="$RELEASE_REF"
+          # The signature set exists only when the opt-in signing step ran.
+          # nullglob + the array keeps an unmatched `*.sig` from reaching gh
+          # as a literal filename on unsigned releases.
+          shopt -s nullglob
+          sigs=(artifacts/*.sig)
+          [ -f artifacts/ai-usagebar-signing-key.asc ] && \
+            sigs+=("artifacts/ai-usagebar-signing-key.asc")
           # Replace any pre-existing assets so re-runs (workflow_dispatch on
           # an existing tag) overwrite cleanly.
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$TAG" artifacts/*.tar.gz artifacts/*.zip artifacts/*.exe artifacts/*.sha256 \
+            gh release upload "$TAG" artifacts/*.tar.gz artifacts/*.zip artifacts/*.exe \
+              artifacts/*-macos-aarch64 artifacts/*-macos-x86_64 artifacts/*.sha256 \
+              ${sigs[@]+"${sigs[@]}"} \
               --repo "$GITHUB_REPOSITORY" --clobber
             gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes-file body.md
           else
-            gh release create "$TAG" artifacts/*.tar.gz artifacts/*.zip artifacts/*.exe artifacts/*.sha256 \
+            gh release create "$TAG" artifacts/*.tar.gz artifacts/*.zip artifacts/*.exe \
+              artifacts/*-macos-aarch64 artifacts/*-macos-x86_64 artifacts/*.sha256 \
+              ${sigs[@]+"${sigs[@]}"} \
               --repo "$GITHUB_REPOSITORY" \
               --title "$TAG" \
               --notes-file body.md \
@@ -413,8 +694,8 @@ jobs:
 
           X86_SHA=$(awk '{print $1}' artifacts/ai-usagebar-linux-x86_64.tar.gz.sha256)
           ARM_SHA=$(awk '{print $1}' artifacts/ai-usagebar-linux-aarch64.tar.gz.sha256)
-          sed -i "s/^sha256sums_x86_64=.*/sha256sums_x86_64=('$X86_SHA')/" packaging/aur/PKGBUILD-bin
-          sed -i "s/^sha256sums_aarch64=.*/sha256sums_aarch64=('$ARM_SHA')/" packaging/aur/PKGBUILD-bin
+          sed -i "s/^sha256sums_x86_64=.*/sha256sums_x86_64=('$X86_SHA' 'SKIP')/" packaging/aur/PKGBUILD-bin
+          sed -i "s/^sha256sums_aarch64=.*/sha256sums_aarch64=('$ARM_SHA' 'SKIP')/" packaging/aur/PKGBUILD-bin
 
           # deploy-aur copies pkgbuild verbatim (preserves filename). The AUR
           # bin repo tracks a file literally named `PKGBUILD`, so stage the

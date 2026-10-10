@@ -54,7 +54,7 @@ When cutting a new version (patch, minor, or major):
      merge is not evidence here; the comparison is, and now the guard is too.
 3. **Bump `packaging/aur/PKGBUILD`** — `pkgver=X.Y.Z`, `pkgrel=1`, reset `sha256sums` to `'SKIP'`.
 4. **Bump `packaging/aur/PKGBUILD-bin`** — same `pkgver`, `pkgrel=1`, reset both
-   `sha256sums_x86_64` and `sha256sums_aarch64` to `'SKIP'`.
+   `sha256sums_x86_64` and `sha256sums_aarch64` to `('SKIP' 'SKIP')`.
 5. **Regenerate both `.SRCINFO`s NOW, before tagging** — the release
    workflow's `verify-version` job rejects the tag if `packaging/aur/.SRCINFO`
    or `.SRCINFO-bin` still carry the old `pkgver` (learned at v0.17.0, which
@@ -76,9 +76,9 @@ When cutting a new version (patch, minor, or major):
    cargo machete                               # no unused deps
    omarchy plugin validate .                   # plugin manifest + entry points
    ```
-   `make test` rather than `cargo test`: it also runs the GNOME, KDE, and
-   Omarchy frontend contract suites. `cargo fmt --all -- --check` is on this
-   list because CI's ubuntu job runs it and fails the build on a diff — it was
+   `make test` rather than `cargo test`: it also runs the GNOME, KDE, Omarchy,
+   and Linux Mint frontend contract suites. `cargo fmt --all -- --check` is on
+   this list because CI's ubuntu job runs it and fails the build on a diff — it was
    missing here once, and a correctly-working commit landed on `main` red for
    nothing but a rustfmt line-wrap. If `kde-plasmoid/` changed, also bump
    `KPlugin.Version` in `kde-plasmoid/package/metadata.json`; it is versioned
@@ -124,7 +124,18 @@ When cutting a new version (patch, minor, or major):
    `packaging/aur/PKGBUILD*` + regen'd `.SRCINFO*` from the main repo,
    commit, push.
 
-**Anything skipping any of 1–9 is an incomplete release.** Tags are
+10. **Reclaim the build storage.** After the release is verified (not merely
+    tagged), run `cargo clean` — release gates leave tens of GB of
+    incremental artifacts in `target/`, and multi-arch work compounds it.
+    Also remove scratch from the audit/gating workflow: any `git worktree`
+    checkouts under `/tmp` (prune with `git worktree remove --force` +
+    `git worktree prune`) and their `CARGO_TARGET_DIR` side directories
+    (`/tmp/opencode/*-tgt`), which each hold a full dependency build.
+    The next `make test` pays a full rebuild for the reclaimed space —
+    that trade is correct exactly once per release, and leaving the trash
+    in place has exhausted disk storage before.
+
+**Anything skipping any of 1–10 is an incomplete release.** Tags are
 immutable; do **not** force-move a tag once it's pushed. Cut a new
 patch version instead.
 
@@ -184,6 +195,24 @@ patch version instead.
   already. Build report metrics through
   `SectionBuilder::push_metric` so the absolute reset travels with its row;
   never recreate a per-vendor metric-order table in `report.rs`.
+- **Vendor registration includes the macOS mirror.** A vendor's custom
+  placeholders must be appended (never inserted — the Swift side reads fields
+  by index, so those are stable contracts) to the `FORMAT` string in
+  `macos/ai-usagebar-menubar.swift`, with their dispatch case. Three vendors
+  shipped without their slot before this was guarded (#372 was the third).
+  Every `VendorId` is classified in `macos_mirror` in `src/guard.rs`, as
+  either `Slot(token)` — it has its own field in the mirror — or
+  `Generic(tokens)` — the bar renders it from the generic `session_*`/
+  `weekly_*` placeholders, which are named so the claim is checkable. **The
+  match is exhaustive, so a new vendor does not compile until it is
+  classified**; that is the point, because the hand-written token list this
+  replaced could only catch a token that was listed *and* missing, and a
+  vendor absent from both it and the mirror passed in silence. Claimed tokens
+  are also checked against the placeholders Rust emits, so renaming one side
+  fails instead of leaving both sides agreeing about nothing. The mirror is a
+  deliberate subset — Rust emits ~289 placeholders and the bar asks for ~57 —
+  so which figures appear is a product decision; making the decision is not
+  optional.
 - **Tests are hermetic.** A `#[test]`/`#[tokio::test]` must never read or
   write a real `$HOME`/`$XDG` path (config, cache, creds, Omarchy theme)
   or branch on an ambient env var — the AUR `check()` runs `cargo test`
@@ -276,14 +305,17 @@ vendor's response shape drifts:
   auth file and pass the paths in; never touch the real ones.
 - `src/anthropic/keychain.rs` — macOS-only Keychain fallback when
   `~/.claude/.credentials.json` is absent (Claude Code on macOS stores
-  the OAuth blob in the login Keychain). Reads, deletes and normal-sized writes
-  use `security(1)`: the writer's code identity is what macOS stamps onto the item's
+  the OAuth blob in the login Keychain). Reads, writes and deletes all use
+  `security(1)`: the writer's code identity is what macOS stamps onto the item's
   XARA partition list, so a native write left the item owned by
   `cdhash:<ai-usagebar>` and made every `/usr/bin/security` read — ours and
-  Claude Code's — raise a Keychain dialog (#148). OAuth JSON still never enters
-  process arguments: the command goes to `security -i` on stdin. Only a blob
-  over that reader's line cap falls back to Security.framework. Module-gated with
-  `#[cfg(target_os = "macos")]`; Linux build never compiles it.
+  Claude Code's — raise a Keychain dialog (#148). Normal-sized blobs go to
+  `security -i` on stdin, keeping the JSON out of argv; a blob over that
+  reader's line cap (real once Claude Code keeps `mcpOAuth` plugin state in the
+  item) is passed to `security add-generic-password` as an argument instead —
+  never through Security.framework, which is now a dev-dependency used only by
+  the opt-in Keychain tests. Module-gated with `#[cfg(target_os = "macos")]`;
+  Linux build never compiles it.
 - `src/cache.rs` — atomic per-vendor cache writes + flock, plus the shared
   cross-platform path resolvers (`xdg_cache_dir`, `home_dir`). `home_dir`
   resolves `$HOME` / `%USERPROFILE%` via `directories::BaseDirs` and is reused
@@ -292,6 +324,12 @@ vendor's response shape drifts:
 - `src/context/` — opt-in, bounded reader for local Claude Code JSONL
   transcripts. This format is best-effort and schema-tolerant; tests must use
   `scan_dir(&Path)` with a temp directory and never inspect a real user history.
+  `context/activity.rs` counts working/waiting sessions from each account's
+  `sessions/<pid>.json` (#356), read-only; tests seed a temp directory and pass
+  a fake `ProcessProbe`, never `SystemProbe`, and the report seam is
+  `attach_session_activity_with`, which also takes the live CLI label. It is
+  the only reader of those files: the Waybar tooltip and `usage --json` both
+  find the directory through `CredsTarget::config_dir`.
 - `src/tui/settings.rs` — Settings overlay (toml_edit-backed,
   auto-signals waybar after save)
 - `src/tui/panels.rs` — native ratatui per-vendor panels
@@ -301,7 +339,9 @@ vendor's response shape drifts:
 - `src/tooltip.rs` — shared Pango bordered-box renderer (used by
   every vendor's tooltip)
 - `gnome-extension/marker-logic.js` — pure GNOME formatting helpers and their
-  own Node contract tests.
+  own Node contract tests. `gnome-extension/report-model.js` projects
+  `usage --json` for the provider submenus; the top bar still uses the format
+  string.
 - `kde-plasmoid/` — KDE Plasma 6 plasmoid (KPackage). Vendor selection is
   per applet instance via KConfigXT. Its single `usage --json` request omits
   `--vendor`; selection happens client-side, so it never reads

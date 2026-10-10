@@ -76,6 +76,9 @@ pub enum SavedCredential<'a> {
     Keyring,
     /// Use this raw blob.
     Blob(&'a str),
+    /// Read the blob from this file each time, so a test can model a
+    /// credential that another program rewrites between two reads.
+    File(&'a std::path::Path),
     /// Behave as if the keyring held nothing.
     Absent,
 }
@@ -90,9 +93,34 @@ pub struct RemoteOverride<'a> {
     pub credential: SavedCredential<'a>,
     /// Cloud Code endpoints, in place of [`cloud::Endpoints::default`].
     pub endpoints: Option<&'a cloud::Endpoints>,
-    /// Local base URLs to probe, in place of discovery. `Some(vec![])` means
+    /// Local candidates to probe, in place of discovery. `Some(vec![])` means
     /// "no local server", which is what sends the fetch down the remote path.
-    pub local_bases: Option<Vec<String>>,
+    /// `pid` marks which process owns each listener; tests that model one
+    /// product's two listeners give them the same pid.
+    pub local_bases: Option<Vec<Candidate>>,
+    /// How an expired session is renewed through the `agy` CLI. Off by
+    /// default, so only [`fetch_snapshot`] — which asks for discovery — ever
+    /// runs the real one.
+    pub agy: super::agy::AgyCommand,
+}
+
+/// One probe target: the listener's base URL and, when it came from
+/// discovery, the process that owns it. A `missing CSRF` answer spares only
+/// the *same process's* remaining listeners, so the pid is what keeps a
+/// second Antigravity product's ports reachable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Candidate {
+    /// Normalized `scheme://authority` URL the RPC paths are appended to.
+    pub base: String,
+    /// Owning pid when the listener was discovered; `None` for a bare test
+    /// seam or an override whose port discovery did not see.
+    pub pid: Option<u32>,
+}
+
+impl From<String> for Candidate {
+    fn from(base: String) -> Self {
+        Self { base, pid: None }
+    }
 }
 
 pub async fn fetch_snapshot(
@@ -106,7 +134,10 @@ pub async fn fetch_snapshot(
         cache,
         cache_ttl,
         oauth,
-        RemoteOverride::default(),
+        RemoteOverride {
+            agy: super::agy::AgyCommand::Discover,
+            ..Default::default()
+        },
         Utc::now(),
     )
     .await
@@ -154,7 +185,13 @@ pub async fn fetch_snapshot_at(
     let endpoints = remote.endpoints.unwrap_or(&default_endpoints);
     let live = match origin {
         Origin::Local(session) => fetch_live(client, session).await,
-        Origin::Remote(token) => fetch_remote(client, cache, oauth, endpoints, token, now).await,
+        Origin::Remote(token) => {
+            let renewal = Renewal {
+                agy: &remote.agy,
+                credential: remote.credential,
+            };
+            fetch_remote(client, cache, oauth, endpoints, token, renewal, now).await
+        }
     };
 
     match live {
@@ -225,8 +262,10 @@ impl RemoteFallbackReason {
 }
 
 /// Local failures the saved Google session is allowed to answer. The `agy`
-/// response is matched structurally and exactly; an arbitrary local `401`
-/// remains a signed-out diagnosis and never triggers remote traffic.
+/// CSRF refusal is matched on status, code, and the `missing CSRF token`
+/// wording (including the `unauthenticated:` prefix `agy` 1.3.1 added). An
+/// arbitrary local `401` remains a signed-out diagnosis and never triggers
+/// remote traffic.
 fn remote_fallback_reason(error: &AppError) -> Option<RemoteFallbackReason> {
     if matches!(error, AppError::Credentials(message) if message == NO_LOCAL_SERVER) {
         Some(RemoteFallbackReason::NoLocalServer)
@@ -242,25 +281,43 @@ fn remote_fallback_reason(error: &AppError) -> Option<RemoteFallbackReason> {
 /// session each run their own — and only some of them are signed in.
 ///
 /// `bases` replaces discovery when given; see [`RemoteOverride::local_bases`].
-async fn open_session(client: &reqwest::Client, bases: Option<&[String]>) -> Result<Session> {
-    let bases = bases.map_or_else(candidate_bases, <[String]>::to_vec);
-    if bases.is_empty() {
+async fn open_session(client: &reqwest::Client, bases: Option<&[Candidate]>) -> Result<Session> {
+    let candidates = bases.map_or_else(candidate_bases, <[Candidate]>::to_vec);
+    if candidates.is_empty() {
         return Err(no_local_server());
     }
 
     let mut errors = Vec::new();
-    for base in bases {
-        let csrf = fetch_csrf(client, &base).await;
-        match post_rpc(client, &base, csrf.as_deref(), STATUS_RPC).await {
+    // Products already proved unusable. Skipping *their* remaining ports —
+    // not the whole list — is what keeps a second product's RPC listener
+    // reachable: the candidates are flattened rank by rank, so the port after
+    // an `agy` answer can belong to a different process.
+    let mut blocked_pids = std::collections::HashSet::new();
+    for candidate in candidates {
+        if candidate.pid.is_some_and(|pid| blocked_pids.contains(&pid)) {
+            continue;
+        }
+        let csrf = fetch_csrf(client, &candidate.base).await;
+        match post_rpc(client, &candidate.base, csrf.as_deref(), STATUS_RPC).await {
             Ok(v) => {
                 return Ok(Session {
-                    base,
+                    base: candidate.base,
                     csrf,
                     plan: plan_from_status(&v),
                     account: account_key(&v),
                 });
             }
-            Err(e) => errors.push(e),
+            Err(e) => {
+                // agy exposes no token-discovery route and requires CSRF. Once
+                // confirmed, probing this process's other ports only triggers
+                // the same rejection or spurious Go TLS handshake error logs.
+                if is_missing_csrf(&e)
+                    && let Some(pid) = candidate.pid
+                {
+                    blocked_pids.insert(pid);
+                }
+                errors.push(e);
+            }
         }
     }
     Err(select_probe_error(errors))
@@ -309,8 +366,9 @@ fn select_probe_error(errors: Vec<AppError>) -> AppError {
 
 /// `agy` currently serves no page containing its CSRF token, then returns this
 /// structured response from the status RPC. Matching the status, code, and
-/// message avoids treating an unrelated local service or a genuinely
-/// signed-out Antigravity product as permission to use the cloud fallback.
+/// the `missing CSRF token` wording avoids treating an unrelated local service
+/// or a genuinely signed-out Antigravity product as permission to use the
+/// cloud fallback. `agy` 1.3.1 prefixes that wording with `unauthenticated:`.
 fn is_missing_csrf(error: &AppError) -> bool {
     let AppError::Http { status: 401, body } = error else {
         return false;
@@ -322,8 +380,17 @@ fn is_missing_csrf(error: &AppError) -> bool {
         (body["code"].as_str(), body["message"].as_str()),
         (Some(code), Some(message))
             if code.eq_ignore_ascii_case("unauthenticated")
-                && message.trim().eq_ignore_ascii_case("missing CSRF token")
+                && is_missing_csrf_message(message)
     )
+}
+
+/// Historical wording, or that wording as the last colon-separated field so
+/// `agy` 1.3.1's `unauthenticated: missing CSRF token` still matches.
+fn is_missing_csrf_message(message: &str) -> bool {
+    message
+        .rsplit(':')
+        .next()
+        .is_some_and(|part| part.trim().eq_ignore_ascii_case("missing CSRF token"))
 }
 
 /// An error the user can do something about, as opposed to "that product is not
@@ -381,6 +448,7 @@ fn saved_session(
     let raw = match credential {
         SavedCredential::Keyring => credential::read()?,
         SavedCredential::Blob(blob) => Some(blob.to_string()),
+        SavedCredential::File(path) => std::fs::read_to_string(path).ok(),
         SavedCredential::Absent => None,
     };
     let Some(raw) = raw else {
@@ -409,7 +477,7 @@ fn session_expired() -> AppError {
 fn refresh_unconfigured() -> AppError {
     AppError::Credentials(
         "Antigravity's saved Google session expired and ai-usagebar has no OAuth client to \
-         refresh it; open Antigravity to sign in again, or set [antigravity] oauth_client_id \
+         refresh it; open Antigravity (or run `agy`) to sign in again, or set [antigravity] oauth_client_id \
          and oauth_client_secret in config.toml"
             .into(),
     )
@@ -496,6 +564,31 @@ async fn refresh_and_persist(
     })
 }
 
+/// What the remote path needs to renew an expired session through `agy`:
+/// the command to run, and where to read the credential again afterwards.
+struct Renewal<'a> {
+    agy: &'a super::agy::AgyCommand,
+    credential: SavedCredential<'a>,
+}
+
+impl Renewal<'_> {
+    /// Run `agy` to renew the saved session, then read it again. `None` when
+    /// `agy` did not run or left nothing readable, so the caller keeps the
+    /// error that sent it here.
+    async fn renewed(&self, cache: &Cache, now: DateTime<Utc>) -> Option<StoredToken> {
+        if !super::agy::renew_session(self.agy, cache, now).await {
+            return None;
+        }
+        let raw = match self.credential {
+            SavedCredential::Keyring => credential::read().ok().flatten()?,
+            SavedCredential::Blob(blob) => blob.to_string(),
+            SavedCredential::File(path) => std::fs::read_to_string(path).ok()?,
+            SavedCredential::Absent => return None,
+        };
+        credential::parse_keyring_blob(&raw).ok()
+    }
+}
+
 /// Quota through the Cloud Code API, as the signed-in Google account.
 ///
 /// A rejected token gets one refresh and one retry, unless it was refreshed a
@@ -508,16 +601,37 @@ async fn fetch_remote(
     oauth: Option<&cloud::OauthClient>,
     endpoints: &cloud::Endpoints,
     token: Result<StoredToken>,
+    renewal: Renewal<'_>,
     now: DateTime<Utc>,
 ) -> Result<AntigravitySnapshot> {
-    let token = token?;
+    let mut token = token?;
     let oauth_path = cloud::oauth_cache_path(cache);
     let mut access =
-        resolve_access_token(client, oauth, endpoints, &oauth_path, &token, now).await?;
+        match resolve_access_token(client, oauth, endpoints, &oauth_path, &token, now).await {
+            Ok(access) => access,
+            // Without an OAuth client this program cannot renew the session
+            // itself, but the `agy` CLI can.
+            Err(e) if oauth.is_none() => {
+                let Some(renewed) = renewal.renewed(cache, now).await else {
+                    return Err(e);
+                };
+                token = renewed;
+                resolve_access_token(client, oauth, endpoints, &oauth_path, &token, now).await?
+            }
+            Err(e) => return Err(e),
+        };
 
     let quota = match cloud::fetch_quota(client, endpoints, &access.value).await {
         Err(e) if is_auth_rejection(&e) && !access.just_refreshed => {
-            access = refresh_and_persist(client, oauth, endpoints, &oauth_path, &token).await?;
+            access = if oauth.is_none() {
+                let Some(renewed) = renewal.renewed(cache, now).await else {
+                    return Err(refresh_unconfigured());
+                };
+                token = renewed;
+                resolve_access_token(client, oauth, endpoints, &oauth_path, &token, now).await?
+            } else {
+                refresh_and_persist(client, oauth, endpoints, &oauth_path, &token).await?
+            };
             cloud::fetch_quota(client, endpoints, &access.value)
                 .await
                 .map_err(|e| {
@@ -793,7 +907,7 @@ fn parse_reset(value: &serde_json::Value, field: &str) -> Result<Option<DateTime
 // ---------------------------------------------------------------------------
 
 /// Base URLs worth probing, most specific first.
-fn candidate_bases() -> Vec<String> {
+fn candidate_bases() -> Vec<Candidate> {
     candidate_bases_with(
         std::env::var("ANTIGRAVITY_LS_ADDRESS").ok().as_deref(),
         discover_ls_ports(),
@@ -801,11 +915,19 @@ fn candidate_bases() -> Vec<String> {
 }
 
 /// Test seam for [`candidate_bases`] — takes the address override and the
-/// discovered ports instead of reading the environment and `/proc`.
-fn candidate_bases_with(override_addr: Option<&str>, discovered: Vec<u16>) -> Vec<String> {
-    let mut bases = Vec::new();
+/// discovered `(pid, port)` pairs instead of reading the environment and
+/// `/proc`.
+fn candidate_bases_with(
+    override_addr: Option<&str>,
+    discovered: Vec<(u32, u16)>,
+) -> Vec<Candidate> {
+    let mut candidates = Vec::new();
     if let Some(base) = override_addr.and_then(normalize_base) {
-        bases.push(base);
+        // An override that names a port discovery also saw belongs to that
+        // process: its missing-CSRF answer must spare the process's sibling
+        // listeners too.
+        let pid = base_port(&base).and_then(|port| unique_owner(&discovered, port));
+        candidates.push(Candidate { base, pid });
     }
 
     // No hardcoded fallback port on purpose: the server always binds with
@@ -813,14 +935,34 @@ fn candidate_bases_with(override_addr: Option<&str>, discovered: Vec<u16>) -> Ve
     // and cannot be guessed. Probing a fixed one would just poke whatever
     // unrelated process happens to own it. Discovered ports follow any
     // explicit override as fallback, with duplicates omitted.
-    for p in discovered {
-        let candidate = format!("http://127.0.0.1:{p}");
-        if !bases.contains(&candidate) {
-            bases.push(candidate);
+    for (pid, port) in discovered {
+        let base = format!("http://127.0.0.1:{port}");
+        if !candidates.iter().any(|c| c.base == base) {
+            candidates.push(Candidate {
+                base,
+                pid: Some(pid),
+            });
         }
     }
 
-    bases
+    candidates
+}
+
+/// The port an already-normalized base targets, when it names one.
+fn base_port(base: &str) -> Option<u16> {
+    let (_, authority) = base.split_once("://")?;
+    authority.rsplit_once(':')?.1.parse().ok()
+}
+
+/// The one process discovery attributes to `port`; `None` when it is not
+/// listed or more than one process claims it.
+fn unique_owner(discovered: &[(u32, u16)], port: u16) -> Option<u32> {
+    let mut owners = discovered
+        .iter()
+        .filter(|(_, p)| *p == port)
+        .map(|(pid, _)| *pid);
+    let first = owners.next()?;
+    owners.all(|pid| pid == first).then_some(first)
 }
 
 /// Turn a configured address into a base URL: trim surrounding whitespace,
@@ -860,7 +1002,9 @@ fn is_antigravity_process(comm: &str, exe: Option<&str>) -> bool {
     })
 }
 
-/// Flatten per-process listener ports into the order they should be probed.
+/// Flatten per-process listener ports into the order they should be probed,
+/// keeping each port's owner so `open_session` can spare the rest of a
+/// process's listeners once its RPC answer proves the product unusable.
 ///
 /// Each Antigravity product binds an HTTPS/TLS listener and the unencrypted
 /// HTTP JSON-RPC listener that serves `GetUserStatus` and
@@ -881,48 +1025,54 @@ fn is_antigravity_process(comm: &str, exe: Option<&str>) -> bool {
 ///
 /// This stays a preference, not a guarantee, and the two-listener shape is the
 /// assumption it rests on: a product caught mid-startup, with only its TLS port
-/// bound so far, sits alone at rank 0 and is probed first. Every candidate is
-/// probed regardless, so a mis-ranked one costs an extra round-trip and a line
-/// on `agy`'s stderr, nothing more.
+/// bound so far, sits alone at rank 0 and is probed first. A mis-ranked one
+/// costs an extra round-trip, nothing more — unless its answer proves it
+/// unusable, in which case its remaining ports are skipped rather than probed.
 ///
 /// Order among products is arbitrary — all of them report the same
 /// account-wide quota, so whichever answers first is authoritative — and pid
 /// order is used only to keep the result reproducible, since `/proc`, `lsof`
 /// and the Windows TCP table each enumerate in their own order.
 #[cfg(any(test, target_os = "linux", target_os = "macos", target_os = "windows"))]
-fn probe_order(per_pid: std::collections::BTreeMap<u32, Vec<u16>>) -> Vec<u16> {
-    let groups: Vec<Vec<u16>> = per_pid
-        .into_values()
-        .map(|mut group| {
+fn probe_order(per_pid: std::collections::BTreeMap<u32, Vec<u16>>) -> Vec<(u32, u16)> {
+    let groups: Vec<(u32, Vec<u16>)> = per_pid
+        .into_iter()
+        .map(|(pid, mut group)| {
             group.sort_unstable_by(|a, b| b.cmp(a));
             // Within a product a port is one listener however many rows named
             // it — a dual-stack bind reports the same port from both
             // `/proc/net/tcp` and `tcp6`. Collapsing them here keeps a rank
             // meaning "the Nth listener" rather than "the Nth row".
             group.dedup();
-            group
+            (pid, group)
         })
         .collect();
 
-    let mut ports: Vec<u16> = Vec::new();
-    for rank in 0..groups.iter().map(Vec::len).max().unwrap_or(0) {
-        for port in groups.iter().filter_map(|group| group.get(rank)) {
-            if !ports.contains(port) {
-                ports.push(*port);
+    let mut ports: Vec<(u32, u16)> = Vec::new();
+    for rank in 0..groups.iter().map(|(_, g)| g.len()).max().unwrap_or(0) {
+        for (pid, port) in groups
+            .iter()
+            .filter_map(|(pid, group)| group.get(rank).map(|port| (*pid, *port)))
+        {
+            // Two processes cannot share one loopback port; dedup by port so a
+            // pathological double-claim stays a single probe.
+            if !ports.iter().any(|(_, p)| *p == port) {
+                ports.push((pid, port));
             }
         }
     }
     ports
 }
 
-/// Loopback ports listened on by any running Antigravity product.
+/// Loopback `(pid, port)` pairs listened on by any running Antigravity
+/// product.
 ///
 /// Reads `/proc` directly rather than shelling out to `ss`/`lsof`: find the
 /// candidate pids, collect their socket inodes, then keep the listening TCP
 /// entries owning one of those inodes. All three products report the *same*
 /// shared quota, so whichever answers first is authoritative.
 #[cfg(target_os = "linux")]
-pub(crate) fn discover_ls_ports() -> Vec<u16> {
+pub(crate) fn discover_ls_ports() -> Vec<(u32, u16)> {
     use std::collections::{BTreeMap, HashMap};
 
     // Socket inode -> owning pid, so the ports found in `/proc/net` can be
@@ -992,7 +1142,7 @@ pub(crate) fn discover_ls_ports() -> Vec<u16> {
 /// then an `n<address>` line per matching socket already filtered down to
 /// listening TCP sockets by `-iTCP -sTCP:LISTEN`.
 #[cfg(target_os = "macos")]
-pub(crate) fn discover_ls_ports() -> Vec<u16> {
+pub(crate) fn discover_ls_ports() -> Vec<(u32, u16)> {
     let Ok(output) = std::process::Command::new("lsof")
         .args(["-nP", "-iTCP", "-sTCP:LISTEN", "-F", "pcn"])
         .output()
@@ -1010,7 +1160,7 @@ pub(crate) fn discover_ls_ports() -> Vec<u16> {
 /// `test` on every platform, like [`matching_windows_ports`], so its tests are
 /// not macOS-only.
 #[cfg(any(test, target_os = "macos"))]
-fn parse_lsof_pcn(output: &str) -> Vec<u16> {
+fn parse_lsof_pcn(output: &str) -> Vec<(u32, u16)> {
     let mut per_pid: std::collections::BTreeMap<u32, Vec<u16>> = std::collections::BTreeMap::new();
     // The pid arrives on the `p` line and the command name on the `c` line
     // right after it, so hold the pid until the name confirms it is ours.
@@ -1066,7 +1216,7 @@ fn matching_windows_process_ids(processes: &[(u32, String)]) -> std::collections
 fn matching_windows_ports(
     pids: &std::collections::HashSet<u32>,
     rows: &[WindowsTcpRow],
-) -> Vec<u16> {
+) -> Vec<(u32, u16)> {
     let mut per_pid: std::collections::BTreeMap<u32, Vec<u16>> = std::collections::BTreeMap::new();
     for row in rows {
         if !pids.contains(&row.pid) || row.local_addr != [127, 0, 0, 1] {
@@ -1240,7 +1390,7 @@ fn windows_tcp_rows() -> Vec<WindowsTcpRow> {
 }
 
 #[cfg(target_os = "windows")]
-pub(crate) fn discover_ls_ports() -> Vec<u16> {
+pub(crate) fn discover_ls_ports() -> Vec<(u32, u16)> {
     let pids = matching_windows_process_ids(&windows_processes());
     if pids.is_empty() {
         return Vec::new();
@@ -1249,7 +1399,7 @@ pub(crate) fn discover_ls_ports() -> Vec<u16> {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-pub(crate) fn discover_ls_ports() -> Vec<u16> {
+pub(crate) fn discover_ls_ports() -> Vec<(u32, u16)> {
     Vec::new()
 }
 
@@ -1970,35 +2120,40 @@ mod tests {
 
     #[test]
     fn explicit_address_comes_first_and_gets_a_scheme() {
+        let candidate = |base: &str, pid| Candidate {
+            base: base.to_string(),
+            pid,
+        };
         assert_eq!(
-            candidate_bases_with(Some("127.0.0.1:1234"), vec![5678]),
+            candidate_bases_with(Some("127.0.0.1:1234"), vec![(10, 5678)]),
             vec![
-                "http://127.0.0.1:1234".to_string(),
-                "http://127.0.0.1:5678".to_string(),
+                candidate("http://127.0.0.1:1234", None),
+                candidate("http://127.0.0.1:5678", Some(10)),
             ]
         );
         // Trailing slashes are trimmed.
         assert_eq!(
-            candidate_bases_with(Some("127.0.0.1:1234/"), vec![5678]),
+            candidate_bases_with(Some("127.0.0.1:1234/"), vec![(10, 5678)]),
             vec![
-                "http://127.0.0.1:1234".to_string(),
-                "http://127.0.0.1:5678".to_string(),
+                candidate("http://127.0.0.1:1234", None),
+                candidate("http://127.0.0.1:5678", Some(10)),
             ]
         );
-        // Duplicate base URL is omitted.
+        // Duplicate base URL is omitted — and the override inherits the pid of
+        // the process discovery saw on that port.
         assert_eq!(
-            candidate_bases_with(Some("127.0.0.1:5678"), vec![5678]),
-            vec!["http://127.0.0.1:5678".to_string()]
+            candidate_bases_with(Some("127.0.0.1:5678"), vec![(10, 5678)]),
+            vec![candidate("http://127.0.0.1:5678", Some(10))]
         );
         // Duplicate discovered ports are omitted.
         assert_eq!(
-            candidate_bases_with(None, vec![5678, 5678]),
-            vec!["http://127.0.0.1:5678".to_string()]
+            candidate_bases_with(None, vec![(10, 5678), (10, 5678)]),
+            vec![candidate("http://127.0.0.1:5678", Some(10))]
         );
         // An address that already carries a scheme is left alone.
         assert_eq!(
             candidate_bases_with(Some("https://host:9"), vec![]),
-            vec!["https://host:9".to_string()]
+            vec![candidate("https://host:9", None)]
         );
     }
 
@@ -2010,15 +2165,32 @@ mod tests {
     }
 
     fn missing_csrf() -> AppError {
+        missing_csrf_with("missing CSRF token")
+    }
+
+    fn missing_csrf_with(message: &str) -> AppError {
         AppError::Http {
             status: 401,
-            body: r#"{"code":"unauthenticated","message":"missing CSRF token"}"#.into(),
+            body: serde_json::json!({
+                "code": "unauthenticated",
+                "message": message,
+            })
+            .to_string(),
         }
     }
 
     #[test]
     fn only_agys_exact_missing_csrf_response_enables_remote_fallback() {
         assert!(is_missing_csrf(&missing_csrf()));
+        assert!(is_missing_csrf(&missing_csrf_with(
+            "unauthenticated: missing CSRF token"
+        )));
+        assert!(is_missing_csrf(&missing_csrf_with(
+            " unauthenticated: missing CSRF token "
+        )));
+        assert!(!is_missing_csrf(&missing_csrf_with(
+            "unauthenticated: invalid token"
+        )));
         assert!(!is_missing_csrf(&AppError::Http {
             status: 403,
             body: r#"{"code":"unauthenticated","message":"missing CSRF token"}"#.into(),
@@ -2196,10 +2368,16 @@ mod tests {
     #[test]
     fn every_discovered_port_is_probed_in_order() {
         assert_eq!(
-            candidate_bases_with(None, vec![33875, 37435]),
+            candidate_bases_with(None, vec![(10, 33875), (10, 37435)]),
             vec![
-                "http://127.0.0.1:33875".to_string(),
-                "http://127.0.0.1:37435".to_string(),
+                Candidate {
+                    base: "http://127.0.0.1:33875".to_string(),
+                    pid: Some(10),
+                },
+                Candidate {
+                    base: "http://127.0.0.1:37435".to_string(),
+                    pid: Some(10),
+                },
             ]
         );
     }
@@ -2311,7 +2489,10 @@ mod tests {
                 pid: 10,
             },
         ];
-        assert_eq!(matching_windows_ports(&pids, &rows), vec![59870, 59868]);
+        assert_eq!(
+            matching_windows_ports(&pids, &rows),
+            vec![(10, 59870), (10, 59868)]
+        );
     }
 
     /// Antigravity 2.0 and an interactive `agy` session at once. Their port
@@ -2333,7 +2514,7 @@ mod tests {
         ];
         assert_eq!(
             matching_windows_ports(&pids, &rows),
-            vec![40001, 50001, 40000, 50000]
+            vec![(10, 40001), (20, 50001), (10, 40000), (20, 50000)]
         );
     }
 
@@ -2347,7 +2528,7 @@ mod tests {
         // One process, the ordinary case: RPC (higher) before TLS (lower).
         assert_eq!(
             probe_order(BTreeMap::from([(10, vec![59868, 59870])])),
-            vec![59870, 59868]
+            vec![(10, 59870), (10, 59868)]
         );
         // Two products. A plain descending sort would yield 50001, 50000,
         // 40001, 40000 and reach pid 20's TLS listener second; taking the
@@ -2358,7 +2539,7 @@ mod tests {
                 (10, vec![40000, 40001]),
                 (20, vec![50000, 50001]),
             ])),
-            vec![40001, 50001, 40000, 50000]
+            vec![(10, 40001), (20, 50001), (10, 40000), (20, 50000)]
         );
         // Uneven groups: the extra port of the deeper group trails everything
         // it ranks below, and a port claimed by two pids is probed once.
@@ -2367,7 +2548,7 @@ mod tests {
                 (10, vec![6000, 5000, 4000]),
                 (20, vec![6000, 7000]),
             ])),
-            vec![6000, 7000, 5000, 4000]
+            vec![(10, 6000), (20, 7000), (10, 5000), (10, 4000)]
         );
         assert!(probe_order(BTreeMap::new()).is_empty());
     }
@@ -2385,7 +2566,7 @@ mod tests {
                 (10, vec![40001, 40001, 40000, 40000]),
                 (20, vec![50001, 50000]),
             ])),
-            vec![40001, 50001, 40000, 50000],
+            vec![(10, 40001), (20, 50001), (10, 40000), (20, 50000)],
             "duplicate rows must not reorder the ranks below them"
         );
     }
@@ -2403,7 +2584,7 @@ mod tests {
                 (10, vec![40000]),
                 (20, vec![50001, 50000])
             ])),
-            vec![40000, 50001, 50000]
+            vec![(10, 40000), (20, 50001), (20, 50000)]
         );
     }
 
@@ -2415,8 +2596,11 @@ mod tests {
     fn an_override_with_no_authority_is_dropped_not_probed() {
         for junk in ["/", "///", "http://", "https://", "  /  "] {
             assert_eq!(
-                candidate_bases_with(Some(junk), vec![4242]),
-                vec!["http://127.0.0.1:4242".to_string()],
+                candidate_bases_with(Some(junk), vec![(10, 4242)]),
+                vec![Candidate {
+                    base: "http://127.0.0.1:4242".to_string(),
+                    pid: Some(10),
+                }],
                 "{junk:?} should not survive as a candidate"
             );
         }
@@ -2493,7 +2677,10 @@ mod tests {
         // `agy` (pid 74101) has three listening sockets; `sshd` (pid 200) has
         // one that must be excluded even though it sorts right after `c`.
         let output = "p74101\ncagy\nf10\nn127.0.0.1:8829\nf11\nn127.0.0.1:61289\nf12\nn127.0.0.1:61290\np200\ncsshd\nf5\nn*:22\n";
-        assert_eq!(parse_lsof_pcn(output), vec![61290, 61289, 8829]);
+        assert_eq!(
+            parse_lsof_pcn(output),
+            vec![(74101, 61290), (74101, 61289), (74101, 8829)]
+        );
     }
 
     /// The pid on each `p` line has to survive to the `n` lines, or the ports
@@ -2507,7 +2694,7 @@ mod tests {
         );
         assert_eq!(
             parse_lsof_pcn(output),
-            vec![40001, 50001, 40000, 50000],
+            vec![(100, 40001), (200, 50001), (100, 40000), (200, 50000)],
             "both HTTP listeners must precede both TLS listeners"
         );
     }
@@ -2515,13 +2702,13 @@ mod tests {
     #[test]
     fn lsof_parser_matches_the_capitalised_macos_app_name() {
         let output = "p900\ncAntigravity\nf7\nn127.0.0.1:54321\n";
-        assert_eq!(parse_lsof_pcn(output), vec![54321]);
+        assert_eq!(parse_lsof_pcn(output), vec![(900, 54321)]);
     }
 
     #[test]
     fn lsof_parser_deduplicates_and_handles_empty_output() {
         let output = "p1\ncagy\nf3\nn127.0.0.1:9000\nf4\nn127.0.0.1:9000\n";
-        assert_eq!(parse_lsof_pcn(output), vec![9000]);
+        assert_eq!(parse_lsof_pcn(output), vec![(1, 9000)]);
         assert!(parse_lsof_pcn("").is_empty());
     }
 
@@ -2577,8 +2764,11 @@ mod tests {
     #[test]
     fn blank_override_falls_through_to_discovery() {
         assert_eq!(
-            candidate_bases_with(Some("   "), vec![4242]),
-            vec!["http://127.0.0.1:4242".to_string()]
+            candidate_bases_with(Some("   "), vec![(10, 4242)]),
+            vec![Candidate {
+                base: "http://127.0.0.1:4242".to_string(),
+                pid: Some(10),
+            }]
         );
     }
 
@@ -2624,6 +2814,7 @@ mod tests {
             credential: SavedCredential::Blob(blob),
             endpoints: Some(eps),
             local_bases: Some(vec![]),
+            ..Default::default()
         }
     }
 
@@ -2764,12 +2955,71 @@ mod tests {
             RemoteOverride {
                 credential: SavedCredential::Blob(&blob),
                 endpoints: Some(&eps),
-                local_bases: Some(vec![server.url()]),
+                local_bases: Some(vec![server.url().into()]),
+                ..Default::default()
             },
             Duration::ZERO,
         )
         .await
         .expect("saved session bypasses agy's unusable local RPC");
+
+        root.assert_async().await;
+        status.assert_async().await;
+        quota.assert_async().await;
+        plan.assert_async().await;
+        assert_eq!(outcome.snapshot.source, AntigravitySource::Remote);
+    }
+
+    /// `agy` 1.3.1 prefixes the historical message with `unauthenticated: `.
+    /// That still means the local RPC is unusable, so the saved session must
+    /// answer the same way as the unprefixed wording above.
+    #[tokio::test]
+    async fn agys_prefixed_missing_csrf_response_uses_the_saved_session() {
+        let mut server = mockito::Server::new_async().await;
+        let eps = endpoints(&server);
+        let root = server
+            .mock("GET", "/")
+            .with_status(404)
+            .expect(1)
+            .create_async()
+            .await;
+        let status_path = format!("/{STATUS_RPC}");
+        let status = server
+            .mock("POST", status_path.as_str())
+            .with_status(401)
+            .with_body(
+                r#"{"code":"unauthenticated","message":"unauthenticated: missing CSRF token"}"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+        let quota = quota_mock(&mut server, "KEYRING-AT")
+            .expect(1)
+            .create_async()
+            .await;
+        let plan = server
+            .mock("POST", "/daily/plan")
+            .match_header("authorization", "Bearer KEYRING-AT")
+            .with_status(200)
+            .with_body(r#"{"currentTier":{"name":"google_ai_pro"}}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let blob = keyring_blob(VALID, true);
+        let (_td, cache) = fixture();
+
+        let outcome = run(
+            &cache,
+            RemoteOverride {
+                credential: SavedCredential::Blob(&blob),
+                endpoints: Some(&eps),
+                local_bases: Some(vec![server.url().into()]),
+                ..Default::default()
+            },
+            Duration::ZERO,
+        )
+        .await
+        .expect("saved session bypasses agy 1.3.1's prefixed missing-CSRF RPC");
 
         root.assert_async().await;
         status.assert_async().await;
@@ -2807,7 +3057,8 @@ mod tests {
             RemoteOverride {
                 credential: SavedCredential::Absent,
                 endpoints: Some(&eps),
-                local_bases: Some(vec![server.url()]),
+                local_bases: Some(vec![server.url().into()]),
+                ..Default::default()
             },
             Duration::ZERO,
         )
@@ -2820,6 +3071,149 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("requires a CSRF token"), "{message}");
         assert!(message.contains("saved Google session"), "{message}");
+    }
+
+    /// Both ports belong to the same `agy` process: once the RPC listener
+    /// reports the missing-CSRF verdict, the companion TLS listener must never
+    /// be probed — the cleartext request is exactly what makes Go log the
+    /// handshake error.
+    #[tokio::test]
+    async fn agys_missing_csrf_aborts_further_candidate_probes_to_spare_tls_listeners() {
+        let mut server1 = mockito::Server::new_async().await;
+        let mut server2 = mockito::Server::new_async().await;
+        let eps = endpoints(&server1);
+        let root1 = server1
+            .mock("GET", "/")
+            .with_status(404)
+            .expect(1)
+            .create_async()
+            .await;
+        let status_path = format!("/{STATUS_RPC}");
+        let status1 = server1
+            .mock("POST", status_path.as_str())
+            .with_status(401)
+            .with_body(r#"{"code":"unauthenticated","message":"missing CSRF token"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        // server2 is the same process's other listener: must NEVER be probed.
+        let root2 = server2.mock("GET", "/").expect(0).create_async().await;
+        let status2 = server2
+            .mock("POST", status_path.as_str())
+            .expect(0)
+            .create_async()
+            .await;
+
+        let (_td, cache) = fixture();
+        let error = run(
+            &cache,
+            RemoteOverride {
+                credential: SavedCredential::Absent,
+                endpoints: Some(&eps),
+                local_bases: Some(vec![
+                    Candidate {
+                        base: server1.url(),
+                        pid: Some(42),
+                    },
+                    Candidate {
+                        base: server2.url(),
+                        pid: Some(42),
+                    },
+                ]),
+                ..Default::default()
+            },
+            Duration::ZERO,
+        )
+        .await
+        .expect_err("aborted probe returns agy missing csrf diagnosis");
+
+        root1.assert_async().await;
+        status1.assert_async().await;
+        root2.assert_async().await;
+        status2.assert_async().await;
+        let message = error.to_string();
+        assert!(message.contains("requires a CSRF token"), "{message}");
+    }
+
+    /// `agy` and a signed-in desktop product can run side by side, and the
+    /// candidates reach `open_session` flattened rank by rank — the port after
+    /// `agy`'s can be the other product's RPC listener, not `agy`'s TLS one.
+    /// The missing-CSRF verdict covers only `agy`'s own remaining ports;
+    /// skipping the whole list would sacrifice the usable session to spare
+    /// one listener.
+    #[tokio::test]
+    async fn agys_missing_csrf_does_not_skip_other_products_servers() {
+        let mut agy = mockito::Server::new_async().await;
+        let mut ide = mockito::Server::new_async().await;
+        let eps = endpoints(&agy);
+        let agy_root = agy
+            .mock("GET", "/")
+            .with_status(404)
+            .expect(1)
+            .create_async()
+            .await;
+        let status_path = format!("/{STATUS_RPC}");
+        let agy_status = agy
+            .mock("POST", status_path.as_str())
+            .with_status(401)
+            .with_body(r#"{"code":"unauthenticated","message":"missing CSRF token"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let ide_root = ide
+            .mock("GET", "/")
+            .with_status(404)
+            .expect(1)
+            .create_async()
+            .await;
+        let ide_status = ide
+            .mock("POST", status_path.as_str())
+            .with_status(200)
+            .with_body(r#"{"userStatus":{"userTier":{"name":"Pro"},"email":"u@example.com"}}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let quota_path = format!("/{QUOTA_RPC}");
+        let ide_quota = ide
+            .mock("POST", quota_path.as_str())
+            .with_status(200)
+            .with_body(QUOTA_JSON)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let (_td, cache) = fixture();
+        let outcome = run(
+            &cache,
+            RemoteOverride {
+                credential: SavedCredential::Absent,
+                endpoints: Some(&eps),
+                local_bases: Some(vec![
+                    Candidate {
+                        base: agy.url(),
+                        pid: Some(42),
+                    },
+                    Candidate {
+                        base: ide.url(),
+                        pid: Some(7),
+                    },
+                ]),
+                ..Default::default()
+            },
+            Duration::ZERO,
+        )
+        .await
+        .expect("the other product's server still answers");
+
+        agy_root.assert_async().await;
+        agy_status.assert_async().await;
+        ide_root.assert_async().await;
+        ide_status.assert_async().await;
+        ide_quota.assert_async().await;
+        assert_eq!(outcome.snapshot.source, AntigravitySource::Local);
+        assert_eq!(outcome.snapshot.plan, "Pro");
     }
 
     /// The refreshed token is persisted under the session's fingerprint, so
@@ -2934,6 +3328,124 @@ mod tests {
         assert!(err.to_string().contains("sign in again"), "{err}");
     }
 
+    /// `run` with no OAuth client configured, the case `agy` exists for.
+    async fn run_without_oauth(cache: &Cache, remote: RemoteOverride<'_>) -> Result<FetchOutcome> {
+        fetch_snapshot_at(
+            &reqwest::Client::new(),
+            cache,
+            Duration::ZERO,
+            None,
+            remote,
+            now(),
+        )
+        .await
+    }
+
+    /// An `agy` stand-in: appends to `runs`, then writes `blob` into `file`
+    /// the way the real CLI rewrites the keyring entry.
+    #[cfg(unix)]
+    fn fake_agy(
+        dir: &std::path::Path,
+        runs: &std::path::Path,
+        file: &std::path::Path,
+        blob: &str,
+    ) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("agy");
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\necho \"$@\" >> '{}'\nprintf '%s' '{}' > '{}'\n",
+                runs.display(),
+                blob,
+                file.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// The whole point: with no OAuth client and an expired session, running
+    /// `agy` renews it and the quota comes back on the same poll.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_expired_session_is_renewed_by_running_agy() {
+        let mut server = mockito::Server::new_async().await;
+        let eps = endpoints(&server);
+        let quota = quota_mock(&mut server, "KEYRING-AT").create_async().await;
+        let _plan = server
+            .mock("POST", "/daily/plan")
+            .with_status(200)
+            .with_body(r#"{"currentTier":{"name":"Pro"}}"#)
+            .create_async()
+            .await;
+        let (td, cache) = fixture();
+        let file = td.path().join("credential");
+        std::fs::write(&file, keyring_blob(EXPIRED, true)).unwrap();
+        let runs = td.path().join("runs");
+        let agy = fake_agy(td.path(), &runs, &file, &keyring_blob(VALID, true));
+
+        let out = run_without_oauth(
+            &cache,
+            RemoteOverride {
+                credential: SavedCredential::File(&file),
+                endpoints: Some(&eps),
+                local_bases: Some(vec![]),
+                agy: super::super::agy::AgyCommand::At(agy),
+            },
+        )
+        .await
+        .expect("agy renewed the session");
+
+        quota.assert_async().await;
+        assert_eq!(out.snapshot.source, AntigravitySource::Remote);
+        assert_eq!(std::fs::read_to_string(runs).unwrap().trim(), "models");
+    }
+
+    /// `agy` that leaves the session as it was changes nothing: the original
+    /// error stands, and the failed attempt is not repeated on the next poll.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agy_that_does_not_renew_keeps_the_original_error_and_runs_once() {
+        let server = mockito::Server::new_async().await;
+        let eps = endpoints(&server);
+        let (td, cache) = fixture();
+        let file = td.path().join("credential");
+        std::fs::write(&file, keyring_blob(EXPIRED, true)).unwrap();
+        let runs = td.path().join("runs");
+        let agy = fake_agy(td.path(), &runs, &file, &keyring_blob(EXPIRED, true));
+        let remote = || RemoteOverride {
+            credential: SavedCredential::File(&file),
+            endpoints: Some(&eps),
+            local_bases: Some(vec![]),
+            agy: super::super::agy::AgyCommand::At(agy.clone()),
+        };
+
+        for _ in 0..2 {
+            let err = run_without_oauth(&cache, remote())
+                .await
+                .expect_err("still expired");
+            assert!(err.to_string().contains("no OAuth client"), "{err}");
+        }
+        assert_eq!(std::fs::read_to_string(runs).unwrap().lines().count(), 1);
+    }
+
+    /// The default seam is off: a test that never mentions `agy` cannot run
+    /// the real CLI, even with an expired session and no OAuth client.
+    #[tokio::test]
+    async fn without_an_agy_command_an_expired_session_is_left_alone() {
+        let server = mockito::Server::new_async().await;
+        let eps = endpoints(&server);
+        let blob = keyring_blob(EXPIRED, true);
+        let (_td, cache) = fixture();
+
+        let err = run_without_oauth(&cache, remote(&blob, &eps))
+            .await
+            .expect_err("nothing renews it");
+        assert!(err.to_string().contains("no OAuth client"), "{err}");
+    }
+
     /// A session saved without a refresh token cannot be renewed here.
     #[tokio::test]
     async fn an_expired_session_without_a_refresh_token_asks_to_sign_in_again() {
@@ -2970,6 +3482,7 @@ mod tests {
                 credential: SavedCredential::Absent,
                 endpoints: Some(&eps),
                 local_bases: Some(vec![]),
+                ..Default::default()
             },
             Duration::ZERO,
         )
@@ -3007,7 +3520,8 @@ mod tests {
             RemoteOverride {
                 credential: SavedCredential::Blob(&blob),
                 endpoints: Some(&eps),
-                local_bases: Some(vec![server.url()]),
+                local_bases: Some(vec![server.url().into()]),
+                ..Default::default()
             },
             Duration::ZERO,
         )
@@ -3063,6 +3577,13 @@ mod tests {
         assert_eq!(
             parse_cache_at(&bytes, None, now()).unwrap().source,
             AntigravitySource::Remote
+        );
+
+        snap.source = AntigravitySource::Statusline;
+        let bytes = serde_json::to_vec(&snap_to_json(&snap)).unwrap();
+        assert_eq!(
+            parse_cache_at(&bytes, None, now()).unwrap().source,
+            AntigravitySource::Statusline
         );
 
         // A payload from before the field existed is a local one.

@@ -7,24 +7,40 @@ export interface RowPrefs {
 }
 
 export type TimeFormat = "12" | "24" | "auto";
+export type Language = "en" | "pt-BR" | "ko" | "es";
+export type PopoverStyle = "classic" | "native";
+export type MenuBarLook = "chart" | "logos" | "quattro";
 
 export interface Layout {
   alwaysShowPace: boolean;
+  usageGoal: boolean;
   cardOrder: string[];
   collapsed: Record<string, boolean>;
-  density: string;
   hidden: Record<string, boolean>;
   hideExtras: boolean;
   hintDismissed: boolean;
+  language: Language;
+  popoverStyle: PopoverStyle;
   resetTimes: string;
   rows: Record<string, RowPrefs>;
   seeded: boolean;
   showAs: string;
+  /** Provider id → starred metric keys (max 2). */
+  stars: Record<string, string[]>;
+  /** Menu-bar strip: compact bars glyph, or provider+values text. */
+  stripStyle: "bars" | "text";
   theme: string;
   timeFormat: TimeFormat;
 }
 
 export interface MetricRow {
+  /** The report's detail line; the hover text when `headline` is "value". */
+  detail: string;
+  /** Which number the headline shows: the percentage, or `value`. */
+  headline: "percent" | "value";
+  /** The row sits under a group heading (SuperGrok's product slices, Claude's
+   * CLI sessions) rather than being one of the provider's quota windows. */
+  grouped?: boolean;
   key?: string;
   kind: "metric";
   label: string;
@@ -33,6 +49,8 @@ export interface MetricRow {
   resetAt: string;
   severity: string;
   usedPercent: number;
+  /** The report's value text; the headline when `headline` is "value" (a money figure). */
+  value: string;
   /** Reset window length in seconds; 0 when the host reports none. */
   window: number;
 }
@@ -72,6 +90,15 @@ export interface ResetCredits {
   credits: ResetCredit[];
 }
 
+/** One line of a reset timeline: a banked credit's expiry, or a metric's next reset. */
+export interface ResetItem {
+  date: string;
+  remaining: string;
+  /** How soon a banked credit expires; "" for a metric reset or an unknown date. */
+  severity: "" | "blue" | "red" | "yellow";
+  title: string;
+}
+
 export interface ResetCreditsRow extends ResetCredits {
   key?: string;
   kind: "resetCredits";
@@ -97,6 +124,16 @@ export interface CardWarning {
   title: string;
 }
 
+export interface ResetCredit {
+  expiresAt: string;
+  title: string;
+}
+
+export interface ResetCredits {
+  available: number;
+  credits: ResetCredit[];
+}
+
 export interface Card {
   error: string;
   errorDetail: string;
@@ -104,6 +141,7 @@ export interface Card {
   errorTitle: string;
   id: string;
   plan: string;
+  resetCredits: ResetCredits | null;
   rows: Row[];
   stale: boolean;
   title: string;
@@ -112,6 +150,9 @@ export interface Card {
 
 export interface MetricSection {
   detail: string;
+  /** Sub-group heading this metric renders under ("" when it stands alone). */
+  group: string;
+  headline: "percent" | "value";
   label: string;
   percent: number;
   resetAt: string;
@@ -154,16 +195,67 @@ export type UpdateState = "available" | "checking" | "downloading" | "failed" | 
 
 export interface UpdateInfo {
   error: string;
+  /** The release ships this OS/arch and the install directory is writable. */
+  installable: boolean;
   state: UpdateState;
   /** Release page; only a `https://github.com/` URL is kept, else "". */
   url: string;
   version: string;
 }
 
+/** One vendor's switchable logins, as the macOS host reports them. */
+export interface AccountSwitchInfo {
+  /** Label of the login in use, or "" when it is not a managed account. */
+  active: string;
+  labels: string[];
+  /** Label of the last switch requested, running or finished. */
+  target: string;
+  switching: boolean;
+  /** Why that switch failed, or "". */
+  error: string;
+}
+
+/** The switch control on one account's card. */
+export interface CardAccount {
+  vendor: string;
+  label: string;
+  active: boolean;
+  /** A switch to this account is running. */
+  switching: boolean;
+  /** Another switch for this vendor is running, so this one must wait. */
+  busy: boolean;
+  /** Why the last switch to this account failed, or "". */
+  error: string;
+}
+
+/** What an update affordance does on click: a host command, or open `url`. */
+export interface UpdateAction {
+  busy: boolean;
+  cmd: "" | "check-update" | "install-update" | "open-url";
+  label: string;
+  url: string;
+}
+
+export interface Accent {
+  dark: string;
+  light: string;
+}
+
 export interface Payload {
+  /** Switchable logins keyed by vendor slug ("anthropic", "openai"); empty off macOS. */
+  accounts: Record<string, AccountSwitchInfo>;
+  accent: Accent | null;
   entries: Entry[];
   generatedAt: number;
   hostError: string;
+  /** macOS menu-bar look the host draws. */
+  menuBarLook: MenuBarLook;
+  /** Whether the Quattro look draws the short name beside the logo. */
+  menuBarShortName: boolean;
+  notificationsEnabled: boolean;
+  notificationsThreshold: number;
+  /** Host OS: macos, windows, or linux. */
+  os: string;
   nextRefreshAt: number;
   primary: string;
   /** Host refresh interval; one of 1, 5 or 10. */
@@ -174,7 +266,9 @@ export interface Payload {
   update: UpdateInfo | null;
   updateCheckedAt: number;
   updates: UpdateMode;
+  /** GitHub repository this build was compiled from, or "". */
+  repository: string;
   version: string;
 }
 
-export type Screen = "customize" | "dashboard" | "provider" | "settings";
+export type Screen = "about" | "customize" | "dashboard" | "provider" | "settings";

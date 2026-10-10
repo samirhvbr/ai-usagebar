@@ -34,6 +34,9 @@ pub struct RenderInput<'a> {
     pub format_pace_color: bool,
     pub tooltip_pace_pts: bool,
     pub now: DateTime<Utc>,
+    /// What this account's live Claude Code sessions are doing, for the
+    /// tooltip (#356). `None`, or nothing working or waiting, = no line.
+    pub claude_sessions: Option<&'a crate::context::activity::SessionActivity>,
 }
 
 /// Compose the full Waybar output for an Anthropic snapshot.
@@ -257,6 +260,8 @@ fn build_placeholders(input: &RenderInput) -> HashMap<&'static str, String> {
                 .unwrap_or_else(|| "0".into()),
         ),
         ("extra_bar", extra_bar),
+        ("resets_available", snap.reset_credits.available.to_string()),
+        ("resets", crate::format::reset_credits(&snap.reset_credits)),
     ]);
 
     insert_pace(&mut v, "session", &session, input.format_pace_color, theme);
@@ -522,6 +527,20 @@ fn render_default_tooltip(input: &RenderInput) -> String {
         )));
     }
 
+    if snap.reset_credits.available > 0 {
+        lines.push(Line::Body("".into()));
+        lines.push(Line::Sep);
+        lines.push(Line::Body(format!(
+            " <span foreground='{fg}'>  󰁯  Reset credits</span>"
+        )));
+        for line in crate::format::reset_credit_lines(&snap.reset_credits, input.now) {
+            lines.push(Line::Body(format!(
+                " <span foreground='{dim}'>     {}</span>",
+                escape(&line)
+            )));
+        }
+    }
+
     if let Some((code, msg)) = input.outcome.last_error.as_ref()
         && *code != 0
     {
@@ -540,6 +559,13 @@ fn render_default_tooltip(input: &RenderInput) -> String {
                 "     <span foreground='{dim}'>{wrapped}</span>"
             )));
         }
+    }
+
+    if let Some(text) = input.claude_sessions.and_then(|s| s.summary()) {
+        lines.push(Line::Body("".into()));
+        lines.push(Line::Body(format!(
+            " <span foreground='{dim}'>  {text}</span>"
+        )));
     }
 
     let updated = updated_at_hm(input.now, input.outcome.cache_age);
@@ -621,6 +647,7 @@ mod tests {
                 currency: None,
                 decimal_places: Some(2),
             }),
+            reset_credits: Default::default(),
         };
         FetchOutcome {
             snapshot: snap,
@@ -632,6 +659,7 @@ mod tests {
 
     fn input<'a>(outcome: &'a FetchOutcome, theme: &'a Theme) -> RenderInput<'a> {
         RenderInput {
+            claude_sessions: None,
             outcome,
             theme,
             format: DEFAULT_FORMAT,
@@ -810,6 +838,41 @@ mod tests {
     }
 
     #[test]
+    fn tooltip_reports_banked_resets_and_stays_silent_without_them() {
+        let theme = Theme::default();
+        let mut oc = sample_outcome();
+
+        // The overwhelmingly common case: no grant, and therefore no row.
+        let out = render_anthropic(&input(&oc, &theme));
+        assert!(!out.tooltip.contains("Reset credits"), "{}", out.tooltip);
+
+        oc.snapshot.reset_credits = crate::usage::ResetCredits {
+            available: 1,
+            credits: vec![crate::usage::ResetCredit {
+                title: Some("Opus 5.5 launch reset".into()),
+                expires_at: Some(now() + chrono::Duration::days(28)),
+            }],
+        };
+        let out = render_anthropic(&input(&oc, &theme));
+        assert!(out.tooltip.contains("Reset credits"), "{}", out.tooltip);
+        assert!(
+            out.tooltip.contains("Opus 5.5 launch reset"),
+            "{}",
+            out.tooltip
+        );
+        // The deadline is what the user acts on, so it travels with the row.
+        // Asserted through the countdown rather than the rendered date: the
+        // date is formatted in local time and this suite must not depend on
+        // the machine's zone.
+        assert!(out.tooltip.contains("expires"), "{}", out.tooltip);
+        assert!(out.tooltip.contains("28d"), "{}", out.tooltip);
+
+        let values = build_placeholders(&input(&oc, &theme));
+        assert_eq!(values["resets_available"], "1");
+        assert_eq!(values["resets"], "1 reset available");
+    }
+
+    #[test]
     fn tooltip_includes_http_error_when_last_error_present() {
         let mut oc = sample_outcome();
         oc.last_error = Some((429, "rate limited".into()));
@@ -856,5 +919,34 @@ mod tests {
         let lines = wrap_words("aaa bbb ccc ddd eee fff", 8);
         // "aaa bbb" (7) fits; "ccc ddd" (7) fits next; "eee fff" (7) next.
         assert_eq!(lines, vec!["aaa bbb", "ccc ddd", "eee fff"]);
+    }
+
+    /// #356: the tooltip says what the account's live sessions are doing, and
+    /// says nothing when none are working or waiting.
+    #[test]
+    fn tooltip_names_working_and_waiting_sessions_only_when_there_are_some() {
+        use crate::context::activity::SessionActivity;
+        let oc = sample_outcome();
+        let theme = Theme::default();
+
+        let active = SessionActivity {
+            working: 2,
+            waiting: 1,
+        };
+        let mut inp = input(&oc, &theme);
+        inp.claude_sessions = Some(&active);
+        let out = render_anthropic(&inp);
+        assert!(
+            out.tooltip.contains("2 working · 1 waiting"),
+            "{}",
+            out.tooltip
+        );
+
+        let idle = SessionActivity::default();
+        let mut inp = input(&oc, &theme);
+        inp.claude_sessions = Some(&idle);
+        let quiet = render_anthropic(&inp);
+        assert!(!quiet.tooltip.contains("working"), "{}", quiet.tooltip);
+        assert!(!quiet.tooltip.contains("waiting"), "{}", quiet.tooltip);
     }
 }

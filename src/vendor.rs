@@ -27,7 +27,9 @@ pub const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 pub(crate) const VENDOR_SECRET_ENV_VARS: &[&str] = &[
     "ZAI_API_KEY",
     "OPENROUTER_API_KEY",
+    "OPENROUTER_MANAGEMENT_API_KEY",
     "DEEPSEEK_API_KEY",
+    "DEEPINFRA_API_KEY",
     "KIMI_API_KEY",
     "KILO_API_KEY",
     "NOVITA_API_KEY",
@@ -39,6 +41,8 @@ pub(crate) const VENDOR_SECRET_ENV_VARS: &[&str] = &[
     "GROK_API_KEY",
     "OPENCODE_GO_API_KEY",
     "COMMANDCODE_API_KEY",
+    "ORCAROUTER_API_KEY",
+    "LYCEUM_API_KEY",
     "GITHUB_COPILOT_TOKEN",
     "GH_TOKEN",
     "GITHUB_TOKEN",
@@ -161,6 +165,7 @@ pub enum VendorId {
     Zai,
     Openrouter,
     Deepseek,
+    Deepinfra,
     Kimi,
     Kilo,
     Novita,
@@ -180,6 +185,10 @@ pub enum VendorId {
     CommandCode,
     Shvia,
     Ollama,
+    OrcaRouter,
+    ModelStudio,
+    Lyceum,
+    Devin,
 }
 
 /// How a provider authenticates. Drives what a frontend offers a provider that
@@ -192,8 +201,8 @@ pub enum AuthKind {
     Oauth,
     /// An API key, from the environment or an inline `api_key` in config.
     ApiKey,
-    /// No credential of its own — a local product's session or state file is
-    /// the login, and there is nothing for the user to paste.
+    /// No API key of its own — the login artifact belongs to a local product
+    /// (or its official CLI), and there is nothing for the user to paste.
     Local,
 }
 
@@ -217,6 +226,7 @@ impl VendorId {
             VendorId::Zai => "zai",
             VendorId::Openrouter => "openrouter",
             VendorId::Deepseek => "deepseek",
+            VendorId::Deepinfra => "deepinfra",
             VendorId::Kimi => "kimi",
             VendorId::Kilo => "kilo",
             VendorId::Novita => "novita",
@@ -233,6 +243,10 @@ impl VendorId {
             VendorId::CommandCode => "commandcode",
             VendorId::Shvia => "shvia",
             VendorId::Ollama => "ollama",
+            VendorId::OrcaRouter => "orcarouter",
+            VendorId::ModelStudio => "modelstudio",
+            VendorId::Lyceum => "lyceum",
+            VendorId::Devin => "devin",
         }
     }
 
@@ -248,6 +262,7 @@ impl VendorId {
             VendorId::Zai => "Z.AI",
             VendorId::Openrouter => "OpenRouter",
             VendorId::Deepseek => "DeepSeek",
+            VendorId::Deepinfra => "DeepInfra",
             VendorId::Kimi => "Kimi",
             VendorId::Kilo => "Kilo",
             VendorId::Novita => "Novita",
@@ -264,6 +279,10 @@ impl VendorId {
             VendorId::CommandCode => "Command Code",
             VendorId::Shvia => "ShvIA",
             VendorId::Ollama => "Ollama Cloud",
+            VendorId::OrcaRouter => "OrcaRouter",
+            VendorId::ModelStudio => "Model Studio",
+            VendorId::Lyceum => "Lyceum",
+            VendorId::Devin => "Devin",
         }
     }
 
@@ -279,6 +298,7 @@ impl VendorId {
             VendorId::Zai => VendorId::Zai.short_name(),
             VendorId::Openrouter => "󱙺",
             VendorId::Deepseek => "󰧑",
+            VendorId::Deepinfra => VendorId::Deepinfra.short_name(),
             VendorId::Kimi => VendorId::Kimi.short_name(),
             VendorId::Kilo => "󰭟",
             VendorId::Novita => "󰄔",
@@ -296,6 +316,12 @@ impl VendorId {
             // name is unique by construction and cannot render as tofu.
             VendorId::Ollama => VendorId::Ollama.short_name(),
             VendorId::Shvia => VendorId::Shvia.short_name(),
+            // Same story for OrcaRouter: the `orc` short name is unique.
+            VendorId::OrcaRouter => VendorId::OrcaRouter.short_name(),
+            // Same story for Model Studio: the `mst` short name is unique.
+            VendorId::ModelStudio => VendorId::ModelStudio.short_name(),
+            VendorId::Lyceum => VendorId::Lyceum.short_name(),
+            VendorId::Devin => VendorId::Devin.short_name(),
         }
     }
 
@@ -312,6 +338,7 @@ impl VendorId {
             VendorId::Zai => "zai",
             VendorId::Openrouter => "opr",
             VendorId::Deepseek => "dsk",
+            VendorId::Deepinfra => "dif",
             VendorId::Kimi => "kmi",
             VendorId::Kilo => "klo",
             VendorId::Novita => "nvt",
@@ -328,6 +355,10 @@ impl VendorId {
             VendorId::CommandCode => "cmc",
             VendorId::Shvia => "shv",
             VendorId::Ollama => "oll",
+            VendorId::OrcaRouter => "orc",
+            VendorId::ModelStudio => "mst",
+            VendorId::Lyceum => "lyc",
+            VendorId::Devin => "dvn",
         }
     }
 
@@ -347,6 +378,7 @@ impl VendorId {
             VendorId::Zai => "zai",
             VendorId::Openrouter => "openrouter",
             VendorId::Deepseek => "deepseek",
+            VendorId::Deepinfra => "deepinfra",
             VendorId::Kimi => "kimi",
             VendorId::Kilo => "kilo",
             VendorId::Novita => "novita",
@@ -363,6 +395,10 @@ impl VendorId {
             VendorId::CommandCode => "commandcode",
             VendorId::Shvia => "shvia",
             VendorId::Ollama => "ollama",
+            VendorId::OrcaRouter => "orcarouter",
+            VendorId::ModelStudio => "modelstudio",
+            VendorId::Lyceum => "lyceum",
+            VendorId::Devin => "devin",
         }
     }
 
@@ -382,6 +418,7 @@ impl VendorId {
             | VendorId::Zai
             | VendorId::Openrouter
             | VendorId::Deepseek
+            | VendorId::Deepinfra
             | VendorId::Kimi
             | VendorId::Kilo
             | VendorId::Novita
@@ -390,18 +427,24 @@ impl VendorId {
             | VendorId::Minimax
             | VendorId::OpenCodeGo
             | VendorId::Shvia
-            | VendorId::Ollama => AuthKind::ApiKey,
+            | VendorId::Ollama
+            | VendorId::OrcaRouter
+            | VendorId::Lyceum => AuthKind::ApiKey,
             // No credential of their own: another local product's session is
             // the login. Antigravity has no credential file at all (the binary
             // probes whichever local server answers), Cursor and Kiro read the
             // IDE's and kiro-cli's own state, SuperGrok uses the Grok Build
-            // CLI's login, and Grok Bot reads the desktop app's own
-            // OSCrypt-protected session file.
+            // CLI's login, Grok Bot reads the desktop app's own
+            // OSCrypt-protected session file, and Model Studio reads the `bl`
+            // CLI's own console-login file. Devin reads only the existing
+            // official CLI credential key in memory, without refresh/writeback.
             VendorId::Supergrok
             | VendorId::Antigravity
             | VendorId::Cursor
             | VendorId::Kiro
-            | VendorId::Grokbot => AuthKind::Local,
+            | VendorId::Grokbot
+            | VendorId::ModelStudio
+            | VendorId::Devin => AuthKind::Local,
         }
     }
 
@@ -415,6 +458,7 @@ impl VendorId {
             VendorId::Zai => "ZAI_API_KEY",
             VendorId::Openrouter => "OPENROUTER_API_KEY",
             VendorId::Deepseek => "DEEPSEEK_API_KEY",
+            VendorId::Deepinfra => "DEEPINFRA_API_KEY",
             VendorId::Kimi => "KIMI_API_KEY",
             VendorId::Kilo => "KILO_API_KEY",
             VendorId::Novita => "NOVITA_API_KEY",
@@ -424,6 +468,8 @@ impl VendorId {
             VendorId::OpenCodeGo => "OPENCODE_GO_API_KEY",
             VendorId::Shvia => "SHVIA_API_KEY",
             VendorId::Ollama => "OLLAMA_API_KEY",
+            VendorId::OrcaRouter => "ORCAROUTER_API_KEY",
+            VendorId::Lyceum => "LYCEUM_API_KEY",
             // OAuth-first, with an environment override for CI and headless
             // use. Neither name is configurable, so neither has an
             // `api_key_env` field in its config section.
@@ -436,7 +482,9 @@ impl VendorId {
             | VendorId::Antigravity
             | VendorId::Cursor
             | VendorId::Kiro
-            | VendorId::NousResearch => "",
+            | VendorId::NousResearch
+            | VendorId::ModelStudio
+            | VendorId::Devin => "",
         }
     }
 
@@ -467,6 +515,11 @@ impl VendorId {
             VendorId::Antigravity => "Open Antigravity or run `agy`, then Refresh.",
             VendorId::Grok | VendorId::Supergrok => "Sign in with `grok`, then Refresh.",
             VendorId::Grokbot => "Install and sign in to the Grok Bot desktop app, then Refresh.",
+            // Local login through the official CLI's own console session.
+            VendorId::ModelStudio => {
+                "Install the official `bl` CLI and run `bl auth login --console`, then Refresh."
+            }
+            VendorId::Devin => "Sign in with the official Devin CLI, then Refresh.",
             // Key-only providers: there is nothing to log into, only a key to
             // put in the config. Ollama Cloud's key is minted at
             // ollama.com/settings/keys; the local `ollama` CLI's Ed25519 key
@@ -475,13 +528,16 @@ impl VendorId {
             | VendorId::Zai
             | VendorId::Openrouter
             | VendorId::Deepseek
+            | VendorId::Deepinfra
             | VendorId::Kilo
             | VendorId::Novita
             | VendorId::Moonshot
             | VendorId::Minimax
             | VendorId::OpenCodeGo
             | VendorId::Shvia
-            | VendorId::Ollama => "Add an API key in Settings, then Refresh.",
+            | VendorId::Ollama
+            | VendorId::OrcaRouter
+            | VendorId::Lyceum => "Add an API key in Settings, then Refresh.",
         }
     }
 
@@ -493,6 +549,9 @@ impl VendorId {
             VendorId::CommandCode => "commandcode",
             VendorId::NousResearch => "ai-usagebar auth nous login",
             VendorId::Kiro => "kiro-cli login",
+            // The `bl` CLI's console login is the whole credential.
+            VendorId::ModelStudio => "bl auth login --console",
+            VendorId::Devin => "",
             // Kimi takes a key *or* the Kimi Code CLI's own OAuth login, which
             // is what a subscriber already has locally.
             VendorId::Kimi => "kimi",
@@ -500,6 +559,7 @@ impl VendorId {
             | VendorId::Zai
             | VendorId::Openrouter
             | VendorId::Deepseek
+            | VendorId::Deepinfra
             | VendorId::Kilo
             | VendorId::Novita
             | VendorId::Moonshot
@@ -511,11 +571,20 @@ impl VendorId {
             | VendorId::Minimax
             | VendorId::OpenCodeGo
             | VendorId::Shvia
-            | VendorId::Ollama => "",
+            | VendorId::Ollama
+            | VendorId::OrcaRouter
+            | VendorId::Lyceum => "",
         }
     }
 
-    pub fn all() -> &'static [VendorId] {
+    /// Whether first-run detection may enable this provider from local
+    /// credentials. Devin is opt-in: its CLI credential file is discoverable,
+    /// but finding one must never switch on a provider that sends the key.
+    pub const fn auto_detectable(self) -> bool {
+        !matches!(self, VendorId::Devin)
+    }
+
+    pub const fn all() -> &'static [VendorId] {
         &[
             VendorId::Anthropic,
             VendorId::AnthropicApi,
@@ -524,6 +593,7 @@ impl VendorId {
             VendorId::Zai,
             VendorId::Openrouter,
             VendorId::Deepseek,
+            VendorId::Deepinfra,
             VendorId::Kimi,
             VendorId::Kilo,
             VendorId::Novita,
@@ -540,7 +610,19 @@ impl VendorId {
             VendorId::CommandCode,
             VendorId::Shvia,
             VendorId::Ollama,
+            VendorId::OrcaRouter,
+            VendorId::ModelStudio,
+            VendorId::Lyceum,
+            VendorId::Devin,
         ]
+    }
+
+    /// Look a vendor up by its config/report slug — the validation every
+    /// by-name writer (the settings surfaces' provider on/off toggles, #244)
+    /// goes through before touching a config section, so a slug that names
+    /// no built-in vendor can never become a `[section]`.
+    pub fn from_slug(slug: &str) -> Option<Self> {
+        Self::all().iter().copied().find(|id| id.slug() == slug)
     }
 }
 
@@ -588,6 +670,13 @@ mod tests {
         assert_eq!(VendorId::Anthropic.display_name(), "Claude");
         assert_eq!(VendorId::Openai.display_name(), "Codex");
         assert_eq!(VendorId::Zai.display_name(), "Z.AI");
+        assert!(VendorId::all().contains(&VendorId::Lyceum));
+        assert_eq!(VendorId::Lyceum.slug(), "lyceum");
+        assert_eq!(VendorId::Lyceum.display_name(), "Lyceum");
+        assert_eq!(VendorId::Lyceum.short_name(), "lyc");
+        assert_eq!(VendorId::Lyceum.api_key_env(), "LYCEUM_API_KEY");
+        assert_eq!(VendorId::Lyceum.config_section(), "lyceum");
+        assert_eq!(VendorId::Lyceum.auth_kind(), AuthKind::ApiKey);
     }
 
     /// `{vendor_short}` is a documented format placeholder and now also rides
@@ -656,6 +745,10 @@ mod tests {
             serde_json::to_value(VendorId::OpenCodeGo).unwrap(),
             serde_json::json!("opencode-go")
         );
+        assert_eq!(VendorId::Devin.slug(), "devin");
+        assert_eq!(VendorId::Devin.display_name(), "Devin");
+        assert_eq!(VendorId::Devin.short_name(), "dvn");
+        assert_eq!(VendorId::Devin.auth_kind(), AuthKind::Local);
     }
 
     #[test]
@@ -663,7 +756,9 @@ mod tests {
         let configured_defaults = [
             "ZAI_API_KEY",
             "OPENROUTER_API_KEY",
+            "OPENROUTER_MANAGEMENT_API_KEY",
             "DEEPSEEK_API_KEY",
+            "DEEPINFRA_API_KEY",
             "KIMI_API_KEY",
             "KILO_API_KEY",
             "NOVITA_API_KEY",
@@ -672,6 +767,8 @@ mod tests {
             "XAI_MANAGEMENT_KEY",
             "ANTHROPIC_ADMIN_KEY",
             "GITHUB_COPILOT_TOKEN",
+            "ORCAROUTER_API_KEY",
+            "LYCEUM_API_KEY",
         ];
         for name in configured_defaults {
             assert!(VENDOR_SECRET_ENV_VARS.contains(&name), "missing {name}");
@@ -855,5 +952,26 @@ mod tests {
                 serde_json::to_value(id).unwrap().as_str().unwrap()
             );
         }
+    }
+
+    /// `from_slug` is the whitelist by-name config writers validate through,
+    /// so it must accept every real slug (and its own renames) and nothing
+    /// else — not a section name it doesn't own, not an empty string.
+    #[test]
+    fn from_slug_resolves_every_slug_and_rejects_everything_else() {
+        for id in VendorId::all() {
+            assert_eq!(VendorId::from_slug(id.slug()), Some(*id));
+        }
+        assert_eq!(
+            VendorId::from_slug("anthropic_api"),
+            Some(VendorId::AnthropicApi)
+        );
+        assert_eq!(
+            VendorId::from_slug("opencode-go"),
+            Some(VendorId::OpenCodeGo)
+        );
+        assert_eq!(VendorId::from_slug(""), None);
+        assert_eq!(VendorId::from_slug("custom"), None);
+        assert_eq!(VendorId::from_slug("Anthropic"), None);
     }
 }

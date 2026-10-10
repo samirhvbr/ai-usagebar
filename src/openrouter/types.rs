@@ -82,8 +82,23 @@ where
         .transpose()
 }
 
-/// Combine the two endpoint responses into the canonical snapshot.
-pub fn combine(credits: CreditsData, key: KeyData) -> OpenRouterSnapshot {
+/// An item from `GET /api/v1/activity`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ActivityItem {
+    pub date: Option<String>,
+    pub model: Option<String>,
+    #[serde(default)]
+    pub usage: f64,
+    #[serde(default)]
+    pub requests: u64,
+}
+
+/// Combine the endpoint responses into the canonical snapshot.
+pub fn combine(
+    credits: CreditsData,
+    key: KeyData,
+    recent_models: Vec<String>,
+) -> OpenRouterSnapshot {
     let label = if key.label.is_empty() {
         "OpenRouter".to_string()
     } else {
@@ -99,6 +114,7 @@ pub fn combine(credits: CreditsData, key: KeyData) -> OpenRouterSnapshot {
         is_free_tier: key.is_free_tier,
         limit: key.limit,
         limit_remaining: key.limit_remaining,
+        recent_models,
     }
 }
 
@@ -144,7 +160,7 @@ mod tests {
             usage_monthly: 30.0,
             is_free_tier: false,
         };
-        let snap = combine(c, k);
+        let snap = combine(c, k, Vec::new());
         assert_eq!(snap.label, "OpenRouter — key-A");
         assert!((snap.balance() - 70.0).abs() < 1e-9);
         assert_eq!(snap.consumed_pct(), 30);
@@ -167,6 +183,7 @@ mod tests {
                 usage_monthly: 0.0,
                 is_free_tier: false,
             },
+            Vec::new(),
         );
         assert_eq!(snap.label, "OpenRouter");
     }
@@ -205,6 +222,7 @@ mod tests {
             is_free_tier: true,
             limit: None,
             limit_remaining: None,
+            recent_models: Vec::new(),
         };
         assert_eq!(s.consumed_pct(), 0);
     }

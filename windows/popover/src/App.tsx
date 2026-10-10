@@ -2,37 +2,47 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Footer, TopBar } from "@/components/Chrome";
 import type { RowAction } from "@/components/RowMenu";
 import type { RowLists } from "@/components/dnd";
+import { UpdateDialog } from "@/components/UpdateDialog";
 import type { Layout, Screen } from "@/lib/types";
+import { LanguageProvider } from "@/lib/i18n";
+import { m } from "@/paraglide/messages.js";
+import { cn } from "@/lib/utils";
+import { About } from "@/screens/About";
 import { Customize } from "@/screens/Customize";
 import { Dashboard } from "@/screens/Dashboard";
+import { NativeDashboard } from "@/screens/NativeDashboard";
 import { ProviderDetail } from "@/screens/ProviderDetail";
-import { Settings } from "@/screens/Settings";
+import { Settings, type SettingsTab } from "@/screens/Settings";
 import {
   absorbPayload,
   applyCardLayout,
-  applyDensity,
   applyTheme,
   emptyLayout,
   hintPending,
   emptyPayload,
   loadLayout,
   memoryStorage,
+  menuAction,
   mergeVisibleOrder,
   moveRowToList,
+  optionsMenuLabels,
   parseHostPayload,
   prefsForCard,
   projectCards,
   resolvedTheme,
   saveLayout,
+  seedStars,
   sendCommand,
   setRowEnabled,
+  stripCommand,
+  toggleStar,
 } from "./model.js";
 import { measurePanelHeight } from "./panel-size.js";
 
 type Direction = "back" | "forward";
 
 /** Screens ordered as the OpenUsage pager lays them out: dashboard ← customize/provider → settings. */
-const SCREEN_DEPTH: Record<Screen, number> = { dashboard: 0, customize: 1, provider: 2, settings: 3 };
+const SCREEN_DEPTH: Record<Screen, number> = { dashboard: 0, customize: 1, provider: 2, settings: 3, about: 4 };
 
 function resolveStorage() {
   try {
@@ -50,53 +60,140 @@ export default function App() {
   const shellRef = useRef<HTMLDivElement>(null);
   const [payload, setPayload] = useState(() => emptyPayload(""));
   const [layout, setLayout] = useState<Layout>(() => loadLayout(storageRef.current));
+  const native = layout.popoverStyle === "native";
   const [screen, setScreen] = useState<Screen>("dashboard");
+  const [settingsTab, setSettingsTab] = useState<SettingsTab>("general");
   const [direction, setDirection] = useState<Direction>("forward");
   const [providerId, setProviderId] = useState("");
   // Where the provider detail was opened from, so Back returns there: the
   // Customize list, or the dashboard header's Customize shortcut.
   const [providerFrom, setProviderFrom] = useState<Screen>("customize");
+  const [aboutFrom, setAboutFrom] = useState<Screen>("dashboard");
+  const [updateDialogOpen, setUpdateDialogOpen] = useState(false);
+  // When the user last asked for a check (for the no-answer timeout, on this clock) and the
+  // host's last check stamp at that moment (the answer is any newer stamp, on the host's clock).
+  const [updateCheck, setUpdateCheck] = useState({ at: 0, baseline: 0 });
   const [nowMs, setNowMs] = useState(() => Date.now());
   const [locked, setLocked] = useState(false);
   const [optionsOpen, setOptionsOpen] = useState(false);
   const [rowMenuOpen, setRowMenuOpen] = useState(false);
   const [resetArmed, setResetArmed] = useState(false);
+  const [starError, setStarError] = useState("");
   const [popoverVisible, setPopoverVisible] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
 
-  const cards = useMemo(() => (payload.hostError ? [] : projectCards(payload, nowMs)), [payload, nowMs]);
+  const cards = useMemo(() => (payload.hostError ? [] : projectCards(payload, nowMs, layout.language)), [payload, nowMs, layout.language]);
   const visible = useMemo(() => applyCardLayout(cards, layout), [cards, layout]);
   const currentCard = cards.find((card) => card.id === providerId);
-  const showFooter = screen === "dashboard" || screen === "settings";
 
   function commit(next: Layout) {
     setLayout(next);
     saveLayout(storageRef.current, next);
+    sendCommand("strip", stripCommand(next, cards));
   }
 
   function go(next: Screen) {
+    if (next === "customize" && native) {
+      setSettingsTab("providers");
+      next = "settings";
+    }
     setDirection(SCREEN_DEPTH[next] < SCREEN_DEPTH[screen] ? "back" : "forward");
     setScreen(next);
     setResetArmed(false);
     if (scrollRef.current) scrollRef.current.scrollTop = 0;
   }
 
+  function changeSettingsTab(next: SettingsTab) {
+    setSettingsTab(next);
+    if (scrollRef.current) scrollRef.current.scrollTop = 0;
+  }
+
   function goBack() {
-    if (screen === "provider") go(providerFrom === "dashboard" ? "dashboard" : "customize");
+    if (screen === "about") {
+      go(aboutFrom === "about" ? "dashboard" : aboutFrom);
+      return;
+    }
+    if (screen === "provider") go(providerFrom);
     else go("dashboard");
   }
 
-  useEffect(() => {
-    applyTheme(layout.theme);
-    const media = window.matchMedia("(prefers-color-scheme: dark)");
-    const onChange = () => applyTheme(layout.theme);
-    media.addEventListener("change", onChange);
-    return () => media.removeEventListener("change", onChange);
-  }, [layout.theme]);
+  function openAbout() {
+    setOptionsOpen(false);
+    if (screen !== "about") setAboutFrom(screen);
+    go("about");
+  }
+
+  /** Check in place: the dialog opens over whatever screen is showing. */
+  function checkForUpdates() {
+    setOptionsOpen(false);
+    requestCheck();
+    setUpdateDialogOpen(true);
+  }
+
+  function requestCheck() {
+    setUpdateCheck({ at: Date.now(), baseline: payload.updateCheckedAt });
+    sendCommand("check-update");
+  }
+
+  // Native tray menu entry point: the host posts one of the whitelisted actions
+  // and we open the matching popover screen, exactly like the Options items do.
+  function onMenuAction(action: string) {
+    switch (menuAction(action)) {
+      case "customize":
+        setOptionsOpen(false);
+        go("customize");
+        break;
+      case "settings":
+        setOptionsOpen(false);
+        go("settings");
+        break;
+      case "about":
+        openAbout();
+        break;
+      case "check-updates":
+        checkForUpdates();
+        break;
+      default:
+        break;
+    }
+  }
+
+  // The hook is installed once, so it calls onMenuAction through a ref refreshed on every
+  // render — never opening a screen with a stale `screen`/`payload`.
+  const menuActionRef = useRef(onMenuAction);
+  menuActionRef.current = onMenuAction;
 
   useEffect(() => {
-    applyDensity(layout.density);
-  }, [layout.density]);
+    // The host tints its native backdrop by the page's theme, so it hears about every change,
+    // including a System theme flipping with the OS, which moves no height to report.
+    const apply = () => {
+      applyTheme(layout.theme);
+      sendCommand("resize", { theme: resolvedTheme(layout.theme), style: layout.popoverStyle });
+    };
+    apply();
+    const media = window.matchMedia("(prefers-color-scheme: dark)");
+    media.addEventListener("change", apply);
+    return () => media.removeEventListener("change", apply);
+  }, [layout.theme, layout.popoverStyle]);
+
+  useEffect(() => {
+    document.documentElement.lang = layout.language;
+  }, [layout.language]);
+
+  useEffect(() => {
+    const style = document.documentElement.style;
+    if (payload.accent) {
+      style.setProperty("--system-accent-light", payload.accent.light);
+      style.setProperty("--system-accent-dark", payload.accent.dark);
+    } else {
+      style.removeProperty("--system-accent-light");
+      style.removeProperty("--system-accent-dark");
+    }
+    return () => {
+      style.removeProperty("--system-accent-light");
+      style.removeProperty("--system-accent-dark");
+    };
+  }, [payload.accent]);
 
   useEffect(() => {
     const timer = window.setInterval(() => setNowMs(Date.now()), 1000);
@@ -108,8 +205,10 @@ export default function App() {
       const next = parseHostPayload(raw);
       setPayload(next);
       setLayout((current) => {
-        const synced = absorbPayload(current, next.entries);
+        const cards = projectCards(next, Date.now(), current.language);
+        const synced = seedStars(absorbPayload(current, next.entries), cards);
         if (synced !== current) saveLayout(storageRef.current, synced);
+        sendCommand("strip", stripCommand(synced, cards));
         return synced;
       });
     };
@@ -123,6 +222,7 @@ export default function App() {
       // menus closed (OpenUsage "Closing").
       setOptionsOpen(false);
       setRowMenuOpen(false);
+      setUpdateDialogOpen(false);
       setResetArmed(false);
       setScreen("dashboard");
       if (scrollRef.current) scrollRef.current.scrollTop = 0;
@@ -136,13 +236,23 @@ export default function App() {
         document.documentElement.style.pointerEvents = "";
       }, hold);
     };
+    // The tray host calls this for the native menu items that open a popover
+    // screen (Customize / Settings / About / Check for Updates).
+    window.__AIUB_MENU_ACTION__ = (action) => menuActionRef.current(String(action));
     sendCommand("ready");
     return () => {
       delete window.__AIUB_APPLY__;
       delete window.__AIUB_LOCKCLICKS__;
       delete window.__AIUB_VISIBLE__;
+      delete window.__AIUB_MENU_ACTION__;
     };
   }, []);
+
+  // The native tray menu must match the popover's language: publish the menu's
+  // labels on mount and whenever the language changes.
+  useEffect(() => {
+    sendCommand("menu-labels", optionsMenuLabels(layout.language));
+  }, [layout.language]);
 
   // The panel follows its content (PanelHeightCoordinator): report the intrinsic height of the
   // shell — chrome plus unscrolled content — and let the host clamp it to the work area. A
@@ -155,10 +265,13 @@ export default function App() {
     let last = -1;
     const report = () => {
       frame = 0;
-      const height = measurePanelHeight(shell);
+      const measured = measurePanelHeight(shell);
+      // Same floor as tray MIN_POPOVER_HEIGHT: keep room for the Options menu
+      // (side=top from the footer, nine rows) so Radix does not scroll the list.
+      const height = measured > 0 ? Math.max(measured, 360) : measured;
       if (height <= 0 || height === last) return;
       last = height;
-      sendCommand("resize", { height, theme: resolvedTheme(layout.theme) });
+      sendCommand("resize", { height, theme: resolvedTheme(layout.theme), style: layout.popoverStyle });
     };
     const schedule = () => {
       if (frame === 0) frame = window.setTimeout(report, 0);
@@ -176,7 +289,8 @@ export default function App() {
   }, [screen, payload, layout, popoverVisible]);
 
   function onKeyDown(event: KeyboardEvent) {
-    if (locked || event.defaultPrevented || optionsOpen || rowMenuOpen) return;
+    // An open menu or dialog owns Escape/Enter: Escape closes it, not the screen or the popover.
+    if (locked || event.defaultPrevented || optionsOpen || rowMenuOpen || updateDialogOpen) return;
     // The shortcut recorder owns every key while it records (Escape cancels it, not the screen).
     if (document.activeElement?.closest("[data-recording]")) return;
     // Controls own Enter/Escape: switches, pickers, menus, sortable handles.
@@ -205,10 +319,6 @@ export default function App() {
     commit({ ...layout, showAs: layout.showAs === "used" ? "left" : "used" });
   }
 
-  function toggleResetTimes() {
-    commit({ ...layout, resetTimes: layout.resetTimes === "exact" ? "countdown" : "exact" });
-  }
-
   // Two clicks within three seconds; a native confirm() would steal focus and the
   // popover hides itself on focus loss. Like OpenUsage's Reset All, it also re-runs
   // provider detection so the layout starts from the tools on this machine.
@@ -223,8 +333,8 @@ export default function App() {
       absorbPayload(
         {
           ...emptyLayout(),
+          language: layout.language,
           alwaysShowPace: layout.alwaysShowPace,
-          density: layout.density,
           resetTimes: layout.resetTimes,
           showAs: layout.showAs,
           theme: layout.theme,
@@ -254,26 +364,29 @@ export default function App() {
   function reorderRows(lists: RowLists) {
     if (!currentCard) return;
     const prevOff = prefsForCard(currentCard, layout).off || {};
-    const off: Record<string, boolean> = {};
-    const demand: string[] = [];
-    for (const key of lists.demand) {
-      if (prevOff[key]) off[key] = true;
-      else demand.push(key);
-    }
-    commit({ ...layout, rows: { ...layout.rows, [providerId]: { always: lists.always, demand, off } } });
+    commit({
+      ...layout,
+      rows: { ...layout.rows, [providerId]: { always: lists.always, demand: lists.demand, off: prevOff } },
+    });
   }
 
   // Row context menu. Hide / Always show / Show on demand rewrite that provider's row prefs the
-  // same way the Customize screen does; Refresh and Customize are provider-level shortcuts.
+  // same way the Customize screen does; Customize is a provider-level shortcut.
   function onRowAction(id: string, key: string, action: RowAction) {
     const card = cards.find((item) => item.id === id);
     if (!card) return;
-    if (action === "refresh") {
-      sendCommand("refresh-entry", { id });
-      return;
-    }
     if (action === "customize") {
       openProvider(id, "dashboard");
+      return;
+    }
+    if (action === "star") {
+      const result = toggleStar(layout.stars, id, key);
+      if (result.error) {
+        setStarError(result.error);
+        window.setTimeout(() => setStarError(""), 2200);
+        return;
+      }
+      commit({ ...layout, stars: result.stars });
       return;
     }
     const prefs = prefsForCard(card, layout);
@@ -282,15 +395,29 @@ export default function App() {
   }
 
   const title =
-    screen === "customize" ? "Customize" : screen === "settings" ? "Settings" : currentCard?.title || "Provider";
+    screen === "customize"
+      ? m.customize({}, { locale: layout.language })
+      : screen === "settings"
+        ? m.settings({}, { locale: layout.language })
+        : screen === "about"
+          ? m.about({}, { locale: layout.language })
+          : currentCard?.title || m.provider({}, { locale: layout.language });
 
   return (
-    <div ref={shellRef} className="flex h-full flex-col bg-background text-foreground">
+    <LanguageProvider language={layout.language}>
+    <div
+      ref={shellRef}
+      data-os={payload.os}
+      className={cn(
+        "flex h-full flex-col overflow-hidden rounded-[var(--window-radius)] bg-background text-foreground",
+        native && "native-panel",
+      )}
+    >
       {screen !== "dashboard" ? (
         <TopBar
           resetArmed={resetArmed}
           title={title}
-          resetLabel={screen === "customize" ? "Reset All Customization" : screen === "provider" ? `Reset ${title}` : undefined}
+          resetLabel={screen === "customize" ? m.reset_all_customization({}, { locale: layout.language }) : screen === "provider" ? `${m.reset({}, { locale: layout.language })} ${title}` : undefined}
           onBack={goBack}
           onReset={screen === "customize" ? resetAll : screen === "provider" ? () => resetProviderRows(providerId) : undefined}
         />
@@ -300,10 +427,37 @@ export default function App() {
           key={screen}
           data-direction={direction}
           data-scroll-content
-          className="screen-enter px-[var(--panel-pad)] pb-3 pt-[var(--content-top)]"
+          className={cn(
+            "screen-enter px-[var(--panel-pad)] pb-0",
+            screen === "dashboard" ? "pt-[var(--panel-pad)]" : "pt-0",
+          )}
         >
           {screen === "dashboard" ? (
-            <Dashboard
+            // Native began as the macOS dashboard and now serves every OS.
+            native ? (
+              <NativeDashboard
+                cards={visible}
+                hint={hintPending(layout)}
+                layout={layout}
+                nowMs={nowMs}
+                payload={payload}
+                onCustomizeProvider={(id) => openProvider(id, "dashboard")}
+                onDismissHint={() => commit({ ...layout, hintDismissed: true })}
+                onOpenCustomize={() => go("customize")}
+                onOpenSettings={() => go("settings")}
+                onRowAction={onRowAction}
+                onRowMenuOpenChange={setRowMenuOpen}
+                onSwitchAccount={(vendor, label) => sendCommand("switch-account", { vendor, label })}
+                onToggleCollapse={(id) => {
+                  const collapsed = { ...layout.collapsed };
+                  if (collapsed[id]) delete collapsed[id];
+                  else collapsed[id] = true;
+                  commit({ ...layout, collapsed });
+                }}
+                onToggleShowAs={toggleShowAs}
+              />
+            ) : (
+              <Dashboard
               cards={cards}
               hint={hintPending(layout)}
               layout={layout}
@@ -313,19 +467,19 @@ export default function App() {
               onCustomizeProvider={(id) => openProvider(id, "dashboard")}
               onDismissHint={() => commit({ ...layout, hintDismissed: true })}
               onOpenCustomize={() => go("customize")}
-              onResetProvider={resetProviderRows}
               onReorder={(ids) => commit({ ...layout, cardOrder: mergeVisibleOrder(layout.cardOrder, ids) })}
               onRowAction={onRowAction}
               onRowMenuOpenChange={setRowMenuOpen}
+              onSwitchAccount={(vendor, label) => sendCommand("switch-account", { vendor, label })}
               onToggleCollapse={(id) => {
                 const collapsed = { ...layout.collapsed };
                 if (collapsed[id]) delete collapsed[id];
                 else collapsed[id] = true;
                 commit({ ...layout, collapsed });
               }}
-              onToggleResetTimes={toggleResetTimes}
               onToggleShowAs={toggleShowAs}
-            />
+              />
+            )
           ) : null}
           {screen === "customize" ? (
             <Customize
@@ -346,7 +500,18 @@ export default function App() {
             <ProviderDetail
               card={currentCard}
               layout={layout}
+              starError={starError}
               onReorderRows={reorderRows}
+              onToggleStar={(key) => {
+                if (!currentCard) return;
+                const result = toggleStar(layout.stars, currentCard.id, key);
+                if (result.error) {
+                  setStarError(result.error);
+                  window.setTimeout(() => setStarError(""), 2200);
+                  return;
+                }
+                commit({ ...layout, stars: result.stars });
+              }}
               onToggleRow={(key, on) => {
                 if (!currentCard) return;
                 commit({
@@ -356,40 +521,67 @@ export default function App() {
               }}
             />
           ) : null}
+          {screen === "about" ? <About payload={payload} /> : null}
           {screen === "settings" ? (
             <Settings
+              tab={settingsTab}
+              onTabChange={changeSettingsTab}
+              cards={cards}
               layout={layout}
               nowMs={nowMs}
               payload={payload}
               onAlwaysShowPace={(alwaysShowPace) => commit({ ...layout, alwaysShowPace })}
-              onDensity={(density) => commit({ ...layout, density })}
+              onUsageGoal={(usageGoal) => commit({ ...layout, usageGoal })}
+              onLanguage={(language) => commit({ ...layout, language })}
+              onCheckUpdates={checkForUpdates}
               onOpenCustomize={() => go("customize")}
+              onOpenProvider={(id) => openProvider(id, "settings")}
+              onReorderProviders={(ids) => commit({ ...layout, cardOrder: mergeVisibleOrder(layout.cardOrder, ids) })}
+              onToggleProvider={(id, on) => {
+                const hidden = { ...layout.hidden };
+                if (on) delete hidden[id];
+                else hidden[id] = true;
+                commit({ ...layout, hidden });
+              }}
+              onResetCustomization={resetAll}
+              resetArmed={resetArmed}
               onResetTimes={(resetTimes) => commit({ ...layout, resetTimes })}
               onShowAs={(showAs) => commit({ ...layout, showAs })}
               onTheme={(theme) => commit({ ...layout, theme })}
               onTimeFormat={(timeFormat) => commit({ ...layout, timeFormat })}
+              onPopoverStyle={(popoverStyle) => commit({ ...layout, popoverStyle })}
             />
           ) : null}
         </div>
       </div>
-      {showFooter ? (
-        <Footer
-          locked={locked}
-          nowMs={nowMs}
-          optionsOpen={optionsOpen}
-          payload={payload}
-          updatePending={payload.update !== null}
-          onOpenCustomize={() => {
-            setOptionsOpen(false);
-            go("customize");
-          }}
-          onOpenSettings={() => {
-            setOptionsOpen(false);
-            go("settings");
-          }}
-          onOptionsOpenChange={setOptionsOpen}
-        />
-      ) : null}
+      <Footer
+        nowMs={nowMs}
+        optionsOpen={optionsOpen}
+        payload={payload}
+        popoverStyle={layout.popoverStyle}
+        updatePending={Boolean(payload.update?.version)}
+        onCheckUpdates={checkForUpdates}
+        onOpenAbout={openAbout}
+        onOpenCustomize={() => {
+          setOptionsOpen(false);
+          go("customize");
+        }}
+        onOpenSettings={() => {
+          setOptionsOpen(false);
+          go("settings");
+        }}
+        onOptionsOpenChange={setOptionsOpen}
+      />
+      <UpdateDialog
+        checkBaseline={updateCheck.baseline}
+        checkRequestedAt={updateCheck.at}
+        nowMs={nowMs}
+        open={updateDialogOpen}
+        payload={payload}
+        onCheck={requestCheck}
+        onOpenChange={setUpdateDialogOpen}
+      />
     </div>
+    </LanguageProvider>
   );
 }

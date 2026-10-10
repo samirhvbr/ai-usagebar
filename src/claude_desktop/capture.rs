@@ -26,6 +26,7 @@ use std::time::{Duration, Instant};
 
 use super::app::AppControl;
 use super::{Paths, merge};
+use crate::display::sanitize_untrusted_path;
 use crate::error::{AppError, Result};
 
 /// Everything the app remembers an account by. Backed up before a capture
@@ -101,7 +102,7 @@ pub fn capture_profile(
     if profiles.iter().any(|profile| profile.label == label) {
         return Err(AppError::Credentials(format!(
             "a Claude Desktop account {label:?} already exists in {}; pick another name",
-            paths.profiles_dir.display()
+            sanitize_untrusted_path(&paths.profiles_dir)
         )));
     }
     let known_accounts: Vec<String> = profiles.iter().map(|p| p.account_uuid.clone()).collect();
@@ -190,7 +191,7 @@ pub fn capture_profile(
             if let Err(cleanup) = cleanup {
                 error = AppError::Other(format!(
                     "{error}; could not remove the partial profile {}: {cleanup}",
-                    partial.display()
+                    sanitize_untrusted_path(&partial)
                 ));
             }
             return Err(error);
@@ -327,7 +328,7 @@ fn backup_login_state(paths: &Paths, notes: &mut Vec<String>) -> Result<()> {
     let parent = backup.parent().ok_or_else(|| {
         AppError::Other(format!(
             "pre-login backup has no parent: {}",
-            backup.display()
+            sanitize_untrusted_path(&backup)
         ))
     })?;
     std::fs::create_dir_all(parent).map_err(|e| AppError::io_at(parent, e))?;
@@ -386,7 +387,7 @@ fn restore_login_state(paths: &Paths) -> Result<()> {
     if !backup.is_dir() {
         return Err(AppError::Other(format!(
             "no pre-login backup at {} to restore",
-            backup.display()
+            sanitize_untrusted_path(&backup)
         )));
     }
     for name in LOGIN_STATE_FILES {

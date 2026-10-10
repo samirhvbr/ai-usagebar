@@ -12,10 +12,11 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
 
+use crate::display::sanitize_untrusted_path;
 use crate::error::{AppError, Result};
 
 /// Per-account schedule registry, stored beside that account's session indexes.
-const SCHEDULED_TASKS: &str = "scheduled-tasks.json";
+pub(super) const SCHEDULED_TASKS: &str = "scheduled-tasks.json";
 
 /// Session-index files that a switch would bring into the target account's
 /// history folder, so it shows the union of everything rather than only the
@@ -476,7 +477,7 @@ pub fn plan_name_convergence(
         let object = document.as_object_mut().ok_or_else(|| {
             AppError::Other(format!(
                 "scheduled task registry {} is not a JSON object",
-                path.display()
+                sanitize_untrusted_path(&path)
             ))
         })?;
         let Some(tasks) = object.get_mut("scheduledTasks") else {
@@ -485,7 +486,7 @@ pub fn plan_name_convergence(
         let tasks = tasks.as_array_mut().ok_or_else(|| {
             AppError::Other(format!(
                 "scheduledTasks in {} is not a JSON array",
-                path.display()
+                sanitize_untrusted_path(&path)
             ))
         })?;
         let mut changed = false;

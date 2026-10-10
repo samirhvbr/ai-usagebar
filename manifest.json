@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "akitaonrails.ai-usagebar",
   "name": "AI Usage",
-  "version": "1.20.2",
+  "version": "1.34.0",
   "author": "AkitaOnRails",
   "license": "MIT",
   "description": "Multi-provider AI plan usage and balances in a native Omarchy Quattro panel. Needs the ai-usagebar binary as well as this plugin: omarchy pkg aur add ai-usagebar-bin",
@@ -28,9 +28,19 @@
       "provider": "",
       "refreshIntervalSec": 300,
       "showValue": true,
+      "brandIcons": true,
       "showProvider": false,
+      "colorCodeUsage": false,
       "showAll": false,
-      "barWindow": "auto"
+      "uiLocale": "auto",
+      "barWindow": "auto",
+      "showAs": "used",
+      "showCursorModels": true,
+      "showCursorOther": true,
+      "showCursorOnDemand": true,
+      "showCursorCredits": true,
+      "showAntigravityGemini": true,
+      "showAntigravityClaudeGpt": true
     },
     "schema": [
       {
@@ -57,10 +67,24 @@
         "defaultValue": true
       },
       {
+        "key": "brandIcons",
+        "type": "boolean",
+        "label": "Show provider logos",
+        "description": "Draw each provider's own mark in the top bar and panel. Off restores the generic icon the bar used before the marks: one robot for a single provider, and the provider's short code on each chip when Show all providers is on. On by default.",
+        "defaultValue": true
+      },
+      {
         "key": "showProvider",
         "type": "boolean",
         "label": "Show provider name",
         "description": "Show the selected provider's short code (cld, gpt, zai, agy) before the usage value, the way Waybar's {vendor_short} does. Off by default.",
+        "defaultValue": false
+      },
+      {
+        "key": "colorCodeUsage",
+        "type": "boolean",
+        "label": "Color-code usage by level",
+        "description": "Paint bar values, panel meters, and the tooltip green → yellow → orange → red as usage climbs, using your Omarchy theme. Turn off for a single foreground color. Off by default.",
         "defaultValue": false
       },
       {
@@ -69,6 +93,21 @@
         "label": "Show all providers",
         "description": "Show every configured provider's icon and usage in the top bar at once, instead of cycling one at a time. Off by default.",
         "defaultValue": false
+      },
+      {
+        "key": "uiLocale",
+        "type": "enum",
+        "label": "Interface language",
+        "description": "Language for the Omarchy panel and settings. Auto follows the system locale.",
+        "options": [
+          "auto",
+          "en",
+          "pt-BR",
+          "ru",
+          "ko",
+          "es"
+        ],
+        "defaultValue": "auto"
       },
       {
         "key": "barWindow",
@@ -82,6 +121,59 @@
           "monthly"
         ],
         "defaultValue": "auto"
+      },
+      {
+        "key": "showAs",
+        "type": "enum",
+        "label": "Show usage as",
+        "description": "Whether percentages in the top bar, tooltip and panel read what you have used or what is left of the same window. Which window the bar picks does not change; only the number drawn for it does.",
+        "options": [
+          "used",
+          "left"
+        ],
+        "defaultValue": "used"
+      },
+      {
+        "key": "showCursorModels",
+        "type": "boolean",
+        "label": "Show Cursor Models",
+        "description": "Show the Cursor Models pool in the top bar and tooltip. The panel header and list drop it too. At least one Cursor pool stays visible.",
+        "defaultValue": true
+      },
+      {
+        "key": "showCursorOther",
+        "type": "boolean",
+        "label": "Show Other Models",
+        "description": "Show the Other Models pool in the top bar and tooltip. The panel header and list drop it too. At least one Cursor pool stays visible.",
+        "defaultValue": true
+      },
+      {
+        "key": "showCursorOnDemand",
+        "type": "boolean",
+        "label": "Show On-Demand",
+        "description": "Show prepaid on-demand usage in the top bar and tooltip. The panel header and list drop it too. At least one Cursor pool stays visible.",
+        "defaultValue": true
+      },
+      {
+        "key": "showCursorCredits",
+        "type": "boolean",
+        "label": "Show Credits",
+        "description": "Show a spending-page credit grant in the top bar and tooltip. The panel header and list drop it too. Hidden when the account has no grant. At least one Cursor figure stays visible.",
+        "defaultValue": true
+      },
+      {
+        "key": "showAntigravityGemini",
+        "type": "boolean",
+        "label": "Show Gemini",
+        "description": "Show the Gemini pool in the top bar and tooltip. The panel list drops its Session and Weekly rows too. At least one Antigravity pool stays visible.",
+        "defaultValue": true
+      },
+      {
+        "key": "showAntigravityClaudeGpt",
+        "type": "boolean",
+        "label": "Show Claude & GPT OSS",
+        "description": "Show the Claude & GPT OSS pool in the top bar and tooltip. The panel list drops its Session and Weekly rows too. At least one Antigravity pool stays visible.",
+        "defaultValue": true
       }
     ]
   }

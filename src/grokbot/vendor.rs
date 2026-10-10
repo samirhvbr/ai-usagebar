@@ -7,7 +7,7 @@ use chrono::{DateTime, Utc};
 
 use crate::countdown;
 use crate::format::{placeholders, substitute, updated_at_hm};
-use crate::pacing::PaceSeverity;
+use crate::pacing::{self, PaceSeverity, Pacing};
 use crate::pango::{color_span, escape, severity_color, severity_for};
 use crate::theme::Theme;
 use crate::tooltip::{Line as TooltipLine, WindowRow, push_window_with_row, render_bordered};
@@ -23,7 +23,35 @@ pub fn build_placeholders(
     snap: &GrokbotSnapshot,
     now: DateTime<Utc>,
 ) -> HashMap<&'static str, String> {
+    build_placeholders_with_tolerance(snap, pacing::DEFAULT_TOLERANCE, now)
+}
+
+fn weekly_pacing(snap: &GrokbotSnapshot, tolerance: u32, now: DateTime<Utc>) -> Pacing {
+    if !snap.has_included_allowance {
+        return Pacing::neutral();
+    }
+    pacing::calc(
+        snap.weekly_pct,
+        snap.reset_at,
+        now,
+        snap.window.unwrap_or_else(chrono::Duration::zero),
+        tolerance,
+    )
+}
+
+fn build_placeholders_with_tolerance(
+    snap: &GrokbotSnapshot,
+    tolerance: u32,
+    now: DateTime<Utc>,
+) -> HashMap<&'static str, String> {
     let reset = countdown::format(snap.reset_at, now);
+    let pace = weekly_pacing(snap, tolerance, now);
+    let elapsed =
+        if snap.window.is_some_and(|window| window.num_seconds() > 0) && snap.reset_at.is_some() {
+            pace.elapsed_pct.to_string()
+        } else {
+            String::new()
+        };
     // With no included allowance the weekly placeholders resolve to empty
     // strings (the missing-placeholder convention) rather than a fabricated 0.
     let allowance = |value: String| {
@@ -40,10 +68,20 @@ pub fn build_placeholders(
         ("plan", snap.plan.clone()),
         ("weekly_pct", allowance(snap.weekly_pct.to_string())),
         ("weekly_reset", allowance(reset.clone())),
+        ("weekly_elapsed", allowance(elapsed.clone())),
         // Grok Bot-specific placeholders.
         ("gbt_plan", snap.plan.clone()),
         ("gbt_weekly_pct", allowance(snap.weekly_pct.to_string())),
         ("gbt_weekly_reset", allowance(reset)),
+        ("gbt_weekly_elapsed", allowance(elapsed)),
+        ("gbt_weekly_pace", allowance(pace.ratio_pace.glyph().into())),
+        ("gbt_weekly_pace_pct", allowance(pace.ratio_label)),
+        (
+            "gbt_weekly_pace_indicator",
+            allowance(pace.point_pace.glyph().into()),
+        ),
+        ("gbt_weekly_pace_pts", allowance(pace.point_label)),
+        ("gbt_weekly_pace_delta", allowance(pace.delta.to_string())),
         (
             "gbt_on_demand",
             if snap.on_demand_enabled { "on" } else { "off" }.to_string(),
@@ -72,7 +110,7 @@ pub fn render(
         .format
         .clone()
         .unwrap_or_else(|| DEFAULT_FORMAT.to_string());
-    let values = build_placeholders(snap, now);
+    let values = build_placeholders_with_tolerance(snap, opts.pace_tolerance, now);
     // User formats are Pango markup after Waybar renders them; the plan label
     // is API-controlled, so it is escaped at this projection boundary, once.
     let mut pango_values = values.clone();
@@ -81,13 +119,32 @@ pub fn render(
             *value = escape(value);
         }
     }
+    if opts.format_pace_color && snap.has_included_allowance {
+        let pace = weekly_pacing(snap, opts.pace_tolerance, now);
+        let color = severity_color(pacing::pace_severity(pace.delta), theme);
+        for key in [
+            "gbt_weekly_pace",
+            "gbt_weekly_pace_pct",
+            "gbt_weekly_pace_indicator",
+            "gbt_weekly_pace_pts",
+            "gbt_weekly_pace_delta",
+        ] {
+            if let Some(value) = pango_values.get_mut(key) {
+                *value = color_span(color, value);
+            }
+        }
+    }
 
     let mut text = substitute(&format, &pango_values);
     if outcome.stale {
         text.push_str(" ⏸");
     }
 
-    let wrapper_color = severity_color(severity(snap), theme).to_string();
+    let wrapper_color = if opts.format_pace_color && format.contains("_pace") {
+        theme.fg.clone()
+    } else {
+        severity_color(severity(snap), theme).to_string()
+    };
     let icon_prefix = match opts.icon.as_deref() {
         Some(ic) if !ic.is_empty() => format!("{ic} "),
         _ => String::new(),
@@ -97,7 +154,7 @@ pub fn render(
     let tooltip = if let Some(fmt) = opts.tooltip_format.as_deref() {
         substitute(fmt, &pango_values)
     } else {
-        render_tooltip(outcome, snap, theme, now)
+        render_tooltip(outcome, snap, theme, opts, now)
     };
 
     WaybarOutput {
@@ -111,6 +168,7 @@ fn render_tooltip(
     outcome: &VendorOutcome,
     snap: &GrokbotSnapshot,
     theme: &Theme,
+    opts: &RenderOpts,
     now: DateTime<Utc>,
 ) -> String {
     let blue = &theme.blue;
@@ -137,17 +195,25 @@ fn render_tooltip(
     if snap.has_included_allowance {
         // The window's length is derived from the reported instants, never
         // assumed — and only the reset carries a countdown.
+        let window = UsageWindow {
+            utilization_pct: snap.weekly_pct,
+            resets_at: snap.reset_at,
+            window_duration: snap.window.unwrap_or_else(chrono::Duration::zero),
+        };
+        let row = if snap.window.is_some_and(|window| window.num_seconds() > 0)
+            && snap.reset_at.is_some()
+        {
+            WindowRow::paced(&window, now, opts.pace_tolerance, opts.tooltip_pace_pts)
+        } else {
+            WindowRow::default()
+        };
         push_window_with_row(
             &mut lines,
             "  󰅄  Weekly included usage",
-            &UsageWindow {
-                utilization_pct: snap.weekly_pct,
-                resets_at: snap.reset_at,
-                window_duration: snap.window.unwrap_or_else(chrono::Duration::zero),
-            },
+            &window,
             theme,
             now,
-            WindowRow::default(),
+            row,
         );
         if let Some(note) = snap.on_demand_note() {
             lines.push(TooltipLine::Body(format!(
@@ -208,6 +274,7 @@ mod tests {
     fn sample_snap() -> GrokbotSnapshot {
         GrokbotSnapshot {
             plan: "Grok Bot Plan".into(),
+            billed_by: None,
             has_included_allowance: true,
             weekly_pct: 42,
             has_available_usage: true,
@@ -235,6 +302,94 @@ mod tests {
             pace_tolerance: 5,
             format_pace_color: false,
             tooltip_pace_pts: false,
+        }
+    }
+
+    #[test]
+    fn weekly_pace_uses_the_reported_period_and_exposes_both_conventions() {
+        let snap = GrokbotSnapshot {
+            weekly_pct: 70,
+            period_start: Some(now() - chrono::Duration::days(5)),
+            reset_at: Some(now() + chrono::Duration::days(5)),
+            window: Some(chrono::Duration::days(10)),
+            ..sample_snap()
+        };
+        let values = build_placeholders(&snap, now());
+        assert_eq!(values["weekly_elapsed"], "50");
+        assert_eq!(values["gbt_weekly_elapsed"], "50");
+        assert_eq!(values["gbt_weekly_pace"], "↑");
+        assert_eq!(values["gbt_weekly_pace_indicator"], "↑");
+        assert_eq!(values["gbt_weekly_pace_pct"], "40% ahead");
+        assert_eq!(values["gbt_weekly_pace_pts"], "20pts ahead");
+        assert_eq!(values["gbt_weekly_pace_delta"], "20");
+    }
+
+    #[test]
+    fn weekly_pace_respects_tolerance_color_and_tooltip_point_mode() {
+        let snap = GrokbotSnapshot {
+            weekly_pct: 70,
+            reset_at: Some(now() + chrono::Duration::days(5)),
+            window: Some(chrono::Duration::days(10)),
+            ..sample_snap()
+        };
+        let outcome = sample_outcome(snap.clone());
+        let theme = Theme::default();
+        let mut o = opts();
+        o.format = Some("{gbt_weekly_pace} {gbt_weekly_pace_indicator}".into());
+        o.pace_tolerance = 50;
+        let plain = render(&outcome, &snap, &theme, &o, now());
+        assert!(plain.text.contains("→ ↑"));
+        assert!(plain.tooltip.contains('→'));
+        o.format_pace_color = true;
+        o.tooltip_pace_pts = true;
+        let colored = render(&outcome, &snap, &theme, &o, now());
+        assert!(
+            colored
+                .text
+                .contains(&format!("foreground='{}'>↑", theme.red))
+        );
+        assert!(colored.tooltip.contains('↑'));
+        assert_ne!(plain.tooltip, colored.tooltip);
+    }
+
+    #[test]
+    fn weekly_pace_covers_under_even_and_over_consumption() {
+        for (usage, glyph, delta) in [(30, "↓", "-20"), (50, "→", "0"), (70, "↑", "20")] {
+            let snap = GrokbotSnapshot {
+                weekly_pct: usage,
+                reset_at: Some(now() + chrono::Duration::days(5)),
+                window: Some(chrono::Duration::days(10)),
+                ..sample_snap()
+            };
+            let values = build_placeholders(&snap, now());
+            assert_eq!(values["gbt_weekly_pace"], glyph);
+            assert_eq!(values["gbt_weekly_pace_delta"], delta);
+        }
+    }
+
+    #[test]
+    fn invalid_periods_have_neutral_placeholders_and_no_tooltip_marker() {
+        for (reset_at, window) in [
+            (None, Some(chrono::Duration::days(7))),
+            (sample_snap().reset_at, None),
+            (sample_snap().reset_at, Some(chrono::Duration::zero())),
+            (sample_snap().reset_at, Some(chrono::Duration::days(-7))),
+        ] {
+            let snap = GrokbotSnapshot {
+                reset_at,
+                window,
+                ..sample_snap()
+            };
+            let values = build_placeholders(&snap, now());
+            assert_eq!(values["weekly_elapsed"], "");
+            assert_eq!(values["gbt_weekly_pace"], "→");
+            assert_eq!(values["gbt_weekly_pace_delta"], "0");
+            let outcome = sample_outcome(snap.clone());
+            let plain = render(&outcome, &snap, &Theme::default(), &opts(), now());
+            let mut o = opts();
+            o.tooltip_pace_pts = true;
+            let marked = render(&outcome, &snap, &Theme::default(), &o, now());
+            assert_eq!(plain.tooltip, marked.tooltip);
         }
     }
 
@@ -282,6 +437,13 @@ mod tests {
             "gbt_weekly_reset",
             "weekly_pct",
             "weekly_reset",
+            "weekly_elapsed",
+            "gbt_weekly_elapsed",
+            "gbt_weekly_pace",
+            "gbt_weekly_pace_pct",
+            "gbt_weekly_pace_indicator",
+            "gbt_weekly_pace_pts",
+            "gbt_weekly_pace_delta",
         ] {
             assert_eq!(values[key], "", "{key} must render empty");
         }

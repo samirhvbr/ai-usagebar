@@ -145,7 +145,15 @@ pub fn render(
         .format
         .clone()
         .unwrap_or_else(|| DEFAULT_FORMAT.to_string());
-    let values = build_placeholders_with_tolerance(snap, opts.pace_tolerance, now);
+    let mut values = build_placeholders_with_tolerance(snap, opts.pace_tolerance, now);
+    // Both sinks fed by this map (bar text and --tooltip-format) are Pango
+    // markup. The plan label is API-controlled, so escape its aliases at the
+    // projection boundary. The default tooltip escapes the raw snapshot.
+    for key in ["plan", "zai_plan"] {
+        if let Some(value) = values.get_mut(key) {
+            *value = escape(value);
+        }
+    }
 
     let mut text = substitute(&format, &values);
     if outcome.stale {
@@ -480,6 +488,22 @@ mod tests {
         o.tooltip_format = Some("S:{zai_session_pct} W:{zai_weekly_pct}".into());
         let out = render(&oc, &snap, &Theme::default(), &o, Utc::now());
         assert_eq!(out.tooltip, "S:42 W:15");
+    }
+
+    #[test]
+    fn api_plan_is_pango_escaped_in_custom_formats() {
+        let mut snap = sample_snap();
+        snap.plan = "Coding & Analysis <pro>".into();
+        let oc = outcome(snap.clone());
+        let mut o = opts();
+        o.format = Some("{plan}".into());
+        o.tooltip_format = Some("{zai_plan}".into());
+
+        let out = render(&oc, &snap, &Theme::default(), &o, Utc::now());
+        assert!(!out.text.contains(" & "));
+        assert!(!out.tooltip.contains('<'));
+        assert!(out.text.contains("Coding &amp; Analysis &lt;pro&gt;"));
+        assert_eq!(out.tooltip, "Coding &amp; Analysis &lt;pro&gt;");
     }
 
     fn fixed_now() -> DateTime<Utc> {

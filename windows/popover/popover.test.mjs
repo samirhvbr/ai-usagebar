@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import {
+  accountSwitchFor,
   formatDuration,
   nextUpdateLabel,
   parseHostPayload,
@@ -32,10 +34,14 @@ import {
   hintPending,
   absorbPayload,
   setRowEnabled,
+  hiddenMetricKeys,
+  prefsForCard,
   moveRowToList,
   LAYOUT_KEY,
   normalizeLayout,
   meterColor,
+  paceNote,
+  paceVerdict,
   resetText,
   resetAlternate,
   formatResetExact,
@@ -47,19 +53,83 @@ import {
   metricCount,
   sendCommand,
   resolvedTheme,
-  applyDensity,
   emptyPayload,
   pace,
   paceText,
   paceTickPercent,
   paceVisible,
+  usageGoal,
+  usageGoalPercent,
+  prettyMetricLabel,
   shortcutFromKeyEvent,
+  displayShortcut,
+  defaultStars,
+  toggleStar,
+  metricRowKey,
+  paceWarmupMs,
+  paceWarmupText,
+  paceWarmupHint,
+  isStarred,
+  seedStars,
+  stripCommand,
+  MAX_STARS_PER_PROVIDER,
+  expirySeverity,
+  providerLinks,
+  isHttpUrl,
   formatAgo,
   updateStatusLabel,
   updateBannerPending,
   updateModeLabel,
+  updateAction,
+  updateMessage,
+  bannerMessage,
+  optionsMenuLabels,
+  menuAction,
 } from './src/model.js';
 import { measurePanelHeight } from './src/panel-size.js';
+
+const englishMessages = JSON.parse(readFileSync(new URL('./messages/en.json', import.meta.url), 'utf8'));
+
+{
+  const fixture = JSON.parse(readFileSync(new URL('../../tests/fixtures/grokbot_paced_report.json', import.meta.url), 'utf8'));
+  const now = Date.parse('2026-09-25T12:00:00Z');
+  const row = projectCards(parseHostPayload(fixture), now)[0].rows[0];
+  const projected = pace(row, now);
+  assert.equal(projected.elapsedPercent, 50);
+  assert.equal(projected.state, 'behind');
+  assert.match(paceText(projected, now), /Limit/);
+  assert.equal(pace({...row, window: undefined}, now), null);
+}
+
+{
+  const fixture = JSON.parse(readFileSync(new URL('../../tests/fixtures/cursor_paced_report.json', import.meta.url), 'utf8'));
+  const now = Date.parse('2026-09-25T12:00:00Z');
+  const [ahead, behind] = projectCards(parseHostPayload(fixture), now)[0].rows;
+  assert.equal(pace(ahead, now).elapsedPercent, 50);
+  assert.equal(pace(ahead, now).state, 'behind');
+  assert.equal(pace(behind, now).elapsedPercent, 50);
+  assert.notEqual(pace(behind, now).state, 'behind');
+  assert.equal(pace({...ahead, window: undefined}, now), null);
+}
+
+// The page declares an empty icon, so the WebView never asks the tray for /favicon.ico: the
+// custom protocol serves only the page, its script and its stylesheet, and the request logged
+// a 404 in the popover's console on every open.
+{
+  const page = readFileSync(new URL('./index.html', import.meta.url), 'utf8');
+  assert.match(page, /<link rel="icon" href="data:," \/>/);
+}
+
+const portugueseMessages = JSON.parse(readFileSync(new URL('./messages/pt-BR.json', import.meta.url), 'utf8'));
+assert.deepEqual(Object.keys(portugueseMessages).sort(), Object.keys(englishMessages).sort());
+assert.ok(Object.values(englishMessages).every((value) => typeof value === 'string' && value.trim()));
+assert.ok(Object.values(portugueseMessages).every((value) => typeof value === 'string' && value.trim()));
+assert.equal(englishMessages.menu_bar_shows_hint, "Chart and Logos show every provider's starred metrics. Quattro shows the selected provider's highest usage.");
+assert.equal(portugueseMessages.menu_bar_shows_hint, "Gráfico e Logotipos mostram as métricas marcadas de todos os provedores. Quattro mostra o maior uso do provedor selecionado.");
+for (const key of ['focused_provider', 'highest_consumption', 'usage_window']) {
+  assert.equal(Object.hasOwn(englishMessages, key), false);
+  assert.equal(Object.hasOwn(portugueseMessages, key), false);
+}
 
 // The native window can retain a tall viewport while WebView2 is hidden. Its
 // stretched scroll region must not become the next requested panel height.
@@ -77,6 +147,11 @@ const report = {
   next_refresh_at: 61_000,
   startup_enabled: true,
   host_error: null,
+  menu_bar_show_all: false,
+  menu_bar_hide_value: true,
+  menu_bar_names: 'short',
+  menu_bar_look: 'quattro',
+  accent: { light: '#123456', dark: '#ABCDEF' },
   primary: 'anthropic',
   entries: [
     {
@@ -111,6 +186,37 @@ const report = {
 const payload = parseHostPayload(report);
 assert.equal(payload.version, '1.10.0');
 assert.equal(payload.startupEnabled, true);
+assert.equal(Object.hasOwn(payload, 'menuBarShowAll'), false);
+assert.equal(Object.hasOwn(payload, 'menuBarHideValue'), false);
+assert.equal(Object.hasOwn(payload, 'menuBarNames'), false);
+assert.equal(payload.menuBarLook, 'quattro');
+// ASSERT: an unknown or missing look reads as the default chart, never as a blank one.
+assert.equal(parseHostPayload({ menu_bar_look: 'sparkles' }).menuBarLook, 'chart');
+assert.equal(parseHostPayload({}).menuBarLook, 'chart');
+assert.equal(emptyPayload('').menuBarLook, 'chart');
+assert.equal(parseHostPayload({ menu_bar_look: 'logos' }).menuBarLook, 'logos');
+assert.equal(parseHostPayload({ menu_bar_look: 'quattro' }).menuBarLook, 'quattro');
+// The host only reports `quattro`; the 1.32.0 spelling is read on the Rust side, so `name` is unknown here.
+assert.equal(parseHostPayload({ menu_bar_look: 'name' }).menuBarLook, 'chart');
+// The Quattro look's short name is on unless the host says otherwise.
+assert.equal(parseHostPayload({}).menuBarShortName, true);
+assert.equal(emptyPayload('').menuBarShortName, true);
+assert.equal(parseHostPayload({ menu_bar_short_name: false }).menuBarShortName, false);
+assert.equal(parseHostPayload({ menu_bar_short_name: 'no' }).menuBarShortName, true);
+assert.deepEqual(payload.accent, { light: '#123456', dark: '#abcdef' });
+// ASSERT: malformed, partial, and non-object accent data cannot set either CSS color.
+assert.equal(parseHostPayload({ accent: { light: '#112233', dark: 'bad' } }).accent, null);
+assert.equal(parseHostPayload({ accent: { light: '#112233' } }).accent, null);
+assert.equal(parseHostPayload({ accent: ['#112233', '#445566'] }).accent, null);
+assert.equal(emptyPayload('').accent, null);
+assert.equal(Object.hasOwn(emptyPayload(''), 'menuBarShowAll'), false);
+assert.equal(Object.hasOwn(emptyPayload(''), 'menuBarHideValue'), false);
+assert.equal(Object.hasOwn(emptyPayload(''), 'menuBarNames'), false);
+assert.equal(payload.notificationsEnabled, true);
+assert.equal(payload.notificationsThreshold, 97);
+assert.equal(parseHostPayload({ notifications_enabled: false, notifications_threshold: 85 }).notificationsEnabled, false);
+assert.equal(parseHostPayload({ notifications_threshold: 85 }).notificationsThreshold, 85);
+assert.equal(parseHostPayload({ notifications_threshold: 101 }).notificationsThreshold, 97);
 assert.equal(payload.entries.length, 1);
 assert.equal(payload.entries[0].displayName, 'Claude');
 assert.equal(payload.entries[0].sections.length, 2); // spacer dropped
@@ -119,6 +225,8 @@ assert.equal(formatDuration(0), 'now');
 assert.equal(formatDuration(90_000), '1m');
 assert.equal(formatDuration(3_600_000 + 120_000), '1h 2m');
 assert.equal(formatDuration(2 * 86_400_000 + 3_600_000), '2d 1h');
+assert.equal(formatDuration(0, 'pt-BR'), 'agora');
+assert.equal(formatDuration(90_000, 'pt-BR'), '1m');
 
 const cards = projectCards(payload, Date.parse('2026-09-04T00:00:00Z'));
 assert.equal(cards.length, 1);
@@ -138,6 +246,15 @@ assert.equal(
 
 assert.equal(nextUpdateLabel(payload, 1_000), 'Next update in 1m');
 assert.equal(nextUpdateLabel(payload, 61_000), 'Updating…');
+assert.equal(nextUpdateLabel(payload, 1_000, 'pt-BR'), 'Próxima atualização em 1m');
+assert.equal(nextUpdateLabel(payload, 61_000, 'pt-BR'), 'Atualizando…');
+assert.equal(updateMessage({ state: 'checking' }, 'pt-BR'), 'Procurando uma versão mais recente…');
+// Without a version each language words "the new version" itself, never an English splice.
+assert.equal(updateMessage({ state: 'available', installable: true }, 'pt-BR'), 'A nova versão do AI Usage está pronta para instalar.');
+assert.equal(updateMessage({ state: 'downloading' }, 'pt-BR'), 'Baixando a nova versão…');
+assert.equal(updateMessage({ state: 'downloading' }), 'Downloading the new version…');
+// A diagnosis that is only a path cleans to nothing: the fallback hint is translated too.
+assert.equal(explainError('/Users/someone/.config/x', 'zai', 'pt-BR').hint, 'Abra o TUI para ver detalhes.');
 
 const bad = parseHostPayload('{');
 assert.equal(bad.hostError.includes('valid JSON'), true);
@@ -222,6 +339,21 @@ assert.equal(
   'Provider is unavailable',
 );
 assert.ok(!friendlyError('Zai: no API key in C:\\Users\\dj4lm\\AppData\\Roaming\\ai-usagebar\\config\\config.toml.').includes('AppData'));
+
+// A diagnostic keeps its path, with only the home prefix folded to `~`; a
+// space inside the path must not cut it (macOS `Application Support`).
+{
+  const mac = friendlyError('Credentials error. Cursor database not found at /Users/someone/Library/Application Support/Cursor/User/globalStorage/state.vscdb. Open the Cursor IDE and sign in.');
+  assert.ok(mac.includes('~/Library/Application Support/Cursor/User/globalStorage/state.vscdb'), mac);
+  assert.ok(!mac.includes('someone'), mac);
+  const win = friendlyError('Credentials error. Cursor database not found at C:\\Users\\someone\\AppData\\Roaming\\Cursor\\User\\globalStorage\\state.vscdb. Open the Cursor IDE and sign in.');
+  assert.ok(win.includes('~\\AppData\\Roaming\\Cursor\\User\\globalStorage\\state.vscdb'), win);
+  assert.ok(!win.includes('someone'), win);
+  const linux = friendlyError('Credentials error. file missing at /home/someone/.config/cursor/auth.json, sign in.');
+  assert.ok(linux.includes('~/.config/cursor/auth.json'), linux);
+  assert.ok(!linux.includes('someone'), linux);
+  assert.ok(friendlyError('Credentials error. not found at /root/.x/y.json.').includes('~/.x/y.json'));
+}
 
 assert.equal(displayPlan('Claude', 'Claude Max 5x'), 'Max 5x');
 assert.equal(displayPlan('Claude', 'Team 5x'), 'Team 5x');
@@ -313,6 +445,10 @@ assert.deepEqual(resetDetails.items.map((item) => item.date), [
   'Date unavailable',
 ]);
 assert.deepEqual(resetDetails.items.map((item) => item.remaining), ['5d 13h', '19d 18h', '—']);
+// Dots are colored by how soon each credit expires, never by position; an
+// unknown date gets the neutral dot.
+assert.deepEqual(resetDetails.items.map((item) => item.severity), ['yellow', 'blue', '']);
+
 assert.equal(resetDetails.hidden, 0);
 assert.equal(
   formatResetCreditDate('2026-09-20T23:58:00Z', { locale: 'en-US', timeZone: 'UTC', timeFormat: '12' }),
@@ -337,9 +473,16 @@ const extraOnAlways = moveRowToList(
 );
 assert.deepEqual(extraOnAlways.always.slice(-1), ['text:Extra Usage']);
 assert.equal(visibleRowsFor(cursorCard, { collapsed: true, prefs: extraOnAlways }).length, 3);
-const disabledApi = setRowEnabled(defaultRowPrefs(cursorCard.rows), 'metric:API', false);
+const cursorPrefs = defaultRowPrefs(cursorCard.rows);
+const disabledApi = setRowEnabled(cursorPrefs, 'metric:API', false);
 assert.equal(disabledApi.off['metric:API'], true);
+assert.deepEqual(disabledApi.always, cursorPrefs.always);
+assert.deepEqual(disabledApi.demand, cursorPrefs.demand);
 assert.equal(visibleRowsFor(cursorCard, { collapsed: false, prefs: disabledApi }).length, 3);
+const reenabledApi = setRowEnabled(disabledApi, 'metric:API', true);
+assert.equal(reenabledApi.off['metric:API'], undefined);
+assert.deepEqual(reenabledApi.always, cursorPrefs.always);
+assert.deepEqual(reenabledApi.demand, cursorPrefs.demand);
 const mergedStored = mergeRowPrefs(cursorCard.rows, {
   always: ['metric:API'],
   demand: ['metric:Total'],
@@ -374,65 +517,143 @@ const synced = syncLayout(loaded, ['anthropic', 'openai', 'cursor']);
 assert.deepEqual(synced.cardOrder, ['cursor', 'openai', 'anthropic']);
 assert.ok(store.getItem(LAYOUT_KEY).includes('cursor'));
 assert.deepEqual(emptyLayout().cardOrder, []);
+assert.equal(emptyLayout().popoverStyle, 'classic');
+assert.equal(normalizeLayout({ popoverStyle: 'glass' }).popoverStyle, 'native');
+assert.equal(normalizeLayout({ popoverStyle: 'native' }).popoverStyle, 'native');
+assert.equal(normalizeLayout({ popoverStyle: 'other' }).popoverStyle, 'classic');
+assert.equal(normalizeLayout({}).popoverStyle, 'classic');
+const nativeStyleStore = memoryStorage();
+saveLayout(nativeStyleStore, { ...emptyLayout(), popoverStyle: 'native' });
+assert.equal(JSON.parse(nativeStyleStore.getItem(LAYOUT_KEY)).popoverStyle, 'native');
+assert.equal(loadLayout(nativeStyleStore).popoverStyle, 'native');
+const legacyStyleStore = memoryStorage({ [LAYOUT_KEY]: JSON.stringify({ popoverStyle: 'glass' }) });
+assert.equal(loadLayout(legacyStyleStore).popoverStyle, 'native');
+saveLayout(legacyStyleStore, loadLayout(legacyStyleStore));
+assert.equal(JSON.parse(legacyStyleStore.getItem(LAYOUT_KEY)).popoverStyle, 'native');
 
-// --- density / resetTimes layout fields ------------------------------------
+// Language must survive storage normalization and every host payload refresh.
+const languageStore = memoryStorage();
+saveLayout(languageStore, { ...emptyLayout(), language: 'pt-BR' });
+assert.equal(loadLayout(languageStore).language, 'pt-BR');
+assert.equal(syncLayout(loadLayout(languageStore), ['anthropic']).language, 'pt-BR');
+assert.equal(normalizeLayout({ language: 'invalid' }).language, 'en');
+assert.equal(nextUpdateLabel({ nextRefreshAt: 120_000 }, 60_000, 'pt-BR'), 'Próxima atualização em 1m');
+assert.equal(resetText({ resetAt: '2026-09-24T12:00:00Z' }, 'countdown', Date.parse('2026-09-24T11:00:00Z'), { locale: 'pt-BR' }), 'Redefine em 1h 0m');
+assert.match(formatResetExact(Date.parse('2026-09-24T12:00:00Z'), Date.parse('2026-09-24T11:00:00Z'), { locale: 'pt-BR', timeZone: 'UTC', timeFormat: '24' }), /^hoje às 12:00$/);
+assert.equal(updateStatusLabel({ update: null, updateCheckedAt: 0 }, 0, 'pt-BR'), 'Ainda não verificado');
+saveLayout(languageStore, { ...emptyLayout(), language: 'ko' });
+assert.equal(loadLayout(languageStore).language, 'ko');
+assert.equal(nextUpdateLabel({ nextRefreshAt: 120_000 }, 60_000, 'ko'), '1m 후 업데이트');
+assert.equal(resetText({ resetAt: '2026-09-24T12:00:00Z' }, 'countdown', Date.parse('2026-09-24T11:00:00Z'), { locale: 'ko' }), '1h 0m 후 초기화');
+assert.match(formatResetExact(Date.parse('2026-09-24T12:00:00Z'), Date.parse('2026-09-24T11:00:00Z'), { locale: 'ko', timeZone: 'UTC', timeFormat: '24' }), /^오늘 12:00$/);
+assert.equal(updateStatusLabel({ update: null, updateCheckedAt: 0 }, 0, 'ko'), '아직 확인 안 함');
+saveLayout(languageStore, { ...emptyLayout(), language: 'es' });
+assert.equal(loadLayout(languageStore).language, 'es');
+assert.equal(nextUpdateLabel({ nextRefreshAt: 120_000 }, 60_000, 'es'), 'Próxima actualización en 1m');
+assert.equal(resetText({ resetAt: '2026-09-24T12:00:00Z' }, 'countdown', Date.parse('2026-09-24T11:00:00Z'), { locale: 'es' }), 'Se reinicia en 1h 0m');
+assert.match(formatResetExact(Date.parse('2026-09-24T12:00:00Z'), Date.parse('2026-09-24T11:00:00Z'), { locale: 'es', timeZone: 'UTC', timeFormat: '24' }), /^hoy a las 12:00$/);
+assert.equal(updateStatusLabel({ update: null, updateCheckedAt: 0 }, 0, 'es'), 'Aún sin comprobar');
+
+// --- resetTimes layout field ------------------------------------
 
 {
-  // ARRANGE: a fresh layout
-  // ACT
   const empty = emptyLayout();
-  // ASSERT: defaults are regular density and countdown reset times
-  assert.equal(empty.density, 'regular');
   assert.equal(empty.resetTimes, 'countdown');
 }
 
 {
-  // ARRANGE: valid and invalid values for the new fields
-  // ACT
-  const compactExact = normalizeLayout({ density: 'compact', resetTimes: 'exact' });
-  const junk = normalizeLayout({ density: 'tiny', resetTimes: 'never' });
+  const exact = normalizeLayout({ resetTimes: 'exact' });
+  const junk = normalizeLayout({ resetTimes: 'never' });
   const missing = normalizeLayout({});
-  // ASSERT: only the two known values survive; everything else falls back
-  assert.equal(compactExact.density, 'compact');
-  assert.equal(compactExact.resetTimes, 'exact');
-  assert.equal(junk.density, 'regular');
+  assert.equal(exact.resetTimes, 'exact');
   assert.equal(junk.resetTimes, 'countdown');
-  assert.equal(missing.density, 'regular');
   assert.equal(missing.resetTimes, 'countdown');
 }
 
 {
-  // ARRANGE: a saved layout with the new fields set
-  const densityStore = memoryStorage();
-  saveLayout(densityStore, { cardOrder: ['cursor'], density: 'compact', resetTimes: 'exact' });
-  // ACT: reload and sync against the live card set
-  const reloaded = loadLayout(densityStore);
+  const store = memoryStorage();
+  saveLayout(store, { cardOrder: ['cursor'], resetTimes: 'exact' });
+  const reloaded = loadLayout(store);
   const resynced = syncLayout(reloaded, ['anthropic', 'cursor']);
-  // ASSERT: both fields round-trip through storage and syncLayout
-  assert.equal(reloaded.density, 'compact');
   assert.equal(reloaded.resetTimes, 'exact');
-  assert.equal(resynced.density, 'compact');
   assert.equal(resynced.resetTimes, 'exact');
   assert.deepEqual(resynced.cardOrder, ['cursor', 'anthropic']);
 }
 
 {
-  // ARRANGE: a layout with bogus values for the new fields
-  // ACT
-  const cleaned = syncLayout({ cardOrder: [], density: 'huge', resetTimes: 'maybe' }, ['anthropic']);
-  // ASSERT: syncLayout normalizes rather than passing junk through
-  assert.equal(cleaned.density, 'regular');
+  const cleaned = syncLayout({ cardOrder: [], resetTimes: 'maybe' }, ['anthropic']);
   assert.equal(cleaned.resetTimes, 'countdown');
 }
 
 // --- meterColor --------------------------------------------------------------
 
-assert.equal(meterColor('low'), 'blue');
-assert.equal(meterColor('mid'), 'yellow');
-assert.equal(meterColor('high'), 'yellow');
-assert.equal(meterColor('critical'), 'red');
-assert.equal(meterColor('nope'), 'blue');
+// Without a projection the bar reads what is left: blue with room, yellow as
+// it runs down, red near the limit.
+assert.equal(meterColor(100), 'blue');
+assert.equal(meterColor(50), 'blue');
+assert.equal(meterColor(49), 'yellow');
+assert.equal(meterColor(20), 'yellow');
+assert.equal(meterColor(19), 'red');
+assert.equal(meterColor(0), 'red');
+assert.equal(meterColor(80, null, true), 'red');
 assert.equal(meterColor(undefined), 'blue');
+assert.equal(meterColor(NaN), 'blue');
+// With one, the verdict against the pace line decides: the ratio and the gap
+// between the bar and the tick must both pass their threshold.
+{
+  // A row `used`% spent with `elapsed`% of its window gone.
+  const row = (used, elapsed) => {
+    const projectedPercent = used * 100 / elapsed;
+    return {
+      left: 100 - used,
+      pace: {
+        state: projectedPercent > 100 ? 'behind' : projectedPercent <= 90 ? 'ahead' : 'onTrack',
+        projectedPercent,
+        sparePercent: Math.round(100 - projectedPercent),
+        runsOutMs: null,
+        elapsedPercent: elapsed,
+      },
+    };
+  };
+  const verdict = (used, elapsed) => { const r = row(used, elapsed); return paceVerdict(r.pace, r.left); };
+  const color = (used, elapsed) => { const r = row(used, elapsed); return meterColor(r.left, r.pace); };
+  // Mid-window the ratio decides: 110% and 130% are the boundaries.
+  assert.equal(verdict(55, 50), 'calm'); // 110%, 5 pp
+  assert.equal(verdict(56, 50), 'over'); // 112%, 6 pp
+  assert.equal(color(60, 50), 'yellow'); // 120%
+  assert.equal(verdict(65, 50), 'over'); // 130%
+  assert.equal(verdict(66, 50), 'critical'); // 132%, 16 pp
+  assert.equal(color(62, 44.6), 'red'); // Codex, ~139%
+  assert.equal(color(84, 57.6), 'red'); // Cursor, ~146%
+  assert.equal(color(54, 67.9), 'blue'); // ~80%
+  // Early in a week one whole percent swings the ratio: the gap keeps it calm.
+  const early = 100 * 8 / 168; // eight hours into a week, ~4.8%
+  assert.equal(verdict(5, early), 'calm'); // ~105%
+  assert.equal(verdict(6, early), 'calm'); // ~126%, 1.2 pp
+  assert.equal(verdict(7, early), 'calm'); // ~147%, 2.2 pp
+  assert.equal(verdict(9, early), 'over'); // ~189%, 4.2 pp
+  assert.equal(verdict(10, early), 'critical'); // ~210%, 5.2 pp
+  assert.equal(color(7, early), 'blue');
+  // Past 130% but only 3-5 points over the tick is a look, not a run-out.
+  assert.equal(verdict(8, early), 'over'); // ~168%, 3.2 pp
+  // Nearly spent and over the line is critical whatever the margins...
+  assert.equal(verdict(92, 90), 'critical');
+  // ...but nearly spent on pace is not a run-out warning.
+  assert.equal(verdict(92, 97), 'calm');
+  assert.equal(color(92, 97), 'blue');
+  assert.equal(paceVerdict(null, 50), null);
+  // Notes: only critical warns of a run-out; over says by how much; calm over 100% has no spare.
+  const over = row(60, 50);
+  assert.equal(paceNote(over.pace, over.left, 0), '~20% over pace');
+  assert.equal(paceNote(over.pace, over.left, 0, { locale: 'pt-BR' }), '~20% acima do ritmo');
+  const hair = row(7, early);
+  assert.equal(paceNote(hair.pace, hair.left, 0), '~0% spare');
+  const ahead = row(40, 50);
+  assert.equal(paceNote(ahead.pace, ahead.left, 0), '~20% left at reset');
+  const critical = row(70, 50);
+  assert.equal(paceNote({ ...critical.pace, runsOutMs: 30 * 60_000 }, critical.left, 0), 'Limit in 30m');
+  assert.equal(paceNote(null, 50, 0), '');
+}
 
 // --- resetText / resetAlternate / formatResetExact ---------------------------
 
@@ -493,34 +714,62 @@ assert.equal(resetAlternate(badStampRow, 'exact', resetNow, utc), '');
   assert.equal(resetAlternate(sameDayRow, 'exact', resetNow, h24), 'Resets in 6h 38m');
 }
 
-// --- layout: timeFormat / alwaysShowPace ------------------------------------
+// --- layout: timeFormat / alwaysShowPace / usageGoal --------------------------
 
 {
   // ARRANGE / ACT
   const empty = emptyLayout();
-  const set = normalizeLayout({ timeFormat: '24', alwaysShowPace: true });
-  const junk = normalizeLayout({ timeFormat: 'military', alwaysShowPace: 'yes' });
+  const set = normalizeLayout({ timeFormat: '24', alwaysShowPace: true, usageGoal: true });
+  const junk = normalizeLayout({ timeFormat: 'military', alwaysShowPace: 'yes', usageGoal: 'yes' });
   // ASSERT: defaults, valid values, and junk
   assert.equal(empty.timeFormat, 'auto');
   assert.equal(empty.alwaysShowPace, false);
+  assert.equal(empty.usageGoal, false);
   assert.equal(set.timeFormat, '24');
   assert.equal(set.alwaysShowPace, true);
+  assert.equal(set.usageGoal, true);
   assert.equal(junk.timeFormat, 'auto');
   assert.equal(junk.alwaysShowPace, false);
+  assert.equal(junk.usageGoal, false);
   assert.equal(normalizeLayout({ timeFormat: '12' }).timeFormat, '12');
 
   // ASSERT: both survive storage and syncLayout
   const store = memoryStorage();
-  saveLayout(store, { cardOrder: ['cursor'], timeFormat: '12', alwaysShowPace: true });
+  saveLayout(store, { cardOrder: ['cursor'], timeFormat: '12', alwaysShowPace: true, usageGoal: true });
   const reloaded = loadLayout(store);
   assert.equal(reloaded.timeFormat, '12');
   assert.equal(reloaded.alwaysShowPace, true);
+  assert.equal(reloaded.usageGoal, true);
   const synced = syncLayout(reloaded, ['cursor']);
   assert.equal(synced.timeFormat, '12');
   assert.equal(synced.alwaysShowPace, true);
-  const cleaned = syncLayout({ cardOrder: [], timeFormat: 'nope', alwaysShowPace: 1 }, ['cursor']);
+  assert.equal(synced.usageGoal, true);
+  const cleaned = syncLayout({ cardOrder: [], timeFormat: 'nope', alwaysShowPace: 1, usageGoal: 1 }, ['cursor']);
   assert.equal(cleaned.timeFormat, 'auto');
   assert.equal(cleaned.alwaysShowPace, false);
+  assert.equal(cleaned.usageGoal, false);
+}
+
+// The goal follows wall-clock progress even when no usage has been reported.
+{
+  const end = Date.parse('2026-09-24T15:00:00Z');
+  for (const seconds of [18_000, 604_800, 2_592_000]) {
+    const row = { label: 'Session', resetAt: new Date(end).toISOString(), window: seconds, usedPercent: 0 };
+    assert.deepEqual(usageGoal(row, end - seconds * 1000), { percent: 0, estimated: false });
+    assert.deepEqual(usageGoal(row, end - seconds * 500), { percent: 50, estimated: false });
+    assert.deepEqual(usageGoal(row, end), { percent: 100, estimated: false });
+    assert.equal(usageGoal(row, end + 60_000), null);
+  }
+  const monthly = { label: 'Monthly', resetAt: '2026-03-31T12:00:00Z', window: 0 };
+  assert.deepEqual(usageGoal(monthly, Date.parse('2026-02-28T12:00:00Z')), { percent: 0, estimated: true });
+  assert.deepEqual(usageGoal(monthly, Date.parse('2026-03-31T12:00:00Z')), { percent: 100, estimated: true });
+  assert.equal(usageGoal({ ...monthly, label: 'Weekly' }, end), null);
+  assert.equal(usageGoal({ ...monthly, resetAt: 'bad' }, end), null);
+  // The goal reads like the meter: what should be spent in Used mode, what should remain in Left.
+  assert.equal(usageGoalPercent({ percent: 97, estimated: false }, 'used'), 97);
+  assert.equal(usageGoalPercent({ percent: 97, estimated: false }, 'left'), 3);
+  assert.equal(usageGoalPercent({ percent: 33, estimated: true }, 'left'), 67);
+  assert.equal(usageGoalPercent(null, 'left'), null);
 }
 
 // --- host payload: shortcut / updates / update / window_secs ------------------
@@ -550,6 +799,7 @@ assert.equal(resetAlternate(badStampRow, 'exact', resetNow, utc), '');
   assert.equal(full.updates, 'auto');
   assert.deepEqual(full.update, {
     error: '',
+    installable: false,
     state: 'downloading',
     url: 'https://github.com/akitaonrails/ai-usagebar/releases/tag/v1.12.0',
     version: 'v1.12.0',
@@ -674,12 +924,24 @@ assert.equal(resetAlternate(badStampRow, 'exact', resetNow, utc), '');
     'Limit today at 12:30 PM',
   );
 
-  // behind without a run-out instant (the limit is already spent) has no text: the flame alone
+  // a spent meter (100%, "Limit reached") has no pace at all: no tick, no text, not visible
   const spent = pace(row(100, 2 * 3600_000), now);
-  assert.equal(spent.state, 'behind');
-  assert.equal(spent.runsOutMs, null);
+  assert.equal(spent, null);
+  assert.equal(paceTickPercent(spent, 'used'), null);
+  assert.equal(paceTickPercent(spent, 'left'), null);
   assert.equal(paceText(spent, now), '');
-  assert.equal(paceText(spent, now, { resetTimes: 'exact', timeZone: 'UTC' }), '');
+  assert.equal(paceVisible(spent, { alwaysShowPace: true }), false);
+  assert.equal(pace(row(100.5, 2 * 3600_000), now), null); // past the limit is still spent
+  // one percent short of the limit is still a live row: behind, with the tick on the bar
+  const almostSpent = pace(row(99, 2 * 3600_000), now);
+  assert.equal(almostSpent.state, 'behind');
+  assert.equal(almostSpent.elapsedPercent, 40);
+  assert.equal(paceTickPercent(almostSpent, 'used'), 40);
+  assert.equal(paceTickPercent(almostSpent, 'left'), 60);
+  // behind without a run-out instant has no text: the flame alone
+  const noRunOut = { state: 'behind', sparePercent: -100, projectedPercent: 200, runsOutMs: null, elapsedPercent: 40 };
+  assert.equal(paceText(noRunOut, now), '');
+  assert.equal(paceText(noRunOut, now, { resetTimes: 'exact', timeZone: 'UTC' }), '');
 
   // ASSERT: the tick follows the meter's reading — elapsed in Used mode, remaining in Left mode
   assert.equal(paceTickPercent(behind, 'used'), 40);
@@ -763,6 +1025,39 @@ assert.equal(resetAlternate(badStampRow, 'exact', resetNow, utc), '');
   assert.equal(shortcutFromKeyEvent(null), null);
 }
 
+// --- displayShortcut -------------------------------------------------------------
+
+{
+  // macOS shows the canonical "Win"/"Alt" modifiers as "Cmd"/"Option"; the stored value is untouched.
+  assert.equal(displayShortcut('Win+U', 'macos'), 'Cmd+U');
+  assert.equal(displayShortcut('Alt+U', 'macos'), 'Option+U');
+  assert.equal(displayShortcut('Ctrl+Alt+Shift+Win+K', 'macos'), 'Ctrl+Option+Shift+Cmd+K');
+  assert.equal(displayShortcut('Win+U', 'windows'), 'Win+U');
+  assert.equal(displayShortcut('Win+U', ''), 'Win+U');
+  assert.equal(displayShortcut('', 'macos'), '');
+  assert.equal(displayShortcut(undefined, 'macos'), '');
+}
+
+// --- ShortcutRecorder wiring guard -----------------------------------------------
+// The macOS tray is a WKWebView, and WebKit does not focus a <button> when it is
+// clicked (WebKit bug 22261), so the recorder must capture the chord on `document`
+// while recording rather than on the button. There is no DOM runner here to catch a
+// regression to a button-local handler, so pin the wiring.
+{
+  const source = readFileSync(
+    new URL('./src/components/ShortcutRecorder.tsx', import.meta.url),
+    'utf8',
+  );
+  assert.ok(
+    source.includes('document.addEventListener("keydown"'),
+    'ShortcutRecorder must listen for keydown on document',
+  );
+  assert.ok(
+    !source.includes('onKeyDown={'),
+    'ShortcutRecorder must not put the recording handler on the button',
+  );
+}
+
 // --- update status helpers -------------------------------------------------------
 
 {
@@ -797,7 +1092,45 @@ assert.equal(resetAlternate(badStampRow, 'exact', resetNow, utc), '');
   assert.equal(updateBannerPending(withUpdate('available')), true);
   assert.equal(updateBannerPending(withUpdate('failed')), true);
   assert.equal(updateBannerPending(withUpdate('checking')), false);
+  assert.equal(updateBannerPending(withUpdate('failed', { version: '' })), false, 'a failed check is not an update');
   assert.equal(updateBannerPending(null), false);
+
+  // One action table for the banner and the dialog.
+  const repo = 'https://github.com/akitaonrails/ai-usagebar';
+  const release = 'https://github.com/akitaonrails/ai-usagebar/releases/tag/v1.11.0';
+  assert.equal(updateAction(null, repo).cmd, 'check-update');
+  assert.equal(updateAction(withUpdate('checking').update, repo).busy, true);
+  assert.equal(updateAction(withUpdate('downloading').update, repo).label, 'Downloading…');
+  assert.deepEqual(updateAction(withUpdate('available', { installable: true }).update, repo), {
+    busy: false,
+    cmd: 'install-update',
+    label: 'Install Update',
+    url: '',
+  });
+  // Not installable here: never a dead Install, always the release page.
+  assert.deepEqual(updateAction(withUpdate('available', { url: release }).update, repo), {
+    busy: false,
+    cmd: 'open-url',
+    label: 'View Release',
+    url: release,
+  });
+  assert.equal(updateAction(withUpdate('available').update, repo).url, repo + '/releases/latest');
+  assert.equal(updateAction(withUpdate('failed').update, repo).cmd, 'install-update');
+  assert.equal(updateMessage(withUpdate('available', { installable: true }).update), 'AI Usage v1.11.0 is ready to install.');
+  assert.match(updateMessage(withUpdate('available').update), /release page/);
+  assert.equal(updateMessage(withUpdate('failed', { error: 'offline' }).update), "Couldn't update: offline");
+  assert.equal(updateMessage(withUpdate('failed', { error: 'HTTP 503', version: '' }).update), "Couldn't check: HTTP 503");
+  assert.equal(updateMessage(null), '');
+  // The banner leaves progress to its button: the sentence keeps naming the release.
+  for (const state of ['checking', 'downloading', 'installing']) {
+    const msg = bannerMessage(withUpdate(state, { installable: true }).update);
+    assert.equal(msg, 'AI Usage v1.11.0 is ready to install.', state);
+    assert.doesNotMatch(msg, /Updating|Downloading|Installing|Looking/, state);
+  }
+  assert.equal(bannerMessage(withUpdate('failed', { error: 'offline' }).update), "Couldn't update: offline");
+  assert.equal(bannerMessage(null), '');
+  assert.equal(parseHostPayload({ update: { state: 'available', installable: 'yes' } }).update.installable, false);
+  assert.equal(parseHostPayload({ update: { state: 'available', installable: true } }).update.installable, true);
 
   assert.equal(updateModeLabel('auto'), 'Automatic');
   assert.equal(updateModeLabel('notify'), 'Notify me');
@@ -845,6 +1178,8 @@ assert.equal(resetAlternate(badStampRow, 'exact', resetNow, utc), '');
   });
   const [usageCard] = projectCards(usageNamed, 0);
   assert.deepEqual(usageCard.rows.map((r) => r.label), ['Weekly', 'Grok Build', 'Grok Chat']);
+  // Ungrouped rows are quota windows the Native tab may headline.
+  assert.deepEqual(usageCard.rows.map((r) => r.grouped), [false, false, false]);
 
   // ASSERT: a plan equal to the title vanishes; a prefixed plan keeps its tail
   assert.equal(displayPlan(personal.title, personal.plan), '');
@@ -994,6 +1329,59 @@ assert.equal(quotaAlternate(null, 'left'), '');
   assert.equal(visibleRowsFor(projectCards(repeated, 0)[0], { collapsed: false }).length, 2);
 }
 
+// --- metric-level groups (#213's report field): SuperGrok slices, Claude CLI sessions -----
+
+{
+  // ARRANGE: a Claude entry carrying the #255 session rows — grouped by the
+  // report's own field, not a positional heading — plus one duplicate title.
+  const claude = parseHostPayload({
+    entries: [{ id: 'anthropic', display_name: 'Claude', sections: [
+      { type: 'metric', label: 'Session (5h)', percent: 29, severity: 'low', value: '29%' },
+      { type: 'spacer' },
+      { type: 'metric', label: 'ship the release', percent: 90, severity: 'critical',
+        value: '90%', group: 'Sessions' },
+      { type: 'metric', label: 'ship the release', percent: 0, severity: 'low',
+        value: 'compacted', group: 'Sessions' },
+      { type: 'text', label: '', value: '… and 4 more sessions' },
+    ] }],
+  });
+
+  // ASSERT: normalization keeps the field, and the rows group exactly as a
+  // positional heading would have — "(Sessions)" label suffix, group-aware
+  // keys, severity passthrough — with no heading row of its own. A repeated
+  // session title dedupes on the key (#2), the label untouched.
+  const normalized = claude.entries[0].sections.find((s) => s.group === 'Sessions');
+  assert.ok(normalized, 'metric group survives normalization');
+  const card = projectCards(claude, 0)[0];
+  assert.deepEqual(card.rows.map((r) => [r.label, r.key]), [
+    ['Session', 'metric:Session (5h)'],
+    ['ship the release (Sessions)', 'metric:ship the release (Sessions)'],
+    ['ship the release (Sessions)', 'metric:ship the release (Sessions) #2'],
+    ['', 'text:'],
+  ]);
+  assert.equal(card.rows[3].value, '… and 4 more sessions');
+  assert.equal(card.rows[1].severity, 'critical');
+  assert.equal(card.rows[1].usedPercent, 90);
+  assert.equal(card.rows[2].value, 'compacted');
+  assert.equal(new Set(card.rows.map(rowKey)).size, card.rows.length);
+  assert.equal(metricCount(card), 3);
+
+  // ASSERT: the field wins over a positional heading still in effect, so a
+  // producer cannot accidentally file a session under the previous group.
+  const superimposed = parseHostPayload({
+    entries: [{ id: 'supergrok', display_name: 'SuperGrok', sections: [
+      { type: 'text', label: 'Breakdown', value: '' },
+      { type: 'metric', label: 'Grok Build', percent: 94, severity: 'low', group: 'Breakdown' },
+    ] }],
+  });
+  const grok = projectCards(superimposed, 0)[0];
+  assert.deepEqual(grok.rows.map((r) => [r.label, r.key]), [
+    ['Grok Build (Breakdown)', 'metric:Grok Build (Breakdown)'],
+  ]);
+  // A grouped row is marked, so the Native tab never headlines it over a quota window.
+  assert.equal(grok.rows[0].grouped, true);
+}
+
 // --- vendor warnings become card.warning, and errors carry an action ------------
 
 {
@@ -1056,6 +1444,45 @@ assert.equal(headlineLabel({ kind: 'text', label: 'Balance', value: '$1' }, 'lef
 assert.equal(headlineAlternate({ kind: 'metric', leftPercent: 0, usedPercent: 100 }, 'left'), '100% used');
 assert.equal(headlineAlternate({ kind: 'metric', leftPercent: 81, usedPercent: 19 }, 'used'), '81% left');
 assert.equal(headlineAlternate(null, 'left'), '');
+
+// A metric that names `value` as its headline draws the money figure, like the
+// Omarchy bar; the percentage and the report's detail move to the hover text.
+// `percent` keeps the used/left toggle, and an older report without the field
+// is a percentage.
+const tank = (headline) => projectCards(parseHostPayload({
+  version: '1.21.0',
+  entries: [{
+    id: 'deepseek',
+    display_name: 'DeepSeek',
+    sections: [{
+      type: 'metric',
+      label: 'Balance',
+      percent: 40,
+      value: headline === 'value' ? '$12.00' : '40%',
+      detail: headline === 'value' ? '40% of $20.00 used ($12.00 left)' : '$12.00 of $20.00 left (40% used)',
+      severity: 'low',
+      ...(headline ? { headline } : {}),
+    }],
+  }],
+}), 0)[0].rows[0];
+const amountRow = tank('value');
+assert.equal(amountRow.headline, 'value');
+assert.equal(headlineLabel(amountRow, 'left'), '$12.00');
+assert.equal(headlineLabel(amountRow, 'used'), '$12.00');
+assert.equal(headlineAlternate(amountRow, 'used'), '40% used · 40% of $20.00 used ($12.00 left)');
+assert.equal(headlineAlternate(amountRow, 'left'), '60% left · 40% of $20.00 used ($12.00 left)');
+const percentRow = tank('percent');
+assert.equal(percentRow.headline, 'percent');
+assert.equal(headlineLabel(percentRow, 'used'), '40% used');
+assert.equal(headlineAlternate(percentRow, 'used'), '60% left');
+assert.equal(tank(undefined).headline, 'percent');
+assert.equal(headlineLabel(tank(undefined), 'left'), '60% left');
+// A `value` headline with no value to draw falls back to the percentage
+// rather than an empty button.
+assert.equal(projectCards(parseHostPayload({
+  version: '1.21.0',
+  entries: [{ id: 'deepseek', sections: [{ type: 'metric', label: 'Balance', percent: 40, value: '', headline: 'value' }] }],
+}), 0)[0].rows[0].headline, 'percent');
 
 // --- condensedTextRowIndexes -------------------------------------------------
 
@@ -1129,7 +1556,7 @@ assert.equal(metricCount(null), 0);
   assert.doesNotThrow(() => sendCommand('refresh', { x: 1 }));
 }
 
-// --- resolvedTheme / applyDensity --------------------------------------------
+// --- resolvedTheme --------------------------------------------
 
 assert.equal(resolvedTheme('dark'), 'dark');
 assert.equal(resolvedTheme('light'), 'light');
@@ -1157,20 +1584,336 @@ assert.equal(resolvedTheme('light'), 'light');
 assert.equal(resolvedTheme('system'), 'light');
 
 {
-  // ARRANGE: a minimal document
-  globalThis.document = { documentElement: { dataset: {} } };
-  try {
-    // ACT
-    applyDensity('compact');
-    assert.equal(globalThis.document.documentElement.dataset.density, 'compact');
-    applyDensity('anything-else');
-    // ASSERT
-    assert.equal(globalThis.document.documentElement.dataset.density, 'regular');
-  } finally {
-    delete globalThis.document;
+  const layout = emptyLayout();
+  assert.equal(layout.stripStyle, 'bars');
+  assert.deepEqual(layout.stars, {});
+  const restored = normalizeLayout({
+    stripStyle: 'text',
+    stars: { anthropic: ['metric:Weekly', 'metric:Session', 'metric:Extra'] },
+  });
+  assert.equal(restored.stripStyle, 'bars');
+  assert.deepEqual(restored.stars.anthropic, ['metric:Weekly', 'metric:Session']);
+  assert.equal(MAX_STARS_PER_PROVIDER, 2);
+}
+
+{
+  const payload = parseHostPayload({
+    entries: [{
+      id: 'anthropic',
+      display_name: 'Claude',
+      sections: [
+        { type: 'metric', label: 'Weekly', percent: 19 },
+        { type: 'metric', label: 'Session', percent: 41 },
+        { type: 'text', label: 'Extra', value: '$1' },
+      ],
+    }],
+  });
+  const cards = projectCards(payload, 0);
+  const stars = defaultStars(cards);
+  assert.deepEqual(stars.anthropic, ['metric:Weekly', 'metric:Session']);
+  assert.equal(isStarred(stars, 'anthropic', 'metric:Weekly'), true);
+  const added = toggleStar(stars, 'anthropic', 'metric:Weekly');
+  assert.equal(isStarred(added.stars, 'anthropic', 'metric:Weekly'), false);
+  assert.equal(added.error, '');
+  const capped = toggleStar(stars, 'anthropic', 'text:Extra');
+  assert.equal(capped.error, 'Up to 2 stars per provider');
+  assert.deepEqual(capped.stars, stars);
+  const seeded = seedStars(emptyLayout(), cards);
+  assert.deepEqual(seeded.stars, stars);
+  const kept = seedStars(seeded, cards);
+  assert.equal(kept, seeded);
+  assert.deepEqual(stripCommand(seeded, cards), {
+    style: 'bars',
+    stars,
+    order: ['anthropic'],
+    show_as: 'left',
+    hidden_rows: {},
+  });
+  // The menu bar follows the Used/Left reading, so the strip message carries it.
+  assert.equal(stripCommand({ ...seeded, showAs: 'used' }, cards).show_as, 'used');
+  assert.equal(stripCommand({ ...seeded, showAs: 'sideways' }, cards).show_as, 'left');
+}
+
+{
+  const payload = parseHostPayload({
+    entries: [
+      { id: 'anthropic', display_name: 'Claude', sections: [{ type: 'metric', label: 'Weekly', percent: 10 }] },
+      { id: 'openai', display_name: 'Codex', sections: [{ type: 'metric', label: 'Codex weekly', percent: 2 }] },
+    ],
+  });
+  const cards = projectCards(payload, 0);
+  const layout = {
+    ...emptyLayout(),
+    cardOrder: ['openai', 'anthropic'],
+    stars: {
+      anthropic: ['metric:Weekly'],
+      openai: ['metric:Codex weekly'],
+    },
+  };
+  assert.deepEqual(stripCommand(layout, cards).order, ['openai', 'anthropic']);
+}
+
+{
+  // A metric switched off in Customize does not count toward the macOS name chip's
+  // highest window: the strip message names it, under the key the host derives
+  // (src/tray/strip.rs metric_key). A hidden text row is not a metric and stays out.
+  const payload = parseHostPayload({
+    entries: [{
+      id: 'zai',
+      display_name: 'Z.AI',
+      sections: [
+        { type: 'metric', label: 'Session (5h)', percent: 0 },
+        { type: 'metric', label: 'Weekly', percent: 0 },
+        { type: 'metric', label: 'MCP tools (monthly)', percent: 18 },
+        { type: 'text', label: 'Plan', value: 'Pro' },
+      ],
+    }],
+  });
+  const cards = projectCards(payload, 0);
+  const zai = cards[0];
+  let prefs = setRowEnabled(prefsForCard(zai, emptyLayout()), 'metric:MCP tools (monthly)', false);
+  prefs = setRowEnabled(prefs, 'text:Plan', false);
+  const layout = { ...emptyLayout(), rows: { zai: prefs } };
+  assert.deepEqual(hiddenMetricKeys(zai, layout), ['metric:MCP tools (monthly)']);
+  assert.deepEqual(stripCommand(layout, cards).hidden_rows, { zai: ['metric:MCP tools (monthly)'] });
+  // Switched back on, nothing is hidden.
+  const shown = { ...layout, rows: { zai: setRowEnabled(prefs, 'metric:MCP tools (monthly)', true) } };
+  assert.deepEqual(hiddenMetricKeys(zai, shown), []);
+  assert.deepEqual(stripCommand(shown, cards).hidden_rows, {});
+  // hideExtras switches non-metric rows off by default; it never hides a metric.
+  assert.deepEqual(stripCommand({ ...emptyLayout(), hideExtras: true }, cards).hidden_rows, {});
+}
+
+{
+  assert.equal(expirySeverity(1_000 + 8 * 24 * 3600 * 1000, 1_000), 'blue');
+  assert.equal(expirySeverity(1_000 + 3 * 24 * 3600 * 1000, 1_000), 'yellow');
+  assert.equal(expirySeverity(1_000 + 2 * 3600 * 1000, 1_000), 'red');
+  assert.equal(expirySeverity(500, 1_000), 'red');
+  // A host that sends `reset_credits` without the text block still gets the
+  // row, and it starts On Demand like every non-metric row.
+  const payload = parseHostPayload({
+    entries: [{
+      id: 'openai',
+      display_name: 'Codex',
+      reset_credits: { available: 2, credits: [{ expires_at: '2026-10-03T23:00:00Z' }] },
+      sections: [
+        { type: 'metric', label: 'Weekly', percent: 10, reset_at: '2026-10-01T00:00:00Z' },
+      ],
+    }],
+  });
+  const [card] = projectCards(payload, 0);
+  assert.equal(card.resetCredits.available, 2);
+  const resets = card.rows.find((row) => row.kind === 'resetCredits');
+  assert.equal(resets.label, 'Rate Limit Resets');
+  assert.equal(resets.available, 2);
+  assert.equal(resets.credits.length, 1);
+  assert.equal(card.rows.filter((row) => row.kind === 'resetCredits').length, 1);
+  const prefs = defaultRowPrefs(card.rows);
+  assert.ok(prefs.demand.indexOf('resetCredits:Rate Limit Resets') >= 0);
+  assert.ok(prefs.always.indexOf('resetCredits:Rate Limit Resets') < 0);
+}
+
+{
+  assert.equal(isHttpUrl('https://status.anthropic.com/'), true);
+  assert.equal(isHttpUrl('javascript:alert(1)'), false);
+  const claude = providerLinks('anthropic');
+  assert.equal(claude.length, 2);
+  assert.equal(claude[0].label, 'Status');
+  assert.equal(claude[1].label, 'Dashboard');
+  const codex = providerLinks('openai@work');
+  assert.equal(codex[0].label, 'Status');
+  assert.equal(codex[1].label, 'Dashboard');
+  assert.equal(providerLinks('unknown-vendor').length, 0);
+  const grok = providerLinks('supergrok');
+  assert.equal(grok.length, 1);
+  assert.equal(grok[0].label, 'Usage');
+  assert.ok(grok[0].url.indexOf('https://grok.com/') === 0);
+}
+
+{
+  assert.equal(prettyMetricLabel('anthropic', 'Session (5h)'), 'Session');
+  assert.equal(prettyMetricLabel('anthropic', 'Weekly (7d)'), 'Weekly');
+  assert.equal(prettyMetricLabel('anthropic', 'Fable (7d)'), 'Fable');
+  assert.equal(prettyMetricLabel('openai', 'Codex weekly'), 'Weekly');
+  assert.equal(prettyMetricLabel('openai', 'Codex 5h'), 'Session');
+  assert.equal(prettyMetricLabel('cursor', 'Cursor Models'), 'Cursor Models');
+  assert.equal(prettyMetricLabel('antigravity', 'Gemini', 'Session'), 'Gemini (Session)');
+  const payload = parseHostPayload({
+    entries: [{
+      id: 'openai',
+      display_name: 'Codex',
+      sections: [
+        { type: 'metric', label: 'Codex weekly', percent: 28 },
+        { type: 'metric', label: 'Codex 5h', percent: 0 },
+      ],
+    }],
+  });
+  const [card] = projectCards(payload, 0);
+  assert.equal(card.rows[0].label, 'Weekly');
+  assert.equal(card.rows[0].key, 'metric:Codex weekly');
+  assert.equal(card.rows[1].label, 'Session');
+  assert.equal(card.rows[1].key, 'metric:Codex 5h');
+}
+
+// Account switch: only the macOS host reports switchable logins, keyed by
+// vendor; each named card finds its own label and nothing else does.
+{
+  const payload = parseHostPayload(JSON.stringify({
+    entries: [],
+    accounts: {
+      anthropic: { active: 'main', labels: ['main', 'work'], target: 'work', switching: false, error: 'no stored credential' },
+      openai: { active: '', labels: ['main', 'work'], target: 'work', switching: true, error: '' },
+      cursor: { active: 'x', labels: ['x'] },
+      grok: 'not an object',
+    },
+  }));
+  assert.deepEqual(Object.keys(payload.accounts).sort(), ['anthropic', 'openai']);
+
+  const active = accountSwitchFor('anthropic@main', payload.accounts);
+  assert.equal(active.active, true);
+  assert.equal(active.error, '');
+
+  const failed = accountSwitchFor('anthropic@work', payload.accounts);
+  assert.equal(failed.active, false);
+  assert.equal(failed.error, 'no stored credential');
+
+  const running = accountSwitchFor('openai@work', payload.accounts);
+  assert.equal(running.switching, true);
+  assert.equal(running.busy, false);
+  const waiting = accountSwitchFor('openai@main', payload.accounts);
+  assert.equal(waiting.busy, true);
+  assert.equal(waiting.switching, false);
+
+  assert.equal(accountSwitchFor('anthropic', payload.accounts), null);
+  assert.equal(accountSwitchFor('anthropic@unknown', payload.accounts), null);
+  assert.equal(accountSwitchFor('cursor@x', payload.accounts), null);
+  assert.equal(accountSwitchFor('openai@work', {}), null);
+  assert.deepEqual(parseHostPayload(JSON.stringify({ entries: [] })).accounts, {});
+}
+
+// Every card that renders keeps its switch control: as many accounts as there
+// are cards, and a label longer than a card id matched through the id's cut.
+{
+  const many = Array.from({ length: 63 }, (_, i) => `acct${i}`);
+  const long = 'x'.repeat(200);
+  const payload = parseHostPayload(JSON.stringify({
+    entries: [{ id: `openai@${long}` }],
+    accounts: {
+      openai: { active: long, labels: [...many, long] },
+      anthropic: { active: '', labels: [`${long}-a`, `${long}-b`] },
+    },
+  }));
+  assert.equal(accountSwitchFor('openai@acct62', payload.accounts).label, 'acct62');
+  const cardId = payload.entries[0].id;
+  assert.notEqual(cardId, `openai@${long}`);
+  const control = accountSwitchFor(cardId, payload.accounts);
+  assert.equal(control.label, long);
+  assert.equal(control.active, true);
+  // Two labels that share the cut id are ambiguous, so neither card offers one.
+  assert.equal(accountSwitchFor(cardId.replace('openai', 'anthropic'), payload.accounts), null);
+}
+
+// Early in a window there is no pace yet: the meter says "Estimating…". The wait
+// is 1% of the window, capped at an hour so long windows do not sit for hours.
+{
+  const now = Date.parse('2026-09-23T15:00:00Z');
+  const week = 604800;
+  const at = (window, elapsedSecs, used = 1) => ({
+    usedPercent: used,
+    resetAt: new Date(now + (window - elapsedSecs) * 1000).toISOString(),
+    window,
+  });
+  const young = at(week, 1800); // 30m into a week
+  assert.equal(pace(young, now), null);
+  assert.equal(paceWarmupMs(young, now), 1800_000);
+  assert.equal(paceWarmupText(young, now), 'Estimating…');
+  assert.equal(paceWarmupHint(young), 'The pace shows after the first 1h of each window.');
+  // A week or a month waits an hour, not 1h 41m or 7h 12m.
+  assert.notEqual(pace(at(week, 3600), now), null);
+  assert.notEqual(pace(at(2592000, 3600), now), null);
+  // A 5h session keeps its 3 minutes.
+  assert.equal(pace(at(18000, 170), now), null);
+  assert.equal(paceWarmupHint(at(18000, 170)), 'The pace shows after the first 3m of each window.');
+  // Nothing spent, no window, or already projecting: no warm-up note.
+  assert.equal(paceWarmupText({ ...young, usedPercent: 0 }, now), '');
+  assert.equal(paceWarmupText({ ...young, window: 0 }, now), '');
+  assert.equal(paceWarmupText(at(week, 7200), now), '');
+}
+
+// Star keys are a contract with the tray host (src/tray/strip.rs metric_key),
+// which reads the same fixture: a rule changed here alone fails its test there.
+{
+  const fixture = JSON.parse(readFileSync(new URL('../../tests/fixtures/strip_metric_keys.json', import.meta.url), 'utf8'));
+  assert.ok(fixture.cases.length > 0);
+  for (const c of fixture.cases) {
+    assert.equal(metricRowKey(c.id, c.label, c.group || ''), c.key, JSON.stringify(c));
   }
 }
-// no document: no-op
-assert.doesNotThrow(() => applyDensity('compact'));
+
+// --- options menu labels / native menu action --------------------------------
+
+{
+  // The native tray menu reuses the popover's Options labels in the popover's
+  // current language; the host publishes them via the `menu-labels` command.
+  assert.deepEqual(optionsMenuLabels('en'), {
+    customize: 'Customize',
+    settings: 'Settings',
+    refresh: 'Refresh',
+    detect: 'Detect Providers',
+    openTui: 'Open TUI',
+    startAtLogin: 'Start at Login',
+    checkForUpdates: 'Check for Updates…',
+    about: 'About',
+    quit: 'Quit',
+  });
+  assert.deepEqual(optionsMenuLabels('pt-BR'), {
+    customize: 'Personalizar',
+    settings: 'Configurações',
+    refresh: 'Atualizar',
+    detect: 'Detectar provedores',
+    openTui: 'Abrir TUI',
+    startAtLogin: 'Iniciar ao entrar',
+    checkForUpdates: 'Verificar atualizações…',
+    about: 'Sobre',
+    quit: 'Sair',
+  });
+  assert.deepEqual(optionsMenuLabels('ko'), {
+    customize: '사용자화',
+    settings: '설정',
+    refresh: '새로 고침',
+    detect: '제공자 감지',
+    openTui: 'TUI 열기',
+    startAtLogin: '로그인 시 시작',
+    checkForUpdates: '업데이트 확인…',
+    about: '정보',
+    quit: '종료',
+  });
+  assert.deepEqual(optionsMenuLabels('es'), {
+    customize: 'Personalizar',
+    settings: 'Ajustes',
+    refresh: 'Actualizar',
+    detect: 'Detectar proveedores',
+    openTui: 'Abrir TUI',
+    startAtLogin: 'Abrir al iniciar sesión',
+    checkForUpdates: 'Buscar actualizaciones…',
+    about: 'Acerca de',
+    quit: 'Salir',
+  });
+  // Unknown locales resolve to English, like the `lang` helper.
+  assert.deepEqual(optionsMenuLabels('de'), optionsMenuLabels('en'));
+
+  // menuAction whitelists the four native-menu actions; anything else — a
+  // case/spacing variant, a non-string, the empty string — is ignored ("").
+  assert.equal(menuAction('customize'), 'customize');
+  assert.equal(menuAction('settings'), 'settings');
+  assert.equal(menuAction('about'), 'about');
+  assert.equal(menuAction('check-updates'), 'check-updates');
+  assert.equal(menuAction('refresh'), '');
+  assert.equal(menuAction('Settings'), '');
+  assert.equal(menuAction(' about'), '');
+  assert.equal(menuAction(''), '');
+  assert.equal(menuAction(undefined), '');
+  assert.equal(menuAction(42), '');
+}
 
 console.log('ok');

@@ -48,7 +48,7 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
 use crate::error::{AppError, Result};
-use crate::usage::CursorSnapshot;
+use crate::usage::{CursorCreditGrant, CursorSnapshot};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct UsageSummary {
@@ -183,6 +183,7 @@ pub fn to_snapshot(resp: UsageSummary) -> Result<CursorSnapshot> {
             on_demand_limit_cents: None,
             reset_at: Some(reset_at),
             cycle_start,
+            credits: Vec::new(),
         });
     }
 
@@ -210,6 +211,7 @@ pub fn to_snapshot(resp: UsageSummary) -> Result<CursorSnapshot> {
             on_demand_limit_cents,
             reset_at: Some(reset_at),
             cycle_start,
+            credits: Vec::new(),
         });
     }
 
@@ -245,6 +247,7 @@ pub fn to_snapshot(resp: UsageSummary) -> Result<CursorSnapshot> {
             on_demand_limit_cents,
             reset_at: Some(reset_at),
             cycle_start,
+            credits: Vec::new(),
         });
     }
 
@@ -276,6 +279,93 @@ fn title_case(s: &str) -> String {
     match chars.next() {
         Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
         None => "Cursor".to_string(),
+    }
+}
+
+/// `GetClientVisibleCreditGrants` — the spending-page card. A body that is
+/// not that shape, including an error document, is no grants: the caller has
+/// already decided a failed grant call must not take down the usage bars.
+///
+/// Connect-RPC JSON encodes proto3 `int64` as either a number or a string.
+/// One bad grant is dropped; its siblings are kept. Soonest expiry comes first
+/// so a tooltip lists the grant that lapses next.
+pub fn parse_credit_grants(bytes: &[u8]) -> Vec<CursorCreditGrant> {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return Vec::new();
+    };
+    let Some(items) = value.get("grants").and_then(serde_json::Value::as_array) else {
+        return Vec::new();
+    };
+    let mut grants: Vec<CursorCreditGrant> = items.iter().filter_map(grant_from_value).collect();
+    grants.sort_by(|a, b| match (a.expires_at, b.expires_at) {
+        (Some(left), Some(right)) => left.cmp(&right),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    });
+    grants
+}
+
+fn grant_from_value(value: &serde_json::Value) -> Option<CursorCreditGrant> {
+    let obj = value.as_object()?;
+    let total_cents = json_i64(obj, &["totalCents", "total_cents"])?;
+    let remaining_cents = json_i64(obj, &["remainingCents", "remaining_cents"])?;
+    if total_cents <= 0 || remaining_cents < 0 {
+        return None;
+    }
+    let expires_at = match json_field(obj, &["expiresAtMs", "expires_at_ms"]) {
+        None | Some(serde_json::Value::Null) => None,
+        Some(raw) => {
+            let ms = json_i64_value(raw)?;
+            if ms <= 0 {
+                None
+            } else {
+                Some(DateTime::from_timestamp_millis(ms)?)
+            }
+        }
+    };
+    let display_name = json_field(obj, &["displayName", "display_name"])
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .chars()
+        .take(160)
+        .collect();
+    Some(CursorCreditGrant {
+        remaining_cents,
+        total_cents,
+        expires_at,
+        display_name,
+    })
+}
+
+fn json_field<'a>(
+    obj: &'a serde_json::Map<String, serde_json::Value>,
+    names: &[&str],
+) -> Option<&'a serde_json::Value> {
+    names.iter().find_map(|name| obj.get(*name))
+}
+
+fn json_i64(obj: &serde_json::Map<String, serde_json::Value>, names: &[&str]) -> Option<i64> {
+    json_i64_value(json_field(obj, names)?)
+}
+
+/// Proto3 JSON `int64`: a number, or a decimal string. A fractional number is
+/// not a cent count.
+fn json_i64_value(value: &serde_json::Value) -> Option<i64> {
+    match value {
+        serde_json::Value::Number(number) => {
+            if let Some(integer) = number.as_i64() {
+                return Some(integer);
+            }
+            let float = number.as_f64()?;
+            if !float.is_finite() || float.fract() != 0.0 || float.abs() > (1_i64 << 53) as f64 {
+                return None;
+            }
+            Some(float as i64)
+        }
+        serde_json::Value::String(text) => text.trim().parse().ok(),
+        _ => None,
     }
 }
 
@@ -482,5 +572,56 @@ mod tests {
         );
         assert_eq!(parse_percent_from_message("no percent here"), None);
         assert_eq!(parse_percent_from_message("unavailable"), None);
+    }
+
+    #[test]
+    fn credit_grants_accept_string_and_number_cents_and_skip_a_bad_sibling() {
+        let raw = r#"{
+            "grants": [
+                {"remainingCents": "2100", "totalCents": 2500, "expiresAtMs": "1793577600000", "displayName": " Promo "},
+                {"remainingCents": 100, "total_cents": 0},
+                {"remainingCents": -1, "totalCents": 500},
+                {"totalCents": 800, "remainingCents": 800, "expiresAtMs": 1790000000000}
+            ]
+        }"#;
+        let grants = parse_credit_grants(raw.as_bytes());
+        assert_eq!(grants.len(), 2);
+        // Soonest expiry first. The zero-total and negative-remaining grants
+        // are not a balance the spending page would draw.
+        assert_eq!(grants[0].remaining_cents, 800);
+        assert_eq!(grants[0].total_cents, 800);
+        assert!(grants[0].display_name.is_empty());
+        assert_eq!(grants[1].remaining_cents, 2100);
+        assert_eq!(grants[1].total_cents, 2500);
+        assert_eq!(grants[1].display_name, "Promo");
+        assert_eq!(
+            grants[1].expires_at,
+            DateTime::from_timestamp_millis(1_793_577_600_000)
+        );
+    }
+
+    #[test]
+    fn a_grant_with_nothing_left_is_kept() {
+        let raw = r#"{"grants":[{"remainingCents":0,"totalCents":2500,"displayName":"Power user grant"}]}"#;
+        let grants = parse_credit_grants(raw.as_bytes());
+        assert_eq!(grants.len(), 1);
+        assert_eq!(grants[0].remaining_cents, 0);
+        assert_eq!(grants[0].total_cents, 2500);
+    }
+
+    #[test]
+    fn credit_grants_without_a_list_are_none() {
+        assert!(parse_credit_grants(br#"{"grants":[]}"#).is_empty());
+        assert!(parse_credit_grants(br#"{}"#).is_empty());
+        assert!(parse_credit_grants(br#"{"grants":null}"#).is_empty());
+        assert!(parse_credit_grants(b"not json").is_empty());
+    }
+
+    #[test]
+    fn a_zero_expiry_is_a_grant_with_no_date() {
+        let raw = r#"{"grants":[{"remainingCents":500,"totalCents":500,"expiresAtMs":0}]}"#;
+        let grants = parse_credit_grants(raw.as_bytes());
+        assert_eq!(grants.len(), 1);
+        assert!(grants[0].expires_at.is_none());
     }
 }

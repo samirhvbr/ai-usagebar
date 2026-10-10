@@ -1,68 +1,46 @@
 import MdiArrowDownCircle from "~icons/mdi/arrow-down-circle-outline";
-import MdiClose from "~icons/mdi/close";
+import { HintCard } from "@/components/HintCard";
 import type { UpdateInfo } from "@/lib/types";
+import { m } from "@/paraglide/messages.js";
+import { useI18n } from "@/lib/i18n";
 import { useBusyLabel } from "@/lib/useBusyLabel";
-import { sendCommand } from "../model.js";
+import { bannerMessage, sendCommand, updateAction } from "../model.js";
 
 interface UpdateBannerProps {
+  repository: string;
   update: UpdateInfo;
 }
 
-const ACTION_LABEL: Record<UpdateInfo["state"], string> = {
-  available: "Install Update",
-  checking: "Checking…",
-  downloading: "Downloading…",
-  failed: "Try Again",
-  installing: "Installing…",
-};
-
 /**
- * Same anatomy as HintCard: icon, title + message + small action button, ✕ in the corner. The
- * ✕ snoozes the update; it is hidden while a download or install is under way.
+ * A HintCard for a waiting release, with the same action the update dialog offers: Install when
+ * the host can install it here, the release page when it cannot. The ✕ snoozes this version; it
+ * is hidden while a download or install is under way. Progress shows on the button only; the
+ * sentence keeps naming the release.
  */
-export function UpdateBanner({ update }: UpdateBannerProps) {
+export function UpdateBanner({ repository, update }: UpdateBannerProps) {
+  const { language } = useI18n();
   const [clicked, startClicked] = useBusyLabel();
+  const action = updateAction(update, repository, language);
+  const busy = clicked !== null || action.busy;
 
-  const busy = clicked !== null || update.state === "downloading" || update.state === "installing";
-  const version = update.version.replace(/^v/i, "");
-  const message =
-    clicked ?? (update.state === "failed" ? `Couldn't update: ${update.error}` : `AI Usage v${version} is ready to install.`);
-  const actionLabel = clicked ?? ACTION_LABEL[update.state];
-
-  function onInstall() {
-    startClicked("Updating…");
-    sendCommand("install-update");
+  function onAction() {
+    if (action.cmd === "open-url") {
+      if (action.url) sendCommand("open-url", { url: action.url });
+      return;
+    }
+    startClicked(m.updating());
+    sendCommand(action.cmd);
   }
   return (
-    <div className="card-surface flex items-start gap-[10px] px-[14px] py-3">
-      <span className="grid size-5 shrink-0 place-items-center text-label-2 [&_svg]:size-4">
-        <MdiArrowDownCircle />
-      </span>
-      <div className="flex min-w-0 flex-1 flex-col gap-1">
-        <span className="text-[length:var(--sz-label)] font-semibold">Update available</span>
-        <span className="text-[length:var(--sz-support)] leading-[1.35] text-label-2" title={update.url || undefined}>
-          {message}
-        </span>
-        <button
-          type="button"
-          className="mt-1 h-6 w-fit rounded-[6px] bg-[var(--control-fill)] px-2.5 text-[length:var(--sz-support)] hover:bg-[var(--control-fill-hover)] disabled:opacity-60"
-          disabled={busy}
-          onClick={onInstall}
-        >
-          {actionLabel}
-        </button>
-      </div>
-      {busy ? null : (
-        <button
-          type="button"
-          aria-label="Dismiss"
-          className="plain-btn grid size-4 shrink-0 place-items-center text-label-2"
-          title="Remind me later"
-          onClick={() => sendCommand("snooze-update")}
-        >
-          <MdiClose className="size-3" />
-        </button>
-      )}
-    </div>
+    <HintCard
+      actionDisabled={busy}
+      buttonTitle={clicked ?? action.label}
+      dismissTitle={m.remind_me_later()}
+      icon={<MdiArrowDownCircle />}
+      message={bannerMessage(update, language)}
+      title={m.update_available()}
+      onAction={onAction}
+      onDismiss={busy ? undefined : () => sendCommand("snooze-update")}
+    />
   );
 }

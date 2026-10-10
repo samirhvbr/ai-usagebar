@@ -2,6 +2,8 @@
 
 ai-usagebar can report several OpenRouter keys without running separate config
 or cache roots. The existing `[openrouter]` key remains the default account.
+The same `[[<vendor>.accounts]]` array works for the other API-key providers;
+the [API-key account guide](api-key-accounts.md) covers them.
 
 ## Add named accounts
 
@@ -28,6 +30,15 @@ tightens the config file to mode `0600` on Unix.
 
 Labels cannot be empty, contain path separators, drive prefixes, or control
 characters, or use a reserved cache filename. Duplicate labels are rejected.
+
+## What one entry separates
+
+Each account entry is one OpenRouter login's key — one entry per workspace is
+the pattern for working across several workspaces. Be aware of what it does
+*not* separate: keys created inside the same OpenRouter workspace share that
+workspace's billing account, so two entries holding two keys from one
+workspace both report that workspace's credits and spend. The per-entry split
+is per login session (workspace), not per key within a single bill.
 
 ## Select an account
 
@@ -65,3 +76,26 @@ accounts exist, the default entry remains visible.
 
 The Settings panel edits the default key. Add or change named account entries
 in `config.toml`; saving other settings preserves them.
+
+## Recent models activity (optional management key)
+
+The "Recent models" block lists the two most recently used models with their
+spend and request counts. It reads `GET /api/v1/activity`, which rejects the
+regular inference key — it answers only to an OpenRouter *management* key
+(create one at <https://openrouter.ai/settings/management-keys>). When no
+management key resolves, the request is skipped and the block simply does not
+appear; the regular key is never sent to that endpoint.
+
+```toml
+[openrouter]
+# Default account; OPENROUTER_MANAGEMENT_API_KEY is the default var name.
+management_api_key_env = "OPENROUTER_MANAGEMENT_API_KEY"
+
+[[openrouter.accounts]]
+label = "work"
+api_key_env = "OPENROUTER_WORK_API_KEY"
+management_api_key_env = "OPENROUTER_WORK_MANAGEMENT_API_KEY"
+```
+
+A named account resolves a management key only from its own
+`management_api_key_env`; it never inherits the default account's.

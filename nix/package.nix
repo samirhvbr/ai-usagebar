@@ -24,6 +24,10 @@ rustPlatform.buildRustPackage {
     fileset = lib.fileset.unions [
       ../Cargo.toml
       ../Cargo.lock
+      # The tray hosts `include_str!` the popover from OUT_DIR, which only
+      # exists when the build script runs; without it the darwin build has no
+      # `OUT_DIR` at all. On Linux it returns at once.
+      ../build.rs
       ../src
       ../tests
       ../config.example.toml
@@ -34,6 +38,9 @@ rustPlatform.buildRustPackage {
       # .rgba files: the popover's TypeScript is built by `build.rs` on Windows
       # only, and pulling it in would rebuild this derivation on every UI edit.
       (lib.fileset.fileFilter (file: file.hasExt "rgba") ../windows)
+      # `src/tray/marks.rs` (menu-bar logos) is not gated either: it
+      # `include_bytes!`s the popover's provider SVGs. Only that folder.
+      (lib.fileset.fileFilter (file: file.hasExt "svg") ../windows/popover/src/icons/providers)
     ];
   };
 

@@ -12,6 +12,7 @@ switch the active login used by Claude Desktop and the `claude` CLI.
 | Accounts already organized by `CLAUDE_CONFIG_DIR` | Set `[anthropic] accounts_dir`. |
 | Separate Waybar modules backed by files you already manage | Use `--creds-path` and `--cache-dir`. |
 | Switch Claude Desktop or the CLI on macOS | Use `ai-usagebar account switch`. |
+| Several Claude Desktop apps side by side on macOS | Use `ai-usagebar account merge-history`. |
 
 ## Add a named account
 
@@ -206,12 +207,121 @@ that behavior.
 
 The CLI has one default credential slot. A switch first saves the outgoing
 credential under its account, then moves the target credential into the
-default slot. ai-usagebar reads an active account from that default slot, so a
+default slot. ai-usagebar reads an active account from that default slot while
+its own file is gone — which is exactly what the switch leaves behind — so a
 rotating refresh token is never live in two places.
+
+A `CLAUDE_CONFIG_DIR` layout is the other case. There every directory keeps its
+own live login, and two of them can hold the *same* account, which is what the
+active-account marker records. An account whose own credential file is still
+there is therefore read from that file, not from the default slot: otherwise a
+perfectly good account reports a re-auth prompt from a slot its owner never
+signs into.
 
 If the current CLI login is not managed by ai-usagebar, the switch stops before
 discarding it. `--force` overrides that safeguard and removes the unmanaged
 login.
+
+### Adopt the login you already use
+
+The account you signed into first usually lives only in the default slot. Rather
+than signing it in again (which mints a second, independent grant for the same
+account), register it as it is:
+
+```bash
+ai-usagebar account add main --adopt-current
+```
+
+This writes only the identity marker in the new account's directory. The
+credential stays in the default slot, and the first switch away from `main`
+saves it into `main`'s own slot like any other outgoing login. With every
+account named, `[anthropic] show_default_account = false` drops the extra
+unnamed tab.
+
+### Switch Codex
+
+Codex works the same way. The Codex CLI, the Codex desktop app and the IDE
+extension all read `~/.codex/auth.json`, so one switch moves all three:
+
+```bash
+ai-usagebar account add main --codex --adopt-current  # the login ~/.codex already has
+ai-usagebar account add work --codex                  # CODEX_HOME=~/.codex-work codex login
+ai-usagebar account switch work --codex
+```
+
+The switch saves the outgoing login back into its account's `auth.json`, moves
+the target's file into `~/.codex/auth.json`, and records each account's ChatGPT
+account id in a marker next to its file (`.auth.json.ai-usagebar-account.json`,
+no token), so an account whose file was moved away is still recognized. Reads
+for the active account follow it into `~/.codex/auth.json`.
+
+Before writing anything it checks the layout, and refuses when two accounts
+share a credential file, an account points at `~/.codex/auth.json` itself, a
+credential path is a symlink, two accounts are the same ChatGPT account, the
+active account also kept its own copy, or `[openai] codex_auth_path` points
+somewhere the Codex CLI does not read. The directories involved stay locked for
+the whole move, and ai-usagebar's own token refresh takes the same lock, so the
+two never interleave. If a step fails, every file it can put back is restored,
+and any it could not is named in the error.
+
+Codex itself is outside that lock. An open session keeps its account in memory
+until it restarts; before refreshing it reloads `auth.json` and skips the
+refresh when the account changed, but a refresh already in flight at the moment
+of the switch could still write the old account's tokens back. Restart open
+Codex sessions after switching.
+
+### Switch from the macOS menu bar
+
+With named accounts configured, each account's card in the `ai-usagebar-tray`
+popover shows a switch control beside Customize and Reset. The active login has
+a filled star; any other account has an outline star that runs the same
+`ai-usagebar account switch` (with `--codex` for a Codex card). A Claude switch
+quits and reopens Claude Desktop when that account also has a Desktop profile.
+The star spins while the switch runs, and a failed switch turns it red with
+the reason in its tooltip.
+
+### Side-by-side profiles
+
+Claude Desktop can be launched against an alternative profile with
+`--user-data-dir`, which is how several accounts can run at once as separate
+apps. Each such profile has its own history, so by default those windows do not
+see each other's conversations.
+
+```bash
+ai-usagebar account merge-history --data-dir <DIR>
+ai-usagebar account merge-history --data-dir <DIR> --dry-run
+ai-usagebar account merge-history --data-dir <DIR> --from <DIR> --from <DIR>
+```
+
+`--from` names the profiles to read history from, defaulting to every other
+profile on the machine: the default one, plus any sibling directory of
+`--data-dir`. Sources are opened read-only and need not be idle. Run it just
+before the app starts.
+
+`account switch` is not usable here: it requires a saved profile per label and
+installs that label's stored token over the profile's live login, and it quits
+and relaunches Claude Desktop by *application name*, which is ambiguous once
+several app bundles answer to the same name. `merge-history` swaps no
+credential and never controls the app.
+
+The merge is additive. No deletion sweep runs, so a run with nobody at the
+keyboard cannot remove anything — conflicting items are reported and kept. The
+target profile must not be running, detected from the process's own
+`--user-data-dir` argument rather than the app name, and the default profile is
+refused as a target (`account switch` owns it). Re-running is a no-op: an index
+is copied only when the destination is absent or older.
+
+Each relocated profile keeps its own sync ledger, in a
+`<profile>-ai-usagebar/` directory beside it. That is deliberate rather than
+incidental: the ledger records what each account held after the last merge, and
+deletion candidates are the difference against it, so two profiles sharing one
+ledger would each overwrite it with their own narrower view and items merely
+absent from one profile would later read as intentional deletions.
+
+**This deliberately crosses accounts.** Afterwards the window signed into one
+account lists conversations and routines started under the others, because the
+point is that every profile opens on the union. Do not use it across accounts
+that must stay visually separate.
 
 ### Storage and history conflicts
 

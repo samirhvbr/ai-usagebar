@@ -64,11 +64,19 @@ pub fn resolve_auth_in(
     // `credentials_path` or a relocated `KIMI_CODE_HOME` in play, "log in with
     // the CLI" is useless advice if the user logged in somewhere this build
     // never looked. Sanitized because the path can carry a configured value.
+    // The env var is named only when it is a valid name: anything else is
+    // most likely a key pasted into `api_key_env`, which
+    // `config::resolve_api_key` never repeats either.
+    let env_var: &str = if crate::config::is_valid_env_var_name(&cfg.api_key_env) {
+        &cfg.api_key_env
+    } else {
+        "a valid environment variable (`api_key_env` is not one)"
+    };
     Err(AppError::Credentials(format!(
         "Kimi: no credentials. Either log in with the Kimi Code CLI (`kimi`) — its login is \
          read from {} — or set an API key in {} or `api_key` under [kimi] in {}.",
         crate::display::sanitize_untrusted_path(&kimi_code.credentials_path),
-        cfg.api_key_env,
+        env_var,
         crate::config::config_path_hint()
     )))
 }
@@ -129,6 +137,22 @@ mod tests {
         // The file that was actually consulted, so "log in with the CLI" can be
         // acted on when the home is not the default one.
         assert!(message.contains("kimi-code.json"), "{message}");
+    }
+
+    /// A value that is not a variable name is most likely a key pasted into
+    /// `api_key_env`: the error asks for a valid one and never repeats it.
+    #[test]
+    fn a_key_pasted_into_api_key_env_is_not_repeated() {
+        let td = TempDir::new().unwrap();
+        let cfg = KimiConfig {
+            api_key_env: "sk-kimi-pasted-secret".into(),
+            ..KimiConfig::default()
+        };
+        let message = resolve_auth_in(&cfg, td.path(), None)
+            .unwrap_err()
+            .to_string();
+        assert!(!message.contains("sk-kimi-pasted-secret"), "{message}");
+        assert!(message.contains("api_key_env"), "{message}");
     }
 
     #[test]

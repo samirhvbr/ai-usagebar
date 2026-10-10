@@ -68,6 +68,14 @@ pub async fn fetch_snapshot(
     let team = match resolve_team(client, endpoints, management_key, team_id).await {
         Ok(t) => t,
         Err(e) if e.is_transient() => return fallback_silent(cache, &target, e),
+        // Recorded under its own status, like the balance call below: the
+        // cache redacts a 401/403 body and arms the backoff on a 429 by code.
+        Err(AppError::Http { status, body }) => {
+            cache.mark_stale();
+            let diag = cache.write_last_error(status, &body);
+            let original = AppError::Http { status, body };
+            return fallback_with_error(cache, Some(diag), &target, original);
+        }
         Err(e) => {
             cache.mark_stale();
             let diag = cache.write_last_error(0, &e.to_string());
@@ -330,6 +338,81 @@ mod tests {
         assert!(out.stale);
         assert_eq!(out.snapshot.balance, 12.0);
         assert_eq!(out.last_error.as_ref().map(|(c, _)| *c), Some(404));
+    }
+
+    /// Without a `team_id` the key is validated before the balance call, and
+    /// a refusal there is recorded under its HTTP status like one from the
+    /// balance call: the cache keeps the neutral auth message, not the body.
+    #[tokio::test]
+    async fn a_rejected_key_validation_is_recorded_under_its_status() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("GET", "/auth/management-keys/validation")
+            .with_status(401)
+            .with_body(r#"{"error":"key revoked for user@example.test"}"#)
+            .create_async()
+            .await;
+
+        let (_td, cache) = cache_fixture();
+        cache
+            .write_payload(
+                serde_json::json!({
+                    "target": target_key("k", None),
+                    "team": "t",
+                    "snapshot": { "balance": 12.0 },
+                })
+                .to_string()
+                .as_bytes(),
+            )
+            .unwrap();
+
+        let client = reqwest::Client::new();
+        let endpoints = Endpoints { base: server.url() };
+        let out = fetch_snapshot(
+            &client,
+            "k",
+            &cache,
+            &endpoints,
+            Duration::from_secs(0),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(out.stale);
+        assert_eq!(out.snapshot.balance, 12.0);
+        assert_eq!(
+            out.last_error,
+            Some((401, crate::error::AUTH_FAILURE_MESSAGE.to_string()))
+        );
+    }
+
+    /// A 429 from the validation endpoint arms the shared backoff, so the
+    /// next polls wait instead of asking again every minute.
+    #[tokio::test]
+    async fn a_rate_limited_key_validation_arms_the_backoff() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("GET", "/auth/management-keys/validation")
+            .with_status(429)
+            .with_body(r#"{"error":"slow down"}"#)
+            .create_async()
+            .await;
+
+        let (_td, cache) = cache_fixture();
+        let client = reqwest::Client::new();
+        let endpoints = Endpoints { base: server.url() };
+        let err = fetch_snapshot(
+            &client,
+            "k",
+            &cache,
+            &endpoints,
+            Duration::from_secs(0),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, AppError::Http { status: 429, .. }), "{err:?}");
+        assert!(cache.backoff_remaining().is_some());
     }
 
     #[tokio::test]

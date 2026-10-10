@@ -11,7 +11,7 @@
 # Valid: anthropic | anthropic_api | openai | copilot | zai | openrouter | deepseek
 #        | kimi | kilo | novita | moonshot | grok | supergrok | grokbot | antigravity
 #        | cursor | minimax | kiro | nous | opencode-go | commandcode | ollama
-#        | shvia
+#        | orcarouter | modelstudio | lyceum | devin | shvia
 # When unset, the TUI opens on the Overview (all vendors at once); set this to
 # open directly on a vendor's tab instead.
 # primary = "anthropic"
@@ -58,24 +58,87 @@
 # [[custom.texts]]               # a free-text row
 # label = "Tier"
 # value = "/account/tier"        # string, number or boolean
+#
+# Recipe: Meta Muse (Muse Spark) local spend. Meta publishes no quota or
+# billing endpoint for api.meta.ai (see docs/vendor-endpoints.md), so there
+# is no native vendor — but Muse Code writes per-call token usage
+# (`model_completed` events) to ~/.local/share/muse/sessions, and a small
+# loopback server can tally it into this shape. Uncomment and point `url`
+# at your tally server:
+# [[custom]]
+# id = "muse"
+# name = "Muse"
+# short_name = "mus"             # exactly 3 lowercase letters, unique
+# enabled = true
+# url = "http://127.0.0.1:41837/usage"
+# allow_http = true              # loopback only
+# api_key_env = ""
+# api_key = "local"              # loopback only; the tally server ignores it
+# auth_header = "Authorization"
+# auth_scheme = ""               # "" sends the bare key
+# plan = "Muse Spark (local)"
+# cache_ttl_secs = 300
+# [[custom.metrics]]
+# label = "Cache miss"           # low-is-good reads correctly in severity colors
+# percent = "/cache/miss_pct"
+# [[custom.texts]]
+# label = "Today"
+# value = "/spend/today_usd"
+# [[custom.texts]]
+# label = "30 days"
+# value = "/spend/last30_usd"
+# [[custom.texts]]
+# label = "Calls today"
+# value = "/calls/today"
 
-# Windows tray popover only. Every key is written by the popover's Settings
-# screen; editing them here works too.
+# Windows/macOS tray. The macOS menu bar also writes its options here from the
+# popover Settings → Menu Bar.
 # [tray]
 # Global shortcut that opens and closes the popover from any window.
-# Ctrl / Alt / Win plus a key; Shift may be added. Omit for none.
+# Ctrl / Alt / Win plus a key; Shift may be added. Omit for none. On macOS the
+# Command and Option keys are accepted as Cmd/Command and Option, and shown as
+# Cmd/Option.
 # shortcut = "Ctrl+Shift+U"
-# How often the tray re-reads every provider: 1, 5 or 10 minutes; the footer's
-# Refresh is always immediate.
+# How often the tray re-reads every provider: 1, 5 or 10 minutes; the panel's
+# Refresh button is always immediate.
 # refresh_minutes = 5
 # New releases: auto (download, verify and restart unattended) | notify
 # (banner with an Install button; default) | off (no background checks).
 # updates = "notify"
+# macOS menu bar: "bars" (default) draws the usage chart; "provider" draws each
+# provider's logo followed by its value; "quattro" draws one chip, the logo, the
+# short name (cld, cdx, …) and the highest percentage among all the windows of
+# the provider selected in the popover, like the Quattro bar, leaving out any
+# metric hidden in the popover's Customize. Chart shows up to two starred
+# metrics per provider. Logos shows one value per starred provider: the highest
+# used percentage across visible quota windows, just like Name and Quattro auto.
+# In the Left reading this is the lowest remaining percentage. Hidden metrics
+# are excluded. Settings → Menu Bar → Menu Bar Shows sets it.
+# menu_bar_style = "bars"
+# "name", the 1.32.0 spelling of "quattro", is still read as it.
+# The "quattro" chip's short name; false leaves just the logo and the value. A
+# provider with no logo keeps its name. Settings → Menu Bar → Show Short Name.
+# menu_bar_short_name = true
 
-# Optional, TUI-only monitor for local Claude Code session context. When
-# enabled, press `c` in ai-usagebar-tui. The scanner reads only bounded tails
+# Quota-threshold desktop notifications, fired after a fresh fetch when a
+# window crosses the threshold (Linux notify-send or macOS Notification Center;
+# Windows delivery follows). One notification per crossing: a window re-arms only when
+# usage drops 7 points below the threshold or the window's reset moves later by
+# more than an hour and a half — a smaller move is the same window reported
+# again, with the sub-second drift the vendors' reset instants carry.
+# Banked reset credits (Codex, SuperGrok) also notify 48h before they expire.
+# [notifications]
+# enabled = true    # false turns every quota/expiry notification off
+# threshold = 97    # 1..=100; at 100 only an exhausted window notifies
+
+# Optional monitor for local Claude Code session context. When enabled, press
+# `c` in ai-usagebar-tui. The scanner reads only bounded tails
 # below ~/.claude/projects, skips subagent transcripts and never follows
-# discovered symlinks. Nothing is read while this remains disabled.
+# discovered symlinks. While enabled, `usage --json` also reports how many of
+# each Claude account's live sessions are working or waiting on you, read from
+# the `sessions/` directory beside its credentials file. Disabled, neither is
+# read; the Waybar widget's Claude tooltip still shows that working/waiting
+# line for the account it displays, since that line is always on.
 [context]
 enabled = false
 # Where the view docks when opened: full (own screen) | split (beside the
@@ -157,6 +220,10 @@ enabled = true
 # Named accounts get isolated caches (~/.cache/ai-usagebar/openai/<label>) and
 # are selected with `--account <label>`; without it you get the default login
 # above, exactly as before.
+# `ai-usagebar account switch <label> --codex` moves a named login into
+# ~/.codex/auth.json (docs/claude-accounts.md, "Switch Codex"). Once every login
+# is named, hide the unnamed default tab so the active account is not listed twice:
+# show_default_account = false
 # [[openai.accounts]]
 # label = "work"
 # codex_auth_path = "~/.config/ai-usagebar/accounts/work-codex/auth.json"
@@ -174,6 +241,26 @@ enabled = false
 # is normally installed; set this to pin the executable that runs on every
 # refresh.
 # gh_binary = "/usr/bin/gh"
+# Several GitHub accounts, each with its own Copilot plan. `gh` already keeps
+# more than one login for a host; these entries just name them, so ai-usagebar
+# still never stores a token itself. `user` is the login name shown by
+# `gh auth status` (not an email), resolved with `gh auth token --user <user>`.
+# Select one with `--account <label>`; each gets its own tab and cache.
+# GITHUB_COPILOT_TOKEN names no account, so combining it with `--account` is an
+# error rather than a guess about which was meant.
+# [[copilot.accounts]]
+# label = "work"
+# user = "my-work-login"
+# [[copilot.accounts]]
+# label = "personal"
+# user = "my-personal-login"
+# Hide the unnamed entry (the account `gh` has active) once every account is
+# named above. Ignored while `accounts` is empty, so Copilot never loses its
+# only tab.
+# show_default_account = true
+# GitHub Enterprise is deliberately unsupported here: `gh` can hold a GHES
+# login, but the quota endpoint is github.com-only, so a `hostname` field would
+# promise something the fetch cannot deliver.
 
 [zai]
 enabled = true
@@ -187,7 +274,19 @@ api_key_env = "ZAI_API_KEY"      # checked first; if set + non-empty, used
 enabled = true
 api_key_env = "OPENROUTER_API_KEY"
 # api_key = "sk-or-v1-..."
+# Optional management key: unlocks the "Recent models" block, which reads
+# /api/v1/activity — an endpoint that rejects the regular inference key.
+# Create one at https://openrouter.ai/settings/management-keys. Unset, the
+# activity request is skipped and the block stays hidden.
+# management_api_key_env = "OPENROUTER_MANAGEMENT_API_KEY"
+# Which number goes on the bar. OpenRouter reports credits purchased against
+# credits used, so it has a denominator of its own and defaults to "percent";
+# "amount" puts the dollar balance there instead. There is deliberately no
+# display_limit here — see the "Account-balance vendors" note below.
+# headline = "percent"           # "percent" | "amount"
 # Named keys appear as separate TUI/report entries and use isolated caches.
+# One entry per workspace is the pattern; keys inside one workspace share its
+# billing account, so the split is per login session, not per key within a bill.
 # The default key above stays visible unless this is false. It is always kept
 # when no named accounts exist.
 # show_default_account = false
@@ -195,6 +294,13 @@ api_key_env = "OPENROUTER_API_KEY"
 # label = "work"
 # api_key_env = "OPENROUTER_WORK_API_KEY"
 # api_key = "sk-or-v1-..."  # optional fallback; chmod 600 when inline
+# management_api_key_env = "OPENROUTER_WORK_MANAGEMENT_API_KEY"  # optional
+#
+# The same array works for [zai], [deepseek], [deepinfra], [kilo], [novita],
+# [moonshot], [grok], [minimax], [orcarouter], and [lyceum] — e.g.
+# [[deepinfra.accounts]] — with the same show_default_account switch.
+# Region/team/organization/display settings stay per provider. See
+# docs/api-key-accounts.md.
 
 [deepseek]
 # Disabled by default — enable once you've set a key (env var or inline).
@@ -203,6 +309,19 @@ api_key_env = "OPENROUTER_API_KEY"
 enabled = false
 api_key_env = "DEEPSEEK_API_KEY"  # checked first; if set + non-empty, used
 # api_key = "sk-..."              # fallback; chmod 600 the file if you use it
+# Turn the balance into a meter by stating the tank size — see the
+# "Account-balance vendors" note below for both settings.
+# display_limit = 200             # e.g. a $200 top-up you want to burn down
+# headline = "amount"              # "amount" | "percent"
+
+[deepinfra]
+# Disabled by default. Reads prepaid balance and current-month usage from the
+# documented DeepInfra billing endpoints.
+enabled = false
+api_key_env = "DEEPINFRA_API_KEY"
+# api_key = "..."                  # fallback; prefer the environment variable
+# display_limit = 50                # optional prepaid tank size in USD
+# headline = "amount"              # "amount" | "percent"
 
 [ollama]
 # Disabled by default. Ollama Cloud quota comes from the same route the
@@ -237,6 +356,38 @@ api_key_env = "KIMI_API_KEY"      # checked first; if set + non-empty, used
 # --- Account-balance vendors -------------------------------------------------
 # These report your REMAINING credit as money, rather than plan usage as a %.
 # All are opt-in and never fetch until enabled with a key present.
+#
+# Two optional display settings apply to every vendor in this group.
+# [openrouter] takes `headline` too, but NOT `display_limit`:
+#
+#   display_limit = 200   Your tank size, in the currency that vendor already
+#                         reports. These APIs state only what is LEFT, never
+#                         what the tank holds, so there is no denominator to
+#                         draw a meter against until you supply one. There is
+#                         no default: leave it out and the row stays a plain
+#                         balance. It is a fallback, never an override — a
+#                         vendor that states a limit of its own keeps it. That
+#                         is why [openrouter] has no display_limit at all: it
+#                         reports credits purchased, and in the one case where
+#                         a tank would not simply be ignored — a free-tier
+#                         account that purchased nothing — honouring it would
+#                         put "0%" on the bar for an account with money in it,
+#                         because that row's percentage comes from the API and
+#                         not from the tank.
+#
+#   headline = "amount"   Which of the two numbers goes on the bar: "amount"
+#                         (the money) or "percent" (how much of the tank is
+#                         used). Balance vendors default to "amount";
+#                         OpenRouter, which always has a denominator, defaults
+#                         to "percent". Whichever you pick, the other number
+#                         stays in the detail line. Setting display_limit does
+#                         not switch this by itself, and picking "percent"
+#                         with no limit from either source leaves the amount
+#                         on the bar.
+#
+# The percentage is CONSUMED, matching every other meter here:
+# (display_limit - balance) / display_limit, clamped to 0-100. A balance above
+# the cap reads as 0% used.
 
 [kilo]
 # Disabled by default — enable once you've set a key (env var or inline).
@@ -251,6 +402,8 @@ api_key_env = "KILO_API_KEY"       # checked first; if set + non-empty, used
 # Omit for the personal balance. Switching this refetches rather than reusing
 # the previous account's cached figure.
 # organization_id = "org_..."
+# display_limit = 200              # tank size in USD; see the group note above
+# headline = "amount"              # "amount" | "percent"
 
 [novita]
 # Disabled by default — enable once you've set a key (env var or inline).
@@ -261,6 +414,29 @@ api_key_env = "KILO_API_KEY"       # checked first; if set + non-empty, used
 enabled = false
 api_key_env = "NOVITA_API_KEY"     # checked first; if set + non-empty, used
 # api_key = "..."                  # fallback; chmod 600 the file if you use it
+# display_limit = 200              # tank size in USD; see the group note above
+# headline = "amount"              # "amount" | "percent"
+
+[lyceum]
+# Disabled by default; this reads only the credits endpoint, not inference.
+enabled = false
+api_key_env = "LYCEUM_API_KEY"
+# api_key = "..."                  # fallback; chmod 600 the file if used
+# [[lyceum.accounts]]              # optional named account
+# label = "work"
+# api_key_env = "LYCEUM_WORK_API_KEY"
+
+[orcarouter]
+# Disabled by default — enable once you've set a key (env var or inline).
+# Saving a key in the Settings overlay writes the inline fallback AND flips
+# `enabled` to true; clearing the field removes the inline key again.
+# Credit card from the one-api compatible dashboard billing endpoints
+# (api.orcarouter.ai/v1/dashboard/billing/{usage,subscription}): spend in
+# exact cents, total credit limit, and the key's expiry when it has one.
+# Unlimited-quota keys report the 100000000 sentinel and render spend-only.
+enabled = false
+api_key_env = "ORCAROUTER_API_KEY"  # checked first; if set + non-empty, used
+# api_key = "sk-orca-..."           # fallback; chmod 600 the file if you use it
 
 [moonshot]
 # Disabled by default — enable once you've set a key (env var or inline).
@@ -274,6 +450,8 @@ api_key_env = "MOONSHOT_API_KEY"   # checked first; if set + non-empty, used
 # rather than showing the other region's figure:
 #   global -> api.moonshot.ai (USD)   |   cn -> api.moonshot.cn (CNY)
 # region = "global"
+# display_limit = 200              # tank size in the region's currency
+# headline = "amount"              # "amount" | "percent"
 
 [grok]
 # Disabled by default — enable once you've set a key (env var or inline).
@@ -292,6 +470,8 @@ api_key_env = "XAI_MANAGEMENT_KEY" # checked first; if set + non-empty, used
 # not a team), so set the team explicitly here. Without it, an org-scoped key
 # reports an error saying so instead of querying the wrong team.
 # team_id = "..."
+# display_limit = 200              # tank size in USD; see the group note above
+# headline = "amount"              # "amount" | "percent"
 
 # SuperGrok subscription usage — distinct from [grok] above. No API key of
 # its own: the official Grok Build CLI owns login, OIDC/provider refresh,
@@ -350,7 +530,9 @@ enabled = false
 # no separate login step for ai-usagebar. Shows this billing cycle's two
 # included-usage pools — "Cursor Models" (Auto + Composer) and "Other Models"
 # (named / API) — from the undocumented cursor.com/api/usage-summary endpoint
-# (the same one the Cursor dashboard itself calls).
+# (the same one the Cursor dashboard itself calls). A spending-page credit
+# grant, when the account has one, is read from GetClientVisibleCreditGrants
+# and shown as remaining dollars; an account with no grant shows nothing extra.
 [cursor]
 # Disabled by default — enable once you've signed in to the Cursor IDE at
 # least once (it needs no key from you, but it does need that one-time login
@@ -368,8 +550,9 @@ enabled = false
 # Override the cursor-agent CLI's own login file, tried only when db_path
 # does not exist. Leave commented out to use the platform default:
 #   Linux:   ~/.config/cursor/auth.json
-#   macOS:   ~/Library/Application Support/cursor/auth.json
-#   Windows: %APPDATA%\cursor\auth.json
+#   macOS:   ~/.cursor/auth.json (the CLI keeps its session in the Keychain
+#            there; the Keychain is read when this file is absent too)
+#   Windows: %APPDATA%\Cursor\auth.json
 # agent_auth_path = "/home/you/.config/cursor/auth.json"
 
 [shvia]
@@ -423,6 +606,12 @@ enabled = false
 # Run `ai-usagebar auth nous login`; logout removes only the Nous entry.
 [nous]
 enabled = false
+# Which number goes on the bar: the consumed percentage of the monthly
+# allocation ("percent", the default) or the credits still usable ("amount"),
+# the way the prepaid-balance vendors do. There is no tank to state — the plan's
+# monthly credits are the percentage's own denominator — and the percentage
+# keeps the meter, the severity colour and the detail line either way.
+# headline = "amount"
 
 # OpenCode Go — usage from /zen/go/v1/usage. Opt in only after exporting the
 # API key under this variable; the key itself is never written to this example.
@@ -431,10 +620,9 @@ enabled = false
 api_key_env = "OPENCODE_GO_API_KEY"
 # api_key = "[REDACTED]"  # optional inline fallback; prefer the environment
 
-# Command Code (commandcode.ai). Disabled by default — enable it once any
-# local agent harness is signed in. There is no key to paste: the OAuth
-# credential written by the official `commandcode` CLI is reused as-is, and
-# it is only ever read, never refreshed or rewritten.
+# Command Code (commandcode.ai). Leave disabled if you do not use it. To opt in,
+# set enabled = true; the OAuth credential written by the official `commandcode`
+# CLI is reused as-is, never refreshed or rewritten.
 [commandcode]
 enabled = false
 # Override where the credential is looked for. Leave commented out to search,
@@ -443,3 +631,28 @@ enabled = false
 #   ~/.pi/agent/auth.json
 # COMMANDCODE_API_KEY in the environment outranks both.
 # auth_paths = ["~/.commandcode/auth.json"]
+
+# Alibaba Cloud Model Studio (Bailian) Token Plan. No API key: the credential
+# is the official `bl` CLI's own console login, written by
+# `bl auth login --console` to ~/.bailian/config.json and only ever read.
+# Reports the plan's 5-hour and weekly percentage windows with their resets,
+# through the same console gateway the CLI uses; the gateway host follows the
+# file's console_region × console_site pair (cn-beijing/ap-southeast-1 ×
+# domestic/international).
+[modelstudio]
+# Disabled by default — enable after installing the official `bl` CLI and
+# running `bl auth login --console` at least once.
+enabled = false
+# Override the bl CLI's config directory (default ~/.bailian; the
+# BAILIAN_CONFIG_DIR env var does the same at runtime, and this wins).
+# config_dir = "/home/you/.bailian"
+
+# Devin CLI quota. This reuses the official CLI's existing credentials file
+# read-only: %APPDATA%/devin/credentials.toml on Windows, or
+# ${XDG_DATA_HOME:-~/.local/share}/devin/credentials.toml on Linux and macOS
+# (the CLI's documented paths; macOS is untested here). The token is held in
+# memory for the request only; no login, refresh, or credential write is
+# performed by ai-usagebar.
+[devin]
+enabled = false
+# credentials_path = "/home/you/.local/share/devin/credentials.toml"

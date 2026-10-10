@@ -2,12 +2,15 @@
 //!
 //! Three-layer precedence (matches claudebar:163-167):
 //!   1. CLI overrides (passed via `Theme::with_overrides`)
-//!   2. Omarchy theme at `~/.config/omarchy/current/theme/colors.toml`
+//!   2. The active Omarchy theme's `colors.toml`
 //!   3. One Dark fallback
 //!
-//! The Omarchy file format is `key = "value"` lines (claudebar:115-131 uses a
-//! regex that tolerates comments + blank lines + extra whitespace). We use
-//! `toml::from_str` for the same effect — Omarchy themes are valid TOML.
+//! Omarchy applies a theme into `~/.local/state/omarchy/current/theme`; the
+//! `~/.config/omarchy/current/theme` location this port originally read is the
+//! older layout and stays as a fallback. The Omarchy file format is
+//! `key = "value"` lines (claudebar:115-131 uses a regex that tolerates
+//! comments + blank lines + extra whitespace). We use `toml::from_str` for the
+//! same effect - Omarchy themes are valid TOML.
 
 use std::path::{Path, PathBuf};
 
@@ -58,12 +61,17 @@ impl Default for Theme {
 }
 
 /// Subset of an Omarchy theme file we care about. Unknown keys are ignored,
-/// missing keys fall back to One Dark.
+/// missing keys fall back to One Dark. Themes name these colors as of Omarchy
+/// 4 (`red`/`green`/`yellow`); `color1`-`color3` are the older aliases and
+/// still resolve, so a theme carrying either layout works.
 #[derive(Debug, Default, Deserialize)]
 struct OmarchyTheme {
     accent: Option<String>,
     foreground: Option<String>,
     background: Option<String>,
+    red: Option<String>,
+    green: Option<String>,
+    yellow: Option<String>,
     color1: Option<String>,
     color2: Option<String>,
     color3: Option<String>,
@@ -113,12 +121,13 @@ impl Theme {
             return self;
         };
 
-        // claudebar mapping (claudebar:133-148):
-        //   accent     → blue
-        //   foreground → fg
-        //   color1     → red AND orange
-        //   color2     → green
-        //   color3     → yellow
+        // claudebar mapping (claudebar:133-148), with the named keys Omarchy
+        // writes today winning over the older color1-3 aliases:
+        //   accent       → blue
+        //   foreground   → fg
+        //   red/color1   → red AND orange
+        //   green/color2 → green
+        //   yellow/color3 → yellow
         //   foreground+background → dim = midpoint
         //   background → bar_empty = midpoint(background, dim)
         if let Some(v) = parsed.accent {
@@ -127,14 +136,14 @@ impl Theme {
         if let Some(v) = parsed.foreground.clone() {
             self.fg = v;
         }
-        if let Some(v) = parsed.color1 {
+        if let Some(v) = parsed.red.or(parsed.color1) {
             self.red = v.clone();
             self.orange = v;
         }
-        if let Some(v) = parsed.color2 {
+        if let Some(v) = parsed.green.or(parsed.color2) {
             self.green = v;
         }
-        if let Some(v) = parsed.color3 {
+        if let Some(v) = parsed.yellow.or(parsed.color3) {
             self.yellow = v;
         }
         if let (Some(fg), Some(bg)) = (&parsed.foreground, &parsed.background)
@@ -154,7 +163,19 @@ impl Theme {
 /// or when `$HOME` isn't set.
 fn omarchy_theme_path() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".config/omarchy/current/theme/colors.toml"))
+    omarchy_theme_path_in(Path::new(&home))
+}
+
+/// Same as `omarchy_theme_path` but with an explicit home (for tests).
+fn omarchy_theme_path_in(home: &Path) -> Option<PathBuf> {
+    [
+        // Where `omarchy-theme-set` applies the active theme.
+        home.join(".local/state/omarchy/current/theme/colors.toml"),
+        // The layout this port and claudebar originally read.
+        home.join(".config/omarchy/current/theme/colors.toml"),
+    ]
+    .into_iter()
+    .find(|path| path.is_file())
 }
 
 /// Average two `#RRGGBB` strings into a midpoint color. Returns `None` if
@@ -252,6 +273,80 @@ mod tests {
             .clone()
             .merged_with_omarchy_file(Path::new("/nonexistent/path.toml"));
         assert_eq!(t, merged);
+    }
+
+    #[test]
+    fn omarchy_named_keys_override_palette() {
+        // Omarchy 4 themes name their colors. Same slots as the color1-3
+        // aliases above, so a theme may carry either layout.
+        let mut f = NamedTempFile::new().unwrap();
+        writeln!(
+            f,
+            r##"
+            accent = "#aabbcc"
+            foreground = "#ffffff"
+            background = "#000000"
+            red = "#ff0000"
+            green = "#00ff00"
+            yellow = "#ffff00"
+            "##
+        )
+        .unwrap();
+
+        let t = Theme::default().merged_with_omarchy_file(f.path());
+        assert_eq!(t.blue, "#aabbcc");
+        assert_eq!(t.fg, "#ffffff");
+        assert_eq!(t.red, "#ff0000");
+        assert_eq!(t.orange, "#ff0000"); // red maps to both
+        assert_eq!(t.green, "#00ff00");
+        assert_eq!(t.yellow, "#ffff00");
+    }
+
+    #[test]
+    fn omarchy_named_keys_win_over_aliases() {
+        // A theme that kept the old aliases next to the named keys keeps the
+        // named value, which is what Omarchy itself reads.
+        let mut f = NamedTempFile::new().unwrap();
+        writeln!(
+            f,
+            r##"
+            red = "#111111"
+            green = "#222222"
+            yellow = "#333333"
+            color1 = "#aaaaaa"
+            color2 = "#bbbbbb"
+            color3 = "#cccccc"
+            "##
+        )
+        .unwrap();
+
+        let t = Theme::default().merged_with_omarchy_file(f.path());
+        assert_eq!(t.red, "#111111");
+        assert_eq!(t.orange, "#111111");
+        assert_eq!(t.green, "#222222");
+        assert_eq!(t.yellow, "#333333");
+    }
+
+    #[test]
+    fn omarchy_theme_path_follows_where_the_theme_is_applied() {
+        let home = tempfile::tempdir().unwrap();
+        assert_eq!(omarchy_theme_path_in(home.path()), None);
+
+        // The pre-Omarchy-4 layout is still read, and only while the applied
+        // theme is missing.
+        let legacy = home
+            .path()
+            .join(".config/omarchy/current/theme/colors.toml");
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, "accent = \"#123456\"\n").unwrap();
+        assert_eq!(omarchy_theme_path_in(home.path()), Some(legacy.clone()));
+
+        let applied = home
+            .path()
+            .join(".local/state/omarchy/current/theme/colors.toml");
+        std::fs::create_dir_all(applied.parent().unwrap()).unwrap();
+        std::fs::write(&applied, "accent = \"#654321\"\n").unwrap();
+        assert_eq!(omarchy_theme_path_in(home.path()), Some(applied));
     }
 
     #[test]

@@ -24,21 +24,23 @@ scoop install ai-usagebar
 
 Or grab `ai-usagebar-windows-x86_64.zip` from the latest
 [GitHub release](https://github.com/akitaonrails/ai-usagebar/releases) and
-unzip it anywhere. Update ownership differs between the two paths: **Scoop
-owns updates for Scoop installs** (`scoop update ai-usagebar`), while the
-tray's built-in updater (below, **Settings → Updates**) applies to
-standalone ZIP installs.
+unzip it anywhere. Update ownership differs between the two paths: a Scoop
+install is updated by Scoop, and **Install Update** runs `scoop update` for
+you (see **Settings → Updates** below), while the tray's built-in updater
+replaces the files of a standalone ZIP install.
 
-![Windows tray popover dashboard — provider cards for Claude, Codex, Cursor, SuperGrok and Antigravity with capsule meters, "used / Resets in" lines under each bar, pace notes such as "Limit in 2d 7h" and "~63% left at reset", and the footer with the AI Usage version, a "Next update in" countdown and the Options menu](../screenshots/windows-tray-dashboard.png)
+![Windows tray popover dashboard — provider cards for Claude, Codex, Cursor, SuperGrok, Antigravity and Grok Bot with capsule meters, "used / Resets in" lines under each bar, pace notes such as "Limit in 1d 9h" and "~92% left at reset", an Antigravity card showing its sign-in error, and the footer with the AI Usage version, a "Next update in" countdown and the Options menu](../screenshots/windows-tray-dashboard.png)
 
 ## Requirements
 
 - Windows 10 (recent) or Windows 11, with the **WebView2 Evergreen** runtime
   (preinstalled on Windows 11).
-- A Rust toolchain (`rustc` 1.88+).
+- A Rust toolchain (`rustc` 1.90+).
 - **Node.js 20+** on PATH — `cargo build --bin ai-usagebar-tray` runs
   `npm ci` / `npm run build` in `windows/popover/` (Vite emits
-  `dist/popover.js` + `dist/popover.css`, which the host `include_str!`s).
+  `dist/popover.js` + `dist/popover.css`; `build.rs` stages them into
+  `OUT_DIR`, which the host `include_str!`s — without Node it stages a
+  placeholder page instead, so `cargo build` still links).
 - At least one provider enabled in `%APPDATA%\ai-usagebar\config\config.toml`.
 
 ## Build & run
@@ -57,23 +59,25 @@ visible.
 | Action | Result |
 |---|---|
 | Left-click | Toggle the popover |
-| Right-click | Refresh, Detect Providers, Open TUI, Start with Windows, Quit |
-| Footer Options ▾ | Customize, Settings, Refresh, Detect Providers, Open TUI, Start with Windows, Quit |
+| Right-click | The footer's Options menu as a native menu, in the popover's language: Customize (Classic only), Settings, Refresh, Detect Providers, Open TUI, Start at Login, Check for Updates…, About, Quit; the screen items open the popover on that screen |
+| Footer Options ▾ | Customize (Classic only), Settings, Refresh, Detect Providers, Open TUI, Start at Login, Check for Updates…, About, Quit |
 | Footer “Next update in …” | Refresh now |
 | Click `52% left` under a bar | Flip Used ⟷ Left everywhere (hover shows the other reading) |
-| Click `Resets in …` | Flip countdown ⟷ exact time everywhere |
+| Click `Resets in …` | Timeline popover with the exact reset time and countdown (Settings → Reset Times switches the row text itself) |
 | Options → Customize (or Return) | Provider list: toggle, drag the grip to reorder, open a provider |
 | Provider Customize | Always Visible vs On Demand rows (toggle + drag across the divider); Reset in the top bar |
-| Options → Settings | Launch at Login, Refresh Every (1/5/10 min), Global Shortcut, Theme, Density (Default/Compact), Time Format, Show Usage As, Reset Times, Always Show Pacing, Updates |
-| Provider header icons (right) | Customize that provider's rows, or reset them to the defaults |
-| Right-click a row | Hide row · Always show / Show on demand · Refresh provider · Customize provider |
+| Options → Settings | Launch at Login, Refresh Every (1/5/10 min), Global Shortcut, Theme, Time Format, Show Usage As, Reset Times, Always Show Pacing, Updates |
+| Provider header icon (right) | Customize that provider's rows (Reset to the defaults is in that screen's top bar) |
+| Right-click a row | Hide row · Star for menu bar (macOS glyph) · Always show / Show on demand · Customize provider |
 | Drag a provider header | Reorder provider sections |
 | Caret inside the card | Show or hide On Demand rows |
 | Global shortcut | Toggle the popover from anywhere (set in Settings → Global Shortcut) |
 | Escape / Back | Back one screen |
 | Escape (dashboard) | Close the popover |
 
-![Right-click menu on the Cursor "Other Models" row — Hide row, Show on demand, Refresh Cursor and Customize Cursor](../screenshots/windows-tray-row-menu.png)
+![Right-click menu on the notification-area icon — Customize, Settings, Refresh, Detect Providers, Open TUI, Start at Login, Check for Updates, About and Quit](../screenshots/windows-tray-right-click-menu.png)
+
+![Right-click menu on the Cursor "Cursor Models" row — Hide row, Unstar from menu bar, Show on demand and Customize Cursor](../screenshots/windows-tray-row-menu.png)
 
 ![Customize screen — provider list (Claude, Codex, Cursor, SuperGrok, Antigravity on; GitHub Copilot, Z.AI, OpenRouter off) with metric counts, drag grips and on/off switches, Back and Reset in the top bar, and a Settings cross-link at the bottom](../screenshots/windows-tray-customize.png)
 
@@ -112,11 +116,19 @@ it says when the last one ran. Once a release is known the same button reads
 **Update** and installs it. The mode is the `updates` key of the `[tray]`
 section in `config.toml`, next to the shortcut and the poll interval.
 
+On a Scoop install, **Install Update** runs `scoop update ai-usagebar` for you;
+Automatic hands off the same way. The tray quits while Scoop replaces it,
+usually 10–60 seconds, and Scoop relaunches it through `current`. Scoop's
+transcript is `%LOCALAPPDATA%\ai-usagebar\updates\scoop.log`. If Scoop does not
+deliver the requested version, the tray reports that log path, and Automatic
+does not retry it in the background. A global Scoop install without the
+`scoop.ps1` shim keeps the release-page fallback.
+
 ![Settings screen — General (Launch at Login, Refresh Every, Global Shortcut), Appearance (Theme, Density, Time Format), Usage Display (Show Usage As, Reset Times, Always Show Pacing) and Updates (mode picker, Check for Updates with "Up to date · checked 33m ago" and a Check Now button)](../screenshots/windows-tray-settings.png)
 
-The download is verified against the release's `.sha256` sidecar, which
-proves the file arrived intact — integrity, not authenticity: anyone who can
-publish a release can publish a matching sidecar. Installing swaps the
+For a standalone ZIP install, the download is verified against the release's
+`.sha256` sidecar, which proves the file arrived intact — integrity, not
+authenticity: anyone who can publish a release can publish a matching sidecar. Installing swaps the
 running executable for the new one and leaves the previous build as
 `ai-usagebar-tray.exe.old`, which the next start removes. Debug builds
 (`cargo build` without `--release`) check but refuse to install. The release
@@ -192,7 +204,10 @@ Settings.
 Open TUI launches `ai-usagebar-tui` in Windows Terminal (`wt.exe -e …`) when
 present, otherwise `conhost.exe`. Provider keys stay in the TUI (`s`).
 Provider order, hidden providers, Always Visible / On Demand rows, theme,
-density, “show usage as” and reset-time format are remembered in the popover.
+“show usage as” and reset-time format are remembered in the popover.
+That memory is the popover's WebView2 profile, kept in
+`%LOCALAPPDATA%\ai-usagebar\popover\`, so it survives updates and moves of
+the install directory.
 Provider marks live in `windows/popover/src/icons/providers/` (OpenUsage, MIT;
 simple-icons, CC0) and load through an `unplugin-icons` custom collection;
 a provider without a mark shows its initials — including `[[custom]]`

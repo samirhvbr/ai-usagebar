@@ -24,7 +24,7 @@ use crate::error::{AppError, Result};
 #[derive(Debug, Clone)]
 pub struct Outcome<T> {
     pub snapshot: T,
-    /// The payload is past its TTL — shown, but marked.
+    /// The payload could not be refreshed — shown, but marked.
     pub stale: bool,
     /// The failure recorded by the most recent unsuccessful refresh, redacted
     /// by [`Cache::write_last_error`]. `None` means the last refresh worked.
@@ -54,7 +54,10 @@ impl<T> Outcome<T> {
     pub fn cached(snapshot: T, cache: &Cache, stale: bool) -> Self {
         Self {
             snapshot,
-            stale,
+            // A 429 backoff can hand an expired payload through the normal
+            // cache fast path. Keep the failure marker visible to frontends
+            // even when the vendor passed `false` for that fast path.
+            stale: stale || cache.is_stale() || cache.backoff_remaining().is_some(),
             last_error: cache.read_last_error(),
             cache_age: cache.payload_age(),
         }
@@ -69,6 +72,17 @@ impl<T> Outcome<T> {
             last_error: self.last_error,
             cache_age: self.cache_age,
         }
+    }
+
+    /// True only for an outcome built by [`Outcome::fresh`]: the payload came
+    /// off the wire in this process, not out of the cache. The signal is
+    /// `cache_age == Some(ZERO)` — a cached outcome's age is measured from
+    /// its payload's mtime and is therefore nonzero. Consumers that must not
+    /// act on replayed data (the notification check is the one today) gate
+    /// on this rather than re-deriving freshness from `stale`, which is
+    /// `false` for a within-TTL cache hit too.
+    pub fn off_the_wire(&self) -> bool {
+        !self.stale && self.cache_age == Some(Duration::ZERO)
     }
 }
 
@@ -176,6 +190,29 @@ mod tests {
     }
 
     #[test]
+    fn a_backoff_cache_hit_is_marked_stale() {
+        let (_td, cache) = fixture();
+        cache.write_payload(b"last good").unwrap();
+        cache.write_last_error(429, "rate limited");
+
+        // Vendor fast paths call cached(..., false), including when the
+        // shared cache serves old data during a 429 backoff.
+        let out = Outcome::cached("last good", &cache, false);
+
+        assert!(out.stale);
+        assert_eq!(out.last_error.as_ref().map(|(code, _)| *code), Some(429));
+    }
+
+    #[test]
+    fn a_cached_outcome_keeps_an_existing_stale_marker() {
+        let (_td, cache) = fixture();
+        cache.write_payload(b"last good").unwrap();
+        cache.mark_stale();
+
+        assert!(Outcome::cached("last good", &cache, false).stale);
+    }
+
+    #[test]
     fn map_re_types_the_snapshot_and_keeps_the_provenance() {
         let (_td, cache) = fixture();
         cache.write_last_error(429, "slow down");
@@ -184,6 +221,40 @@ mod tests {
         assert_eq!(out.snapshot, 14u32);
         assert!(out.stale);
         assert_eq!(out.last_error, Some((429, "slow down".to_string())));
+    }
+
+    /// Freshness as the notification check needs it: only a wire-fresh
+    /// outcome counts, and a within-TTL cache hit — which is also
+    /// `stale: false` — must not.
+    #[test]
+    fn off_the_wire_is_true_only_for_wire_fresh_outcomes() {
+        let fresh = Outcome::fresh("live");
+        assert!(fresh.off_the_wire());
+
+        let hand_cached = Outcome {
+            snapshot: "cached",
+            stale: false,
+            last_error: None,
+            cache_age: Some(Duration::from_secs(1)),
+        };
+        assert!(
+            !hand_cached.off_the_wire(),
+            "a within-TTL cache hit is not wire-fresh"
+        );
+
+        let stale = Outcome {
+            stale: true,
+            ..hand_cached
+        };
+        assert!(!stale.off_the_wire());
+
+        let unknown_age = Outcome {
+            snapshot: "cached",
+            stale: false,
+            last_error: None,
+            cache_age: None,
+        };
+        assert!(!unknown_age.off_the_wire());
     }
 
     /// The regression this closes: five vendors returned

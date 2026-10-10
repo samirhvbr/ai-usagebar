@@ -5,11 +5,17 @@ import MdiChevronRight from "~icons/mdi/chevron-right";
 import MdiCogOutline from "~icons/mdi/cog-outline";
 import MdiConsole from "~icons/mdi/console";
 import MdiMagnifyScan from "~icons/mdi/magnify-scan";
+import MdiApple from "~icons/mdi/apple";
+import MdiLoginVariant from "~icons/mdi/login-variant";
 import MdiMicrosoftWindows from "~icons/mdi/microsoft-windows";
+import MdiInformationOutline from "~icons/mdi/information-outline";
 import MdiPower from "~icons/mdi/power";
 import MdiRefresh from "~icons/mdi/refresh";
+import MdiUpdate from "~icons/mdi/update";
 import MdiRestore from "~icons/mdi/restore";
 import MdiTune from "~icons/mdi/tune-variant";
+import { Hint } from "@/components/Hint";
+import { TruncatedText } from "@/components/TruncatedText";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -17,8 +23,9 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import type { Payload } from "@/lib/types";
-import { cn } from "@/lib/utils";
+import type { Payload, PopoverStyle } from "@/lib/types";
+import { m } from "@/paraglide/messages.js";
+import { useI18n } from "@/lib/i18n";
 import { nextUpdateLabel, sendCommand } from "../model.js";
 
 interface TopBarProps {
@@ -29,24 +36,30 @@ interface TopBarProps {
   title: string;
 }
 
-/** PopoverTopBar: 44pt bar, centered headline, circular Back on the left, circular Reset on the right. */
+/** PopoverTopBar: compact bar, centered headline, Back on the left, Reset on the right. */
 export function TopBar({ onBack, onReset, resetArmed, resetLabel, title }: TopBarProps) {
   return (
-    <div className="bar-glass grid h-[var(--topbar-h)] shrink-0 grid-cols-[28px_1fr_28px] items-center px-[var(--panel-pad)]">
-      <button type="button" aria-label="Back" className="circle-btn" title="Back" onClick={onBack}>
-        <MdiChevronLeft className="size-4" />
-      </button>
-      <h1 className="m-0 truncate text-center text-[13px] font-semibold">{title}</h1>
-      {onReset ? (
-        <button
-          type="button"
-          aria-label={resetArmed ? "Click again to confirm" : resetLabel}
-          className={cn("circle-btn", resetArmed && "bg-destructive text-white hover:bg-destructive")}
-          title={resetArmed ? "Click again to confirm" : resetLabel}
-          onClick={onReset}
-        >
-          <MdiRestore className="size-[15px]" />
+    <div className="bar-glass grid shrink-0 grid-cols-[var(--chrome-btn)_1fr_var(--chrome-btn)] items-center p-[var(--panel-pad)]">
+      <Hint content={m.back()}>
+        <button type="button" aria-label={m.back()} className="circle-btn" onClick={onBack}>
+          <MdiChevronLeft className="size-[var(--icon-card)]" />
         </button>
+      </Hint>
+      <h1 className="m-0 min-w-0 text-center">
+        <TruncatedText className="block w-full text-[length:var(--sz-header)] font-semibold">{title}</TruncatedText>
+      </h1>
+      {onReset ? (
+        <Hint align="end" content={resetArmed ? m.click_again_to_confirm() : resetLabel}>
+          <button
+            type="button"
+            aria-label={resetArmed ? m.click_again_to_confirm() : resetLabel}
+            className="circle-btn"
+            data-armed={resetArmed ? "" : undefined}
+            onClick={onReset}
+          >
+            <MdiRestore className="size-[var(--icon-menu)]" />
+          </button>
+        </Hint>
       ) : (
         <span />
       )}
@@ -55,11 +68,13 @@ export function TopBar({ onBack, onReset, resetArmed, resetLabel, title }: TopBa
 }
 
 interface FooterProps {
-  locked: boolean;
   nowMs: number;
   optionsOpen: boolean;
   payload: Payload;
+  popoverStyle: PopoverStyle;
   updatePending: boolean;
+  onOpenAbout: () => void;
+  onCheckUpdates: () => void;
   onOpenCustomize: () => void;
   onOpenSettings: () => void;
   onOptionsOpenChange: (open: boolean) => void;
@@ -70,62 +85,63 @@ interface FooterProps {
  * right. A blue dot after the version says a newer build is waiting (the banner may be snoozed).
  */
 export function Footer({
-  locked,
   nowMs,
   optionsOpen,
   payload,
+  popoverStyle,
   updatePending,
+  onOpenAbout,
+  onCheckUpdates,
   onOpenCustomize,
   onOpenSettings,
   onOptionsOpenChange,
 }: FooterProps) {
-  const nextLabel = nextUpdateLabel(payload, nowMs);
+  const { language } = useI18n();
+  const nextLabel = nextUpdateLabel(payload, nowMs, language);
+  const native = popoverStyle === "native";
   return (
-    <footer className="bar-glass flex shrink-0 items-center gap-2 px-[var(--panel-pad)] py-3">
-      <div className="flex min-w-0 flex-col text-[10px] leading-[14px] text-label-2">
-        <span className="flex items-center gap-[5px]">
+    <footer className="bar-glass flex shrink-0 items-center gap-[var(--gap-controls)] p-[var(--panel-pad)]">
+      <div className="flex min-w-0 flex-col text-[length:var(--sz-badge)] leading-[var(--leading-note)] text-label-2">
+        <span className="flex items-center gap-[var(--gap-inline)]">
           {payload.version ? `AI Usage ${payload.version}` : "AI Usage"}
           {updatePending ? (
-            <span
-              aria-label="Update available"
-              className="inline-block size-[6px] shrink-0 rounded-full bg-meter-blue"
-              role="img"
-              title="Update available"
-            />
+            <Hint align="start" content={m.update_available()}>
+              <span
+                aria-label={m.update_available()}
+                className="inline-block size-[var(--dot-sm)] shrink-0 rounded-full bg-meter-blue"
+                role="img"
+              />
+            </Hint>
           ) : null}
         </span>
-        <button
-          type="button"
-          className="plain-btn tabular-nums"
-          title="Refresh now"
-          onClick={() => !locked && sendCommand("refresh")}
-        >
-          {nextLabel}
-        </button>
+        {native ? null : <span className="tabular-nums">{nextLabel}</span>}
       </div>
-      <span className="min-w-2 flex-1" />
+      <span className="min-w-[var(--gap-controls)] flex-1" />
       <DropdownMenu modal={false} open={optionsOpen} onOpenChange={onOptionsOpenChange}>
         <DropdownMenuTrigger asChild>
           <button type="button" className="capsule-btn">
-            Options
-            <MdiChevronDown className="size-[13px]" />
+            {m.options()}
+            <MdiChevronDown className="size-[var(--icon-inline)]" />
           </button>
         </DropdownMenuTrigger>
-        <DropdownMenuContent align="end" side="top" sideOffset={6} className="min-w-[184px] rounded-[10px] p-[5px] shadow-lg">
-          <MenuItem icon={<MdiTune />} label="Customize" onSelect={onOpenCustomize} />
-          <MenuItem icon={<MdiCogOutline />} label="Settings" onSelect={onOpenSettings} />
+        <DropdownMenuContent align="end" side="top" sideOffset={6}>
+          {native ? null : <MenuItem icon={<MdiTune />} label={m.customize()} onSelect={onOpenCustomize} />}
+          <MenuItem icon={<MdiCogOutline />} label={m.settings()} onSelect={onOpenSettings} />
           <DropdownMenuSeparator />
-          <MenuItem icon={<MdiRefresh />} label="Refresh" onSelect={() => sendCommand("refresh")} />
-          <MenuItem icon={<MdiMagnifyScan />} label="Detect Providers" onSelect={() => sendCommand("detect")} />
-          <MenuItem icon={<MdiConsole />} label="Open TUI" onSelect={() => sendCommand("open-tui")} />
+          <MenuItem icon={<MdiRefresh />} label={m.refresh()} onSelect={() => sendCommand("refresh")} />
+          <MenuItem icon={<MdiMagnifyScan />} label={m.detect_providers()} onSelect={() => sendCommand("detect")} />
+          <MenuItem icon={<MdiConsole />} label={m.open_tui()} onSelect={() => sendCommand("open-tui")} />
           <DropdownMenuSeparator />
           <MenuItem
             checked={payload.startupEnabled}
-            icon={<MdiMicrosoftWindows />}
-            label="Start with Windows"
+            icon={startupIcon(payload.os)}
+            label={m.start_at_login()}
             onSelect={() => sendCommand("toggle-startup")}
           />
-          <MenuItem destructive icon={<MdiPower />} label="Quit" onSelect={() => sendCommand("quit")} />
+          <DropdownMenuSeparator />
+          <MenuItem icon={<MdiUpdate />} label={m.check_for_updates()} onSelect={onCheckUpdates} />
+          <MenuItem icon={<MdiInformationOutline />} label={m.about()} onSelect={onOpenAbout} />
+          <MenuItem icon={<MdiPower />} label={m.quit()} onSelect={() => sendCommand("quit")} />
         </DropdownMenuContent>
       </DropdownMenu>
     </footer>
@@ -134,25 +150,23 @@ export function Footer({
 
 interface MenuItemProps {
   checked?: boolean;
-  destructive?: boolean;
   icon: ReactNode;
   label: string;
   onSelect: () => void;
 }
 
-function MenuItem({ checked, destructive, icon, label, onSelect }: MenuItemProps) {
+function startupIcon(os: string) {
+  if (os === "macos") return <MdiApple />;
+  if (os === "windows") return <MdiMicrosoftWindows />;
+  return <MdiLoginVariant />;
+}
+
+function MenuItem({ checked, icon, label, onSelect }: MenuItemProps) {
   return (
-    <DropdownMenuItem
-      className={cn(
-        "gap-2 rounded-[6px] px-2 py-[5px] text-[13px] focus:bg-primary focus:text-white [&_svg]:size-[15px] [&_svg]:text-label-2 focus:[&_svg]:text-white",
-        destructive && "text-destructive",
-      )}
-      variant={destructive ? "destructive" : "default"}
-      onSelect={onSelect}
-    >
+    <DropdownMenuItem onSelect={onSelect}>
       {icon}
       <span className="flex-1">{label}</span>
-      {checked ? <span aria-label="On">✓</span> : null}
+      {checked ? <span aria-label={m.on()}>✓</span> : null}
     </DropdownMenuItem>
   );
 }
@@ -164,20 +178,20 @@ interface ScreenCrossLinkRowProps {
   onClick: () => void;
 }
 
-/** ScreenCrossLinkRow: one card-row button that hops between Customize and Settings. */
+/** ScreenCrossLinkRow: grouped card matching Settings/Customize rows (same pad + radius). */
 export function ScreenCrossLinkRow({ icon, subtitle, title, onClick }: ScreenCrossLinkRowProps) {
   return (
     <button
       type="button"
-      className="plain-btn card-surface flex w-full items-center gap-[10px] px-3 py-[var(--pad-control)] text-left"
+      className="card-surface cross-link hover-card flex w-full items-center gap-[var(--row-gap)] px-[var(--card-pad)] py-[var(--pad-control)] text-left"
       onClick={onClick}
     >
-      <span className="grid size-[18px] shrink-0 place-items-center text-label-2 [&_svg]:size-[15px]">{icon}</span>
+      <span className="grid size-[var(--row-icon-box)] shrink-0 place-items-center text-label-2 [&_svg]:size-[var(--icon-menu)]">{icon}</span>
       <span className="flex min-w-0 flex-1 flex-col">
-        <span className="truncate text-[length:var(--sz-header)] font-semibold">{title}</span>
-        <span className="truncate text-[length:var(--sz-badge)] text-label-2">{subtitle}</span>
+        <TruncatedText className="text-[length:var(--sz-header)] font-semibold">{title}</TruncatedText>
+        <TruncatedText className="text-[length:var(--sz-badge)] text-label-2">{subtitle}</TruncatedText>
       </span>
-      <MdiChevronRight className="size-3.5 shrink-0 text-label-3" />
+      <MdiChevronRight className="size-[var(--icon-row)] shrink-0 text-label-3" />
     </button>
   );
 }

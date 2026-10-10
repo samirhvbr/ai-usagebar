@@ -17,6 +17,23 @@ import {
 
 const at = rel => fileURLToPath(new URL(rel, import.meta.url));
 
+{
+    const fixture = readFileSync(at('../tests/fixtures/grokbot_paced_report.json'), 'utf8');
+    const entry = parseReport(fixture).entries[0];
+    assert.equal(entry.id, 'grokbot');
+    assert.equal(metricDetail(detailRows(entry)[0]), '50% elapsed · 20pts ahead');
+}
+
+{
+    const fixture = readFileSync(at('../tests/fixtures/cursor_paced_report.json'), 'utf8');
+    const entry = parseReport(fixture).entries[0];
+    assert.equal(entry.id, 'cursor');
+    assert.deepEqual(detailRows(entry).map(metricDetail), [
+        'Auto + Composer · 50% elapsed · 20pts ahead',
+        'Named / API models · on-demand off · 50% elapsed · 20pts under',
+    ]);
+}
+
 // ---------------------------------------------------------------------------
 // V4 portability. Both of these shipped as real bugs during development and
 // neither is caught by Node, which accepts them happily.
@@ -256,10 +273,65 @@ assert.equal(headline(anthropic).label, 'Weekly (7d)');
 assert.equal(headline(zai).text, 'Error');
 assert.equal(headline(null).text, '');
 
+// The metric names which of its two numbers goes on the panel; its label plays
+// no part. A metric that says nothing is a percentage — which is what
+// OpenRouter's "Credit balance" row is, and what the old label check hid.
+const metered = (h) => parseReport(JSON.stringify({entries: [{
+    id: 'openrouter', error: null,
+    sections: [Object.assign(
+        {type: 'metric', label: 'Credit balance', percent: 25, value: '$75.00', detail: ''},
+        h === undefined ? {} : {headline: h})],
+}]})).entries[0];
+assert.equal(headline(metered(undefined)).text, '25%', 'an older report is a percentage');
+assert.equal(headline(metered('percent')).text, '25%');
+assert.equal(headline(metered('value')).text, '$75.00');
+assert.equal(headline(metered('dollars')).text, '25%', 'an unknown word is not a third rendering');
+// A 'value' headline with nothing to show falls back rather than blanking.
+const emptyValue = parseReport(JSON.stringify({entries: [{
+    id: 'deepseek', error: null,
+    sections: [{type: 'metric', label: 'Balance', percent: 60, value: '', detail: '',
+                headline: 'value'}],
+}]})).entries[0];
+assert.equal(headline(emptyValue).text, '60%');
+// A percent headline on a row whose label says "balance" is drawn as a percent.
+const meteredTank = parseReport(JSON.stringify({entries: [{
+    id: 'deepseek', error: null,
+    sections: [{type: 'metric', label: 'Balance', percent: 75, value: '$50.00',
+                detail: '$50.00 of $200.00 left (75% used)', headline: 'percent'}],
+}]})).entries[0];
+assert.equal(headline(meteredTank).text, '75%');
+
 assert.equal(isAlarming(anthropic), true, 'a critical window is alarming');
 assert.equal(isAlarming(openai), true, 'so is stale data');
 assert.equal(isAlarming(zai), true, 'so is an errored vendor');
 assert.equal(isAlarming(null), false);
+
+// Context sessions (the "Sessions" group) are a breakdown, not quota windows:
+// a session at 90% of its context window must not leak into the headline metric,
+// paint it critical or trigger the alarm when the quota sits lower.
+const sessionBreakdown = parseReport(JSON.stringify({entries: [{
+    id: 'anthropic', error: null,
+    sections: [
+        {type: 'metric', label: 'Session (5h)', percent: 29, value: '29%', severity: 'low'},
+        {type: 'metric', label: 'session one', group: 'Sessions', percent: 90,
+         value: '90%', severity: 'critical'},
+    ],
+}]})).entries[0];
+assert.equal(headline(sessionBreakdown).text, '29%');
+assert.equal(headline(sessionBreakdown).severity, 'low');
+assert.equal(isAlarming(sessionBreakdown), false);
+
+// A grouped row still stands in when an entry has no ungrouped metrics.
+const onlyGrouped = parseReport(JSON.stringify({entries: [{
+    id: 'anthropic', error: null,
+    sections: [
+        {type: 'metric', label: 'session one', group: 'Sessions', percent: 90,
+         value: '90%', severity: 'critical'},
+    ],
+}]})).entries[0];
+assert.equal(headline(onlyGrouped).text, '90%');
+assert.equal(headline(onlyGrouped).severity, 'critical');
+assert.equal(isAlarming(onlyGrouped), true);
 
 // Spacers are dropped: Column spacing sets the rhythm, so keeping them would
 // double it.
@@ -280,6 +352,11 @@ assert.deepEqual(panelCells(zai).map(c => c.text), ['⚠']);
 assert.deepEqual(panelCells(null), []);
 // A vendor whose only section is a block has no percentage to plot.
 assert.deepEqual(panelCells(openai), []);
+// Grouped session rows take no panel cell while a quota window can fill it
+// (the same partition the headline applies) and still stand in when the entry
+// has nothing else.
+assert.deepEqual(panelCells(sessionBreakdown, {max: 2}).map(c => c.text), ['29%']);
+assert.deepEqual(panelCells(onlyGrouped, {max: 2}).map(c => c.text), ['90%']);
 
 // ---------------------------------------------------------------------------
 // cards (viewMode "VendorCards")

@@ -145,9 +145,14 @@ function normalizeSection(raw) {
         return {
             type: 'metric',
             label: safeText(raw.label, 120),
+            group: safeText(raw && raw.group, 80),
             value: safeText(raw.value, 40),
             percent: percent,
             detail: safeText(raw.detail, 400),
+            // Which number the panel draws. Anything but an explicit 'value' —
+            // including a report old enough not to carry the field — leaves it
+            // a percentage.
+            headline: raw.headline === 'value' ? 'value' : 'percent',
             resetAt: safeText(raw.reset_at, 64),
             severity: severityOf(percent, raw.severity),
         };
@@ -273,22 +278,38 @@ function toRing(ring) {
 // ---------------------------------------------------------------------------
 
 // The worst metric, which is what the panel shows when it has room for one
-// number. A balance-style row reports money rather than a percentage, so it
-// contributes its own value text instead.
+// number. Each metric names which of its two numbers belongs on the panel —
+// `headline: 'percent'` or `'value'` — and the other one stays in the detail.
+// Reading that beats guessing from the label, which put OpenRouter's dollar
+// figure on the panel and hid its consumed percent.
 export function headline(entry) {
     if (!entry)
         return {text: '', percent: null, severity: 'low', label: ''};
     let best = null;
-    for (const s of entry.sections)
-        if (s.type === 'metric' && s.percent !== null && (!best || s.percent > best.percent))
-            best = s;
-    if (best) {
-        const isBalance = /balance/i.test(best.label) && best.value !== '';
+    let grouped = null;
+    for (const s of entry.sections) {
+        if (s.type === 'metric' && s.percent !== null) {
+            // A grouped row sits under its own heading below the meters (the
+            // Claude entry's context sessions, SuperGrok's product slices).
+            // It is not a quota window, so it stands in only when the entry
+            // has nothing else.
+            if (s.group) {
+                if (!grouped || s.percent > grouped.percent)
+                    grouped = s;
+            } else if (!best || s.percent > best.percent) {
+                best = s;
+            }
+        }
+    }
+    const chosen = best || grouped;
+    if (chosen) {
+        // An older report omits the field; a metric is a percentage by default.
+        const showsValue = chosen.headline === 'value' && chosen.value !== '';
         return {
-            text: isBalance ? best.value : `${best.percent}%`,
-            percent: best.percent,
-            severity: best.severity,
-            label: best.label,
+            text: showsValue ? chosen.value : `${chosen.percent}%`,
+            percent: chosen.percent,
+            severity: chosen.severity,
+            label: chosen.label,
         };
     }
     for (const s of entry.sections)
@@ -325,18 +346,26 @@ export function panelCells(entry, options) {
         return [];
     if (entry.status === 'error')
         return [{label: '', text: '⚠', severity: 'critical', percent: null}];
-    const cells = [];
+    // The same partition headline() applies: a grouped row sits under its own
+    // heading below the meters and is not a quota window, so it stands in only
+    // when the entry has nothing else.
+    const metrics = [];
+    const grouped = [];
     for (const s of entry.sections) {
-        if (s.type !== 'metric' || cells.length >= max)
+        if (s.type !== 'metric')
             continue;
-        cells.push({
-            label: shortLabel(s.label),
-            text: s.percent === null ? s.value : `${s.percent}%`,
-            severity: s.severity,
-            percent: s.percent,
-        });
+        if (s.group)
+            grouped.push(s);
+        else
+            metrics.push(s);
     }
-    return cells;
+    const chosen = metrics.length ? metrics : grouped;
+    return chosen.slice(0, max).map(s => ({
+        label: shortLabel(s.label),
+        text: s.percent === null ? s.value : `${s.percent}%`,
+        severity: s.severity,
+        percent: s.percent,
+    }));
 }
 
 // The card view (viewMode "VendorCards") projects one card per entry the

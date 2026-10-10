@@ -4,12 +4,14 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use chrono::Utc;
+use ratatui::layout::Rect;
 use reqwest::Client;
 
 use crate::cache::DEFAULT_TTL;
 use crate::config::{Config, CustomProviderConfig};
 use crate::error::{AppError, Result};
 use crate::theme::Theme;
+use crate::tui::settings::SettingsRow;
 use crate::vendor::{VendorId, VendorOutcome};
 
 /// What we display per vendor — raw snapshot + fetch metadata for native
@@ -40,6 +42,12 @@ pub struct ReadyTab {
     /// timestamp stays stable across redraws instead of drifting with the
     /// passing wall clock.
     pub fetched_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Bar-number settings this vendor was configured with — the tank size a
+    /// prepaid balance is metered against, and which of the two numbers goes on
+    /// the bar. Resolved from config at fetch time rather than stored in the
+    /// snapshot, so editing config.toml takes effect on the next redraw instead
+    /// of waiting for the cache to expire.
+    pub display: crate::balance::DisplayPrefs,
 }
 
 /// Where a tab's usage comes from: a built-in vendor, or a user-declared
@@ -202,16 +210,25 @@ fn build_tabs(config: &Config, desktop_labels: &[String]) -> Vec<TabId> {
             for label in desktop_labels {
                 tabs.push(TabId::desktop_account(label.clone()));
             }
-        } else if vendor == VendorId::Openrouter {
-            if config.openrouter.show_default_account || config.openrouter.accounts.is_empty() {
+        } else if let Some(accounts) = config.api_key_accounts(vendor) {
+            if config.show_default_api_key_account(vendor) || accounts.is_empty() {
                 tabs.push(TabId::vendor(vendor));
             }
-            for account in &config.openrouter.accounts {
+            for account in accounts {
                 tabs.push(TabId::account_for(vendor, account.label.clone()));
             }
         } else if vendor == VendorId::Openai {
-            tabs.push(TabId::vendor(vendor));
+            if config.openai.show_default_account || config.openai.accounts.is_empty() {
+                tabs.push(TabId::vendor(vendor));
+            }
             for account in &config.openai.accounts {
+                tabs.push(TabId::account_for(vendor, account.label.clone()));
+            }
+        } else if vendor == VendorId::Copilot {
+            if config.copilot.show_default_account || config.copilot.accounts.is_empty() {
+                tabs.push(TabId::vendor(vendor));
+            }
+            for account in &config.copilot.accounts {
                 tabs.push(TabId::account_for(vendor, account.label.clone()));
             }
         } else {
@@ -248,6 +265,37 @@ fn desktop_profile_labels(_config: &Config) -> Vec<String> {
     Vec::new()
 }
 
+/// Mouse hit-test surface recorded by the last draw and consumed by the event
+/// loop. Draw is the single source of truth for where things are on screen, so
+/// the render pass records the interactive rects here instead of the input
+/// handler re-deriving layout.
+#[derive(Debug, Default, Clone)]
+pub struct HitTargets {
+    /// Vendor navigation entries: Overview first, then each tab by index.
+    pub nav_entries: Vec<(NavTarget, Rect)>,
+    /// Footer actions with a mouse-accessible keyboard equivalent.
+    pub footer_actions: Vec<(FooterAction, Rect)>,
+    /// Settings overlay interactive rows: the primary selector, key fields,
+    /// and save row.
+    pub settings_rows: Vec<(SettingsRow, Rect)>,
+}
+
+/// What a click in the vendor navigation selects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NavTarget {
+    Overview,
+    Tab(usize),
+}
+
+/// What a click in the footer invokes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FooterAction {
+    Refresh,
+    RefreshAll,
+    Settings,
+    Quit,
+}
+
 #[derive(Debug)]
 pub struct App {
     pub tabs_meta: Vec<TabId>,
@@ -279,6 +327,8 @@ pub struct App {
     pub context: Option<crate::tui::context::ContextState>,
     /// Presentation style for the vendor navigation box (`[ui] vendor_box`).
     pub vendor_box: crate::config::VendorBoxStyle,
+    /// Interactive rects from the most recent draw, for mouse hit-testing.
+    pub hit: std::rc::Rc<std::cell::RefCell<HitTargets>>,
 }
 
 impl App {
@@ -290,7 +340,7 @@ impl App {
 
     /// Like [`App::new`] but with an explicit theme. Lets tests build an `App`
     /// without reading the real Omarchy theme file
-    /// (`$HOME/.config/omarchy/current/theme/colors.toml`) — `new` resolves
+    /// (`~/.local/state/omarchy/current/theme/colors.toml`) — `new` resolves
     /// that path and the `$HOME` env var via `merged_with_omarchy`, which is
     /// not hermetic. Production code uses `new`/`new_with_primary`.
     pub fn with_theme(tabs_meta: Vec<TabId>, theme: Theme) -> Self {
@@ -310,6 +360,7 @@ impl App {
             context_generation: 0,
             context: None,
             vendor_box: crate::config::VendorBoxStyle::Sidebar,
+            hit: std::rc::Rc::new(std::cell::RefCell::new(HitTargets::default())),
         }
     }
 
@@ -447,6 +498,27 @@ impl App {
         }
     }
 
+    /// Select the Overview pane (mouse click on the first nav entry).
+    pub fn select_overview(&mut self) {
+        self.overview = true;
+    }
+
+    /// Select a vendor tab by index (mouse click on a nav entry).
+    pub fn select_tab(&mut self, index: usize) {
+        if index < self.tabs_meta.len() {
+            self.active = index;
+            self.overview = false;
+        }
+    }
+
+    /// Apply a mouse click on a vendor-navigation entry.
+    pub fn nav_from_target(&mut self, target: NavTarget) {
+        match target {
+            NavTarget::Overview => self.select_overview(),
+            NavTarget::Tab(index) => self.select_tab(index),
+        }
+    }
+
     /// Tabs the Overview should list: `overview_vendors` filtered against the
     /// live tab set (preserving the config order), or all tabs when unset.
     /// The filter names built-in vendors only, so a configured list excludes
@@ -477,23 +549,58 @@ pub async fn refresh_one(client: &Client, config: &Config, tab: &TabId) -> TabSt
             // `Utc::now() - cache_age` on every draw and the displayed time would
             // tick upward in real time instead of holding at the last refresh.
             let now = Utc::now();
+            let off_the_wire = outcome.off_the_wire();
             let fetched_at = outcome
                 .cache_age
                 .map(|age| now - chrono::Duration::from_std(age).unwrap_or_default());
-            TabState::Ready(Box::new(ReadyTab {
+            let state = TabState::Ready(Box::new(ReadyTab {
                 snapshot: outcome.snapshot,
                 stale: outcome.stale,
                 last_error: outcome.last_error.map(|(code, message)| {
                     (code, crate::display::sanitize_untrusted_field(&message))
                 }),
                 fetched_at,
-            }))
+                display: match &tab.source {
+                    TabSource::Builtin(vendor) => config.display_prefs(*vendor),
+                    // A `[[custom]]` provider states its own percentages; it has
+                    // no balance to meter and no headline to choose.
+                    TabSource::Custom { .. } => crate::balance::DisplayPrefs::default(),
+                },
+            }));
+            // The single notification hook every frontend shares: TUI, `usage`
+            // report, tray, and the GNOME/KDE/Omarchy frontends all land here.
+            // Wire-fresh outcomes only — never cached, stale, or failed ones —
+            // and best-effort by construction: `run` returns nothing and cannot
+            // change this function's result or the caller's exit code.
+            if off_the_wire
+                && config.notifications.enabled
+                && let Some(input) = crate::notify::RefreshInput::from_tab(tab, &state, now)
+            {
+                let _ = crate::notify::run(input, config.notifications.threshold).await;
+            }
+            state
         }
         Err(e) => TabState::error_with_plan(
             crate::display::sanitize_untrusted_field(&e.user_message()),
             e.plan().map(str::to_string),
         ),
     }
+}
+
+/// Key and cache for an API-key vendor tab: a named account's key with its own
+/// `<slug>/<label>` cache, or the default key with the vendor-root cache, whose
+/// path never moves (issue #14).
+fn api_key_and_cache(
+    config: &Config,
+    vendor: VendorId,
+    account: Option<&str>,
+) -> Result<(String, crate::cache::Cache)> {
+    let api_key = config.resolve_account_api_key_for(vendor, account)?;
+    let cache = match account {
+        Some(label) => crate::cache::Cache::for_vendor_account(vendor.slug(), label)?,
+        None => crate::cache::Cache::for_vendor(vendor.slug())?,
+    };
+    Ok((api_key, cache))
 }
 
 async fn build_outcome(client: &Client, config: &Config, tab: &TabId) -> Result<VendorOutcome> {
@@ -525,15 +632,10 @@ async fn build_outcome(client: &Client, config: &Config, tab: &TabId) -> Result<
                     crate::anthropic::desktop_creds::account_target(config, label)?
                 }
                 Some(label) => config.anthropic.account_target(label)?,
-                None => {
-                    let target = match config.anthropic.credentials_path.clone() {
-                        Some(p) => crate::anthropic::creds::CredsTarget::Explicit(p),
-                        None => crate::anthropic::creds::CredsTarget::Default(
-                            crate::anthropic::creds::default_path().unwrap_or_default(),
-                        ),
-                    };
-                    (target, crate::cache::Cache::for_vendor("anthropic")?)
-                }
+                None => (
+                    config.anthropic.default_creds_target(),
+                    crate::cache::Cache::for_vendor("anthropic")?,
+                ),
             };
             let endpoints = crate::anthropic::fetch::Endpoints::default();
             let outcome = crate::anthropic::fetch_snapshot(
@@ -566,15 +668,13 @@ async fn build_outcome(client: &Client, config: &Config, tab: &TabId) -> Result<
             Ok(outcome.into())
         }
         VendorId::Openrouter => {
-            let api_key = config.openrouter.resolve_api_key(tab.account.as_deref())?;
-            let cache = match tab.account.as_deref() {
-                Some(label) => crate::cache::Cache::for_vendor_account("openrouter", label)?,
-                None => crate::cache::Cache::for_vendor("openrouter")?,
-            };
+            let (api_key, cache) = api_key_and_cache(config, vendor, tab.account.as_deref())?;
+            let management_key = config.openrouter_management_key(tab.account.as_deref());
             let endpoints = crate::openrouter::fetch::Endpoints::default();
             let outcome = crate::openrouter::fetch_snapshot(
                 client,
                 &api_key,
+                management_key.as_deref(),
                 &cache,
                 &endpoints,
                 DEFAULT_TTL,
@@ -583,12 +683,7 @@ async fn build_outcome(client: &Client, config: &Config, tab: &TabId) -> Result<
             Ok(outcome.into())
         }
         VendorId::Zai => {
-            let api_key = crate::config::resolve_api_key(
-                "Zai",
-                &config.zai.api_key_env,
-                config.zai.api_key.as_deref(),
-            )?;
-            let cache = crate::cache::Cache::for_vendor("zai")?;
+            let (api_key, cache) = api_key_and_cache(config, vendor, tab.account.as_deref())?;
             let endpoints = crate::zai::fetch::Endpoints::default();
             let outcome = crate::zai::fetch_snapshot(
                 client,
@@ -607,16 +702,25 @@ async fn build_outcome(client: &Client, config: &Config, tab: &TabId) -> Result<
                 Some(label) => crate::cache::Cache::for_vendor_account("openai", label)?,
                 None => crate::cache::Cache::for_vendor("openai")?,
             };
-            let creds_path = config.openai.resolve_auth_path(label)?;
+            let route = || config.openai.fetch_auth_path(label);
             let endpoints = crate::openai::fetch::Endpoints::default();
-            let outcome =
-                crate::openai::fetch_snapshot(client, &creds_path, &cache, &endpoints, DEFAULT_TTL)
-                    .await?;
+            let outcome = crate::openai::fetch_snapshot_routed(
+                client,
+                route,
+                &cache,
+                &endpoints,
+                DEFAULT_TTL,
+            )
+            .await?;
             Ok(outcome.into())
         }
         VendorId::Copilot => {
-            let token = config.copilot.resolve_token()?;
-            let cache = crate::cache::Cache::for_vendor("copilot")?;
+            let label = tab.account.as_deref();
+            let token = config.copilot.resolve_token(label)?;
+            let cache = match label {
+                Some(label) => crate::cache::Cache::for_vendor_account("copilot", label)?,
+                None => crate::cache::Cache::for_vendor("copilot")?,
+            };
             let endpoints = crate::copilot::fetch::Endpoints::default();
             let outcome =
                 crate::copilot::fetch_snapshot(client, &token, &cache, &endpoints, DEFAULT_TTL)
@@ -624,16 +728,24 @@ async fn build_outcome(client: &Client, config: &Config, tab: &TabId) -> Result<
             Ok(outcome.into())
         }
         VendorId::Deepseek => {
-            let api_key = crate::config::resolve_api_key(
-                "DeepSeek",
-                &config.deepseek.api_key_env,
-                config.deepseek.api_key.as_deref(),
-            )?;
-            let cache = crate::cache::Cache::for_vendor("deepseek")?;
+            let (api_key, cache) = api_key_and_cache(config, vendor, tab.account.as_deref())?;
             let endpoints = crate::deepseek::fetch::Endpoints::default();
             let outcome =
                 crate::deepseek::fetch_snapshot(client, &api_key, &cache, &endpoints, DEFAULT_TTL)
                     .await?;
+            Ok(outcome.into())
+        }
+        VendorId::Deepinfra => {
+            let (api_key, cache) = api_key_and_cache(config, vendor, tab.account.as_deref())?;
+            let endpoints = crate::deepinfra::fetch::Endpoints::default();
+            let outcome = crate::deepinfra::fetch::fetch_snapshot(
+                client,
+                &api_key,
+                &cache,
+                &endpoints,
+                DEFAULT_TTL,
+            )
+            .await?;
             Ok(outcome.into())
         }
         VendorId::Kimi => {
@@ -650,12 +762,7 @@ async fn build_outcome(client: &Client, config: &Config, tab: &TabId) -> Result<
             Ok(outcome.into())
         }
         VendorId::Kilo => {
-            let api_key = crate::config::resolve_api_key(
-                "Kilo",
-                &config.kilo.api_key_env,
-                config.kilo.api_key.as_deref(),
-            )?;
-            let cache = crate::cache::Cache::for_vendor("kilo")?;
+            let (api_key, cache) = api_key_and_cache(config, vendor, tab.account.as_deref())?;
             let endpoints = crate::kilo::fetch::Endpoints::default();
             let outcome = crate::kilo::fetch_snapshot(
                 client,
@@ -693,12 +800,7 @@ async fn build_outcome(client: &Client, config: &Config, tab: &TabId) -> Result<
             Ok(outcome.into())
         }
         VendorId::Novita => {
-            let api_key = crate::config::resolve_api_key(
-                "Novita",
-                &config.novita.api_key_env,
-                config.novita.api_key.as_deref(),
-            )?;
-            let cache = crate::cache::Cache::for_vendor("novita")?;
+            let (api_key, cache) = api_key_and_cache(config, vendor, tab.account.as_deref())?;
             let endpoints = crate::novita::fetch::Endpoints::default();
             let outcome =
                 crate::novita::fetch_snapshot(client, &api_key, &cache, &endpoints, DEFAULT_TTL)
@@ -706,12 +808,7 @@ async fn build_outcome(client: &Client, config: &Config, tab: &TabId) -> Result<
             Ok(outcome.into())
         }
         VendorId::Moonshot => {
-            let api_key = crate::config::resolve_api_key(
-                "Moonshot",
-                &config.moonshot.api_key_env,
-                config.moonshot.api_key.as_deref(),
-            )?;
-            let cache = crate::cache::Cache::for_vendor("moonshot")?;
+            let (api_key, cache) = api_key_and_cache(config, vendor, tab.account.as_deref())?;
             let (endpoints, currency) =
                 crate::moonshot::fetch::Endpoints::for_region(&config.moonshot.region);
             let outcome = crate::moonshot::fetch_snapshot(
@@ -725,26 +822,8 @@ async fn build_outcome(client: &Client, config: &Config, tab: &TabId) -> Result<
             .await?;
             Ok(outcome.into())
         }
-        VendorId::Minimax => {
-            let api_key = crate::config::resolve_api_key(
-                "MiniMax",
-                &config.minimax.api_key_env,
-                config.minimax.api_key.as_deref(),
-            )?;
-            let cache = crate::cache::Cache::for_vendor("minimax")?;
-            let endpoints = crate::minimax::fetch::Endpoints::for_region(&config.minimax.region);
-            let outcome =
-                crate::minimax::fetch_snapshot(client, &api_key, &cache, &endpoints, DEFAULT_TTL)
-                    .await?;
-            Ok(outcome.into())
-        }
         VendorId::Grok => {
-            let key = crate::config::resolve_api_key(
-                "Grok",
-                &config.grok.api_key_env,
-                config.grok.api_key.as_deref(),
-            )?;
-            let cache = crate::cache::Cache::for_vendor("grok")?;
+            let (key, cache) = api_key_and_cache(config, vendor, tab.account.as_deref())?;
             let endpoints = crate::grok::fetch::Endpoints::default();
             let outcome = crate::grok::fetch_snapshot(
                 client,
@@ -799,6 +878,37 @@ async fn build_outcome(client: &Client, config: &Config, tab: &TabId) -> Result<
                 DEFAULT_TTL,
             )
             .await?;
+            Ok(outcome.into())
+        }
+        VendorId::ModelStudio => {
+            // The bl CLI's own console session is the login; its region/site
+            // pair picks the gateway, and only a token fingerprint persists.
+            let creds = crate::modelstudio::resolve_credentials(&config.modelstudio)?;
+            let cache = crate::cache::Cache::for_vendor("modelstudio")?;
+            let endpoints =
+                crate::modelstudio::fetch::Endpoints::for_gateway(creds.region, creds.site);
+            let outcome = crate::modelstudio::fetch_snapshot_with(
+                client,
+                &creds,
+                &cache,
+                &endpoints,
+                DEFAULT_TTL,
+            )
+            .await?;
+            Ok(outcome.into())
+        }
+        VendorId::Devin => {
+            let cache = crate::cache::Cache::for_vendor("devin")?;
+            let outcome =
+                crate::devin::fetch::fetch_snapshot(&config.devin, &cache, DEFAULT_TTL).await?;
+            Ok(outcome.into())
+        }
+        VendorId::Minimax => {
+            let (api_key, cache) = api_key_and_cache(config, vendor, tab.account.as_deref())?;
+            let endpoints = crate::minimax::fetch::Endpoints::for_region(&config.minimax.region);
+            let outcome =
+                crate::minimax::fetch_snapshot(client, &api_key, &cache, &endpoints, DEFAULT_TTL)
+                    .await?;
             Ok(outcome.into())
         }
         VendorId::Cursor => {
@@ -904,6 +1014,25 @@ async fn build_outcome(client: &Client, config: &Config, tab: &TabId) -> Result<
                 DEFAULT_TTL,
             )
             .await?;
+            Ok(outcome.into())
+        }
+        VendorId::OrcaRouter => {
+            let (api_key, cache) = api_key_and_cache(config, vendor, tab.account.as_deref())?;
+            let endpoints = crate::orcarouter::fetch::Endpoints::default();
+            let outcome = crate::orcarouter::fetch_snapshot(
+                client,
+                &api_key,
+                &cache,
+                &endpoints,
+                DEFAULT_TTL,
+            )
+            .await?;
+            Ok(outcome.into())
+        }
+        VendorId::Lyceum => {
+            let (api_key, cache) = api_key_and_cache(config, vendor, tab.account.as_deref())?;
+            let outcome =
+                crate::lyceum::fetch::fetch_snapshot(client, &api_key, &cache, DEFAULT_TTL).await?;
             Ok(outcome.into())
         }
     }
@@ -1035,6 +1164,34 @@ mod tests {
     }
 
     #[test]
+    fn mouse_nav_targets_select_overview_and_tabs() {
+        let mut app = App::with_theme(
+            vec![
+                TabId::vendor(VendorId::Anthropic),
+                TabId::vendor(VendorId::Openai),
+            ],
+            Theme::default(),
+        );
+        app.overview = true;
+        app.nav_from_target(NavTarget::Tab(1));
+        assert!(!app.overview);
+        assert_eq!(app.active, 1);
+        app.nav_from_target(NavTarget::Overview);
+        assert!(app.overview);
+        // Out-of-range tab indices are ignored.
+        app.nav_from_target(NavTarget::Tab(99));
+        assert!(app.overview);
+    }
+
+    #[test]
+    fn hit_targets_default_to_empty() {
+        let app = App::with_theme(Vec::new(), Theme::default());
+        assert!(app.hit.borrow().nav_entries.is_empty());
+        assert!(app.hit.borrow().footer_actions.is_empty());
+        assert!(app.hit.borrow().settings_rows.is_empty());
+    }
+
+    #[test]
     fn overview_tabs_defaults_to_all_and_honors_the_config_filter() {
         let mut app = App::with_theme(
             vec![
@@ -1062,6 +1219,7 @@ mod tests {
         config.openai.enabled = false;
         config.zai.enabled = false;
         config.openrouter.enabled = false;
+        config.commandcode.enabled = false;
         config.shvia.enabled = false;
         config.anthropic.accounts = labels
             .iter()
@@ -1090,6 +1248,7 @@ mod tests {
         empty.openai.enabled = false;
         empty.zai.enabled = false;
         empty.openrouter.enabled = false;
+        empty.commandcode.enabled = false;
         empty.anthropic.show_default_account = false;
         assert_eq!(
             tabs_from_config(&empty),
@@ -1127,16 +1286,19 @@ mod tests {
         config.anthropic.enabled = false;
         config.openai.enabled = false;
         config.zai.enabled = false;
+        config.commandcode.enabled = false;
         config.openrouter.accounts = vec![
-            crate::config::OpenRouterAccount {
+            crate::config::ApiKeyAccount {
                 label: "work".into(),
                 api_key_env: Some("OPENROUTER_WORK_API_KEY".into()),
                 api_key: None,
+                management_api_key_env: None,
             },
-            crate::config::OpenRouterAccount {
+            crate::config::ApiKeyAccount {
                 label: "personal".into(),
                 api_key_env: None,
                 api_key: Some("personal-key".into()),
+                management_api_key_env: None,
             },
         ];
         assert_eq!(
@@ -1155,6 +1317,7 @@ mod tests {
         config.anthropic.enabled = false;
         config.zai.enabled = false;
         config.openrouter.enabled = false;
+        config.commandcode.enabled = false;
         config.openai.accounts.push(crate::config::OpenAiAccount {
             label: "work".into(),
             codex_auth_path: "/tmp/codex-work/auth.json".into(),
@@ -1169,11 +1332,69 @@ mod tests {
     }
 
     #[test]
+    fn copilot_named_accounts_get_their_own_tabs_and_can_hide_the_default() {
+        let base = || {
+            let mut config = Config::default();
+            config.anthropic.enabled = false;
+            config.openai.enabled = false;
+            config.zai.enabled = false;
+            config.openrouter.enabled = false;
+            config.commandcode.enabled = false;
+            config.copilot.enabled = true;
+            config
+        };
+
+        // No accounts: exactly the pre-#378 single tab.
+        assert_eq!(
+            tabs_from_config(&base()),
+            vec![TabId::vendor(VendorId::Copilot)]
+        );
+
+        // Named accounts follow the default, in config order.
+        let mut config = base();
+        config.copilot.accounts.push(crate::config::CopilotAccount {
+            label: "work".into(),
+            user: "octocat-work".into(),
+        });
+        config.copilot.accounts.push(crate::config::CopilotAccount {
+            label: "personal".into(),
+            user: "octocat".into(),
+        });
+        assert_eq!(
+            tabs_from_config(&config),
+            vec![
+                TabId::vendor(VendorId::Copilot),
+                TabId::account_for(VendorId::Copilot, "work"),
+                TabId::account_for(VendorId::Copilot, "personal"),
+            ]
+        );
+
+        // The ambient active-gh tab is suppressible once every account is named.
+        config.copilot.show_default_account = false;
+        assert_eq!(
+            tabs_from_config(&config),
+            vec![
+                TabId::account_for(VendorId::Copilot, "work"),
+                TabId::account_for(VendorId::Copilot, "personal"),
+            ]
+        );
+
+        // But never when it would leave Copilot with no tab at all.
+        let mut empty = base();
+        empty.copilot.show_default_account = false;
+        assert_eq!(
+            tabs_from_config(&empty),
+            vec![TabId::vendor(VendorId::Copilot)]
+        );
+    }
+
+    #[test]
     fn openrouter_can_hide_default_only_when_named_accounts_exist() {
         let mut config = Config::default();
         config.anthropic.enabled = false;
         config.openai.enabled = false;
         config.zai.enabled = false;
+        config.commandcode.enabled = false;
         config.openrouter.show_default_account = false;
         assert_eq!(
             tabs_from_config(&config),
@@ -1183,14 +1404,78 @@ mod tests {
         config
             .openrouter
             .accounts
-            .push(crate::config::OpenRouterAccount {
+            .push(crate::config::ApiKeyAccount {
                 label: "work".into(),
                 api_key_env: Some("OPENROUTER_WORK_API_KEY".into()),
                 api_key: None,
+                management_api_key_env: None,
             });
         assert_eq!(
             tabs_from_config(&config),
             vec![TabId::account_for(VendorId::Openrouter, "work")]
+        );
+    }
+
+    #[test]
+    fn every_api_key_account_vendor_fans_out_like_openrouter() {
+        let config_for = |vendor: VendorId, show_default: bool| -> Config {
+            let section = vendor.config_section();
+            // Switch off the vendors that are on by default, so the tab list
+            // is this vendor's alone.
+            let mut text: String = ["anthropic", "openai", "commandcode", "zai", "openrouter"]
+                .into_iter()
+                .filter(|other| *other != section)
+                .map(|other| format!("[{other}]\nenabled = false\n"))
+                .collect();
+            text.push_str(&format!(
+                "[{section}]\nenabled = true\nshow_default_account = {show_default}\n\
+                 [[{section}.accounts]]\nlabel = \"work\"\napi_key = \"k1\"\n\
+                 [[{section}.accounts]]\nlabel = \"personal\"\napi_key = \"k2\"\n"
+            ));
+            let config: Config = toml::from_str(&text).unwrap();
+            config.validate().unwrap();
+            config
+        };
+        for vendor in Config::API_KEY_ACCOUNT_VENDORS {
+            let named = vec![
+                TabId::account_for(vendor, "work"),
+                TabId::account_for(vendor, "personal"),
+            ];
+            let mut with_default = vec![TabId::vendor(vendor)];
+            with_default.extend(named.clone());
+            assert_eq!(
+                tabs_from_config(&config_for(vendor, true)),
+                with_default,
+                "{vendor:?}"
+            );
+            assert_eq!(
+                tabs_from_config(&config_for(vendor, false)),
+                named,
+                "{vendor:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_can_hide_default_only_when_named_accounts_exist() {
+        let mut config = Config::default();
+        config.anthropic.enabled = false;
+        config.zai.enabled = false;
+        config.openrouter.enabled = false;
+        config.commandcode.enabled = false;
+        config.openai.show_default_account = false;
+        assert_eq!(
+            tabs_from_config(&config),
+            vec![TabId::vendor(VendorId::Openai)]
+        );
+
+        config.openai.accounts.push(crate::config::OpenAiAccount {
+            label: "work".into(),
+            codex_auth_path: "/tmp/codex-work/auth.json".into(),
+        });
+        assert_eq!(
+            tabs_from_config(&config),
+            vec![TabId::account_for(VendorId::Openai, "work")]
         );
     }
 
@@ -1208,6 +1493,7 @@ mod tests {
         config.openai.enabled = false;
         config.zai.enabled = false;
         config.openrouter.enabled = false;
+        config.commandcode.enabled = false;
         config.anthropic.accounts_dir = Some(td.path().to_path_buf());
 
         let tabs = tabs_from_config(&config);
@@ -1376,10 +1662,12 @@ mod tests {
                 is_free_tier: false,
                 limit: None,
                 limit_remaining: None,
+                recent_models: Vec::new(),
             }),
             stale: false,
             last_error: None,
             fetched_at: Some(fetched_at),
+            display: Default::default(),
         }))
     }
 

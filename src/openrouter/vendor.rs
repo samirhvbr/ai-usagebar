@@ -246,6 +246,7 @@ mod tests {
             is_free_tier: false,
             limit: Some(50.0),
             limit_remaining: Some(24.5),
+            recent_models: Vec::new(),
         }
     }
 

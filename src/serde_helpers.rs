@@ -1,11 +1,14 @@
 //! Deserializers shared by the OAuth credential readers.
 //!
-//! Both `~/.claude/.credentials.json` and `~/.codex/auth.json` are written by
-//! another product, and both can hold a token field that is present but blank.
-//! An empty access token is not a credential — it produces a request that gets
-//! a 401 the user cannot act on — so it is rejected at parse time rather than
-//! carried into a fetch. The rule is the same for both readers and lives here
-//! once so it cannot come to mean two things.
+//! Credential files are written by another product, and a token field can be
+//! present but blank. An empty access token is not a credential — it produces
+//! a request that gets a 401 the user cannot act on — so where a hard parse
+//! error is the right signal (the OAuth *refresh responses* and the
+//! kiro/kimi credential files use this) the blank is rejected at parse time.
+//! Readers whose blank shapes are legitimate (#11's trusted-device flow keeps
+//! a live access token with an empty refresh token, and the Claude Keychain
+//! fallback distinguishes "signed out" from "corrupt") reject blanks in their
+//! fetch path instead, with a credentials error naming the login command.
 
 use serde::Deserialize as _;
 

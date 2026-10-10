@@ -6,12 +6,14 @@ use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 
 use crate::countdown;
-use crate::format::{placeholders, reset_credit_lines, reset_credits, substitute, updated_at_hm};
-use crate::pacing::{self, PaceSeverity};
+use crate::format::{
+    placeholders, reset_credit_lines, reset_credits, substitute, updated_at_hm, window_placeholders,
+};
+use crate::pacing::PaceSeverity;
 use crate::pango::{color_span, escape, severity_color, severity_for};
 use crate::theme::Theme;
 use crate::tooltip::{Line as TooltipLine, push_window, render_bordered};
-use crate::usage::{OpenAiSnapshot, OpenAiSource, UsageWindow};
+use crate::usage::{OpenAiSnapshot, OpenAiSource};
 use crate::vendor::{RenderOpts, VendorId, VendorOutcome};
 use crate::waybar::{Class, WaybarOutput};
 
@@ -112,39 +114,6 @@ pub fn build_placeholders(
     ])
 }
 
-#[derive(Default)]
-struct WindowPlaceholderValues {
-    pct: String,
-    reset: String,
-    elapsed: String,
-    ratio_pace: String,
-    point_pace: String,
-}
-
-fn window_placeholders(
-    window: Option<&UsageWindow>,
-    opts: &RenderOpts,
-    now: DateTime<Utc>,
-) -> WindowPlaceholderValues {
-    let Some(window) = window else {
-        return WindowPlaceholderValues::default();
-    };
-    let pace = pacing::calc(
-        window.utilization_pct,
-        window.resets_at,
-        now,
-        window.window_duration,
-        opts.pace_tolerance,
-    );
-    WindowPlaceholderValues {
-        pct: window.utilization_pct.to_string(),
-        reset: countdown::format(window.resets_at, now),
-        elapsed: pace.elapsed_pct.to_string(),
-        ratio_pace: pace.ratio_pace.glyph().to_string(),
-        point_pace: pace.point_pace.glyph().to_string(),
-    }
-}
-
 pub fn severity(snap: &OpenAiSnapshot) -> PaceSeverity {
     let windows = [
         snap.session.as_ref(),
@@ -172,7 +141,21 @@ pub fn render(
         .format
         .clone()
         .unwrap_or_else(|| default_format(snap).to_string());
-    let values = build_placeholders(snap, opts, now);
+    let mut values = build_placeholders(snap, opts, now);
+    // Both sinks fed by this map (bar text and --tooltip-format) are Pango
+    // markup. The plan label and model names are API-controlled, so escape
+    // their aliases at the projection boundary. The default tooltip escapes
+    // the raw snapshot.
+    for key in [
+        "plan",
+        "oai_plan",
+        "oai_extra_limits",
+        "oai_unavailable_models",
+    ] {
+        if let Some(value) = values.get_mut(key) {
+            *value = escape(value);
+        }
+    }
 
     let mut text = substitute(&format, &values);
     if outcome.stale {
@@ -589,5 +572,23 @@ mod tests {
         for glyph in ['↑', '→', '↓'] {
             assert!(!out.tooltip.contains(glyph), "{}", out.tooltip);
         }
+    }
+
+    #[test]
+    fn api_plan_is_pango_escaped_in_custom_formats() {
+        let mut s = sample();
+        s.plan = "ChatGPT Pro & Enterprise <preview>".into();
+        let mut o = opts();
+        o.format = Some("{plan}".into());
+        o.tooltip_format = Some("{oai_plan}".into());
+
+        let out = render(&oc(s.clone()), &s, &Theme::default(), &o, Utc::now());
+        assert!(!out.text.contains(" & "));
+        assert!(!out.tooltip.contains('<'));
+        assert!(
+            out.text
+                .contains("ChatGPT Pro &amp; Enterprise &lt;preview&gt;")
+        );
+        assert_eq!(out.tooltip, "ChatGPT Pro &amp; Enterprise &lt;preview&gt;");
     }
 }

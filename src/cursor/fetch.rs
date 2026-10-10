@@ -1,6 +1,11 @@
 //! Fetch Cursor's included-usage summary from `GET /api/usage-summary`,
 //! authenticated with the session token read out of the local `state.vscdb`
 //! (see `db.rs`). Cache/stale/error-fallback shape mirrors `kimi::fetch`.
+//!
+//! Credit grants are a second call, `POST GetClientVisibleCreditGrants` on
+//! `api2.cursor.sh`, with the same access token as a Bearer credential. That
+//! call is best-effort: a timeout, a non-2xx, or a body that is not a grant
+//! list leaves `credits` empty and the usage bars up.
 
 use std::path::Path;
 use std::time::Duration;
@@ -9,13 +14,17 @@ use chrono::{DateTime, Utc};
 
 use crate::cache::{Cache, acquire_lock_async};
 use crate::error::{AppError, Result};
-use crate::usage::CursorSnapshot;
+use crate::usage::{CursorCreditGrant, CursorSnapshot};
 use crate::vendor::{MAX_BODY_BYTES, read_body_capped};
 
 use super::db;
 use super::types::{self, UsageSummary};
 
 pub const BASE_URL: &str = "https://cursor.com";
+/// Connect-RPC the spending page's Credits card is drawn from. Same access
+/// token as the usage-summary cookie, sent as a Bearer credential.
+pub const CREDITS_URL: &str =
+    "https://api2.cursor.sh/aiserver.v1.DashboardService/GetClientVisibleCreditGrants";
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 const LOCK_TIMEOUT: Duration = Duration::from_secs(15);
 /// The dashboard endpoint gates on browser-looking headers; a plain
@@ -26,12 +35,14 @@ const BROWSER_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
 #[derive(Debug, Clone)]
 pub struct Endpoints {
     pub summary: String,
+    pub credits: String,
 }
 
 impl Default for Endpoints {
     fn default() -> Self {
         Self {
             summary: format!("{BASE_URL}/api/usage-summary"),
+            credits: CREDITS_URL.into(),
         }
     }
 }
@@ -44,7 +55,8 @@ pub type FetchOutcome = crate::outcome::Outcome<CursorSnapshot>;
 /// `[cursor] db_path` (config override) vs [`db::default_db_path`], the same
 /// override pattern as `openai.codex_auth_path`. `agent_auth_path` is the
 /// headless `cursor-agent` CLI's own `auth.json`, tried when `db_path` is
-/// missing — see `db::resolve_access_token`.
+/// missing — see `db::resolve_access_token`, which on macOS also tries the
+/// CLI's Keychain items.
 pub async fn fetch_snapshot(
     client: &reqwest::Client,
     db_path: &Path,
@@ -85,13 +97,17 @@ async fn fetch_snapshot_at(
     let token = db::resolve_access_token(db_path, agent_auth_path)?;
     let auth = db::session_auth(&token)?;
 
+    // A payload written before credit grants existed has no `credits` key.
+    // Serving it fresh would hide a balance the spending page is showing
+    // until the TTL elapsed, so that cache is not a hit.
     if let Some(bytes) = cache.fresh_payload(cache_ttl)?
+        && payload_records_credits(&bytes)
         && let Ok(outcome) = reuse_cache(&bytes, cache, false, &auth.account_key, now)
     {
         return Ok(outcome);
     }
 
-    match fetch_live(client, endpoints, &auth).await {
+    match fetch_live(client, endpoints, &auth, &token).await {
         Ok(snap) => {
             let bytes = serde_json::to_vec(&snap_to_json(&snap, &auth.account_key))?;
             cache.write_payload(&bytes)?;
@@ -209,6 +225,47 @@ fn parse_cache_at(bytes: &[u8], account: &str, now: DateTime<Utc>) -> Result<Cur
             .get("cycle_start")
             .and_then(|c| parse_cache_datetime(c).ok())
             .flatten(),
+        credits: parse_cached_credits(&v),
+    })
+}
+
+/// A missing `credits` key is a cache written before grants existed. A bad
+/// entry is skipped so one corrupt grant cannot throw away the usage bars.
+/// `credits` must be present, even as an empty list. Absence means the
+/// payload predates the field and is not a complete snapshot.
+fn payload_records_credits(bytes: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(bytes)
+        .ok()
+        .is_some_and(|value| value.get("credits").is_some())
+}
+
+fn parse_cached_credits(v: &serde_json::Value) -> Vec<CursorCreditGrant> {
+    let Some(items) = v.get("credits").and_then(serde_json::Value::as_array) else {
+        return Vec::new();
+    };
+    items.iter().filter_map(cached_credit).collect()
+}
+
+fn cached_credit(item: &serde_json::Value) -> Option<CursorCreditGrant> {
+    let remaining_cents = item.get("remaining_cents")?.as_i64().filter(|n| *n >= 0)?;
+    let total_cents = item.get("total_cents")?.as_i64().filter(|n| *n > 0)?;
+    let expires_at = match item.get("expires_at") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(raw) => Some(parse_cache_datetime(raw).ok().flatten()?),
+    };
+    let display_name = item
+        .get("display_name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .chars()
+        .take(160)
+        .collect();
+    Some(CursorCreditGrant {
+        remaining_cents,
+        total_cents,
+        expires_at,
+        display_name,
     })
 }
 
@@ -237,6 +294,12 @@ fn snap_to_json(snap: &CursorSnapshot, account: &str) -> serde_json::Value {
         "on_demand_limit_cents": snap.on_demand_limit_cents,
         "reset_at": snap.reset_at.map(|dt| dt.to_rfc3339()),
         "cycle_start": snap.cycle_start.map(|dt| dt.to_rfc3339()),
+        "credits": snap.credits.iter().map(|grant| serde_json::json!({
+            "remaining_cents": grant.remaining_cents,
+            "total_cents": grant.total_cents,
+            "expires_at": grant.expires_at.map(|dt| dt.to_rfc3339()),
+            "display_name": grant.display_name,
+        })).collect::<Vec<_>>(),
     })
 }
 
@@ -244,6 +307,7 @@ async fn fetch_live(
     client: &reqwest::Client,
     endpoints: &Endpoints,
     auth: &db::SessionAuth,
+    access_token: &str,
 ) -> Result<CursorSnapshot> {
     // usage-summary keys off the session cookie alone (no `?user=` param); the
     // browser-ish headers get past its CORS gate.
@@ -279,7 +343,39 @@ async fn fetch_live(
     let bytes = read_body_capped(resp, MAX_BODY_BYTES).await?;
     let parsed: UsageSummary = serde_json::from_slice(&bytes)
         .map_err(|e| AppError::Schema(format!("cursor usage-summary response: {e}")))?;
-    types::to_snapshot(parsed)
+    let mut snap = types::to_snapshot(parsed)?;
+    snap.credits = fetch_credits(client, endpoints, access_token).await;
+    Ok(snap)
+}
+
+/// Best-effort. Anything other than a 2xx grant list — including auth failure
+/// on this call alone — is an empty balance, not an error on the usage bars.
+async fn fetch_credits(
+    client: &reqwest::Client,
+    endpoints: &Endpoints,
+    access_token: &str,
+) -> Vec<CursorCreditGrant> {
+    let Ok(Ok(resp)) = tokio::time::timeout(
+        HTTP_TIMEOUT,
+        client
+            .post(&endpoints.credits)
+            .header("Content-Type", "application/json")
+            .header("Authorization", format!("Bearer {access_token}"))
+            .header("Connect-Protocol-Version", "1")
+            .body("{}")
+            .send(),
+    )
+    .await
+    else {
+        return Vec::new();
+    };
+    if !resp.status().is_success() {
+        return Vec::new();
+    }
+    let Ok(bytes) = read_body_capped(resp, MAX_BODY_BYTES).await else {
+        return Vec::new();
+    };
+    types::parse_credit_grants(&bytes)
 }
 
 #[cfg(test)]
@@ -328,6 +424,16 @@ mod tests {
         std::path::PathBuf::from("/nonexistent/cursor-agent-auth.json")
     }
 
+    fn endpoints_for(server: &mockito::Server) -> Endpoints {
+        Endpoints {
+            summary: format!("{}/api/usage-summary", server.url()),
+            credits: format!(
+                "{}/aiserver.v1.DashboardService/GetClientVisibleCreditGrants",
+                server.url()
+            ),
+        }
+    }
+
     fn cached_snapshot(account: &str, reset_at: &str) -> Vec<u8> {
         serde_json::to_vec(&serde_json::json!({
             "account": account,
@@ -374,9 +480,7 @@ mod tests {
         let db_path = seed_state_db(&db_dir, &token);
         let (_cache_dir, cache) = cache_fixture();
         let client = reqwest::Client::new();
-        let endpoints = Endpoints {
-            summary: format!("{}/api/usage-summary", server.url()),
-        };
+        let endpoints = endpoints_for(&server);
 
         let out = fetch_snapshot(
             &client,
@@ -440,9 +544,7 @@ mod tests {
         .unwrap();
         let (_cache_dir, cache) = cache_fixture();
         let client = reqwest::Client::new();
-        let endpoints = Endpoints {
-            summary: format!("{}/api/usage-summary", server.url()),
-        };
+        let endpoints = endpoints_for(&server);
 
         let out = fetch_snapshot(
             &client,
@@ -481,9 +583,7 @@ mod tests {
             .unwrap();
 
         let client = reqwest::Client::new();
-        let endpoints = Endpoints {
-            summary: format!("{}/api/usage-summary", server.url()),
-        };
+        let endpoints = endpoints_for(&server);
         let out = fetch_snapshot(
             &client,
             &db_path,
@@ -517,6 +617,7 @@ mod tests {
                     "on_demand_used_cents": 1785,
                     "on_demand_limit_cents": 35000,
                     "reset_at": "2099-08-04T00:00:00Z",
+                    "credits": [],
                 })
                 .to_string()
                 .as_bytes(),
@@ -539,6 +640,64 @@ mod tests {
         assert!(out.snapshot.on_demand_enabled);
         assert_eq!(out.snapshot.on_demand_used_cents, Some(1785));
         assert_eq!(out.snapshot.on_demand_limit_cents, Some(35000));
+        assert!(!out.stale);
+    }
+
+    #[tokio::test]
+    async fn fresh_cache_without_a_credits_field_is_refetched() {
+        let token = fake_token("user_123");
+        let db_dir = TempDir::new().unwrap();
+        let db_path = seed_state_db(&db_dir, &token);
+        let (_cache_dir, cache) = cache_fixture();
+        cache
+            .write_payload(
+                serde_json::json!({
+                    "account": account_key(&token),
+                    "plan": "Pro", "auto_pct": 7, "api_pct": 3, "total_pct": 5,
+                    "unlimited": false, "on_demand_enabled": false,
+                    "reset_at": "2099-08-04T00:00:00Z",
+                })
+                .to_string()
+                .as_bytes(),
+            )
+            .unwrap();
+
+        let mut server = mockito::Server::new_async().await;
+        let summary = server
+            .mock("GET", "/api/usage-summary")
+            .with_status(200)
+            .with_body(sample_json())
+            .expect(1)
+            .create_async()
+            .await;
+        let grants = server
+            .mock(
+                "POST",
+                "/aiserver.v1.DashboardService/GetClientVisibleCreditGrants",
+            )
+            .with_status(200)
+            .with_body(
+                r#"{"grants":[{"remainingCents":2100,"totalCents":2500,"expiresAtMs":1793577600000,"displayName":"Promo"}]}"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+
+        let out = fetch_snapshot(
+            &reqwest::Client::new(),
+            &db_path,
+            &no_agent_auth(),
+            &cache,
+            &endpoints_for(&server),
+            Duration::from_secs(3600),
+        )
+        .await
+        .unwrap();
+        summary.assert_async().await;
+        grants.assert_async().await;
+        assert_eq!(out.snapshot.auto_pct, 98);
+        assert_eq!(out.snapshot.credits.len(), 1);
+        assert_eq!(out.snapshot.credits[0].remaining_cents, 2100);
         assert!(!out.stale);
     }
 
@@ -568,9 +727,7 @@ mod tests {
             .expect(1)
             .create_async()
             .await;
-        let endpoints = Endpoints {
-            summary: format!("{}/api/usage-summary", server.url()),
-        };
+        let endpoints = endpoints_for(&server);
 
         let out = fetch_snapshot(
             &reqwest::Client::new(),
@@ -606,9 +763,7 @@ mod tests {
             .with_status(503)
             .create_async()
             .await;
-        let endpoints = Endpoints {
-            summary: format!("{}/api/usage-summary", server.url()),
-        };
+        let endpoints = endpoints_for(&server);
         let now = DateTime::parse_from_rfc3339("2026-08-05T00:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
@@ -637,5 +792,141 @@ mod tests {
         let err =
             parse_cache_at(&serde_json::to_vec(&payload).unwrap(), "account", now).unwrap_err();
         assert!(matches!(err, AppError::Schema(_)));
+    }
+
+    #[tokio::test]
+    async fn credit_grants_ride_along_and_a_failed_grant_call_keeps_the_bars() {
+        let mut server = mockito::Server::new_async().await;
+        let token = fake_token("user_123");
+        let summary = server
+            .mock("GET", "/api/usage-summary")
+            .with_status(200)
+            .with_body(sample_json())
+            .expect(2)
+            .create_async()
+            .await;
+        let grants = server
+            .mock(
+                "POST",
+                "/aiserver.v1.DashboardService/GetClientVisibleCreditGrants",
+            )
+            .match_header("authorization", format!("Bearer {token}").as_str())
+            .match_header("connect-protocol-version", "1")
+            .match_body("{}")
+            .with_status(200)
+            .with_body(
+                r#"{"grants":[{"remainingCents":"2100","totalCents":2500,"expiresAtMs":"1793577600000","displayName":"Promo"}]}"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+
+        let db_dir = TempDir::new().unwrap();
+        let db_path = seed_state_db(&db_dir, &token);
+        let (_cache_dir, cache) = cache_fixture();
+        let client = reqwest::Client::new();
+        let endpoints = endpoints_for(&server);
+
+        let out = fetch_snapshot(
+            &client,
+            &db_path,
+            &no_agent_auth(),
+            &cache,
+            &endpoints,
+            Duration::from_secs(0),
+        )
+        .await
+        .unwrap();
+        grants.assert_async().await;
+        assert!(!out.stale);
+        assert_eq!(out.snapshot.auto_pct, 98);
+        assert_eq!(out.snapshot.credits.len(), 1);
+        assert_eq!(out.snapshot.credits[0].remaining_cents, 2100);
+        assert_eq!(out.snapshot.credits[0].total_cents, 2500);
+        assert_eq!(out.snapshot.credits[0].display_name, "Promo");
+        assert!(out.last_error.is_none());
+
+        // Registered after the success mock so it is the one the refetch hits.
+        // A grant-call failure must not stale the bars or surface the body.
+        let down = server
+            .mock(
+                "POST",
+                "/aiserver.v1.DashboardService/GetClientVisibleCreditGrants",
+            )
+            .with_status(503)
+            .with_body("upstream body")
+            .expect(1)
+            .create_async()
+            .await;
+        let again = fetch_snapshot(
+            &client,
+            &db_path,
+            &no_agent_auth(),
+            &cache,
+            &endpoints,
+            Duration::from_secs(0),
+        )
+        .await
+        .unwrap();
+        down.assert_async().await;
+        summary.assert_async().await;
+        assert!(!again.stale);
+        assert_eq!(again.snapshot.auto_pct, 98);
+        assert!(again.snapshot.credits.is_empty());
+        assert!(again.last_error.is_none());
+    }
+
+    #[test]
+    fn cache_round_trips_credit_grants_and_skips_a_bad_one() {
+        let now = DateTime::parse_from_rfc3339("2026-08-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let expires = DateTime::parse_from_rfc3339("2026-11-02T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let snap = CursorSnapshot {
+            plan: "Pro".into(),
+            auto_pct: 1,
+            api_pct: 2,
+            total_pct: 1,
+            unlimited: false,
+            on_demand_enabled: false,
+            on_demand_used_cents: None,
+            on_demand_limit_cents: None,
+            reset_at: Some(
+                DateTime::parse_from_rfc3339("2026-08-04T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            ),
+            cycle_start: None,
+            credits: vec![CursorCreditGrant {
+                remaining_cents: 2100,
+                total_cents: 2500,
+                expires_at: Some(expires),
+                display_name: "Promo".into(),
+            }],
+        };
+        let parsed = parse_cache_at(
+            &serde_json::to_vec(&snap_to_json(&snap, "account")).unwrap(),
+            "account",
+            now,
+        )
+        .unwrap();
+        assert_eq!(parsed.credits, snap.credits);
+
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(&cached_snapshot("account", "2026-08-04T00:00:00Z")).unwrap();
+        let without =
+            parse_cache_at(&serde_json::to_vec(&legacy).unwrap(), "account", now).unwrap();
+        assert!(without.credits.is_empty());
+
+        legacy["credits"] = serde_json::json!([
+            {"remaining_cents": -1, "total_cents": 100},
+            {"remaining_cents": 2100, "total_cents": 2500, "display_name": "Kept"}
+        ]);
+        let mixed = parse_cache_at(&serde_json::to_vec(&legacy).unwrap(), "account", now).unwrap();
+        assert_eq!(mixed.credits.len(), 1);
+        assert_eq!(mixed.credits[0].display_name, "Kept");
+        assert!(mixed.credits[0].expires_at.is_none());
     }
 }

@@ -51,7 +51,13 @@ pub fn render(
         .format
         .clone()
         .unwrap_or_else(|| DEFAULT_FORMAT.to_string());
-    let values = build_placeholders(snap);
+    let mut values = build_placeholders(snap);
+    // Both sinks fed by this map (bar text and --tooltip-format) are Pango
+    // markup. The plan label is API-controlled, so escape its aliases at the
+    // projection boundary. The default tooltip escapes the raw snapshot.
+    if let Some(value) = values.get_mut("plan") {
+        *value = escape(value);
+    }
 
     let mut text = substitute(&format, &values);
     if outcome.stale {
@@ -238,5 +244,21 @@ mod tests {
         o.tooltip_format = Some("bal: {kilo_balance}".into());
         let out = render(&outcome, &snap, &Theme::default(), &o, Utc::now());
         assert_eq!(out.tooltip, "bal: $8.42");
+    }
+
+    #[test]
+    fn api_plan_is_pango_escaped_in_custom_formats() {
+        let mut snap = sample_snap();
+        snap.label = "Kilo & Gateway <org>".into();
+        let outcome = sample_outcome(snap.clone());
+        let mut o = opts();
+        o.format = Some("{plan}".into());
+        o.tooltip_format = Some("{plan}".into());
+
+        let out = render(&outcome, &snap, &Theme::default(), &o, Utc::now());
+        assert!(!out.text.contains(" & "));
+        assert!(!out.tooltip.contains('<'));
+        assert!(out.text.contains("Kilo &amp; Gateway &lt;org&gt;"));
+        assert_eq!(out.tooltip, "Kilo &amp; Gateway &lt;org&gt;");
     }
 }

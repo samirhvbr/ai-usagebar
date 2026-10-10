@@ -31,7 +31,7 @@ from the settings page is also out of scope — see CONTRIBUTING.
 ## Config
 
 Ollama Cloud is opt-in, like DeepSeek. Enable it in
-`~/.config/ai-usagebar/config.toml` (or `%APPDATA%\ai-usagebar\config.toml`):
+`~/.config/ai-usagebar/config.toml` (or `%APPDATA%\ai-usagebar\config\config.toml`):
 
 ```toml
 [ui]
@@ -48,8 +48,9 @@ The `[ollama]` section is documented in [`config.example.toml`](../config.exampl
 Copy it into your config and set `enabled = true`. `api_key_env` is the
 **name of the variable**, not the token.
 
-An inline `api_key` works (`chmod 600` the file) but the environment is
-preferred.
+An inline `api_key` works (`chmod 600` the file — the app now tightens the
+permissions itself on load when Ollama's is the only inline key) but the
+environment is preferred.
 
 Saving a key (or picking Ollama as primary) in the TUI Settings overlay
 writes `enabled = true` for you.
@@ -71,7 +72,8 @@ ai-usagebar-tui
 
 Default bar format: `{oll_session_pct}% · {oll_weekly_pct}%w`. Accounts that
 report `limits.monthly` instead render `{oll_monthly_pct}%` there — see
-"What the bar shows" below.
+"What the bar shows" below. Placeholders for a window the account omitted
+are empty (not `0`), so a native menu bar cannot paint a fake 0% 5h/7d pair.
 
 ## What the bar shows
 

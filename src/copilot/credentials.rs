@@ -51,7 +51,11 @@ pub fn hosts_path_with(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GhAuthTokenCommand {
     pub program: std::path::PathBuf,
-    pub args: [&'static str; 2],
+    /// Owned rather than `[&'static str; 2]` because a named account appends
+    /// `--user <login>`. The shape stays fixed: `auth token` always, plus that
+    /// one pair and nothing else. `user` is validated against GitHub's login
+    /// grammar first, so a config value can never arrive here as a flag.
+    pub args: Vec<String>,
     pub env_remove: Vec<&'static str>,
 }
 
@@ -63,12 +67,54 @@ impl GhAuthTokenCommand {
     pub fn standard(gh_binary: Option<&std::path::Path>) -> Self {
         Self {
             program: gh_binary.map_or_else(|| std::path::PathBuf::from("gh"), Into::into),
-            args: ["auth", "token"],
+            args: vec!["auth".to_string(), "token".to_string()],
             // `gh auth token` must use its saved OAuth login, rather than an
             // arbitrary provider token inherited from this process.
             env_remove: vendor_secret_env_vars_to_remove(&[]),
         }
     }
+
+    /// The same command for one named account: `gh auth token --user <login>`.
+    ///
+    /// `login` is validated before it reaches argv. That check is the security
+    /// boundary this type exists for — `gh` is spawned without a shell, so the
+    /// risk is not quoting but a config value that *looks like a flag*
+    /// (`--hostname`, `-h`) and silently re-points the command at another
+    /// account or option. Rejecting anything outside GitHub's login grammar
+    /// closes that off by construction.
+    pub fn for_user(gh_binary: Option<&std::path::Path>, login: &str) -> Result<Self> {
+        validate_gh_login(login)?;
+        let mut command = Self::standard(gh_binary);
+        command.args.push("--user".to_string());
+        command.args.push(login.to_string());
+        Ok(command)
+    }
+}
+
+/// GitHub's own login grammar: 1-39 characters of ASCII alphanumerics and
+/// single hyphens, never leading or trailing. Anything else — a flag, a path,
+/// a space, a shell metacharacter, an empty string — is refused with the
+/// offending value quoted, because the usual cause is a typo in `config.toml`.
+fn validate_gh_login(login: &str) -> Result<()> {
+    let bad = |why: &str| {
+        Err(AppError::Other(format!(
+            "GitHub Copilot: {login:?} is not a valid GitHub login ({why}). \
+             Use the account's login name, as shown by `gh auth status`."
+        )))
+    };
+    if login.is_empty() || login.len() > 39 {
+        return bad("1 to 39 characters");
+    }
+    if !login
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    {
+        return bad("letters, digits and hyphens only");
+    }
+    if login.starts_with('-') || login.ends_with('-') || login.contains("--") {
+        return bad("no leading, trailing or repeated hyphens");
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,7 +135,7 @@ impl GhAuthTokenRunner for SystemGhAuthTokenRunner {
     fn run(&self, command: &GhAuthTokenCommand) -> io::Result<GhAuthTokenOutput> {
         let mut process = Command::new(&command.program);
         process
-            .args(command.args)
+            .args(&command.args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
@@ -111,11 +157,17 @@ impl GhAuthTokenRunner for SystemGhAuthTokenRunner {
     }
 }
 
+/// `login` selects one of several `gh` accounts; `None` keeps the historical
+/// behavior of using whichever account `gh` has active.
 pub fn resolve_with(
     runner: &impl GhAuthTokenRunner,
     gh_binary: Option<&std::path::Path>,
+    login: Option<&str>,
 ) -> Result<String> {
-    let command = GhAuthTokenCommand::standard(gh_binary);
+    let command = match login {
+        Some(login) => GhAuthTokenCommand::for_user(gh_binary, login)?,
+        None => GhAuthTokenCommand::standard(gh_binary),
+    };
     let output = match runner.run(&command) {
         Ok(output) => output,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -126,7 +178,13 @@ pub fn resolve_with(
         Err(_) => return Err(login_error("GitHub CLI could not be started. Run")),
     };
     if !output.success {
-        return Err(login_error("GitHub CLI is not logged in. Run"));
+        return match login {
+            Some(login) => Err(AppError::Credentials(format!(
+                "GitHub Copilot: `gh` has no token for {login:?}. Check the login name \
+                 against `gh auth status`, then `gh auth login --web` for that account."
+            ))),
+            None => Err(login_error("GitHub CLI is not logged in. Run")),
+        };
     }
     let token = String::from_utf8(output.stdout)
         .ok()
@@ -173,7 +231,7 @@ mod tests {
         };
 
         assert_eq!(
-            resolve_with(&runner, None).unwrap(),
+            resolve_with(&runner, None, None).unwrap(),
             "test-github-oauth-token"
         );
         let command = runner.command.into_inner().unwrap();
@@ -183,6 +241,85 @@ mod tests {
         assert!(command.env_remove.contains(&"GITHUB_COPILOT_TOKEN"));
         assert!(command.env_remove.contains(&"GH_TOKEN"));
         assert!(command.env_remove.contains(&"GITHUB_TOKEN"));
+    }
+
+    /// The whole point of keeping this command as data: a named account must
+    /// expand the argv by exactly one flag pair and nothing else.
+    #[test]
+    fn a_named_account_appends_only_user_to_the_fixed_argv() {
+        let runner = FakeRunner {
+            result: Ok(GhAuthTokenOutput {
+                success: true,
+                stdout: b"work-token\n".to_vec(),
+            }),
+            command: RefCell::new(None),
+        };
+        assert_eq!(
+            resolve_with(&runner, None, Some("octocat-work")).unwrap(),
+            "work-token"
+        );
+        let command = runner.command.into_inner().unwrap();
+        assert_eq!(command.args, ["auth", "token", "--user", "octocat-work"]);
+        // Env scrubbing is not weakened by the account path.
+        assert!(command.env_remove.contains(&"GH_TOKEN"));
+        assert!(command.env_remove.contains(&"GITHUB_TOKEN"));
+        assert!(command.env_remove.contains(&"GITHUB_COPILOT_TOKEN"));
+    }
+
+    /// `gh` is spawned without a shell, so the risk is not quoting — it is a
+    /// config value that reads as a *flag* and re-points the command at
+    /// another option or account. GitHub's login grammar excludes every such
+    /// value, so validation happens before argv is built.
+    #[test]
+    fn a_login_outside_githubs_grammar_never_reaches_argv() {
+        for bad in [
+            "--hostname",           // a flag
+            "-u",                   // a short flag
+            "octocat --hostname x", // smuggled second flag
+            "octo cat",             // whitespace
+            "octo/cat",             // path separator
+            "octo;cat",             // shell metacharacter
+            "octo@cat",             // an email, the likely typo
+            "",                     // empty
+            "-octocat",             // leading hyphen
+            "octocat-",             // trailing hyphen
+            "octo--cat",            // repeated hyphen
+            "ã",                    // non-ASCII
+        ] {
+            let error = GhAuthTokenCommand::for_user(None, bad)
+                .expect_err(&format!("{bad:?} must be refused"))
+                .to_string();
+            assert!(
+                error.contains("not a valid GitHub login"),
+                "{bad:?}: {error}"
+            );
+        }
+        // A realistic login still works, including digits and inner hyphens.
+        let command = GhAuthTokenCommand::for_user(None, "octo-cat-99").unwrap();
+        assert_eq!(command.args, ["auth", "token", "--user", "octo-cat-99"]);
+        // 39 characters is GitHub's maximum; 40 is not.
+        assert!(GhAuthTokenCommand::for_user(None, &"a".repeat(39)).is_ok());
+        assert!(GhAuthTokenCommand::for_user(None, &"a".repeat(40)).is_err());
+    }
+
+    /// A signed-out *named* account must not be told to run `gh auth login`
+    /// as though nothing were signed in — the usual cause is a mistyped login
+    /// while another account works fine.
+    #[test]
+    fn a_signed_out_named_account_names_the_account_in_the_error() {
+        let runner = FakeRunner {
+            result: Ok(GhAuthTokenOutput {
+                success: false,
+                stdout: b"never-echo-gh-output".to_vec(),
+            }),
+            command: RefCell::new(None),
+        };
+        let error = resolve_with(&runner, None, Some("octocat"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("octocat"), "{error}");
+        assert!(error.contains("gh auth status"), "{error}");
+        assert!(!error.contains("never-echo-gh-output"), "{error}");
     }
 
     /// `gh` has no canonical path, so `PATH` is the sensible default — but it
@@ -274,7 +411,7 @@ mod tests {
             command: RefCell::new(None),
         };
 
-        let error = resolve_with(&runner, None).unwrap_err().to_string();
+        let error = resolve_with(&runner, None, None).unwrap_err().to_string();
         assert!(error.contains("gh auth login --web"));
         assert!(!error.contains("private-token-or-error"));
     }

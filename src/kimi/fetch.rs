@@ -293,6 +293,26 @@ fn snap_to_json(snap: &KimiSnapshot) -> serde_json::Value {
 
 /// Resolve the bearer for this fetch. The API key is already one; a Kimi Code
 /// login may first need a refresh, which rotates the CLI's stored token pair
+/// The access token to send, or `None` when one has to be fetched.
+///
+/// A future `expires_at` normally means the token is good. A *blank*
+/// `access_token` next to it is an internally inconsistent file — the CLI
+/// never writes one — but trusting the timestamp there sends
+/// `Authorization: Bearer ` and turns a logged-out state into an opaque 401
+/// instead of the re-login the user actually needs. So a blank token counts as
+/// expired and the refresh token gets its chance; `read_from` has already
+/// refused a blank refresh token, so the fallthrough ends in a credentials
+/// error either way. Mirrors the Claude (#370) and Codex (#373) guards (#382).
+fn usable_access_token(creds: &oauth::Credentials, now: DateTime<Utc>) -> Option<String> {
+    if oauth::needs_refresh(creds.expires_at, now.timestamp()) {
+        return None;
+    }
+    if creds.access_token.trim().is_empty() {
+        return None;
+    }
+    Some(creds.access_token.clone())
+}
+
 /// and is therefore serialized against the CLI itself.
 async fn bearer_token(
     client: &reqwest::Client,
@@ -306,8 +326,8 @@ async fn bearer_token(
     };
 
     let creds = oauth::read_from(&kimi_code.credentials_path)?;
-    if !oauth::needs_refresh(creds.expires_at, now.timestamp()) {
-        return Ok(creds.access_token);
+    if let Some(token) = usable_access_token(&creds, now) {
+        return Ok(token);
     }
 
     let _lock = super::lock::acquire(&kimi_code.lock_target).await?;
@@ -315,8 +335,8 @@ async fn bearer_token(
     // have refreshed while we waited, and reusing our pre-lock copy would burn
     // an already-rotated refresh token.
     let creds = oauth::read_from(&kimi_code.credentials_path)?;
-    if !oauth::needs_refresh(creds.expires_at, now.timestamp()) {
-        return Ok(creds.access_token);
+    if let Some(token) = usable_access_token(&creds, now) {
+        return Ok(token);
     }
 
     let refreshed = tokio::time::timeout(
@@ -433,6 +453,37 @@ async fn fetch_live(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A blank access token beside a future `expires_at` is a file the CLI
+    /// never writes, but trusting the timestamp sent `Authorization: Bearer `
+    /// and turned a logged-out state into an opaque 401 (#382).
+    #[test]
+    fn a_blank_access_token_is_refreshed_rather_than_sent() {
+        let now = chrono::Utc::now();
+        let creds = |access: &str, expires_at: i64| crate::kimi::oauth::Credentials {
+            access_token: access.to_string(),
+            refresh_token: "rt".to_string(),
+            expires_at,
+            expires_in: 900,
+            scope: String::new(),
+            token_type: "Bearer".to_string(),
+            extra: serde_json::Map::new(),
+        };
+        let live = now.timestamp() + 3_600;
+        let expired = now.timestamp() - 3_600;
+
+        // The normal case is untouched: a live token is returned as-is.
+        assert_eq!(
+            usable_access_token(&creds("at", live), now).as_deref(),
+            Some("at")
+        );
+        // Blank, or whitespace-only, with a future expiry: refresh instead.
+        assert_eq!(usable_access_token(&creds("", live), now), None);
+        assert_eq!(usable_access_token(&creds("   ", live), now), None);
+        // And an expired token still refreshes, blank or not.
+        assert_eq!(usable_access_token(&creds("at", expired), now), None);
+        assert_eq!(usable_access_token(&creds("", expired), now), None);
+    }
     use tempfile::TempDir;
 
     fn cache_fixture() -> (TempDir, Cache) {

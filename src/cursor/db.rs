@@ -47,8 +47,8 @@ pub fn default_db_path() -> Result<PathBuf> {
 pub fn read_access_token(path: &Path) -> Result<String> {
     if !path.exists() {
         return Err(AppError::Credentials(format!(
-            "Cursor database not found at {}. Open the Cursor IDE and sign in at least once, \
-             then try again.",
+            "Cursor database not found at {}. Open the Cursor IDE (or run `cursor-agent`) and \
+             sign in at least once, then try again.",
             sanitize_untrusted_path(path)
         )));
     }
@@ -84,13 +84,28 @@ pub fn read_access_token(path: &Path) -> Result<String> {
 
 /// Default location of the `cursor-agent` CLI's own login state — a plain
 /// JSON file, not the IDE's `state.vscdb`. Written by the headless
-/// `cursor-agent` tool, so it stays
-/// populated on machines that never run the desktop IDE at all.
+/// `cursor-agent` tool, so it stays populated on machines that never run the
+/// desktop IDE at all.
+///
+/// The CLI picks the path itself, per OS, and only one of the three follows
+/// the config-directory convention the IDE database uses:
+///   - Linux: `$XDG_CONFIG_HOME/cursor/auth.json` (else `~/.config/...`)
+///   - macOS: `~/.cursor/auth.json` — not `~/Library/Application Support`
+///   - Windows: `%APPDATA%\Cursor\auth.json`
+///
+/// On macOS the CLI normally keeps its session in the Keychain instead and
+/// this file is the fallback; see [`read_agent_keychain_token`].
 pub fn default_agent_auth_path() -> Result<PathBuf> {
     let base = directories::BaseDirs::new().ok_or_else(|| {
         AppError::Other("could not resolve the platform config directory (no HOME?)".into())
     })?;
-    Ok(base.config_dir().join("cursor").join("auth.json"))
+    Ok(if cfg!(target_os = "macos") {
+        base.home_dir().join(".cursor").join("auth.json")
+    } else if cfg!(windows) {
+        base.config_dir().join("Cursor").join("auth.json")
+    } else {
+        base.config_dir().join("cursor").join("auth.json")
+    })
 }
 
 /// Read `cursor-agent`'s `accessToken` out of its `auth.json`. Same error
@@ -125,19 +140,88 @@ pub fn read_agent_access_token(path: &Path) -> Result<String> {
     Ok(token.to_string())
 }
 
-/// Resolve a Cursor session token from either source. The IDE's `state.vscdb`
-/// is tried first (it is the live, continuously-refreshed source when the
-/// desktop app is actually running); a text-only / headless machine that has
-/// never opened the IDE falls back to whatever `cursor-agent` last wrote to
-/// its own `auth.json`. If the agent file exists but cannot be used, its error
-/// is surfaced so a headless user gets an actionable diagnostic. The IDE's
-/// error remains the one surfaced when both sources are absent, since it names
-/// the more commonly expected path.
+/// Where `cursor-agent` keeps its login on macOS: two generic-password items
+/// in the login Keychain (`cursor-access-token` / `cursor-refresh-token`, both
+/// under the account `cursor-user`), not the `auth.json` it writes on Linux.
+/// A Mac with the CLI and no IDE therefore has neither of the other two
+/// sources.
+#[cfg(target_os = "macos")]
+const AGENT_KEYCHAIN_SERVICE: &str = "cursor-access-token";
+#[cfg(target_os = "macos")]
+const AGENT_KEYCHAIN_ACCOUNT: &str = "cursor-user";
+
+/// Read `cursor-agent`'s access token from the macOS Keychain. `None` for
+/// every failure — item absent, Keychain locked, access denied, not macOS —
+/// because this is a last-resort source: the caller's own "sign in" error is
+/// the more useful thing to show than a `security` exit code. Goes through
+/// `security(1)`, like `anthropic::keychain`, so the item's ACL stays the
+/// one `cursor-agent` created.
+#[cfg(target_os = "macos")]
+pub fn read_agent_keychain_token() -> Option<String> {
+    let out = std::process::Command::new("/usr/bin/security")
+        .args([
+            "find-generic-password",
+            "-s",
+            AGENT_KEYCHAIN_SERVICE,
+            "-a",
+            AGENT_KEYCHAIN_ACCOUNT,
+            "-w",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let token = String::from_utf8(out.stdout).ok()?;
+    let token = token.trim();
+    (!token.is_empty()).then(|| token.to_string())
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn read_agent_keychain_token() -> Option<String> {
+    None
+}
+
+/// Resolve a Cursor session token from the available sources. The IDE's
+/// `state.vscdb` is tried first (it is the live, continuously-refreshed source
+/// when the desktop app is actually running); a machine that has never opened
+/// the IDE falls back to whatever `cursor-agent` holds: its `auth.json`, or on
+/// macOS its Keychain items. An existing but unusable IDE database is *not*
+/// papered over by the CLI's login — that would silently swap accounts. If the
+/// agent file exists but cannot be used, the Keychain is tried before its
+/// error is surfaced, so a headless user with neither gets an actionable
+/// diagnostic. The IDE's error remains the one surfaced when every source is
+/// absent, since it names the more commonly expected path.
+///
+/// The real Keychain is only consulted when `agent_auth_path` is the default
+/// location: a config override (or a test's temp file) names a specific
+/// source and must not be widened to the machine's own login.
 pub fn resolve_access_token(db_path: &Path, agent_auth_path: &Path) -> Result<String> {
+    let default_agent = default_agent_auth_path().ok();
+    let ambient = default_agent.as_deref() == Some(agent_auth_path);
+    resolve_access_token_with(db_path, agent_auth_path, || {
+        ambient.then(read_agent_keychain_token).flatten()
+    })
+}
+
+/// [`resolve_access_token`] with the Keychain reader injected.
+pub fn resolve_access_token_with(
+    db_path: &Path,
+    agent_auth_path: &Path,
+    keychain: impl FnOnce() -> Option<String>,
+) -> Result<String> {
     match read_access_token(db_path) {
         Ok(token) => Ok(token),
-        Err(_) if !db_path.exists() && agent_auth_path.exists() => {
-            read_agent_access_token(agent_auth_path)
+        Err(ide_err) if !db_path.exists() => {
+            if agent_auth_path.exists() {
+                match read_agent_access_token(agent_auth_path) {
+                    Ok(token) => return Ok(token),
+                    Err(agent_err) => return keychain().ok_or(agent_err),
+                }
+            }
+            keychain().ok_or(ide_err)
         }
         Err(ide_err) => Err(ide_err),
     }
@@ -314,9 +398,19 @@ mod tests {
     }
 
     #[test]
-    fn default_agent_auth_path_ends_with_cursor_auth_json() {
+    fn default_agent_auth_path_follows_the_cli_own_convention_per_os() {
         let p = default_agent_auth_path().unwrap();
-        assert!(p.ends_with(std::path::Path::new("cursor").join("auth.json")));
+        let expected_tail = if cfg!(target_os = "macos") {
+            std::path::Path::new(".cursor").join("auth.json")
+        } else if cfg!(windows) {
+            std::path::Path::new("Cursor").join("auth.json")
+        } else {
+            std::path::Path::new("cursor").join("auth.json")
+        };
+        assert!(p.ends_with(expected_tail), "{}", p.display());
+        // The macOS default is the CLI's `~/.cursor`, never the IDE's
+        // Application Support directory.
+        assert!(!cfg!(target_os = "macos") || !p.to_string_lossy().contains("Application Support"));
     }
 
     #[test]
@@ -382,7 +476,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            resolve_access_token(&db_path, &agent_path).unwrap(),
+            resolve_access_token_with(&db_path, &agent_path, || None).unwrap(),
             "ide-token"
         );
     }
@@ -398,7 +492,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            resolve_access_token(&db_path, &agent_path).unwrap(),
+            resolve_access_token_with(&db_path, &agent_path, || None).unwrap(),
             "agent-token"
         );
     }
@@ -415,7 +509,7 @@ mod tests {
         )
         .unwrap();
 
-        let err = resolve_access_token(&db_path, &agent_path).unwrap_err();
+        let err = resolve_access_token_with(&db_path, &agent_path, || None).unwrap_err();
         match err {
             AppError::Credentials(m) => {
                 assert!(m.contains(&db_path.display().to_string()));
@@ -430,7 +524,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("state.vscdb");
         let agent_path = dir.path().join("auth.json");
-        let err = resolve_access_token(&db_path, &agent_path).unwrap_err();
+        let err = resolve_access_token_with(&db_path, &agent_path, || None).unwrap_err();
         match err {
             AppError::Credentials(m) => assert!(m.contains(&db_path.display().to_string())),
             other => panic!("expected Credentials error, got {other:?}"),
@@ -444,7 +538,7 @@ mod tests {
         let agent_path = dir.path().join("auth.json");
         std::fs::write(&agent_path, "not json").unwrap();
 
-        let err = resolve_access_token(&db_path, &agent_path).unwrap_err();
+        let err = resolve_access_token_with(&db_path, &agent_path, || None).unwrap_err();
         match err {
             AppError::Credentials(m) => {
                 assert!(m.contains(&agent_path.display().to_string()));
@@ -452,5 +546,60 @@ mod tests {
             }
             other => panic!("expected Credentials error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn resolve_falls_back_to_the_keychain_when_the_ide_db_and_agent_file_are_missing() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("state.vscdb");
+        let agent_path = dir.path().join("auth.json");
+        assert_eq!(
+            resolve_access_token_with(&db_path, &agent_path, || Some("keychain-token".into()))
+                .unwrap(),
+            "keychain-token"
+        );
+    }
+
+    #[test]
+    fn resolve_tries_the_keychain_when_the_agent_file_is_unusable() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("state.vscdb");
+        let agent_path = dir.path().join("auth.json");
+        std::fs::write(
+            &agent_path,
+            serde_json::json!({"refreshToken": "r"}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_access_token_with(&db_path, &agent_path, || Some("keychain-token".into()))
+                .unwrap(),
+            "keychain-token"
+        );
+    }
+
+    #[test]
+    fn resolve_never_consults_the_keychain_over_a_present_ide_db() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("state.vscdb");
+        seed_db(&db_path, None);
+        let agent_path = dir.path().join("auth.json");
+        let err = resolve_access_token_with(&db_path, &agent_path, || {
+            panic!("an existing IDE db must not be widened to the keychain")
+        })
+        .unwrap_err();
+        assert!(matches!(err, AppError::Credentials(_)));
+    }
+
+    #[test]
+    fn resolve_leaves_the_keychain_alone_for_a_non_default_agent_path() {
+        // A temp path is never the default location, so the real Keychain is
+        // not read: this must fail rather than pick up the machine's login.
+        let dir = TempDir::new().unwrap();
+        let err = resolve_access_token(
+            &dir.path().join("state.vscdb"),
+            &dir.path().join("auth.json"),
+        )
+        .unwrap_err();
+        assert!(matches!(err, AppError::Credentials(_)));
     }
 }

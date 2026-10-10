@@ -178,6 +178,12 @@ fn parse_cache_at(bytes: &[u8], fingerprint: &str) -> Result<GrokbotSnapshot> {
     };
     Ok(GrokbotSnapshot {
         plan,
+        // Absent in caches written before the field existed.
+        billed_by: v["billed_by"]
+            .as_str()
+            .map(str::trim)
+            .filter(|name| !name.is_empty() && name.chars().count() <= 64)
+            .map(str::to_string),
         has_included_allowance,
         weekly_pct,
         has_available_usage: v["has_available_usage"].as_bool().unwrap_or(false),
@@ -202,6 +208,7 @@ fn snap_to_json(snap: &GrokbotSnapshot, fingerprint: &str) -> serde_json::Value 
     serde_json::json!({
         "account": fingerprint,
         "plan": snap.plan,
+        "billed_by": snap.billed_by,
         "has_included_allowance": snap.has_included_allowance,
         "weekly_pct": snap.weekly_pct,
         "has_available_usage": snap.has_available_usage,
@@ -276,7 +283,11 @@ async fn fetch_live(
         // the paired refresh token and retry exactly once.
         let refreshed = refresh(client, &endpoints.token, &refresh_token).await?;
         let persisted = PersistedOAuth {
-            fingerprint: super::creds::fingerprint_of(&refreshed.refresh_token),
+            // Scoped to the sign-in the app's file holds, which is what the
+            // next poll looks the pair up by. The app does not rewrite that
+            // file on a refresh, so a rotated token's own fingerprint would
+            // never be asked for again.
+            fingerprint: creds.fingerprint.clone(),
             access_token: refreshed.access_token,
             refresh_token: refreshed.refresh_token,
         };
@@ -446,7 +457,7 @@ mod tests {
         GrokbotCredentials {
             access_token: "at-stored".into(),
             refresh_token: "rt-stored".into(),
-            fingerprint: super::super::creds::fingerprint_of("rt-stored"),
+            fingerprint: crate::cache::fingerprint_of("rt-stored"),
         }
     }
 
@@ -562,15 +573,15 @@ mod tests {
         retried.assert_async().await;
         assert_eq!(out.snapshot.weekly_pct, 12);
 
-        // The rotated pair persisted to the vendor cache, scoped by the new
-        // refresh token's fingerprint — never back to the app's file.
+        // The rotated pair persisted to the vendor cache, scoped by the
+        // sign-in it was refreshed from, and never back to the app's file.
         let persisted: serde_json::Value =
             serde_json::from_slice(&std::fs::read(oauth_cache_path(&cache)).unwrap()).unwrap();
         assert_eq!(persisted["access_token"], "at-fresh");
         assert_eq!(persisted["refresh_token"], "rt-rotated");
         assert_eq!(
             persisted["fingerprint"],
-            super::super::creds::fingerprint_of("rt-rotated")
+            crate::cache::fingerprint_of("rt-stored")
         );
         #[cfg(unix)]
         {
@@ -581,6 +592,52 @@ mod tests {
                 .mode();
             assert_eq!(mode & 0o077, 0);
         }
+    }
+
+    /// The app does not rewrite its file on a refresh, so the poll after a
+    /// rotation still reads the old pair from it. It has to find the rotated
+    /// pair in the vendor cache, not try the expired access token and spend
+    /// the original refresh token again.
+    #[tokio::test]
+    async fn the_next_poll_reuses_a_rotated_pair() {
+        let mut server = mockito::Server::new_async().await;
+        let stale = usage_mock(&mut server, "at-stored")
+            .with_status(401)
+            .with_body(r#"{"error":"expired"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let refresh = server
+            .mock("POST", "/oauth/token")
+            .with_status(200)
+            .with_body(r#"{"access_token":"at-fresh","refresh_token":"rt-rotated"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let fresh = usage_mock(&mut server, "at-fresh")
+            .with_status(200)
+            .with_body(usage_json())
+            .expect(2)
+            .create_async()
+            .await;
+
+        let (_td, cache) = cache_fixture();
+        for _ in 0..2 {
+            let out = fetch_snapshot_with(
+                &reqwest::Client::new(),
+                &test_creds(),
+                &cache,
+                &test_endpoints(&server.url()),
+                Duration::ZERO,
+            )
+            .await
+            .unwrap();
+            assert_eq!(out.snapshot.weekly_pct, 12);
+        }
+
+        stale.assert_async().await;
+        refresh.assert_async().await;
+        fresh.assert_async().await;
     }
 
     #[tokio::test]
@@ -597,7 +654,7 @@ mod tests {
             &cache,
             &PersistedOAuth {
                 // Same sign-in as the app's file, so the rotation is honored.
-                fingerprint: super::super::creds::fingerprint_of("rt-stored"),
+                fingerprint: crate::cache::fingerprint_of("rt-stored"),
                 access_token: "at-fresh".into(),
                 refresh_token: "rt-stored".into(),
             },
@@ -631,7 +688,7 @@ mod tests {
         write_persisted_oauth(
             &cache,
             &PersistedOAuth {
-                fingerprint: super::super::creds::fingerprint_of("rt-someone-else"),
+                fingerprint: crate::cache::fingerprint_of("rt-someone-else"),
                 access_token: "at-stranger".into(),
                 refresh_token: "rt-stranger".into(),
             },
@@ -854,6 +911,7 @@ mod tests {
     fn a_snapshot_survives_the_cache_round_trip() {
         let snap = GrokbotSnapshot {
             plan: "Grok Bot Plan".into(),
+            billed_by: Some("Cursor Ultra".into()),
             has_included_allowance: true,
             weekly_pct: 42,
             has_available_usage: true,
@@ -868,6 +926,11 @@ mod tests {
         };
         let bytes = serde_json::to_vec(&snap_to_json(&snap, "fp")).unwrap();
         assert_eq!(parse_cache_at(&bytes, "fp").unwrap(), snap);
+        // A cache written before `billed_by` existed still parses, unnamed.
+        let mut older = snap_to_json(&snap, "fp");
+        older.as_object_mut().unwrap().remove("billed_by");
+        let parsed = parse_cache_at(older.to_string().as_bytes(), "fp").unwrap();
+        assert_eq!(parsed.billed_by, None);
     }
 
     #[test]

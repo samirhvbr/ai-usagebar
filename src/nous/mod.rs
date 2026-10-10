@@ -187,6 +187,17 @@ mod tests {
     }
 
     #[test]
+    fn spent_allocation_residue_reads_as_zero() {
+        // A drained plan reports the rounding residue instead of a clean zero;
+        // that must still render, while a real negative balance stays an error.
+        let mut residue = fixture(include_str!("../../tests/fixtures/nous/account.json"));
+        residue["credits_remaining"] = serde_json::json!(-1.64e-20);
+        let parsed = parse_account(&residue).expect("residue is not a negative balance");
+        assert_eq!(parsed.credits_remaining, Some(0.0));
+        assert_eq!(parsed.usage_percent(), Some(100.0));
+    }
+
+    #[test]
     fn absent_optional_account_metrics_stay_unavailable() {
         let value = serde_json::json!({"plan": "Free", "future": "allowed"});
         let parsed = parse_account(&value).expect("optional metrics may be absent");

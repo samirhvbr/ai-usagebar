@@ -4,6 +4,7 @@ import Quickshell.Io
 import qs.Commons
 import qs.Ui
 import "Model.js" as Model
+import "I18n.js" as I18n
 
 // Native Quattro settings form. Rust remains the sole config owner: this view
 // receives only non-secret key-presence metadata and sends changed keys over
@@ -17,11 +18,24 @@ Column {
   property bool showValue: true
   property bool showProvider: false
   property bool showAll: false
+  property bool colorCodeUsage: false
+  property string uiLocale: "en"
+  property string uiLocaleSetting: "auto"
   property string barWindow: "auto"
+  property string showAs: "used"
+  property bool brandIcons: true
+  property var metricEntries: []
+  property string openMetricEntry: ""
+  property string openSection: "display"
+  property int keyPendingCount: 0
   readonly property color dim: Qt.darker(foreground, 1.45)
 
-  property var snapshot: ({ primary_choices: [], keys: [] })
+  property var snapshot: ({ primary_choices: [], keys: [], vendors: [] })
   property string selectedPrimary: ""
+  // Pending provider on/off overrides (#244), keyed by provider id. Rebuilt
+  // (never mutated) so the Toggle bindings re-evaluate.
+  property var vendorOverrides: ({})
+  property int vendorPendingCount: 0
   property string stateStdout: ""
   property string stateStderr: ""
   property string applyStdout: ""
@@ -34,7 +48,8 @@ Column {
   property bool loading: false
   property bool saving: false
   readonly property bool canSave: !loading && !saving
-    && (selectedPrimary !== "" || snapshot.primary_choices.length === 0)
+    && (selectedPrimary !== "" || snapshot.primary_choices.length === 0
+        || vendorPendingCount > 0)
 
   signal saved()
   signal fallbackRequested()
@@ -43,7 +58,12 @@ Column {
   signal showValueRequested(bool enabled)
   signal showProviderRequested(bool enabled)
   signal showAllRequested(bool enabled)
+  signal colorCodeUsageRequested(bool enabled)
+  signal uiLocaleRequested(string value)
   signal barWindowRequested(string value)
+  signal showAsRequested(string value)
+  signal brandIconsRequested(bool enabled)
+  signal metricToggleRequested(string entryId, string key)
   signal closeRequested()
 
   spacing: Style.space(12)
@@ -51,6 +71,7 @@ Column {
   Keys.onEscapePressed: closeRequested()
 
   function safe(value) { return Model.autoTextSafe(value) }
+  function tr(key, params) { return I18n.t(uiLocale, key, params || null) }
 
   function load() {
     if (stateProcess.running || applyProcess.running) return
@@ -60,6 +81,7 @@ Column {
     stateStdout = ""
     stateStderr = ""
     stateExitCode = -1
+    resetVendorOverrides()
     stateProcess.running = true
   }
 
@@ -68,16 +90,16 @@ Column {
     if (stateExitCode !== 0) {
       var detail = Model.errorMessage(stateStderr)
       errorText = detail.indexOf("unrecognized subcommand") >= 0
-        ? "This installed ai-usagebar binary predates native settings. Update the package, or use the terminal settings fallback."
+        ? root.tr("error.binary_old")
         : detail
-      snapshot = ({ primary_choices: [], keys: [] })
+      snapshot = ({ primary_choices: [], keys: [], vendors: [] })
       selectedPrimary = ""
       return
     }
     var parsed = Model.parseSettingsSnapshot(stateStdout)
     if (!parsed.ok) {
       errorText = parsed.error
-      snapshot = ({ primary_choices: [], keys: [] })
+      snapshot = ({ primary_choices: [], keys: [], vendors: [] })
       selectedPrimary = ""
       return
     }
@@ -99,9 +121,83 @@ Column {
     return changes
   }
 
+  function collectVendorToggles() {
+    var toggles = []
+    for (var id in root.vendorOverrides) {
+      if (Object.prototype.hasOwnProperty.call(root.vendorOverrides, id))
+        toggles.push({ id: id, enabled: root.vendorOverrides[id] })
+    }
+    return toggles
+  }
+
+  // Record one pending provider switch (#244). A value equal to the snapshot
+  // drops the override, so toggling twice returns the row to "unchanged".
+  function setVendorOverride(id, enabled) {
+    var next = {}
+    var base = snapshot.vendors || []
+    var current = null
+    for (var i = 0; i < base.length; i++) {
+      if (base[i].id === id) current = base[i].enabled
+    }
+    for (var key in root.vendorOverrides) {
+      if (Object.prototype.hasOwnProperty.call(root.vendorOverrides, key) && key !== id)
+        next[key] = root.vendorOverrides[key]
+    }
+    if (enabled !== current) next[id] = enabled
+    vendorOverrides = next
+    vendorPendingCount = Object.keys(next).length
+  }
+
+  function vendorSummary() {
+    var list = snapshot.vendors || []
+    var on = 0
+    for (var i = 0; i < list.length; i++) {
+      var pending = vendorOverrides[list[i].id]
+      var effective = pending === true || pending === false ? pending : list[i].enabled
+      if (effective) on++
+    }
+    return (vendorPendingCount > 0 ? "● " : "") + on + "/" + list.length
+  }
+
+  function metricShownCount(rows) {
+    var count = 0
+    for (var i = 0; i < rows.length; i++)
+      if (rows[i].checked) count++
+    return count
+  }
+
+  function toggleMetricEntry(id) {
+    openMetricEntry = openMetricEntry === id ? "" : id
+  }
+
+  function toggleSection(id) {
+    openSection = openSection === id ? "" : id
+  }
+
+  function primaryLabel() {
+    var choices = snapshot.primary_choices || []
+    for (var i = 0; i < choices.length; i++)
+      if (choices[i].id === selectedPrimary) return safe(choices[i].label)
+    return ""
+  }
+
+  function recountKeys() {
+    var count = 0
+    for (var i = 0; i < keyRepeater.count; i++) {
+      var row = keyRepeater.itemAt(i)
+      if (row && row.pendingAction !== "unchanged") count++
+    }
+    keyPendingCount = count
+  }
+
+  function resetVendorOverrides() {
+    vendorOverrides = ({})
+    vendorPendingCount = 0
+  }
+
   function save() {
     if (!canSave) return
-    var built = Model.buildSettingsPatch(selectedPrimary, collectChanges())
+    var built = Model.buildSettingsPatch(selectedPrimary, collectChanges(), collectVendorToggles())
     if (!built.ok) {
       errorText = built.error
       return
@@ -130,18 +226,20 @@ Column {
     // in this long-lived shell, even if the save failed.
     scrubSecrets()
     if (applyExitCode !== 0 || !Model.parseSettingsApplyResult(applyStdout)) {
-      errorText = Model.errorMessage(applyStderr || "The settings command did not confirm the save.")
+      errorText = Model.errorMessage(applyStderr || root.tr("error.apply"))
       return
     }
     saved()
     load()
     // load() clears stale status before refreshing the snapshot, so set the
     // confirmation afterwards and keep it visible while the refresh runs.
-    statusText = "Settings saved. Usage is refreshing."
+    statusText = root.tr("status.saved")
   }
 
   onVisibleChanged: {
     if (visible) {
+      openSection = "display"
+      openMetricEntry = ""
       load()
       Qt.callLater(function() { root.forceActiveFocus() })
     }
@@ -197,13 +295,13 @@ Column {
     spacing: Style.space(8)
 
     PanelSectionHeader {
-      text: "SETTINGS"
+      text: root.tr("section.settings")
       foreground: root.foreground
       fontFamily: root.fontFamily
     }
     Text {
       width: parent.width
-      text: "Loading configuration…"
+      text: root.tr("loading.config")
       color: root.dim
       font.family: root.fontFamily
       font.pixelSize: Style.font.body
@@ -216,40 +314,66 @@ Column {
     width: parent.width
     spacing: Style.space(8)
 
-    PanelSectionHeader {
-      text: "DISPLAY"
-      foreground: root.foreground
-      fontFamily: root.fontFamily
+    Disclosure {
+      text: root.tr("section.display")
+      expanded: root.openSection === "display"
+      onToggled: root.toggleSection("display")
     }
-    Toggle {
+    Column {
+      visible: root.openSection === "display"
       width: parent.width
-      label: "Show usage value in the top bar"
-      description: "Turn this off for an icon-only bar entry. The panel and tooltip still show full usage details. Applies immediately."
-      checked: root.showValue
-      foreground: root.foreground
-      fontFamily: root.fontFamily
-      enabled: !root.saving
-      onClicked: root.showValueRequested(!root.showValue)
-    }
-    Toggle {
-      width: parent.width
-      label: "Show provider name in the top bar"
-      description: "Turn this on to prefix the bar entry with the provider's short code — cld, gpt, zai, agy — the way Waybar's {vendor_short} does. Off by default. Applies immediately."
-      checked: root.showProvider
-      foreground: root.foreground
-      fontFamily: root.fontFamily
-      enabled: !root.saving
-      onClicked: root.showProviderRequested(!root.showProvider)
-    }
-    Toggle {
-      width: parent.width
-      label: "Show all providers in the top bar"
-      description: "Turn this on to show every configured provider's icon and usage in the top bar at once, instead of cycling one at a time. Click still opens the panel; the wheel still selects which details you see. Off by default. Applies immediately."
-      checked: root.showAll
-      foreground: root.foreground
-      fontFamily: root.fontFamily
-      enabled: !root.saving
-      onClicked: root.showAllRequested(!root.showAll)
+      spacing: Style.space(8)
+
+      Toggle {
+        width: parent.width
+        label: root.tr("toggle.show_value")
+        description: root.tr("toggle.show_value_desc")
+        checked: root.showValue
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        enabled: !root.saving
+        onClicked: root.showValueRequested(!root.showValue)
+      }
+      Toggle {
+        width: parent.width
+        label: root.tr("toggle.brand_icons")
+        description: root.tr("toggle.brand_icons_desc")
+        checked: root.brandIcons
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        enabled: !root.saving
+        onClicked: root.brandIconsRequested(!root.brandIcons)
+      }
+      Toggle {
+        width: parent.width
+        label: root.tr("toggle.show_provider")
+        description: root.tr("toggle.show_provider_desc")
+        checked: root.showProvider
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        enabled: !root.saving
+        onClicked: root.showProviderRequested(!root.showProvider)
+      }
+      Toggle {
+        width: parent.width
+        label: root.tr("toggle.color_code")
+        description: root.tr("toggle.color_code_desc")
+        checked: root.colorCodeUsage
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        enabled: !root.saving
+        onClicked: root.colorCodeUsageRequested(!root.colorCodeUsage)
+      }
+      Toggle {
+        width: parent.width
+        label: root.tr("toggle.show_all")
+        description: root.tr("toggle.show_all_desc")
+        checked: root.showAll
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        enabled: !root.saving
+        onClicked: root.showAllRequested(!root.showAll)
+      }
     }
   }
 
@@ -258,34 +382,198 @@ Column {
     width: parent.width
     spacing: Style.space(8)
 
-    PanelSectionHeader {
-      text: "TOP BAR WINDOW"
-      foreground: root.foreground
-      fontFamily: root.fontFamily
+    Disclosure {
+      text: root.tr("section.language")
+      badge: root.tr("language." + (I18n.normalizeLocaleTag(root.uiLocaleSetting) || "auto"))
+      expanded: root.openSection === "language"
+      onToggled: root.toggleSection("language")
     }
-    Text {
+    Column {
+      visible: root.openSection === "language"
       width: parent.width
-      text: "Which quota the bar shows. Providers lacking it fall back to highest. Applies immediately."
-      textFormat: Text.PlainText
-      color: root.dim
-      font.family: root.fontFamily
-      font.pixelSize: Style.font.caption
-      wrapMode: Text.WordWrap
+      spacing: Style.space(8)
+
+      Text {
+        width: parent.width
+        text: root.tr("language.help")
+        textFormat: Text.PlainText
+        color: root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        wrapMode: Text.WordWrap
+      }
+      Dropdown {
+        width: parent.width
+        showLabel: false
+        value: {
+          var tag = I18n.normalizeLocaleTag(root.uiLocaleSetting)
+          return tag === "" ? "auto" : tag
+        }
+        options: [
+          { value: "auto", label: root.tr("language.auto") },
+          { value: "en", label: root.tr("language.en") },
+          { value: "pt-BR", label: root.tr("language.pt-BR") },
+          { value: "ru", label: root.tr("language.ru") },
+          { value: "ko", label: root.tr("language.ko") },
+          { value: "es", label: root.tr("language.es") }
+        ]
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        enabled: !root.saving
+        onChanged: function(value) { root.uiLocaleRequested(value) }
+      }
     }
-    Dropdown {
+  }
+
+  Column {
+    visible: !root.loading
+    width: parent.width
+    spacing: Style.space(8)
+
+    Disclosure {
+      text: root.tr("section.bar_window")
+      badge: root.tr("bar_window." + Model.normalizeBarWindow(root.barWindow))
+      expanded: root.openSection === "barWindow"
+      onToggled: root.toggleSection("barWindow")
+    }
+    Column {
+      visible: root.openSection === "barWindow"
       width: parent.width
-      showLabel: false
-      value: Model.normalizeBarWindow(root.barWindow)
-      options: [
-        { value: "auto", label: "Highest (auto)" },
-        { value: "session", label: "5-hour (session)" },
-        { value: "weekly", label: "7-day (weekly)" },
-        { value: "monthly", label: "Monthly (monthly)" }
-      ]
-      foreground: root.foreground
-      fontFamily: root.fontFamily
-      enabled: !root.saving
-      onChanged: function(value) { root.barWindowRequested(value) }
+      spacing: Style.space(8)
+
+      Text {
+        width: parent.width
+        text: root.tr("bar_window.help")
+        textFormat: Text.PlainText
+        color: root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        wrapMode: Text.WordWrap
+      }
+      Dropdown {
+        width: parent.width
+        showLabel: false
+        value: Model.normalizeBarWindow(root.barWindow)
+        options: [
+          { value: "auto", label: root.tr("bar_window.auto") },
+          { value: "session", label: root.tr("bar_window.session") },
+          { value: "weekly", label: root.tr("bar_window.weekly") },
+          { value: "monthly", label: root.tr("bar_window.monthly") }
+        ]
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        enabled: !root.saving
+        onChanged: function(value) { root.barWindowRequested(value) }
+      }
+    }
+  }
+
+  Column {
+    visible: !root.loading
+    width: parent.width
+    spacing: Style.space(8)
+
+    Disclosure {
+      text: root.tr("section.show_as")
+      badge: root.tr("show_as." + Model.normalizeShowAs(root.showAs))
+      expanded: root.openSection === "showAs"
+      onToggled: root.toggleSection("showAs")
+    }
+    Column {
+      visible: root.openSection === "showAs"
+      width: parent.width
+      spacing: Style.space(8)
+
+      Text {
+        width: parent.width
+        text: root.tr("show_as.help")
+        textFormat: Text.PlainText
+        color: root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        wrapMode: Text.WordWrap
+      }
+      Dropdown {
+        width: parent.width
+        showLabel: false
+        value: Model.normalizeShowAs(root.showAs)
+        options: [
+          { value: "used", label: root.tr("show_as.used") },
+          { value: "left", label: root.tr("show_as.left") }
+        ]
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        enabled: !root.saving
+        onChanged: function(value) { root.showAsRequested(value) }
+      }
+    }
+  }
+
+  Column {
+    visible: !root.loading && root.metricEntries.length > 0
+    width: parent.width
+    spacing: Style.space(8)
+
+    Disclosure {
+      text: root.tr("section.metrics")
+      expanded: root.openSection === "metrics"
+      onToggled: root.toggleSection("metrics")
+    }
+    Column {
+      visible: root.openSection === "metrics"
+      width: parent.width
+      spacing: Style.space(8)
+
+      Text {
+        width: parent.width
+        text: root.tr("metrics.help")
+        textFormat: Text.PlainText
+        color: root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        wrapMode: Text.WordWrap
+      }
+      Repeater {
+        model: root.metricEntries
+
+        Column {
+          id: metricProvider
+          required property var modelData
+          width: parent.width
+          spacing: Style.space(8)
+
+          Disclosure {
+            text: root.safe(metricProvider.modelData.name)
+            badge: root.metricShownCount(metricProvider.modelData.rows) + "/" + metricProvider.modelData.rows.length
+            expanded: root.openMetricEntry === metricProvider.modelData.id
+            onToggled: root.toggleMetricEntry(metricProvider.modelData.id)
+          }
+          Column {
+            visible: root.openMetricEntry === metricProvider.modelData.id
+            width: parent.width
+            spacing: Style.space(8)
+
+            Repeater {
+              model: metricProvider.modelData.rows
+
+              Toggle {
+                required property var modelData
+                width: parent.width
+                label: modelData.labelKey !== ""
+                  ? root.tr(modelData.labelKey)
+                  : I18n.displayLabel(root.uiLocale, modelData.label)
+                description: root.safe(modelData.group)
+                checked: modelData.checked
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                enabled: !root.saving && modelData.canToggle
+                opacity: modelData.canToggle ? 1 : 0.45
+                onClicked: root.metricToggleRequested(metricProvider.modelData.id, modelData.key)
+              }
+            }
+          }
+        }
+      }
     }
   }
 
@@ -318,7 +606,7 @@ Column {
       Row {
         spacing: Style.space(8)
         Button {
-          text: "Retry"
+          text: root.tr("action.retry")
           bordered: true
           focusable: true
           foreground: root.foreground
@@ -326,7 +614,7 @@ Column {
           onClicked: root.load()
         }
         Button {
-          text: "Open terminal settings"
+          text: root.tr("action.terminal_settings")
           bordered: true
           focusable: true
           foreground: root.foreground
@@ -342,30 +630,87 @@ Column {
     width: parent.width
     spacing: Style.space(8)
 
-    PanelSectionHeader {
-      text: "PRIMARY PROVIDER"
-      foreground: root.foreground
-      fontFamily: root.fontFamily
+    Disclosure {
+      text: root.tr("section.primary")
+      badge: root.primaryLabel()
+      expanded: root.openSection === "primary"
+      onToggled: root.toggleSection("primary")
     }
-    Text {
+    Column {
+      visible: root.openSection === "primary"
       width: parent.width
-      text: "Used by the CLI, Waybar, TUI, and as this panel's preferred provider."
-      textFormat: Text.PlainText
-      color: root.dim
-      font.family: root.fontFamily
-      font.pixelSize: Style.font.caption
-      wrapMode: Text.WordWrap
+      spacing: Style.space(8)
+
+      Text {
+        width: parent.width
+        text: root.tr("primary.help")
+        textFormat: Text.PlainText
+        color: root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        wrapMode: Text.WordWrap
+      }
+      Dropdown {
+        id: primaryDropdown
+        width: parent.width
+        showLabel: false
+        value: root.selectedPrimary
+        options: root.snapshot.primary_choices
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        enabled: !root.saving
+        onChanged: function(value) { root.selectedPrimary = value }
+      }
     }
-    Dropdown {
-      id: primaryDropdown
+  }
+
+  Column {
+    visible: !root.loading && root.snapshot.vendors.length > 0
+    width: parent.width
+    spacing: Style.space(8)
+
+    Disclosure {
+      text: root.tr("section.providers")
+      badge: root.vendorSummary()
+      expanded: root.openSection === "providers"
+      onToggled: root.toggleSection("providers")
+    }
+    Column {
+      visible: root.openSection === "providers"
       width: parent.width
-      showLabel: false
-      value: root.selectedPrimary
-      options: root.snapshot.primary_choices
-      foreground: root.foreground
-      fontFamily: root.fontFamily
-      enabled: !root.saving
-      onChanged: function(value) { root.selectedPrimary = value }
+      spacing: Style.space(8)
+
+      Text {
+        width: parent.width
+        text: root.tr("providers.help")
+        textFormat: Text.PlainText
+        color: root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        wrapMode: Text.WordWrap
+      }
+      Repeater {
+        model: root.snapshot.vendors
+
+        Toggle {
+          required property var modelData
+          width: parent.width
+          label: root.safe(modelData.label)
+          description: {
+            var pending = root.vendorOverrides[modelData.id]
+            var effective = pending === true || pending === false ? pending : modelData.enabled
+            return effective ? root.tr("status.vendor_on") : root.tr("status.vendor_off")
+          }
+          checked: {
+            var pending = root.vendorOverrides[modelData.id]
+            return pending === true || pending === false ? pending : modelData.enabled
+          }
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+          enabled: !root.saving
+          onClicked: root.setVendorOverride(modelData.id, !checked)
+        }
+      }
     }
   }
 
@@ -374,199 +719,216 @@ Column {
     width: parent.width
     spacing: Style.space(10)
 
-    PanelSeparator {
-      width: parent.width
-      foreground: root.foreground
+    Disclosure {
+      text: root.tr("section.credentials")
+      badge: root.keyPendingCount > 0 ? "● " + root.keyPendingCount : ""
+      expanded: root.openSection === "credentials"
+      onToggled: root.toggleSection("credentials")
     }
-    PanelSectionHeader {
-      text: "AUTHENTICATION"
-      foreground: root.foreground
-      fontFamily: root.fontFamily
-    }
-    Text {
+    Column {
+      visible: root.openSection === "credentials"
       width: parent.width
-      text: "OAuth login opens in a terminal. Complete it, then return here, choose the provider as primary, save, and press Refresh."
-      textFormat: Text.PlainText
-      color: root.dim
-      font.family: root.fontFamily
-      font.pixelSize: Style.font.caption
-      wrapMode: Text.WordWrap
-    }
-    Button {
-      width: parent.width
-      text: "Log in with Nous Research"
-      iconText: "󰍂"
-      bordered: true
-      focusable: true
-      foreground: root.foreground
-      fontFamily: root.fontFamily
-      enabled: !root.saving
-      onClicked: {
-        root.statusText = "Nous Research login is opening in a terminal."
-        root.nousLoginRequested()
+      spacing: Style.space(10)
+
+      PanelSectionHeader {
+        text: root.tr("section.auth")
+        foreground: root.foreground
+        fontFamily: root.fontFamily
       }
-    }
-    Button {
-      width: parent.width
-      text: "Log in with GitHub Copilot"
-      iconText: "󰊤"
-      bordered: true
-      focusable: true
-      foreground: root.foreground
-      fontFamily: root.fontFamily
-      enabled: !root.saving
-      onClicked: {
-        root.statusText = "GitHub sign-in is opening in a terminal. Complete it, then choose GitHub Copilot as primary and save."
-        root.copilotLoginRequested()
+      Text {
+        width: parent.width
+        text: root.tr("auth.help")
+        textFormat: Text.PlainText
+        color: root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        wrapMode: Text.WordWrap
       }
-    }
-  }
+      Button {
+        width: parent.width
+        text: root.tr("auth.nous")
+        iconText: "󰍂"
+        bordered: true
+        focusable: true
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        enabled: !root.saving
+        onClicked: {
+          root.statusText = root.tr("status.nous_login")
+          root.nousLoginRequested()
+        }
+      }
+      Button {
+        width: parent.width
+        text: root.tr("auth.copilot")
+        iconText: "󰊤"
+        bordered: true
+        focusable: true
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        enabled: !root.saving
+        onClicked: {
+          root.statusText = root.tr("status.copilot_login")
+          root.copilotLoginRequested()
+        }
+      }
 
-  Column {
-    visible: !root.loading && root.snapshot.keys.length > 0
-    width: parent.width
-    spacing: Style.space(10)
-
-    PanelSeparator {
+    Column {
+      visible: root.snapshot.keys.length > 0
       width: parent.width
-      foreground: root.foreground
-    }
-    PanelSectionHeader {
-      text: "CREDENTIALS"
-      foreground: root.foreground
-      fontFamily: root.fontFamily
-    }
-    Text {
-      width: parent.width
-      text: "Stored values are never loaded into the shell. Leave a field blank to keep its current value, or use the clear button to remove an inline credential. Environment variables take precedence."
-      textFormat: Text.PlainText
-      color: root.dim
-      font.family: root.fontFamily
-      font.pixelSize: Style.font.caption
-      wrapMode: Text.WordWrap
-    }
+      spacing: Style.space(10)
 
-    Repeater {
-      id: keyRepeater
-      model: root.snapshot.keys
-
-      BorderSurface {
-        id: keyCard
-        required property var modelData
-        readonly property string vendorId: String(modelData.id || "")
-        property string pendingAction: "unchanged"
-        property alias secretText: keyField.text
-
-        function scrub() {
-          keyField.text = ""
-          pendingAction = "unchanged"
+        Text {
+          width: parent.width
+          text: root.tr("credentials.help")
+          textFormat: Text.PlainText
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          wrapMode: Text.WordWrap
         }
 
-        width: keyRepeater.parent.width
-        implicitHeight: keyColumn.implicitHeight + Style.spacing.xl * 2
-        color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.035)
-        borderSpec: Border.flat(Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.10), 1)
-        radius: Style.cornerRadius
+        Repeater {
+          id: keyRepeater
+          model: root.snapshot.keys
 
-        Column {
-          id: keyColumn
-          anchors.left: parent.left
-          anchors.right: parent.right
-          anchors.verticalCenter: parent.verticalCenter
-          anchors.leftMargin: Style.space(12)
-          anchors.rightMargin: Style.space(12)
-          spacing: Style.space(6)
+          BorderSurface {
+            id: keyCard
+            required property var modelData
+            readonly property string vendorId: String(modelData.id || "")
+            property string pendingAction: "unchanged"
+            property alias secretText: keyField.text
+            onPendingActionChanged: root.recountKeys()
 
-          Item {
-            width: parent.width
-            implicitHeight: Math.max(keyLabel.implicitHeight, keyStatus.implicitHeight)
+            function scrub() {
+              keyField.text = ""
+              pendingAction = "unchanged"
+            }
 
-            Text {
-              id: keyLabel
+            width: keyRepeater.parent.width
+            implicitHeight: keyColumn.implicitHeight + Style.spacing.xl * 2
+            color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.035)
+            borderSpec: Border.flat(Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.10), 1)
+            radius: Style.cornerRadius
+
+            Column {
+              id: keyColumn
               anchors.left: parent.left
-              anchors.right: keyStatus.left
-              anchors.rightMargin: Style.spacing.md
-              text: root.safe(keyCard.modelData.label)
-              textFormat: Text.PlainText
-              color: root.foreground
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.bodySmall
-              font.bold: true
-              elide: Text.ElideRight
-            }
-            Text {
-              id: keyStatus
               anchors.right: parent.right
-              text: keyCard.pendingAction === "clear" ? "will clear"
-                : keyCard.pendingAction === "set" ? "new key"
-                : keyCard.modelData.environment_configured ? "environment override"
-                : keyCard.modelData.inline_configured ? "stored"
-                : "not configured"
-              textFormat: Text.PlainText
-              color: keyCard.pendingAction === "clear" ? root.urgent : root.dim
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-            }
-          }
+              anchors.verticalCenter: parent.verticalCenter
+              anchors.leftMargin: Style.space(12)
+              anchors.rightMargin: Style.space(12)
+              spacing: Style.space(6)
 
-          Text {
-            visible: text !== ""
-            width: parent.width
-            text: {
-              var parts = []
-              if (keyCard.modelData.environment) parts.push(root.safe(keyCard.modelData.environment))
-              if (keyCard.modelData.secret_label) parts.push(root.safe(keyCard.modelData.secret_label))
-              if (keyCard.modelData.note) parts.push(root.safe(keyCard.modelData.note))
-              return parts.join(" · ")
-            }
-            textFormat: Text.PlainText
-            color: root.dim
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
-            elide: Text.ElideRight
-          }
+              Item {
+                width: parent.width
+                implicitHeight: Math.max(keyLabel.implicitHeight, keyStatus.implicitHeight)
 
-          Row {
-            width: parent.width
-            spacing: Style.space(8)
+                Text {
+                  id: keyLabel
+                  anchors.left: parent.left
+                  anchors.right: keyStatus.left
+                  anchors.rightMargin: Style.spacing.md
+                  text: root.safe(keyCard.modelData.label)
+                  textFormat: Text.PlainText
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                  font.bold: true
+                  elide: Text.ElideRight
+                }
+                Text {
+                  id: keyStatus
+                  anchors.right: parent.right
+                  text: keyCard.pendingAction === "clear" ? root.tr("status.will_clear")
+                    : keyCard.pendingAction === "set" ? root.tr("credentials.new_key")
+                    : keyCard.modelData.environment_configured ? root.tr("credentials.env_override")
+                    : keyCard.modelData.inline_configured ? root.tr("credentials.stored")
+                    : root.tr("credentials.not_configured")
+                  textFormat: Text.PlainText
+                  color: keyCard.pendingAction === "clear" ? root.urgent : root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                }
+              }
 
-            TextField {
-              id: keyField
-              width: parent.width - clearButton.width - parent.spacing
-              password: true
-              enabled: !root.saving && keyCard.pendingAction !== "clear"
-              placeholderText: keyCard.modelData.configured
-                ? "Leave blank to keep current credential"
-                : "Paste " + (keyCard.modelData.secret_label || "credential")
-              foreground: root.foreground
-              onTextEdited: keyCard.pendingAction = text.length > 0 ? "set" : "unchanged"
-              Keys.onEscapePressed: focus = false
-              onAccepted: root.save()
-            }
+              // Env var stays on its own line (identifier, may elide). Role +
+              // note wrap below so long hints are readable instead of cutting
+              // mid-word as "mont…" / "sp…".
+              Text {
+                visible: text !== ""
+                width: parent.width
+                text: keyCard.modelData.environment ? root.safe(keyCard.modelData.environment) : ""
+                textFormat: Text.PlainText
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                elide: Text.ElideRight
+              }
+              Text {
+                visible: text !== ""
+                width: parent.width
+                text: {
+                  var parts = []
+                  var secret = I18n.displaySecretLabel(root.uiLocale, keyCard.modelData.secret_label)
+                  var note = I18n.displayNote(root.uiLocale, keyCard.modelData.note)
+                  if (secret) parts.push(secret)
+                  if (note) parts.push(note)
+                  return parts.join(" · ")
+                }
+                textFormat: Text.PlainText
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                wrapMode: Text.WordWrap
+              }
 
-            PanelActionButton {
-              id: clearButton
-              anchors.verticalCenter: keyField.verticalCenter
-              iconText: keyCard.pendingAction === "clear" ? "󰕌" : "󰆴"
-              tooltipText: keyCard.pendingAction === "clear"
-                ? "Keep the stored key" : "Clear the stored inline key"
-              foreground: root.foreground
-              hoverColor: keyCard.pendingAction === "clear" ? root.foreground : root.urgent
-              fontFamily: root.fontFamily
-              focusable: true
-              enabled: !root.saving && (keyCard.modelData.inline_configured || keyCard.pendingAction === "clear")
-              onClicked: {
-                if (keyCard.pendingAction === "clear") {
-                  keyCard.pendingAction = "unchanged"
-                } else {
-                  keyField.text = ""
-                  keyCard.pendingAction = "clear"
+              Row {
+                width: parent.width
+                spacing: Style.space(8)
+
+                TextField {
+                  id: keyField
+                  width: parent.width - clearButton.width - parent.spacing
+                  password: true
+                  enabled: !root.saving && keyCard.pendingAction !== "clear"
+                  placeholderText: keyCard.modelData.configured
+                    ? root.tr("credentials.keep_blank")
+                    : root.tr("credentials.paste", {
+                        label: I18n.displaySecretLabel(root.uiLocale, keyCard.modelData.secret_label)
+                          || root.tr("credentials.credential")
+                      })
+                  foreground: root.foreground
+                  onTextEdited: keyCard.pendingAction = text.length > 0 ? "set" : "unchanged"
+                  Keys.onEscapePressed: focus = false
+                  onAccepted: root.save()
+                }
+
+                PanelActionButton {
+                  id: clearButton
+                  anchors.verticalCenter: keyField.verticalCenter
+                  iconText: keyCard.pendingAction === "clear" ? "󰕌" : "󰆴"
+                  tooltipText: keyCard.pendingAction === "clear"
+                    ? root.tr("credentials.keep_key") : root.tr("credentials.clear_key")
+                  foreground: root.foreground
+                  hoverColor: keyCard.pendingAction === "clear" ? root.foreground : root.urgent
+                  fontFamily: root.fontFamily
+                  focusable: true
+                  enabled: !root.saving && (keyCard.modelData.inline_configured || keyCard.pendingAction === "clear")
+                  onClicked: {
+                    if (keyCard.pendingAction === "clear") {
+                      keyCard.pendingAction = "unchanged"
+                    } else {
+                      keyField.text = ""
+                      keyCard.pendingAction = "clear"
+                    }
+                  }
                 }
               }
             }
           }
         }
-      }
+    }
     }
   }
 
@@ -596,9 +958,10 @@ Column {
 
   Button {
     visible: !root.loading
-      && (root.snapshot.primary_choices.length > 0 || root.snapshot.keys.length > 0)
+      && (root.snapshot.primary_choices.length > 0 || root.snapshot.keys.length > 0
+          || root.snapshot.vendors.length > 0)
     width: parent.width
-    text: root.saving ? "Saving…" : "Save settings"
+    text: root.saving ? root.tr("action.saving") : root.tr("action.save")
     iconText: root.saving ? "󰑐" : "󰄬"
     iconSpinning: root.saving
     bordered: true
@@ -607,5 +970,73 @@ Column {
     fontFamily: root.fontFamily
     enabled: root.canSave
     onClicked: root.save()
+  }
+
+  component Disclosure: Item {
+    id: disclosure
+    property string text: ""
+    property string badge: ""
+    property bool expanded: false
+    signal toggled()
+
+    width: parent ? parent.width : 0
+    implicitHeight: Style.spacing.controlHeight
+    activeFocusOnTab: true
+    Keys.onReturnPressed: disclosure.toggled()
+    Keys.onEnterPressed: disclosure.toggled()
+    Keys.onSpacePressed: disclosure.toggled()
+
+    Rectangle {
+      anchors.fill: parent
+      radius: Style.cornerRadius
+      color: disclosureMouse.containsMouse || disclosure.activeFocus
+        ? Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.08) : "transparent"
+    }
+    Text {
+      id: disclosureChevron
+      anchors.left: parent.left
+      anchors.leftMargin: Style.space(8)
+      anchors.verticalCenter: parent.verticalCenter
+      text: disclosure.expanded ? "󰅀" : "󰅂"
+      textFormat: Text.PlainText
+      color: root.foreground
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.body
+    }
+    Text {
+      anchors.left: disclosureChevron.right
+      anchors.leftMargin: Style.space(8)
+      anchors.right: disclosureBadge.left
+      anchors.rightMargin: Style.spacing.md
+      anchors.verticalCenter: parent.verticalCenter
+      text: disclosure.text
+      textFormat: Text.PlainText
+      color: root.foreground
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.bodySmall
+      font.bold: true
+      elide: Text.ElideRight
+    }
+    Text {
+      id: disclosureBadge
+      anchors.right: parent.right
+      anchors.rightMargin: Style.space(8)
+      anchors.verticalCenter: parent.verticalCenter
+      text: disclosure.badge
+      textFormat: Text.PlainText
+      color: root.dim
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.caption
+    }
+    MouseArea {
+      id: disclosureMouse
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: Qt.PointingHandCursor
+      onClicked: {
+        disclosure.forceActiveFocus()
+        disclosure.toggled()
+      }
+    }
   }
 }

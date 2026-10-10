@@ -25,7 +25,7 @@ Output modes:
     between ticks. Useful while iterating on `--format` or `--tooltip-format`.
   - --json: force JSON output even when stdout is a TTY (for scripting).
   - --config PATH: read and write an alternate config file instead of the
-    default `%APPDATA%/ai-usagebar/config.toml` (Windows) or
+    default `%APPDATA%/ai-usagebar/config/config.toml` (Windows) or
     `~/.config/ai-usagebar/config.toml`. Accepted in any position, before or
     after the subcommand; the file must already exist, and Settings saves
     write back to it."
@@ -121,8 +121,10 @@ pub struct Cli {
     #[arg(long, value_name = "FILE")]
     pub creds_path: Option<std::path::PathBuf>,
 
-    /// Select a named Claude, OpenRouter, or Codex (OpenAI) account from the matching
-    /// `[[...accounts]]` config array. Without it, the vendor's default account
+    /// Select a named Claude, Codex (OpenAI), or API-key vendor (Z.AI,
+    /// OpenRouter, DeepSeek, Kilo, Novita, Moonshot, Grok, MiniMax, OrcaRouter,
+    /// Lyceum) account from the matching `[[...accounts]]` config array. Without it,
+    /// the vendor's default account
     /// and original cache path are unchanged. For Claude it conflicts with the
     /// lower-level `--creds-path` because both select a credential source.
     #[arg(long, value_name = "LABEL", conflicts_with = "creds_path")]
@@ -146,6 +148,12 @@ pub enum Command {
     Account {
         #[command(subcommand)]
         action: AccountAction,
+    },
+
+    /// Configure the official Antigravity CLI status line for live sessions.
+    Antigravity {
+        #[command(subcommand)]
+        action: AntigravityAction,
     },
 
     /// Quota and time-to-reset for every configured vendor and account.
@@ -192,6 +200,16 @@ pub enum Command {
         #[command(subcommand)]
         provider: AuthProvider,
     },
+}
+
+#[derive(clap::Subcommand, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AntigravityAction {
+    /// Install the AI UsageBar status line command.
+    SetupStatusline,
+    /// Remove the AI UsageBar status line command if still owned by it.
+    RemoveStatusline,
+    /// Receive and persist one status line payload from stdin.
+    IngestStatusline,
 }
 
 #[derive(clap::Subcommand, Debug, Clone)]
@@ -251,20 +269,43 @@ pub enum AccountAction {
         /// Skip the confirmation before signing the Desktop app out.
         #[arg(short = 'y', long, requires = "desktop")]
         yes: bool,
+
+        /// Register a Codex (ChatGPT) login instead of a Claude one: an
+        /// `[[openai.accounts]]` entry at `~/.codex-<LABEL>/auth.json`, signed
+        /// in with `codex login` under that `CODEX_HOME`.
+        #[arg(long, conflicts_with = "desktop")]
+        codex: bool,
+
+        /// Register the login that is active right now (plain `claude`, or
+        /// `~/.codex` with `--codex`) under this label instead of signing in
+        /// again, so `account switch` can save it before switching away.
+        #[arg(long, conflicts_with_all = ["desktop", "no_login"])]
+        adopt_current: bool,
     },
 
-    /// Show which Claude account the Desktop app and the `claude` CLI use.
+    /// Show which Claude account the Desktop app and the `claude` CLI use, and
+    /// which Codex account `~/.codex` holds.
     Status {
         /// Machine-readable output, consumed by the macOS menu bar.
         #[arg(long)]
         json: bool,
     },
 
-    /// Make <LABEL> the active Claude account (macOS).
+    /// Make <LABEL> the active Claude account (macOS), or the active Codex
+    /// account with `--codex`.
     Switch {
         /// Account to switch to. Desktop profiles come from claude-acc's store;
-        /// CLI accounts from `[[anthropic.accounts]]` / `accounts_dir`.
+        /// CLI accounts from `[[anthropic.accounts]]` / `accounts_dir`; Codex
+        /// accounts from `[[openai.accounts]]`.
         label: String,
+
+        /// Switch the Codex login (`~/.codex/auth.json`, shared by the Codex
+        /// CLI, desktop app and IDE extension) instead of Claude.
+        #[arg(
+            long,
+            conflicts_with_all = ["desktop", "cli", "keep_bridge", "backup_sessions", "delete_conflict"]
+        )]
+        codex: bool,
 
         /// Only switch the Claude Desktop app. Neither flag switches both.
         #[arg(long)]
@@ -282,8 +323,9 @@ pub enum AccountAction {
         #[arg(short = 'y', long)]
         yes: bool,
 
-        /// Overwrite a `claude` CLI login that belongs to no managed account.
-        /// That login cannot be saved first, so this discards it.
+        /// Overwrite a `claude` CLI login (with `--codex`, a `~/.codex` login)
+        /// that belongs to no managed account. That login cannot be saved
+        /// first, so this discards it.
         #[arg(long)]
         force: bool,
 
@@ -310,6 +352,41 @@ pub enum AccountAction {
         #[arg(long, value_name = "KEY")]
         delete_conflict: Vec<String>,
     },
+
+    /// Merge every account's history into the account a Claude Desktop profile
+    /// is already signed into (macOS). Additive: nothing is ever deleted, and
+    /// no credential or app state is touched.
+    ///
+    /// BY DESIGN THIS CROSSES ACCOUNTS. Afterwards the signed-in account's
+    /// window lists conversations and routines that were started under your
+    /// other accounts, because the point is that every profile opens on the
+    /// union of everything. That is a feature, not a leak — but it does mean
+    /// one account's window shows another account's chat titles, so do not run
+    /// it across accounts that must stay visually separate.
+    ///
+    /// For side-by-side Desktop copies launched with `--user-data-dir`, run
+    /// this just before the app starts. Use `account switch` for the normal
+    /// single-profile case.
+    MergeHistory {
+        /// The profile to merge into — the same directory the app is launched
+        /// with via `--user-data-dir`. Required, and refused for the default
+        /// profile, which `account switch` owns.
+        #[arg(long, value_name = "DIR")]
+        data_dir: std::path::PathBuf,
+
+        /// Profile to read history from. Repeatable. Sources are opened
+        /// read-only and need not be idle.
+        ///
+        /// Defaults to every other profile this machine knows: the default
+        /// Claude Desktop profile plus any sibling of `--data-dir`. Pass this
+        /// to override that set.
+        #[arg(long, value_name = "DIR")]
+        from: Vec<std::path::PathBuf>,
+
+        /// Report what would change and exit without touching anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
@@ -322,6 +399,7 @@ pub enum Vendor {
     Zai,
     Openrouter,
     Deepseek,
+    Deepinfra,
     Kimi,
     Kilo,
     Novita,
@@ -341,6 +419,14 @@ pub enum Vendor {
     CommandCode,
     Shvia,
     Ollama,
+    // The slug frontends pass (`vendorArgs` in the macOS menu bar); clap's
+    // derived kebab-case spelling stays accepted for existing scripts.
+    #[value(name = "orcarouter", alias = "orca-router")]
+    OrcaRouter,
+    #[value(name = "modelstudio")]
+    ModelStudio,
+    Lyceum,
+    Devin,
 }
 
 impl Vendor {
@@ -353,6 +439,7 @@ impl Vendor {
             Vendor::Zai => crate::vendor::VendorId::Zai,
             Vendor::Openrouter => crate::vendor::VendorId::Openrouter,
             Vendor::Deepseek => crate::vendor::VendorId::Deepseek,
+            Vendor::Deepinfra => crate::vendor::VendorId::Deepinfra,
             Vendor::Kimi => crate::vendor::VendorId::Kimi,
             Vendor::Kilo => crate::vendor::VendorId::Kilo,
             Vendor::Novita => crate::vendor::VendorId::Novita,
@@ -369,6 +456,10 @@ impl Vendor {
             Vendor::CommandCode => crate::vendor::VendorId::CommandCode,
             Vendor::Shvia => crate::vendor::VendorId::Shvia,
             Vendor::Ollama => crate::vendor::VendorId::Ollama,
+            Vendor::OrcaRouter => crate::vendor::VendorId::OrcaRouter,
+            Vendor::ModelStudio => crate::vendor::VendorId::ModelStudio,
+            Vendor::Lyceum => crate::vendor::VendorId::Lyceum,
+            Vendor::Devin => crate::vendor::VendorId::Devin,
         }
     }
 }
@@ -448,6 +539,7 @@ fn id_to_vendor(id: crate::vendor::VendorId) -> Vendor {
         crate::vendor::VendorId::Zai => Vendor::Zai,
         crate::vendor::VendorId::Openrouter => Vendor::Openrouter,
         crate::vendor::VendorId::Deepseek => Vendor::Deepseek,
+        crate::vendor::VendorId::Deepinfra => Vendor::Deepinfra,
         crate::vendor::VendorId::Kimi => Vendor::Kimi,
         crate::vendor::VendorId::Kilo => Vendor::Kilo,
         crate::vendor::VendorId::Novita => Vendor::Novita,
@@ -464,6 +556,10 @@ fn id_to_vendor(id: crate::vendor::VendorId) -> Vendor {
         crate::vendor::VendorId::CommandCode => Vendor::CommandCode,
         crate::vendor::VendorId::Shvia => Vendor::Shvia,
         crate::vendor::VendorId::Ollama => Vendor::Ollama,
+        crate::vendor::VendorId::OrcaRouter => Vendor::OrcaRouter,
+        crate::vendor::VendorId::ModelStudio => Vendor::ModelStudio,
+        crate::vendor::VendorId::Lyceum => Vendor::Lyceum,
+        crate::vendor::VendorId::Devin => Vendor::Devin,
     }
 }
 
@@ -506,6 +602,25 @@ mod tests {
         ));
         assert!(Cli::try_parse_from(["ai-usagebar", "settings", "enable", "unknown"]).is_err());
         assert!(Cli::try_parse_from(["ai-usagebar", "settings", "enable"]).is_err());
+    }
+
+    #[test]
+    fn antigravity_statusline_actions_parse_and_require_an_action() {
+        for (arguments, expected) in [
+            (&["antigravity", "setup-statusline"][..], "setup"),
+            (&["antigravity", "remove-statusline"][..], "remove"),
+            (&["antigravity", "ingest-statusline"][..], "ingest"),
+        ] {
+            let cli = Cli::try_parse_from(
+                std::iter::once("ai-usagebar").chain(arguments.iter().copied()),
+            )
+            .unwrap();
+            assert!(
+                matches!(cli.command, Some(Command::Antigravity { .. })),
+                "{expected}"
+            );
+        }
+        assert!(Cli::try_parse_from(["ai-usagebar", "antigravity"]).is_err());
     }
 
     #[test]
@@ -785,6 +900,20 @@ mod tests {
     }
 
     #[test]
+    fn vendor_modelstudio_parses_to_modelstudio_variant() {
+        let cli = Cli::parse_from(["ai-usagebar", "--vendor", "modelstudio"]);
+        assert_eq!(cli.vendor, Some(Vendor::ModelStudio));
+        assert_eq!(
+            cli.vendor.unwrap().to_id(),
+            crate::vendor::VendorId::ModelStudio
+        );
+        assert_eq!(
+            id_to_vendor(crate::vendor::VendorId::ModelStudio),
+            Vendor::ModelStudio
+        );
+    }
+
+    #[test]
     fn vendor_anthropic_api_uses_the_documented_slug() {
         let cli = Cli::parse_from(["ai-usagebar", "--vendor", "anthropic_api"]);
         assert_eq!(cli.vendor, Some(Vendor::AnthropicApi));
@@ -792,6 +921,19 @@ mod tests {
             cli.vendor.unwrap().to_id(),
             crate::vendor::VendorId::AnthropicApi
         );
+    }
+
+    #[test]
+    fn every_vendor_parses_from_its_slug() {
+        // Frontends build `--vendor` from `VendorId::slug()`; a clap name that
+        // drifts from the slug makes that vendor unreachable from them.
+        for vendor in <Vendor as clap::ValueEnum>::value_variants() {
+            let slug = vendor.to_id().slug();
+            let cli = Cli::parse_from(["ai-usagebar", "--vendor", slug]);
+            assert_eq!(cli.vendor, Some(*vendor), "{slug}");
+        }
+        let legacy = Cli::parse_from(["ai-usagebar", "--vendor", "orca-router"]);
+        assert_eq!(legacy.vendor, Some(Vendor::OrcaRouter));
     }
 
     #[test]

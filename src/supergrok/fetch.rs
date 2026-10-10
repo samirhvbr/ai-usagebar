@@ -15,7 +15,7 @@ use super::scope::ScopePaths;
 use super::{acp, direct, resets, scope, types};
 
 const LOCK_TIMEOUT: Duration = Duration::from_secs(15);
-const CACHE_SCHEMA: u8 = 3;
+const CACHE_SCHEMA: u8 = 4;
 
 /// This vendor's [`Outcome`](crate::outcome::Outcome) — the shared shape,
 /// specialised to its snapshot.
@@ -55,6 +55,11 @@ async fn fetch_billing_any(
         },
     }?;
     response.reset_credits = resets::fetch(&scope_paths.auth).await.unwrap_or_default();
+    if response.subscription_tier_display.is_none()
+        && let Ok(Some(display)) = direct::fetch_plan_display(&scope_paths.auth).await
+    {
+        response.subscription_tier_display = Some(display);
+    }
     Ok(response)
 }
 
@@ -260,7 +265,7 @@ fn fallback(
         return Err(original);
     };
     let error = error_to_pair(&original);
-    let outcome = crate::outcome::fallback(cache, Some(error.clone()), original, |bytes| {
+    let mut outcome = crate::outcome::fallback(cache, None, original, |bytes| {
         let snapshot = parse_cache(bytes, account_scope)?;
         if period_has_ended(&snapshot, now) {
             return Err(AppError::Schema(
@@ -270,9 +275,10 @@ fn fallback(
         Ok(snapshot)
     })?;
     // Only once a figure is actually going on screen is the failure worth
-    // recording beside it.
+    // recording beside it, and the outcome shows what was recorded: the
+    // cache redacts an auth failure's body, the raw pair does not.
     cache.mark_stale();
-    cache.write_last_error(error.0, &error.1);
+    outcome.last_error = Some(cache.write_last_error(error.0, &error.1));
     Ok(outcome)
 }
 
@@ -496,6 +502,42 @@ mod tests {
         )
         .await;
         assert!(other_scope.is_err());
+    }
+
+    /// An auth failure's body can echo the account. The cache keeps a neutral
+    /// message instead, and the outcome shown beside the stale figure must
+    /// carry that same message rather than the body.
+    #[tokio::test]
+    async fn an_auth_failure_body_never_reaches_the_outcome() {
+        let (_td, cache) = fixture();
+        cache.ensure_dir().unwrap();
+        let snapshot = types::to_snapshot(weekly_response(33.0), "scope-a").unwrap();
+        cache
+            .write_payload(
+                &serde_json::to_vec(&CachedEnvelope::from_snapshot("scope-a", &snapshot)).unwrap(),
+            )
+            .unwrap();
+
+        let fallback = fetch_snapshot_with(
+            &cache,
+            Duration::ZERO,
+            now(),
+            || Some("scope-a".into()),
+            || async {
+                Err(AppError::Http {
+                    status: 401,
+                    body: "user@example.test <credential>".into(),
+                })
+            },
+        )
+        .await
+        .unwrap();
+        assert!(fallback.stale);
+        assert_eq!(
+            fallback.last_error,
+            Some((401, crate::error::AUTH_FAILURE_MESSAGE.to_string()))
+        );
+        assert_eq!(cache.read_last_error(), fallback.last_error);
     }
 
     #[tokio::test]

@@ -138,10 +138,21 @@ impl AppError {
 
 /// Map a reqwest error into the right variant. Connection-class failures
 /// become `Transport` (transient); the rest become generic `Http`/`Other`.
+/// `Transport` carries the source chain — reqwest's own Display swallows it,
+/// and without it a TLS failure behind a corporate proxy is indistinguishable
+/// from an outage (the certificate cause, e.g. `UnknownIssuer`, is in the
+/// chain, not the message). The chain carries TLS internals, never
+/// credentials.
 impl From<reqwest::Error> for AppError {
     fn from(err: reqwest::Error) -> Self {
         if err.is_timeout() || err.is_connect() || err.is_request() {
-            return AppError::Transport(err.to_string());
+            let mut msg = err.to_string();
+            let mut source = std::error::Error::source(&err);
+            while let Some(cause) = source {
+                msg.push_str(&format!(": {cause}"));
+                source = cause.source();
+            }
+            return AppError::Transport(msg);
         }
         if let Some(status) = err.status() {
             return AppError::Http {
@@ -175,6 +186,24 @@ mod tests {
             "an embedded newline forges a line: {rendered:?}"
         );
         assert!(rendered.contains("disk full"), "{rendered}");
+    }
+
+    /// A closed loopback port produces a connect-class reqwest error whose
+    /// Display alone is "error sending request"; the Transport message must
+    /// carry the chain so the OS cause ("Connection refused") survives.
+    #[tokio::test]
+    async fn a_transport_error_carries_its_source_chain() {
+        let client = reqwest::Client::new();
+        let err = client
+            .get("http://127.0.0.1:1/")
+            .send()
+            .await
+            .expect_err("port 1 is closed");
+        let rendered = AppError::from(err).to_string();
+        assert!(
+            rendered.contains("Connection refused") || rendered.contains("refused"),
+            "the OS cause must survive into the message: {rendered:?}"
+        );
     }
 
     #[test]

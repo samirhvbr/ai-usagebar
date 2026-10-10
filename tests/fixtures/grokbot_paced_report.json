@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "entries": [
+    {
+      "id": "grokbot",
+      "display_name": "Grok Bot",
+      "plan": "Cursor Ultra",
+      "sections": [
+        {
+          "type": "metric",
+          "label": "Weekly",
+          "percent": 70,
+          "value": "70%",
+          "headline": "percent",
+          "severity": "mid",
+          "detail": "Resets in 5d 0h · 50% elapsed · 20pts ahead",
+          "reset_at": "2026-09-30T12:00:00Z",
+          "window_secs": 864000
+        }
+      ]
+    }
+  ]
+}

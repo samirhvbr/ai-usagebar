@@ -254,6 +254,16 @@ impl Cache {
         self.stale_path().exists()
     }
 
+    /// Drop the payload and its sidecars when the credential behind this cache
+    /// changed hands: they describe the previous login, and a fresh payload
+    /// would be served as the new one's. Best-effort, like the other markers.
+    pub fn forget(&self) {
+        let _ = fs::remove_file(self.payload_path());
+        let _ = fs::remove_file(self.stale_path());
+        let _ = fs::remove_file(self.last_error_path());
+        self.clear_backoff();
+    }
+
     /// Write the `.last_error` marker — first line `code`, everything after it
     /// `msg`. Best-effort, never errors (matches claudebar:478-486 which
     /// silently continues if the cache dir isn't writable).
@@ -426,6 +436,23 @@ pub fn home_dir() -> Result<PathBuf> {
         .ok_or_else(|| AppError::Other("could not resolve home directory (no HOME?)".into()))
 }
 
+/// The identity a vendor cache is scoped to: the first 8 bytes (16 hex chars)
+/// of the SHA-256 of the credential. A re-login changes it, so one login's
+/// figures are never served as another's; the secret itself is never stored.
+/// Existing cache files carry this exact value, so the truncation is a
+/// compatibility contract, not a tunable.
+pub fn fingerprint_of(secret: &str) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+
+    let digest = Sha256::digest(secret.as_bytes());
+    let mut hex = String::with_capacity(16);
+    for byte in digest.iter().take(8) {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
+
 /// Test-only: a named file inside a fresh `TempDir` with **no open handle** on
 /// it. [`atomic_write`] replaces its destination via rename, which on Windows
 /// fails while the destination is held open (as a live `NamedTempFile` handle
@@ -468,6 +495,30 @@ mod tests {
         cache.write_payload(b"hello world").unwrap();
         let got = cache.maybe_payload().unwrap();
         assert_eq!(got.as_deref(), Some(&b"hello world"[..]));
+    }
+
+    #[test]
+    fn fingerprint_is_the_first_eight_sha256_bytes_in_lower_hex() {
+        // SHA-256("abc") = ba7816bf 8f01cfea 414140de ... — pinned because
+        // existing on-disk caches are keyed by exactly this value.
+        assert_eq!(fingerprint_of("abc"), "ba7816bf8f01cfea");
+        assert_eq!(fingerprint_of("").len(), 16);
+        assert_ne!(fingerprint_of("a"), fingerprint_of("b"));
+    }
+
+    #[test]
+    fn forget_drops_the_payload_and_its_sidecars() {
+        let (_td, cache) = fixture();
+        cache.write_payload(b"previous login").unwrap();
+        cache.mark_stale();
+        cache.write_last_error(401, "expired");
+        cache.note_rate_limit_at(SystemTime::now());
+        cache.forget();
+        assert!(cache.maybe_payload().unwrap().is_none());
+        assert!(!cache.is_stale());
+        assert!(cache.read_last_error().is_none());
+        assert!(cache.backoff_remaining().is_none());
+        assert!(cache.dir().is_dir());
     }
 
     #[test]

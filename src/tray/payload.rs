@@ -18,6 +18,8 @@ pub const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30
 /// machinery. One struct so a new fact does not grow `wrap_report`'s arity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostFacts {
+    /// Windows system accent colors for the Fluent popover; absent on other hosts.
+    pub accent: Option<super::accent::Accent>,
     /// Seconds between full reports; `[tray] refresh_minutes` × 60.
     pub refresh_secs: u64,
     /// Canonical "Ctrl+Shift+U" spelling of the registered shortcut, or empty.
@@ -32,6 +34,29 @@ pub struct HostFacts {
     /// "auto" | "notify" | "off".
     pub updates: String,
     pub version: String,
+    /// Vendors whose active login the popover can switch. Only the macOS host
+    /// fills this; an empty list hides the control everywhere else.
+    pub accounts: Vec<AccountSwitchFact>,
+}
+
+/// One vendor's switchable logins, as the popover renders them beside each
+/// account's card.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AccountSwitchFact {
+    /// Report entry slug: "anthropic" or "openai".
+    pub vendor: String,
+    /// Label the vendor's default login belongs to; `None` when it is not a
+    /// managed account.
+    pub active: Option<String>,
+    /// Labels that can be made active.
+    pub labels: Vec<String>,
+    /// Label of the last switch requested, running or finished; empty before
+    /// the first one.
+    pub target: String,
+    /// Whether that switch is still running.
+    pub switching: bool,
+    /// Why that switch failed, or empty.
+    pub error: String,
 }
 
 /// State of a newer release as the popover renders it.
@@ -39,12 +64,31 @@ pub struct HostFacts {
 pub struct UpdateFact {
     /// Human-readable reason when `state` is "failed", or empty.
     pub error: String,
+    /// The release ships this OS/arch and the install directory is writable;
+    /// otherwise the popover links the release page instead of installing.
+    pub installable: bool,
     /// "checking" | "available" | "downloading" | "installing" | "failed".
     pub state: String,
     /// Release page for the human; never opened by the host itself.
     pub url: String,
     /// Bare "X.Y.Z".
     pub version: String,
+}
+
+/// Host facts are owned jointly: the event-loop thread edits the shortcut, the
+/// worker edits the update state, and every report snapshots the whole thing.
+pub type SharedFacts = std::sync::Arc<std::sync::Mutex<HostFacts>>;
+
+/// Only the hosts read the whole record; the update worker edits in place.
+#[cfg(any(windows, target_os = "macos"))]
+pub fn facts_snapshot(facts: &SharedFacts) -> HostFacts {
+    facts.lock().map(|f| f.clone()).unwrap_or_default()
+}
+
+pub fn with_facts(facts: &SharedFacts, edit: impl FnOnce(&mut HostFacts)) {
+    if let Ok(mut guard) = facts.lock() {
+        edit(&mut guard);
+    }
 }
 
 impl HostFacts {
@@ -61,6 +105,7 @@ impl HostFacts {
 impl Default for HostFacts {
     fn default() -> Self {
         Self {
+            accent: None,
             refresh_secs: POLL_INTERVAL.as_secs(),
             shortcut: String::new(),
             shortcut_error: String::new(),
@@ -69,7 +114,32 @@ impl Default for HostFacts {
             update_checked_at: 0,
             updates: String::new(),
             version: String::new(),
+            accounts: Vec::new(),
         }
+    }
+}
+
+/// GitHub page this binary was built from (`Cargo.toml` `repository`), or
+/// empty when that field is not a GitHub URL. The About screen opens it.
+fn repository_page() -> String {
+    let raw = crate::update::SOURCE_REPOSITORY
+        .trim()
+        .trim_end_matches('/');
+    let raw = raw.strip_suffix(".git").unwrap_or(raw);
+    if raw.starts_with("https://github.com/") {
+        raw.to_string()
+    } else {
+        String::new()
+    }
+}
+
+fn host_os() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "macos"
+    } else if cfg!(windows) {
+        "windows"
+    } else {
+        "linux"
     }
 }
 
@@ -89,6 +159,33 @@ pub fn wrap_report(
             "url": sanitize_untrusted_field(&u.url),
             "state": u.state,
             "error": sanitize_untrusted_field(&u.error),
+            "installable": u.installable,
+        })
+    });
+    let accounts: serde_json::Map<String, Value> = facts
+        .accounts
+        .iter()
+        .map(|fact| {
+            (
+                fact.vendor.clone(),
+                json!({
+                    "active": fact.active.as_deref().map(sanitize_untrusted_field),
+                    "labels": fact
+                        .labels
+                        .iter()
+                        .map(|label| sanitize_untrusted_field(label))
+                        .collect::<Vec<_>>(),
+                    "target": sanitize_untrusted_field(&fact.target),
+                    "switching": fact.switching,
+                    "error": sanitize_untrusted_field(&fact.error),
+                }),
+            )
+        })
+        .collect();
+    let accent = facts.accent.as_ref().map(|accent| {
+        json!({
+            "light": accent.light,
+            "dark": accent.dark,
         })
     });
     let mut payload = json!({
@@ -97,11 +194,15 @@ pub fn wrap_report(
         "next_refresh_at": now_ms.saturating_add(poll_ms),
         "refresh_minutes": facts.refresh_secs / 60,
         "startup_enabled": facts.startup_enabled,
+        "os": host_os(),
         "shortcut": facts.shortcut,
         "shortcut_error": sanitize_untrusted_field(&facts.shortcut_error),
         "updates": facts.updates,
         "update": update,
         "update_checked_at": facts.update_checked_at,
+        "repository": repository_page(),
+        "accounts": accounts,
+        "accent": accent,
         "host_error": host_error.map(sanitize_untrusted_field),
         "primary": Value::Null,
         "entries": [],
@@ -245,6 +346,49 @@ mod tests {
         assert!(entries[3].get("sign_in").is_none(), "{:?}", entries[3]);
     }
 
+    #[test]
+    fn popover_keeps_all_distinct_antigravity_account_cards() {
+        let entries = (0..5)
+            .map(|index| {
+                json!({
+                    "id": format!("antigravity@{index:012x}"),
+                    "name": "antigravity · a***@example.com",
+                    "display_name": "Antigravity · a***@example.com",
+                    "status": "ready",
+                    "sections": [{
+                        "type": "metric",
+                        "label": format!("Weekly {index}"),
+                        "percent": index * 10,
+                        "value": format!("{}%", index * 10),
+                        "detail": format!("Resets in {index}d"),
+                        "severity": "low",
+                        "reset_at": null
+                    }]
+                })
+            })
+            .collect::<Vec<_>>();
+        let report = json!({ "primary": "antigravity", "entries": entries }).to_string();
+        let payload = wrap_report(&report, &facts("1.0.0", false), 0, None);
+        let cards = payload["entries"].as_array().unwrap();
+        let ids = cards
+            .iter()
+            .map(|card| card["id"].as_str().unwrap())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(cards.len(), 5);
+        assert_eq!(ids.len(), 5);
+        assert!(
+            cards
+                .iter()
+                .all(|card| card["display_name"] == "Antigravity · a***@example.com")
+        );
+        assert!(
+            cards
+                .iter()
+                .all(|card| card["sign_in"] == crate::vendor::VendorId::Antigravity.sign_in_hint())
+        );
+        assert_eq!(cards[4]["sections"][0]["detail"], "Resets in 4d");
+    }
+
     /// Every id `usage --json` can emit must resolve, or the popover shows a
     /// generic line for a provider we do know how to sign in.
     #[test]
@@ -327,14 +471,40 @@ mod tests {
         assert_eq!(payload["next_refresh_at"], 301_000);
         assert_eq!(payload["refresh_minutes"], 5);
         assert_eq!(payload["startup_enabled"], true);
+        assert_eq!(payload["accent"], Value::Null);
+        let os = payload["os"].as_str().unwrap_or("");
+        assert!(
+            os == "macos" || os == "windows" || os == "linux",
+            "unexpected os {os}"
+        );
         assert_eq!(payload["shortcut"], "");
         assert_eq!(payload["shortcut_error"], "");
         assert_eq!(payload["updates"], "notify");
         assert!(payload["update"].is_null());
         assert_eq!(payload["update_checked_at"], 0);
+        assert!(
+            payload["repository"]
+                .as_str()
+                .unwrap_or("")
+                .starts_with("https://github.com/")
+        );
         assert!(payload["host_error"].is_null());
         assert_eq!(payload["primary"], "anthropic");
         assert_eq!(payload["entries"][0]["short_name"], "cld");
+    }
+
+    #[test]
+    fn wrap_carries_fluent_accent_colors() {
+        let mut host = facts("1.10.0", false);
+        host.accent = Some(super::super::accent::Accent {
+            light: "#123456".into(),
+            dark: "#abcdef".into(),
+        });
+        let payload = wrap_report(&sample_report(), &host, 0, None);
+
+        // ASSERT: both validated host colors reach the JSON root unchanged.
+        assert_eq!(payload["accent"]["light"], "#123456");
+        assert_eq!(payload["accent"]["dark"], "#abcdef");
     }
 
     #[test]
@@ -346,6 +516,7 @@ mod tests {
         host.update_checked_at = 42;
         host.update = Some(UpdateFact {
             error: String::new(),
+            installable: true,
             state: "available".into(),
             url: "https://github.com/akitaonrails/ai-usagebar/releases/tag/v1.11.0".into(),
             version: "1.11.0".into(),
@@ -363,6 +534,7 @@ mod tests {
         assert_eq!(payload["update"]["version"], "1.11.0");
         assert_eq!(payload["update"]["state"], "available");
         assert_eq!(payload["update"]["error"], "");
+        assert_eq!(payload["update"]["installable"], true);
     }
 
     #[test]
@@ -432,5 +604,33 @@ mod tests {
         let payload = wrap_report(&sample_report(), &host, 1_000, None);
         assert_eq!(payload["next_refresh_at"], 601_000);
         assert_eq!(payload["refresh_minutes"], 10);
+    }
+
+    #[test]
+    fn switchable_accounts_are_keyed_by_vendor() {
+        let mut host = facts("1.10.0", false);
+        host.accounts = vec![AccountSwitchFact {
+            vendor: "openai".into(),
+            active: Some("main".into()),
+            labels: vec!["main".into(), "work\u{1b}[31m".into()],
+            target: "work".into(),
+            switching: false,
+            error: "no stored Codex login".into(),
+        }];
+        let payload = wrap_report(&sample_report(), &host, 0, None);
+        let openai = &payload["accounts"]["openai"];
+        assert_eq!(openai["active"], "main");
+        assert_eq!(openai["labels"][0], "main");
+        assert!(!openai["labels"][1].as_str().unwrap().contains('\u{1b}'));
+        assert_eq!(openai["target"], "work");
+        assert_eq!(openai["switching"], false);
+        assert_eq!(openai["error"], "no stored Codex login");
+        assert!(payload["accounts"].get("anthropic").is_none());
+    }
+
+    #[test]
+    fn no_switchable_accounts_is_an_empty_object() {
+        let payload = wrap_report(&sample_report(), &facts("1.10.0", false), 0, None);
+        assert_eq!(payload["accounts"], json!({}));
     }
 }

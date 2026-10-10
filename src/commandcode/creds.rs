@@ -87,11 +87,17 @@ pub fn read_from(path: &Path) -> Option<Credential> {
 /// Production resolver: the env override, then configured paths, then the
 /// platform defaults. Tests use [`resolve_from`], which takes both as inputs.
 pub fn resolve(configured: Option<&[PathBuf]>) -> Result<Credential> {
-    let paths = match configured {
-        Some(paths) if !paths.is_empty() => paths.to_vec(),
-        _ => default_paths()?,
-    };
+    let paths = effective_paths(configured)?;
     resolve_from(std::env::var("COMMANDCODE_API_KEY").ok().as_deref(), &paths)
+}
+
+/// The effective search list: a configured override when it names at least one
+/// path, else the platform defaults.
+pub fn effective_paths(configured: Option<&[PathBuf]>) -> Result<Vec<PathBuf>> {
+    match configured {
+        Some(paths) if !paths.is_empty() => Ok(paths.to_vec()),
+        _ => default_paths(),
+    }
 }
 
 /// Resolve one credential from the environment, then each path in turn.

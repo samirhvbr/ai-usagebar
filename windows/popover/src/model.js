@@ -3,6 +3,8 @@
 // The JSDoc below only types the exports for the TypeScript side (allowJs);
 // it is inert at runtime.
 
+import { m } from "./paraglide/messages.js";
+
 /** @typedef {import("./lib/types").Card} Card */
 /** @typedef {import("./lib/types").Layout} Layout */
 /** @typedef {import("./lib/types").Payload} Payload */
@@ -10,12 +12,16 @@
 /** @typedef {import("./lib/types").RowPrefs} RowPrefs */
 /** @typedef {import("./lib/types").ExplainedError} ExplainedError */
 /** @typedef {import("./lib/types").Pace} Pace */
+/** @typedef {import("./lib/types").ResetItem} ResetItem */
 /** @typedef {import("./lib/types").UpdateInfo} UpdateInfo */
 /** @typedef {import("./lib/types").UpdateMode} UpdateMode */
 /** @typedef {import("./lib/types").TimeFormat} TimeFormat */
 
 export const LAYOUT_KEY = "aiub.tray.layout.v1";
 const COLLAPSED_METRIC_CAP = 2;
+const lang = (locale) => locale === "pt-BR" || locale === "ko" || locale === "es" ? locale : "en";
+/** At most two starred metrics per provider, matching OpenUsage. */
+export const MAX_STARS_PER_PROVIDER = 2;
 
 /** @returns {Payload} */
 export function parseHostPayload(raw) {
@@ -35,6 +41,11 @@ export function emptyPayload(hostError) {
     nextRefreshAt: 0,
     startupEnabled: false,
     hostError: hostError || "",
+    menuBarLook: "chart",
+    menuBarShortName: true,
+    notificationsEnabled: true,
+    notificationsThreshold: 97,
+    os: "",
     primary: "",
     entries: [],
     refreshMinutes: 5,
@@ -43,6 +54,9 @@ export function emptyPayload(hostError) {
     updates: "notify",
     update: null,
     updateCheckedAt: 0,
+    repository: "",
+    accounts: {},
+    accent: null,
   };
 }
 
@@ -56,11 +70,17 @@ function clean(value, max) {
   return text.slice(0, limit - 1) + "…";
 }
 
+// How many report entries are rendered, and how long a card id may be. The
+// account switch metadata is bounded by the same two numbers, so every card
+// that renders can still find its switch control.
+const MAX_ENTRIES = 64;
+const MAX_ENTRY_ID = 180;
+
 /** @returns {Payload} */
 function normalizePayload(parsed) {
   const entriesIn = Array.isArray(parsed.entries) ? parsed.entries : [];
   const entries = [];
-  for (let i = 0; i < entriesIn.length && i < 64; i++) {
+  for (let i = 0; i < entriesIn.length && i < MAX_ENTRIES; i++) {
     const entry = normalizeEntry(entriesIn[i]);
     if (entry) entries.push(entry);
   }
@@ -70,6 +90,11 @@ function normalizePayload(parsed) {
     nextRefreshAt: Number(parsed.next_refresh_at) || 0,
     startupEnabled: parsed.startup_enabled === true,
     hostError: clean(parsed.host_error, 1200),
+    menuBarLook: normalizeMenuBarLook(parsed.menu_bar_look),
+    menuBarShortName: parsed.menu_bar_short_name !== false,
+    notificationsEnabled: parsed.notifications_enabled !== false,
+    notificationsThreshold: Number.isInteger(parsed.notifications_threshold) && parsed.notifications_threshold >= 1 && parsed.notifications_threshold <= 100 ? parsed.notifications_threshold : 97,
+    os: normalizeOs(parsed.os),
     primary: clean(parsed.primary, 180),
     entries,
     refreshMinutes: normalizeRefreshMinutes(parsed.refresh_minutes),
@@ -78,7 +103,81 @@ function normalizePayload(parsed) {
     updates: normalizeUpdateMode(parsed.updates),
     update: normalizeUpdate(parsed.update),
     updateCheckedAt: finiteNumber(parsed.update_checked_at),
+    repository: githubPage(parsed.repository),
+    accounts: normalizeAccounts(parsed.accounts),
+    accent: normalizeAccent(parsed.accent),
   };
+}
+
+// Both colors must be complete CSS hex values before either reaches styles.
+function normalizeAccent(value) {
+  if (!isPlainObject(value)) return null;
+  const color = /^#[0-9a-f]{6}$/i;
+  if (!color.test(value.light) || !color.test(value.dark)) return null;
+  return { light: value.light.toLowerCase(), dark: value.dark.toLowerCase() };
+}
+
+const SWITCHABLE_VENDORS = ["anthropic", "openai"];
+
+// Switchable logins per vendor. Only the macOS host sends any; anything absent
+// or malformed means no switch control at all rather than a guessed one.
+function normalizeAccounts(value) {
+  const out = {};
+  if (!isPlainObject(value)) return out;
+  for (const vendor of SWITCHABLE_VENDORS) {
+    const raw = value[vendor];
+    if (!isPlainObject(raw) || !Array.isArray(raw.labels)) continue;
+    // Labels are kept whole, since the whole label is what a switch sends;
+    // matching a card goes through the card id's own cut (see `cardIdOf`).
+    const labels = raw.labels.slice(0, MAX_ENTRIES).map((label) => clean(label, 4096)).filter(Boolean);
+    if (labels.length === 0) continue;
+    out[vendor] = {
+      active: clean(raw.active, 4096),
+      labels,
+      target: clean(raw.target, 4096),
+      switching: raw.switching === true,
+      error: clean(raw.error, 300),
+    };
+  }
+  return out;
+}
+
+/** The id the card for `vendor`'s `label` account gets, cut as entry ids are. */
+function cardIdOf(vendor, label) {
+  return clean(`${vendor}@${label}`, MAX_ENTRY_ID).trim();
+}
+
+/**
+ * The switch control for one card: a `vendor@label` entry whose label the host
+ * listed as switchable. Null for every other card, including the unnamed default.
+ * @returns {import("./lib/types").CardAccount | null}
+ */
+export function accountSwitchFor(cardId, accounts) {
+  const id = String(cardId || "");
+  const at = id.indexOf("@");
+  if (at <= 0) return null;
+  const vendor = id.slice(0, at);
+  const info = accounts && Object.prototype.hasOwnProperty.call(accounts, vendor) ? accounts[vendor] : null;
+  if (!info) return null;
+  // Two labels that only differ past the cut share one card; neither is
+  // offered, since the control could not say which one it switches to.
+  const matches = info.labels.filter((label) => cardIdOf(vendor, label) === id);
+  if (matches.length !== 1) return null;
+  const label = matches[0];
+  const mine = info.target === label;
+  return {
+    vendor,
+    label,
+    active: info.active === label,
+    switching: info.switching && mine,
+    busy: info.switching && !mine,
+    error: mine && !info.switching && info.active !== label ? info.error : "",
+  };
+}
+
+function githubPage(value) {
+  const url = clean(value, 300);
+  return url.startsWith("https://github.com/") ? url : "";
 }
 
 function finiteNumber(value) {
@@ -93,6 +192,17 @@ function windowSeconds(value) {
 }
 
 const REFRESH_MINUTES = [1, 5, 10];
+
+function normalizeOs(value) {
+  const os = String(value || "").toLowerCase();
+  if (["macos", "windows", "linux"].includes(os)) return os;
+  return "";
+}
+
+// The menu-bar look the host reports; anything else reads as the default chart.
+function normalizeMenuBarLook(value) {
+  return value === "logos" || value === "quattro" ? value : "chart";
+}
 
 // The host's refresh interval; anything outside the offered set reads as the
 // 5-minute default.
@@ -118,6 +228,7 @@ function normalizeUpdate(raw) {
   const url = clean(raw.url, 400);
   return {
     error: clean(raw.error, 300),
+    installable: raw.installable === true,
     state: UPDATE_STATES.indexOf(state) < 0 ? "available" : state,
     url: url.startsWith(UPDATE_URL_PREFIX) ? url : "",
     version: clean(raw.version, 32),
@@ -126,7 +237,7 @@ function normalizeUpdate(raw) {
 
 function normalizeEntry(raw) {
   if (!raw || typeof raw !== "object") return null;
-  const id = clean(raw.id, 180).trim();
+  const id = clean(raw.id, MAX_ENTRY_ID).trim();
   if (id === "") return null;
   const source = Array.isArray(raw.sections) ? raw.sections : [];
   const sections = [];
@@ -167,6 +278,15 @@ function normalizeResetCredits(raw) {
   return { available, credits };
 }
 
+/** Blue > 7 days, yellow within a week, red within 48 hours — OpenUsage bands. */
+export function expirySeverity(atMs, nowMs) {
+  const remaining = Number(atMs) - Number(nowMs);
+  if (!(remaining > 0)) return "red";
+  if (remaining <= 48 * 3600 * 1000) return "red";
+  if (remaining <= 7 * 24 * 3600 * 1000) return "yellow";
+  return "blue";
+}
+
 function normalizeSection(raw) {
   if (!raw || typeof raw !== "object") return null;
   const type = String(raw.type || "");
@@ -181,9 +301,15 @@ function normalizeSection(raw) {
       percent: Math.max(0, Math.min(100, Math.round(percent))),
       value: clean(raw.value, 240),
       detail: clean(raw.detail, 1000),
+      // Which number the report puts on the bar. An older report omits it,
+      // and a metric is a percentage by default.
+      headline: raw.headline === "value" ? "value" : "percent",
       severity,
       resetAt: clean(raw.reset_at, 80),
       window: windowSeconds(raw.window_secs),
+      // The sub-group the report assigned this metric ("Breakdown" slices,
+      // Claude CLI "Sessions"); "" when it stands on its own.
+      group: clean(raw.group, 80),
     };
   }
   if (type === "text") {
@@ -200,8 +326,8 @@ function normalizeSection(raw) {
   return null;
 }
 
-export function formatDuration(milliseconds) {
-  if (!(milliseconds > 0)) return "now";
+export function formatDuration(milliseconds, locale) {
+  if (!(milliseconds > 0)) return m.now({}, { locale: lang(locale) });
   const minutes = Math.floor(milliseconds / 60000);
   const hours = Math.floor(minutes / 60);
   const days = Math.floor(hours / 24);
@@ -210,11 +336,11 @@ export function formatDuration(milliseconds) {
   return Math.max(1, minutes) + "m";
 }
 
-export function resetLabel(section, nowMs) {
+export function resetLabel(section, nowMs, locale) {
   if (!section || section.type !== "metric") return "";
   if (section.resetAt) {
     const at = Date.parse(section.resetAt);
-    if (!Number.isNaN(at)) return "Resets in " + formatDuration(at - nowMs);
+    if (!Number.isNaN(at)) return m.resets_in({ duration: formatDuration(at - nowMs, locale) }, { locale: lang(locale) });
   }
   const detail = section.detail || "";
   if (/reset/i.test(detail)) return detail;
@@ -257,27 +383,100 @@ export function quotaAlternate(row, showAs) {
 // Dashboard headline under the meter. Unlike quotaLabel it never collapses a spent
 // row into "Limit reached": the flame beside the label carries that verdict, and the
 // headline keeps reading "0% left" / "100% used" like OpenUsage's WidgetRowView.
+//
+// A metric that names `value` as its headline (a prepaid balance with
+// `headline = "amount"`) puts that money figure there instead, like the Omarchy
+// bar does; the percentage and the report's detail move to the hover text.
 export function headlineLabel(row, showAs) {
   if (!row || row.kind !== "metric") return "";
-  if (showAs === "used") return row.usedPercent + "% used";
-  return row.leftPercent + "% left";
+  if (row.headline === "value") return row.value;
+  return percentHeadline(row, showAs);
 }
 
 export function headlineAlternate(row, showAs) {
   if (!row || row.kind !== "metric") return "";
-  return headlineLabel(row, showAs === "used" ? "left" : "used");
+  if (row.headline === "value") {
+    return [percentHeadline(row, showAs), row.detail].filter(Boolean).join(" · ");
+  }
+  return percentHeadline(row, showAs === "used" ? "left" : "used");
 }
 
-export function meterColor(severity) {
-  switch (severity) {
-    case "mid":
-    case "high":
-      return "yellow";
-    case "critical":
-      return "red";
-    default:
-      return "blue";
+function percentHeadline(row, showAs) {
+  if (showAs === "used") return row.usedPercent + "% used";
+  return row.leftPercent + "% left";
+}
+
+// Bands of the bar color on what is left of the window, used while there is no
+// pace projection yet (the first stretch of a window): red under 20%, yellow
+// under 50%, blue otherwise.
+const METER_RED_BELOW_LEFT = 20;
+const METER_YELLOW_BELOW_LEFT = 50;
+
+// Tolerance around the pace line. The tick is the ideal; landing a little over
+// it is noise. Two conditions must both hold before a row warns: the ratio
+// (projected use at the reset) and the absolute gap between the bar and the
+// tick, in percentage points. The gap matters early in a long window, where a
+// single whole percent of use swings the projection by twenty points or more:
+// 7% used eight hours into a week projects 147% while sitting 2 points past the
+// tick. Over 110% and 3 points is worth a look (yellow, no flame); over 130% and
+// 5 points, or over the line with under 10% left, runs out before the reset
+// (red, flame).
+const PACE_OVER_PERCENT = 110;
+const PACE_OVER_GAP = 3;
+const PACE_CRITICAL_PERCENT = 130;
+const PACE_CRITICAL_GAP = 5;
+const PACE_CRITICAL_LEFT = 10;
+
+/**
+ * The row's verdict against the pace line: "calm" within the tolerance,
+ * "over" above it, "critical" when it runs out well before the reset or is
+ * nearly spent. Null without a projection.
+ * @returns {"calm"|"over"|"critical"|null}
+ */
+export function paceVerdict(pace, leftPercent) {
+  if (!pace || !pace.state) return null;
+  const projected = Number(pace.projectedPercent);
+  const left = Number(leftPercent);
+  // Points the bar sits past the tick: used minus the share of the window elapsed.
+  const gap = Number.isFinite(left) ? (100 - left) - Number(pace.elapsedPercent) : 0;
+  // Nearly spent and still over the line: the last few percent go fast.
+  if (projected > 100 && Number.isFinite(left) && left < PACE_CRITICAL_LEFT) return "critical";
+  if (projected > PACE_CRITICAL_PERCENT && gap >= PACE_CRITICAL_GAP) return "critical";
+  if (projected > PACE_OVER_PERCENT && gap >= PACE_OVER_GAP) return "over";
+  return "calm";
+}
+
+/**
+ * Bar color: the pace verdict when there is one (blue calm, yellow over, red
+ * critical), how much is left when there is not, red once spent. The same in
+ * Left and Used mode.
+ */
+export function meterColor(leftPercent, pace, spent) {
+  if (spent) return "red";
+  const verdict = paceVerdict(pace, leftPercent);
+  if (verdict === "critical") return "red";
+  if (verdict === "over") return "yellow";
+  if (verdict === "calm") return "blue";
+  const left = Number(leftPercent);
+  if (!Number.isFinite(left)) return "blue";
+  if (left < METER_RED_BELOW_LEFT) return "red";
+  if (left < METER_YELLOW_BELOW_LEFT) return "yellow";
+  return "blue";
+}
+
+/**
+ * The note beside a row's label. Only a critical row gets "Limit in …" (and the
+ * flame); an "over" row says by how much it is over the line; a calm row over
+ * 100% reads as no spare left rather than a run-out warning.
+ */
+export function paceNote(pace, leftPercent, nowMs, opts) {
+  const verdict = paceVerdict(pace, leftPercent);
+  if (verdict === null) return "";
+  if (verdict === "over") {
+    return m.percent_over_pace({ percent: Math.round(Number(pace.projectedPercent) - 100) }, { locale: lang(opts && opts.locale) });
   }
+  if (verdict === "calm" && pace.state === "behind") return paceText(Object.assign({}, pace, { state: "onTrack", sparePercent: 0 }), nowMs, opts);
+  return paceText(pace, nowMs, opts);
 }
 
 function dayKey(atMs, locale, timeZone) {
@@ -305,12 +504,12 @@ export function formatResetExact(atMs, nowMs, opts) {
   // fold it to a plain space so the string is stable across runtimes.
   const time = new Intl.DateTimeFormat(locale, timeOptions).format(at).replace(/ /g, " ");
   const atDay = dayKey(atMs, locale, timeZone);
-  if (atDay === dayKey(nowMs, locale, timeZone)) return "today at " + time;
-  if (atDay === dayKey(nowMs + 86_400_000, locale, timeZone)) return "tomorrow at " + time;
+  if (atDay === dayKey(nowMs, locale, timeZone)) return m.today_at({ time }, { locale: lang(locale) });
+  if (atDay === dayKey(nowMs + 86_400_000, locale, timeZone)) return m.tomorrow_at({ time }, { locale: lang(locale) });
   const dayOptions = { month: "short", day: "numeric" };
   if (timeZone) dayOptions.timeZone = timeZone;
   const day = new Intl.DateTimeFormat(locale, dayOptions).format(at).replace(/ /g, " ");
-  return day + " at " + time;
+  return m.day_at({ day, time }, { locale: lang(locale) });
 }
 
 // Banked reset credits always show a calendar date, even when they expire
@@ -318,7 +517,7 @@ export function formatResetExact(atMs, nowMs, opts) {
 // item and the stable date makes neighboring expiries easy to compare.
 export function formatResetCreditDate(value, opts) {
   const atMs = typeof value === "number" ? value : Date.parse(String(value || ""));
-  if (!Number.isFinite(atMs)) return "Date unavailable";
+  if (!Number.isFinite(atMs)) return m.date_unavailable({}, { locale: lang(opts && opts.locale) });
   // `undefined` asks Intl for the WebView/Windows locale. Tests can still
   // inject a locale explicitly to keep their expected strings deterministic.
   const locale = opts && opts.locale ? opts.locale : undefined;
@@ -335,9 +534,10 @@ export function formatResetCreditDate(value, opts) {
   else if (timeFormat === "24") timeOptions.hourCycle = "h23";
   const day = new Intl.DateTimeFormat(locale, dayOptions).format(at).replace(/ /g, " ");
   const time = new Intl.DateTimeFormat(locale, timeOptions).format(at).replace(/ /g, " ");
-  return day + " at " + time;
+  return m.day_at({ day, time }, { locale: lang(opts && opts.locale) });
 }
 
+/** @returns {{ items: ResetItem[], hidden: number }} */
 export function resetCreditDetails(row, nowMs, opts) {
   if (!row || row.kind !== "resetCredits") return { items: [], hidden: 0 };
   const available = Math.max(0, Math.floor(finiteNumber(row.available)));
@@ -354,7 +554,8 @@ export function resetCreditDetails(row, nowMs, opts) {
     const atMs = Date.parse(String(credit.expiresAt || ""));
     items.push({
       date: formatResetCreditDate(credit.expiresAt, opts),
-      remaining: Number.isNaN(atMs) ? "—" : atMs <= nowMs ? "expired" : formatDuration(atMs - nowMs),
+      remaining: Number.isNaN(atMs) ? "—" : atMs <= nowMs ? m.expired({}, { locale: lang(opts && opts.locale) }) : formatDuration(atMs - nowMs, opts && opts.locale),
+      severity: Number.isNaN(atMs) ? "" : expirySeverity(atMs, nowMs),
       title: String(credit.title || ""),
     });
   }
@@ -370,9 +571,13 @@ function parseResetAt(row) {
 // `reset` text when there is no parseable absolute timestamp.
 export function resetText(row, mode, nowMs, opts) {
   const at = parseResetAt(row);
-  if (Number.isNaN(at)) return (row && row.reset) || "";
-  if (mode === "exact") return "Resets " + formatResetExact(at, Number(nowMs) || 0, opts);
-  return "Resets in " + formatDuration(at - (Number(nowMs) || 0));
+  if (Number.isNaN(at)) {
+    const fallback = (row && row.reset) || "";
+    const resetFallback = /^Resets in (.*)$/.exec(fallback);
+    return resetFallback ? m.resets_in({ duration: resetFallback[1] }, { locale: lang(opts && opts.locale) }) : fallback;
+  }
+  if (mode === "exact") return m.resets_at({ exact: formatResetExact(at, Number(nowMs) || 0, opts) }, { locale: lang(opts && opts.locale) });
+  return m.resets_in({ duration: formatDuration(at - (Number(nowMs) || 0), opts && opts.locale) }, { locale: lang(opts && opts.locale) });
 }
 
 // Same row in the other mode, for hover tooltips; "" without a timestamp.
@@ -384,8 +589,9 @@ export function resetAlternate(row, mode, nowMs, opts) {
 // Burn-rate pacing, ported from OpenUsage's Pace.swift. Projects the row's
 // usage at its current rate to the end of the reset window. Null when there is
 // no signal: no window length, no parseable reset, the window already reset,
-// nothing spent yet, or too early in the window (under 1% of it, at least a
-// minute) for the projection to be stable.
+// nothing spent yet, too early in the window (see paceMinElapsedMs; under 1% of it, at least a
+// minute) for the projection to be stable, or the meter already spent: a row at 100% reads
+// "Limit reached" and has no pace to keep, so it gets no tick.
 /** @returns {Pace|null} */
 export function pace(row, nowMs) {
   if (!row || typeof row !== "object") return null;
@@ -396,9 +602,9 @@ export function pace(row, nowMs) {
   if (Number.isNaN(resetMs) || resetMs <= now) return null;
   const windowMs = window * 1000;
   const elapsed = windowMs - (resetMs - now);
-  if (elapsed < Math.max(60_000, window * 10)) return null;
+  if (elapsed < paceMinElapsedMs(window)) return null;
   const used = finiteNumber(row.usedPercent);
-  if (used <= 0) return null;
+  if (used <= 0 || used >= 100) return null;
   const rate = used / elapsed; // percent per millisecond
   // Multiply before dividing so a whole-percent meter at a clean fraction of the
   // window lands exactly on the 90 / 100 thresholds instead of a hair past them.
@@ -421,9 +627,46 @@ export function pace(row, nowMs) {
   };
 }
 
+// The goal is the share of the window elapsed since its start. Unlike pace,
+// it remains useful at zero actual usage and during the first minute.
+// Monthly metrics without an exact duration use the preceding calendar month;
+// the UI labels those goals as estimates because billing dates may vary.
+export function usageGoal(row, nowMs) {
+  if (!row || typeof row !== "object") return null;
+  const resetMs = Date.parse(String(row.resetAt || ""));
+  const now = Number(nowMs);
+  if (!Number.isFinite(resetMs) || !Number.isFinite(now) || now > resetMs) return null;
+  const seconds = windowSeconds(row.window);
+  let startMs;
+  let estimated = false;
+  if (seconds > 0) {
+    startMs = resetMs - seconds * 1000;
+  } else if (/^monthly(?:\s|$|\()/i.test(String(row.label || ""))) {
+    const end = new Date(resetMs);
+    const year = end.getUTCFullYear();
+    const month = end.getUTCMonth();
+    const day = Math.min(end.getUTCDate(), new Date(Date.UTC(year, month, 0)).getUTCDate());
+    startMs = Date.UTC(year, month - 1, day, end.getUTCHours(), end.getUTCMinutes(), end.getUTCSeconds(), end.getUTCMilliseconds());
+    estimated = true;
+  } else {
+    return null;
+  }
+  if (!Number.isFinite(startMs) || startMs >= resetMs) return null;
+  return { percent: clampPercent((now - startMs) * 100 / (resetMs - startMs)), estimated };
+}
+
 function clampPercent(value) {
   const number = finiteNumber(value);
   return Math.max(0, Math.min(100, number));
+}
+
+// The goal in the meter's reading: the share that should be spent by now in
+// Used mode, the share that should still remain in Left mode. Reading it as
+// spent beside a meter that shows what is left put `97%` next to `7% left`.
+export function usageGoalPercent(goal, showAs) {
+  if (!goal) return null;
+  const elapsed = clampPercent(goal.percent);
+  return showAs === "used" ? elapsed : 100 - elapsed;
 }
 
 // Where the "you should be here" tick sits on the meter, as a percent of its
@@ -442,11 +685,49 @@ export function paceTickPercent(pace, showAs) {
 export function paceText(pace, nowMs, opts) {
   if (!pace) return "";
   const now = Number(nowMs) || 0;
-  if (pace.state === "ahead") return "~" + Math.round(pace.sparePercent) + "% left at reset";
-  if (pace.state === "onTrack") return "~" + Math.max(Math.round(pace.sparePercent), 0) + "% spare";
+  const locale = lang(opts && opts.locale);
+  if (pace.state === "ahead") return m.percent_left_at_reset({ percent: Math.round(pace.sparePercent) }, { locale });
+  if (pace.state === "onTrack") return m.percent_spare({ percent: Math.max(Math.round(pace.sparePercent), 0) }, { locale });
   if (pace.runsOutMs === null || pace.runsOutMs === undefined) return "";
-  if (opts && opts.resetTimes === "exact") return "Limit " + formatResetExact(pace.runsOutMs, now, opts);
-  return "Limit in " + formatDuration(pace.runsOutMs - now);
+  if (opts && opts.resetTimes === "exact") return m.limit_at({ exact: formatResetExact(pace.runsOutMs, now, opts) }, { locale });
+  return m.limit_in({ duration: formatDuration(pace.runsOutMs - now, opts && opts.locale) }, { locale });
+}
+
+const PACE_MIN_WAIT_MS = 60_000;
+const PACE_MAX_WAIT_MS = 3_600_000;
+
+// How much of a window must pass before its pace is projected: 1% of it, at
+// least a minute and at most an hour. Earlier than that a few requests swing
+// the projection wildly; the hour cap keeps a weekly or monthly window from
+// waiting 1h 41m or 7h 12m for its first estimate.
+function paceMinElapsedMs(windowSecs) {
+  return Math.min(PACE_MAX_WAIT_MS, Math.max(PACE_MIN_WAIT_MS, windowSecs * 10));
+}
+
+// Milliseconds until pace() has a projection for this row, or 0 when it has
+// one already or never will (no window, no reset, nothing spent). The meter
+// shows "Estimating…" meanwhile instead of an empty note.
+export function paceWarmupMs(row, nowMs) {
+  if (!row || typeof row !== "object") return 0;
+  const window = windowSeconds(row.window);
+  if (window === 0 || !(finiteNumber(row.usedPercent) > 0)) return 0;
+  const now = Number(nowMs) || 0;
+  const resetMs = Date.parse(String(row.resetAt || ""));
+  if (Number.isNaN(resetMs) || resetMs <= now) return 0;
+  const elapsed = window * 1000 - (resetMs - now);
+  return Math.max(0, paceMinElapsedMs(window) - elapsed);
+}
+
+// The warm-up note and its hover explanation, or "" once there is a pace.
+export function paceWarmupText(row, nowMs, locale) {
+  return paceWarmupMs(row, nowMs) > 0 ? m.estimating({}, { locale: lang(locale) }) : "";
+}
+
+export function paceWarmupHint(row, locale) {
+  const window = windowSeconds(row && row.window);
+  if (window === 0) return "";
+  const duration = formatDuration(paceMinElapsedMs(window), locale).replace(/ 0m$/, "");
+  return m.pace_shows_after_first({ duration }, { locale: lang(locale) });
 }
 
 // Ahead-of-pace rows stay quiet unless the layout asks for pacing everywhere.
@@ -473,7 +754,7 @@ function dedupeRowKeys(rows) {
 }
 
 /** @returns {Card[]} */
-export function projectCards(payload, nowMs) {
+export function projectCards(payload, nowMs, locale) {
   const now = Number(nowMs) || 0;
   const cards = [];
   for (const entry of payload.entries || []) {
@@ -486,8 +767,8 @@ export function projectCards(payload, nowMs) {
     let warning = null;
     for (const section of entry.sections || []) {
       if (isWarningSection(section)) {
-        const explained = explainError(section.value || section.label, entry);
-        warning = { title: explained.title, hint: explained.hint, raw: shortenDiagnostic(section.value || section.label) };
+        const explained = explainError(section.value || section.label, entry, locale);
+        warning = { title: explained.title, hint: explained.hint, raw: shortenDiagnostic(section.value || section.label, locale) };
         continue;
       }
       if (section.type === "text" && section.label && !section.value) {
@@ -496,18 +777,27 @@ export function projectCards(payload, nowMs) {
       }
       if (section.type === "metric") {
         const left = Math.max(0, 100 - section.percent);
-        const label = metricLabel(entry.id, section.label);
+        const hostLabel = metricLabel(entry.id, section.label);
+        // A metric can also name its group directly in the report (SuperGrok's
+        // product slices, the Claude entry's CLI sessions): that field wins
+        // over the positional heading in effect, so both mechanisms label and
+        // key the row identically.
+        const metricGroup = section.group || group;
         const row = {
           kind: "metric",
-          label: group ? label + " (" + group + ")" : label,
+          label: prettyMetricLabel(entry.id, hostLabel, metricGroup),
           leftPercent: left,
           usedPercent: section.percent,
+          headline: section.headline === "value" && section.value ? "value" : "percent",
+          value: section.value || "",
+          detail: section.detail || "",
           severity: section.severity,
-          reset: resetLabel(section, now),
+          reset: resetLabel(section, now, locale),
           resetAt: section.resetAt || "",
           window: section.window || 0,
+          grouped: Boolean(metricGroup),
         };
-        row.key = rowKey(row);
+        row.key = metricRowKey(entry.id, section.label, metricGroup);
         rows.push(row);
       } else if (section.type === "text" && (section.label || section.value)) {
         const row = { kind: "text", label: section.label, value: section.value };
@@ -517,20 +807,20 @@ export function projectCards(payload, nowMs) {
         const resetCredits = entry.resetCredits;
         const isResetCredits = resetCredits && /^reset credits$/i.test(section.label || "");
         const row = isResetCredits
-          ? {
-              kind: "resetCredits",
-              label: "Rate Limit Resets",
-              available: resetCredits.available,
-              credits: resetCredits.credits,
-            }
+          ? resetCreditsRow(resetCredits)
           : { kind: "block", label: section.label, body: section.body };
         row.key = rowKey(row);
         rows.push(row);
       }
     }
+    if (entry.resetCredits && !rows.some((row) => row.kind === "resetCredits")) {
+      const row = resetCreditsRow(entry.resetCredits);
+      row.key = rowKey(row);
+      rows.push(row);
+    }
     dropRedundantResetRows(rows);
     dedupeRowKeys(rows);
-    const explained = explainError(entry.error, entry);
+    const explained = explainError(entry.error, entry, locale);
     cards.push({
       id: entry.id,
       title: entry.displayName || entry.shortName || entry.id,
@@ -542,15 +832,35 @@ export function projectCards(payload, nowMs) {
       errorDetail: entry.error || "",
       rows,
       warning,
+      resetCredits: entry.resetCredits || null,
     });
   }
   return cards;
+}
+
+// The banked-reset row the host's "Reset credits" block becomes; also appended
+// when the report carries `reset_credits` but no such block.
+function resetCreditsRow(credits) {
+  return {
+    kind: "resetCredits",
+    label: "Rate Limit Resets",
+    available: credits.available,
+    credits: credits.credits,
+  };
 }
 
 // SuperGrok names the overall meter "<Window> usage" (older reports used
 // "<Window> Build credits"). The card title already says SuperGrok, so the
 // row keeps only the window. Product slices (Grok Build, Grok Chat, …) keep
 // their full labels.
+// The key a starred metric is stored under. The tray host derives the same key
+// from the report to paint the menu-bar bars (src/tray/strip.rs metric_key), so
+// both follow tests/fixtures/strip_metric_keys.json.
+export function metricRowKey(entryId, label, group) {
+  const name = metricLabel(entryId, label);
+  return "metric:" + (group ? name + " (" + group + ")" : name);
+}
+
 function metricLabel(entryId, label) {
   if (vendorSlug(entryId) !== "supergrok") return label;
   return String(label || "")
@@ -558,27 +868,63 @@ function metricLabel(entryId, label) {
     .replace(/\s+usage$/i, "");
 }
 
+const PROVIDER_LABEL_PREFIX = {
+  anthropic: ["Claude"],
+  openai: ["Codex", "ChatGPT"],
+  cursor: ["Cursor"],
+  copilot: ["Copilot", "GitHub Copilot"],
+  grok: ["Grok", "SuperGrok"],
+  supergrok: ["Grok", "SuperGrok"],
+  zai: ["Z.AI", "GLM"],
+};
+
+/**
+ * Card-local names: drop well-known window lengths ("Session (5h)" → "Session")
+ * and a redundant provider prefix ("Codex weekly" → "Weekly"). Keep
+ * Antigravity's "Gemini (Session)" vs "Claude & GPT OSS (Session)".
+ */
+export function prettyMetricLabel(entryId, raw, group) {
+  let name = String(raw || "").trim();
+  name = name.replace(/\s*\((?:5h|7d)\)$/i, "");
+  const slug = vendorSlug(entryId);
+  const prefixes = PROVIDER_LABEL_PREFIX[slug] || [];
+  for (const prefix of prefixes) {
+    const re = new RegExp("^" + prefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "\\s+", "i");
+    if (re.test(name)) {
+      const rest = name.replace(re, "");
+      if (/^(5h|weekly|session)$/i.test(rest)) {
+        name = rest;
+        break;
+      }
+    }
+  }
+  if (/^5h$/i.test(name)) name = "Session";
+  if (/^weekly$/i.test(name)) name = "Weekly";
+  if (group) return (name || raw) + " (" + group + ")";
+  return name || String(raw || "").trim();
+}
+
 /** @returns {Layout} */
 export function emptyLayout() {
   return {
     alwaysShowPace: false,
+    usageGoal: false,
     cardOrder: [],
     hidden: {},
     collapsed: {},
-    density: "regular",
     hideExtras: false,
     hintDismissed: false,
+    language: "en",
+    popoverStyle: "classic",
     resetTimes: "countdown",
     rows: {},
     seeded: false,
     showAs: "left",
+    stars: {},
+    stripStyle: "bars",
     theme: "system",
     timeFormat: "auto",
   };
-}
-
-function normalizeDensity(value) {
-  return value === "compact" ? "compact" : "regular";
 }
 
 /** @returns {TimeFormat} */
@@ -596,6 +942,105 @@ function normalizeShowAs(value) {
 
 function normalizeTheme(value) {
   return value === "light" || value === "dark" ? value : "system";
+}
+
+/** @returns {Record<string, string[]>} */
+function normalizeStars(raw) {
+  const stars = {};
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return stars;
+  for (const id of Object.keys(raw)) {
+    const key = clean(id, 180).trim();
+    if (!key) continue;
+    const keys = cleanIdList(raw[id]).slice(0, MAX_STARS_PER_PROVIDER);
+    if (keys.length) stars[key] = keys;
+  }
+  return stars;
+}
+
+/** First two metric rows on each card, used on first launch. */
+export function defaultStars(cards) {
+  const stars = {};
+  for (const card of cards || []) {
+    if (!card || !card.id) continue;
+    const keys = [];
+    for (const row of card.rows || []) {
+      if (row.kind !== "metric") continue;
+      keys.push(rowKey(row));
+      if (keys.length >= MAX_STARS_PER_PROVIDER) break;
+    }
+    if (keys.length) stars[card.id] = keys;
+  }
+  return stars;
+}
+
+/**
+ * Star or unstar a metric. Caps at two per provider; the extra click is a
+ * no-op that returns an error the Customize row can show.
+ * @returns {{ stars: Record<string, string[]>, error: string }}
+ */
+export function toggleStar(stars, providerId, key) {
+  const id = clean(providerId, 180).trim();
+  const metric = clean(key, 180).trim();
+  const current = Object.assign({}, stars && typeof stars === "object" ? stars : {});
+  if (!id || !metric) return { stars: current, error: "" };
+  const list = Array.isArray(current[id]) ? current[id].slice() : [];
+  const idx = list.indexOf(metric);
+  if (idx >= 0) {
+    list.splice(idx, 1);
+    if (list.length === 0) delete current[id];
+    else current[id] = list;
+    return { stars: current, error: "" };
+  }
+  if (list.length >= MAX_STARS_PER_PROVIDER) {
+    return { stars: current, error: "Up to 2 stars per provider" };
+  }
+  list.push(metric);
+  current[id] = list;
+  return { stars: current, error: "" };
+}
+
+export function isStarred(stars, providerId, key) {
+  const list = stars && stars[providerId];
+  return Array.isArray(list) && list.indexOf(key) >= 0;
+}
+
+/** Payload the host paints the menu-bar strip from. */
+export function stripCommand(layout, cards) {
+  const visible = applyCardLayout(cards || [], layout || emptyLayout());
+  const order = visible.map((card) => card.id);
+  const source = layout && layout.stars ? layout.stars : {};
+  const stars = {};
+  if (visible.length) {
+    for (const card of visible) {
+      const wanted = Array.isArray(source[card.id]) ? source[card.id] : [];
+      if (!wanted.length) continue;
+      const keys = [];
+      for (const row of card.rows || []) {
+        const key = rowKey(row);
+        if (wanted.indexOf(key) >= 0 && keys.indexOf(key) < 0) keys.push(key);
+      }
+      for (const key of wanted) {
+        if (keys.indexOf(key) < 0) keys.push(key);
+      }
+      if (keys.length) stars[card.id] = keys.slice(0, MAX_STARS_PER_PROVIDER);
+    }
+  } else {
+    for (const id of Object.keys(source)) stars[id] = source[id];
+  }
+  // The macOS Quattro chip leaves out the metrics hidden here, like the native tab.
+  const hiddenRows = {};
+  for (const card of cards || []) {
+    const keys = hiddenMetricKeys(card, layout || emptyLayout());
+    if (keys.length) hiddenRows[card.id] = keys;
+  }
+  // The menu bar's percentages follow the popover's Used/Left reading.
+  return {
+    style: "bars",
+    stars,
+    order,
+    show_as: normalizeShowAs(layout && layout.showAs),
+    hidden_rows: hiddenRows,
+  };
 }
 
 function cleanIdList(list) {
@@ -620,16 +1065,20 @@ export function normalizeLayout(raw) {
   const layout = emptyLayout();
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return layout;
   layout.alwaysShowPace = raw.alwaysShowPace === true;
+  layout.usageGoal = raw.usageGoal === true;
   layout.cardOrder = cleanIdList(raw.cardOrder);
   copyFlagMap(raw.hidden, layout.hidden);
   copyFlagMap(raw.collapsed, layout.collapsed);
-  layout.density = normalizeDensity(raw.density);
   layout.timeFormat = normalizeTimeFormat(raw.timeFormat);
   layout.hideExtras = raw.hideExtras === true;
   layout.hintDismissed = raw.hintDismissed === true;
+  layout.language = lang(raw.language);
+  layout.popoverStyle = raw.popoverStyle === "native" || raw.popoverStyle === "glass" ? "native" : "classic";
   layout.seeded = raw.seeded === true;
   layout.resetTimes = normalizeResetTimes(raw.resetTimes);
   layout.showAs = normalizeShowAs(raw.showAs);
+  layout.stars = normalizeStars(raw.stars);
+  layout.stripStyle = "bars";
   layout.theme = normalizeTheme(raw.theme);
   if (raw.rows && typeof raw.rows === "object" && !Array.isArray(raw.rows)) {
     for (const id of Object.keys(raw.rows)) {
@@ -705,19 +1154,34 @@ export function syncLayout(layout, cardIds) {
   }
   return {
     alwaysShowPace: layout.alwaysShowPace === true,
+    usageGoal: layout.usageGoal === true,
     cardOrder: order,
     hidden,
     collapsed,
-    density: normalizeDensity(layout.density),
     hideExtras: layout.hideExtras === true,
     hintDismissed: layout.hintDismissed === true,
+    language: lang(layout.language),
+    popoverStyle: layout.popoverStyle === "native" || layout.popoverStyle === "glass" ? "native" : "classic",
     resetTimes: normalizeResetTimes(layout.resetTimes),
     seeded: layout.seeded === true,
     rows,
     showAs: normalizeShowAs(layout.showAs),
+    stars: pruneStars(layout.stars, known),
+    stripStyle: "bars",
     theme: normalizeTheme(layout.theme),
     timeFormat: normalizeTimeFormat(layout.timeFormat),
   };
+}
+
+function pruneStars(source, known) {
+  const stars = {};
+  if (!source || typeof source !== "object") return stars;
+  for (const id of Object.keys(source)) {
+    if (!known.has(id)) continue;
+    const keys = Array.isArray(source[id]) ? source[id].slice(0, MAX_STARS_PER_PROVIDER) : [];
+    if (keys.length) stars[id] = keys;
+  }
+  return stars;
 }
 
 export function metricCount(card) {
@@ -831,6 +1295,14 @@ export function seedLayout(layout, entries) {
   return Object.assign({}, layout, { hidden, seeded: true });
 }
 
+/** Fill default stars once, from projected cards (metric keys). */
+export function seedStars(layout, cards) {
+  if (!layout || (layout.stars && Object.keys(layout.stars).length)) return layout;
+  const stars = defaultStars(cards);
+  if (!Object.keys(stars).length) return layout;
+  return Object.assign({}, layout, { stars });
+}
+
 // What a fresh host payload does to the stored layout. A payload without
 // entries (the host's placeholder before the first report, or a host error)
 // must leave the layout alone: syncing against an empty id list would wipe
@@ -896,19 +1368,19 @@ export function mergeRowPrefs(rows, prefs, opts) {
   const demand = [];
   const seen = new Set();
   for (const key of prefs.always || []) {
-    if (known.has(key) && !off[key] && !seen.has(key)) {
+    if (known.has(key) && !seen.has(key)) {
       always.push(key);
       seen.add(key);
     }
   }
   for (const key of prefs.demand || []) {
-    if (known.has(key) && !off[key] && !seen.has(key)) {
+    if (known.has(key) && !seen.has(key)) {
       demand.push(key);
       seen.add(key);
     }
   }
   for (const key of def.always.concat(def.demand)) {
-    if (!seen.has(key) && !off[key] && known.has(key)) {
+    if (!seen.has(key) && known.has(key)) {
       if (def.always.indexOf(key) >= 0) always.push(key);
       else demand.push(key);
       seen.add(key);
@@ -933,27 +1405,43 @@ export function visibleRowsFor(card, opts) {
   const keys = opts && opts.collapsed ? prefs.always : prefs.always.concat(prefs.demand);
   const out = [];
   for (const key of keys) {
+    if (prefs.off && prefs.off[key]) continue;
     const row = byKey.get(key);
     if (row) out.push(row);
   }
   return out;
 }
 
-export function cardHasExtras(card, hideExtras, prefs) {
-  const merged = mergeRowPrefs(card.rows || [], prefs, { hideExtras });
-  return merged.demand.length > 0;
+/**
+ * Keys of the card's metric rows switched off in Customize. A hidden metric
+ * does not count toward the provider's headline percentage: the native tab
+ * and, through `stripCommand`, the macOS menu bar's Quattro chip both skip it.
+ * @returns {string[]}
+ */
+export function hiddenMetricKeys(card, layout) {
+  const off = prefsForCard(card, layout).off || {};
+  return (card.rows || [])
+    .filter((row) => row.kind === "metric" && off[rowKey(row)])
+    .map(rowKey);
 }
 
-/** @returns {RowPrefs} */
+export function cardHasExtras(card, hideExtras, prefs) {
+  const merged = mergeRowPrefs(card.rows || [], prefs, { hideExtras });
+  return merged.demand.some((key) => !merged.off[key]);
+}
+
+/** Toggle a row on/off without moving it between Always / On Demand. */
 export function setRowEnabled(prefs, key, enabled) {
   const next = {
-    always: (prefs.always || []).filter((item) => item !== key),
-    demand: (prefs.demand || []).filter((item) => item !== key),
+    always: (prefs.always || []).slice(),
+    demand: (prefs.demand || []).slice(),
     off: Object.assign({}, prefs.off || {}),
   };
   if (enabled) {
     delete next.off[key];
-    next.demand.push(key);
+    if (next.always.indexOf(key) < 0 && next.demand.indexOf(key) < 0) {
+      next.demand.push(key);
+    }
   } else {
     next.off[key] = true;
   }
@@ -984,6 +1472,60 @@ function vendorSlug(entryId) {
 
 const ICON_ALIAS = { supergrok: "grok" };
 
+/** OpenUsage-style Status / Dashboard / Usage links. Cap three; only http(s). */
+const PROVIDER_LINKS = {
+  anthropic: [
+    ["Status", "https://status.anthropic.com/"],
+    ["Dashboard", "https://claude.ai/settings/usage"],
+  ],
+  openai: [
+    ["Status", "https://status.openai.com/"],
+    ["Dashboard", "https://chatgpt.com/codex/settings/usage"],
+  ],
+  cursor: [
+    ["Status", "https://status.cursor.com/"],
+    ["Dashboard", "https://www.cursor.com/dashboard"],
+  ],
+  copilot: [
+    ["Status", "https://www.githubstatus.com/"],
+    ["Dashboard", "https://github.com/settings/billing"],
+  ],
+  openrouter: [
+    ["Activity", "https://openrouter.ai/activity"],
+    ["Credits", "https://openrouter.ai/settings/credits"],
+  ],
+  zai: [
+    ["Dashboard", "https://z.ai/manage-apikey/coding-plan/personal/my-plan"],
+    ["API Keys", "https://z.ai/manage-apikey/apikey-list"],
+  ],
+  grok: [["Usage", "https://grok.com/?_s=usage"]],
+  supergrok: [["Usage", "https://grok.com/?_s=usage"]],
+  anthropic_api: [["Dashboard", "https://console.anthropic.com/settings/usage"]],
+  deepseek: [["Usage", "https://platform.deepseek.com/usage"]],
+  kimi: [["Dashboard", "https://platform.moonshot.cn/console"]],
+  moonshot: [["Dashboard", "https://platform.moonshot.cn/console"]],
+};
+
+/** @returns {{ label: string, url: string }[]} */
+export function providerLinks(entryId) {
+  const rows = PROVIDER_LINKS[vendorSlug(entryId)] || [];
+  const out = [];
+  for (let i = 0; i < rows.length && out.length < 3; i++) {
+    const label = String(rows[i][0] || "").trim();
+    const url = String(rows[i][1] || "").trim();
+    if (!label || !isHttpUrl(url)) continue;
+    out.push({ label, url });
+  }
+  return out;
+}
+
+export function isHttpUrl(value) {
+  const url = String(value || "").trim();
+  if (url.length < 8 || url.length > 2048) return false;
+  if (/[\s\u0000-\u001f\u007f]/.test(url)) return false;
+  return url.indexOf("https://") === 0 || url.indexOf("http://") === 0;
+}
+
 // Icon slug for a card: the vendor half of "vendor@account", with product
 // aliases folded onto the shared icon.
 export function providerIconId(entryId) {
@@ -1012,45 +1554,53 @@ function joinError(explained) {
   return explained.title + ". " + explained.hint;
 }
 
-function shortenDiagnostic(raw) {
+// A path in a diagnostic is the actionable part ("not found at <path>"), so it
+// stays; only the home prefix becomes `~`, which keeps the account name off the
+// card. Rewriting the prefix instead of cutting the path to the next space
+// matters: `Application Support` has one, and cutting there left
+// "Support/Cursor/…" behind on macOS and dropped the whole path on Windows.
+const HOME_PREFIX = /(?:[A-Za-z]:\\Users\\[^\\\s]+|\/(?:Users|home)\/[^/\s]+|\/root)(?=[\\/]|$|\s)/g;
+
+function shortenDiagnostic(raw, locale) {
   let text = String(raw || "")
     .replace(/credentials error:\s*/ig, "")
     .replace(/network transport error:\s*/ig, "")
     .replace(/schema mismatch:\s*/ig, "")
     .replace(/HTTP \d+:\s*/g, "")
-    .replace(/[A-Za-z]:\\[^\s]+/g, "")
-    .replace(/(?:\/home|\/Users|\/root|~)[^\s]*/g, "")
+    .replace(HOME_PREFIX, "~")
     .replace(/\s{2,}/g, " ")
     .trim();
   text = text.replace(/^[A-Za-z0-9. _-]+:\s+/, "");
-  if (text === "") return "Open TUI for details.";
+  // A bare path says where, never what went wrong: it is no diagnosis.
+  if (/^~[\\/]\S*$/.test(text)) text = "";
+  if (text === "") return m.open_tui_for_details({}, { locale: lang(locale) });
   // The card wraps long hints, so keep the whole diagnosis; only a runaway
   // body (an HTML error page pasted into the message) is cut.
   if (text.length <= 400) return text;
   return text.slice(0, 399) + "…";
 }
 
-const OPEN_TUI = { cmd: "open-tui", label: "Open TUI" };
-const REFRESH = { cmd: "refresh", label: "Refresh" };
-
 // Title + one-line hint for a raw vendor error, plus the one action the popover
 // can offer (a host command) when there is one. Errors whose fix is a terminal
 // command (sign-in) or waiting (429 backoff) carry no action.
 /** @returns {ExplainedError} */
-export function explainError(text, entry) {
+export function explainError(text, entry, locale) {
   const raw = clean(text, 1200);
+  const options = { locale: lang(locale) };
+  const openTui = { cmd: "open-tui", label: m.open_tui({}, options) };
+  const refresh = { cmd: "refresh", label: m.refresh({}, options) };
   if (raw === "") return { title: "", hint: "" };
   if (/no vendors enabled/i.test(raw)) {
-    return { title: "No providers enabled", hint: "Open TUI → Settings to turn one on.", action: OPEN_TUI };
+    return { title: m.no_providers_enabled({}, options), hint: m.open_tui_settings_to_turn_one_on({}, options), action: openTui };
   }
   if (/no API key/i.test(raw)) {
-    return { title: "No API key", hint: "Open TUI → Settings to add one.", action: OPEN_TUI };
+    return { title: m.no_api_key({}, options), hint: m.open_tui_settings_to_add_one({}, options), action: openTui };
   }
   if (/no local server found|Antigravity must be running|no local language server/i.test(raw)) {
     return {
-      title: "Antigravity isn't running",
-      hint: "Open the Antigravity app or an agy session, then Refresh.",
-      action: REFRESH,
+      title: m.antigravity_not_running({}, options),
+      hint: m.antigravity_start_hint({}, options),
+      action: refresh,
     };
   }
   if (/HTTP 429|rate limited|too many requests/i.test(raw)) {
@@ -1058,26 +1608,30 @@ export function explainError(text, entry) {
     // that instead of inviting a manual Refresh the backoff would ignore.
     const retry = /next attempt in ([0-9]+[a-z]+(?: [0-9]+[a-z]+)?)/i.exec(raw);
     return {
-      title: "Too many requests",
-      hint: retry ? "Retrying automatically in " + retry[1] + "." : "Try Refresh in a minute.",
+      title: m.too_many_requests({}, options),
+      hint: retry ? m.retrying_automatically_in({ duration: retry[1] }, options) : m.try_refresh_in_a_minute({}, options),
     };
   }
   if (/HTTP 401|HTTP 403|authentication rejected|not signed in|token refresh failed|re-auth|run `claude`|run `codex/i.test(raw)) {
-    return { title: "Sign-in expired", hint: signInHint(entry) };
+    const hint = signInHint(entry);
+    return {
+      title: m.sign_in_expired({}, options),
+      hint: hint === "Open TUI → Settings to sign in." ? m.open_tui_settings_to_sign_in({}, options) : hint,
+    };
   }
   if (/HTTP 5\d\d|schema mismatch/i.test(raw)) {
-    return { title: "Provider is unavailable", hint: "Try Refresh in a bit.", action: REFRESH };
+    return { title: m.provider_is_unavailable({}, options), hint: m.try_refresh_in_a_bit({}, options), action: refresh };
   }
   if (/network transport|timed out|timeout|connection refused|dns|connect/i.test(raw)) {
-    return { title: "Can't reach the server", hint: "Check your connection, then Refresh.", action: REFRESH };
+    return { title: m.can_t_reach_the_server({}, options), hint: m.connection_retry_hint({}, options), action: refresh };
   }
   if (/io error/i.test(raw)) {
-    return { title: "Couldn't read local files", hint: "Open TUI for details.", action: OPEN_TUI };
+    return { title: m.couldn_t_read_local_files({}, options), hint: m.open_tui_for_details({}, options), action: openTui };
   }
   if (/did not contain valid JSON/i.test(raw)) {
-    return { title: "Couldn't read usage data", hint: "Try Refresh. If it keeps happening, Open TUI.", action: REFRESH };
+    return { title: m.couldn_t_read_usage_data({}, options), hint: m.error_recovery_hint({}, options), action: refresh };
   }
-  return { title: "Couldn't update", hint: shortenDiagnostic(raw) };
+  return { title: m.couldn_t_update({}, options), hint: shortenDiagnostic(raw, locale) };
 }
 
 // A vendor's "Warning" text section (the cached-data note built from
@@ -1102,66 +1656,158 @@ function isWarningSection(section) {
   return section.type === "text" && (section.label === "Warning" || /schema drift/i.test(section.label));
 }
 
-export function friendlyError(text, entry) {
-  return joinError(explainError(text, entry));
+export function friendlyError(text, entry, locale) {
+  return joinError(explainError(text, entry, locale));
 }
 
-export function nextUpdateLabel(payload, nowMs) {
+export function nextUpdateLabel(payload, nowMs, locale) {
   const remaining = (Number(payload.nextRefreshAt) || 0) - (Number(nowMs) || 0);
-  if (!(remaining > 0)) return "Updating…";
-  return "Next update in " + formatDuration(remaining);
+  const options = { locale: lang(locale) };
+  if (!(remaining > 0)) return m.updating({}, options);
+  return m.next_update_in({ duration: formatDuration(remaining, locale) }, options);
 }
 
 // "just now", "5m ago", "2h ago", "3d ago".
-export function formatAgo(milliseconds) {
+export function formatAgo(milliseconds, locale) {
   const ms = Number(milliseconds) || 0;
-  if (ms < 60_000) return "just now";
+  const options = { locale: lang(locale) };
+  if (ms < 60_000) return m.just_now({}, options);
   const minutes = Math.floor(ms / 60_000);
-  if (minutes < 60) return minutes + "m ago";
+  if (minutes < 60) return m.minutes_ago({ minutes }, options);
   const hours = Math.floor(minutes / 60);
-  if (hours < 24) return hours + "h ago";
-  return Math.floor(hours / 24) + "d ago";
+  if (hours < 24) return m.hours_ago({ hours }, options);
+  return m.days_ago({ days: Math.floor(hours / 24) }, options);
 }
 
 // The Settings row under the update-mode picker.
-export function updateStatusLabel(payload, nowMs) {
+export function updateStatusLabel(payload, nowMs, locale) {
   const update = payload && payload.update;
+  const options = { locale: lang(locale) };
   if (!update) {
     const checkedAt = finiteNumber(payload && payload.updateCheckedAt);
-    if (checkedAt === 0) return "Not checked yet";
-    return "Up to date · checked " + formatAgo((Number(nowMs) || 0) - checkedAt);
+    if (checkedAt === 0) return m.not_checked_yet({}, options);
+    return m.up_to_date_checked({ ago: formatAgo((Number(nowMs) || 0) - checkedAt, locale) }, options);
   }
   const version = update.version ? "v" + String(update.version).replace(/^v/i, "") : "";
   switch (update.state) {
     case "checking":
-      return "Checking…";
+      return m.checking({}, options);
     case "downloading":
-      return "Downloading " + (version || "update") + "…";
+      return m.downloading_update({ version: version || m.update_word({}, options) }, options);
     case "installing":
-      return "Installing…";
+      return m.installing({}, options);
     case "failed":
-      return update.error ? "Couldn't update: " + update.error : "Couldn't update";
+      return update.error ? m.update_failed_with_error({ what: m.couldn_t_update({}, options), error: update.error }, options) : m.couldn_t_update({}, options);
     default:
-      return (version || "An update") + " available";
+      return m.update_available_status({ version: version || m.new_update({}, options) }, options);
   }
 }
 
-// The dashboard shows an update banner while the host has one in hand.
-// A check in flight is Settings feedback, not something to install.
+// What the dashboard banner and the update dialog offer for the host's update
+// state: one table, so the two never disagree about what a click does. A
+// release the host cannot install here (no build for this OS, read-only
+// install directory) links its release page instead of a dead Install.
+/** @returns {import("./lib/types").UpdateAction} */
+export function updateAction(update, repository, locale) {
+  const options = { locale: lang(locale) };
+  switch (update && update.state) {
+    case "checking":
+      return { busy: true, cmd: "", label: m.checking({}, options), url: "" };
+    case "downloading":
+      return { busy: true, cmd: "", label: m.downloading({}, options), url: "" };
+    case "installing":
+      return { busy: true, cmd: "", label: m.installing({}, options), url: "" };
+    case "failed":
+      // The host reinstalls what it found, or checks again when it found nothing.
+      return { busy: false, cmd: "install-update", label: m.try_again({}, options), url: "" };
+    case "available":
+      if (update.installable) return { busy: false, cmd: "install-update", label: m.install_update({}, options), url: "" };
+      return { busy: false, cmd: "open-url", label: m.view_release_action({}, options), url: update.url || releasesPage(repository) };
+    default:
+      return { busy: false, cmd: "check-update", label: m.check_now({}, options), url: "" };
+  }
+}
+
+function releasesPage(repository) {
+  return repository ? repository + "/releases/latest" : "";
+}
+
+// The sentence under an update's title, in the banner and the dialog.
+export function updateMessage(update, locale) {
+  if (!update) return "";
+  const options = { locale: lang(locale) };
+  // Without a version the sentence names "the new version"; each language words that itself.
+  const version = update.version ? "v" + String(update.version).replace(/^v/i, "") : "";
+  switch (update.state) {
+    case "checking":
+      return m.looking_for_newer_release({}, options);
+    case "downloading":
+      return version ? m.downloading_update({ version }, options) : m.downloading_new_version({}, options);
+    case "installing":
+      return version ? m.installing_version({ version }, options) : m.installing_new_version({}, options);
+    case "failed": {
+      // With a version the install failed; without one, the check itself did.
+      const what = update.version ? m.couldn_t_update({}, options) : m.couldnt_check({}, options);
+      return update.error ? m.update_failed_with_error({ what, error: update.error }, options) : what + ".";
+    }
+    default:
+      if (update.installable) return version ? m.ready_to_install({ version }, options) : m.new_version_ready({}, options);
+      return version ? m.update_available_uninstallable({ version }, options) : m.new_version_uninstallable({}, options);
+  }
+}
+
+// The banner's sentence. Progress (checking, downloading, installing, or the
+// click that starts it) is the button's to say; repeating it in the sentence
+// put the same "Updating…" twice on one card. While busy the sentence keeps
+// naming the release, and a failure still explains itself here.
+export function bannerMessage(update, locale) {
+  if (!update) return "";
+  const busy = update.state === "checking" || update.state === "downloading" || update.state === "installing";
+  return updateMessage(busy ? Object.assign({}, update, { state: "available" }) : update, locale);
+}
+
+// The dashboard shows an update banner while the host has a release in hand.
+// A check in flight, or a check that failed before finding one, belongs to the
+// update dialog: neither is something to install.
 export function updateBannerPending(payload) {
   const update = payload && payload.update;
-  return !!update && update.state !== "checking";
+  return !!update && update.state !== "checking" && !!update.version;
 }
 
-export function updateModeLabel(mode) {
+export function updateModeLabel(mode, locale) {
+  const options = { locale: lang(locale) };
   switch (normalizeUpdateMode(mode)) {
     case "auto":
-      return "Automatic";
+      return m.automatic({}, options);
     case "off":
-      return "Off";
+      return m.off({}, options);
     default:
-      return "Notify me";
+      return m.notify_me({}, options);
   }
+}
+
+// Labels for the native tray menu, in the popover's current language, so the host
+// can draw its right-click menu matching the popover's Options items.
+export function optionsMenuLabels(locale) {
+  const options = { locale: lang(locale) };
+  return {
+    customize: m.customize({}, options),
+    settings: m.settings({}, options),
+    refresh: m.refresh({}, options),
+    detect: m.detect_providers({}, options),
+    openTui: m.open_tui({}, options),
+    startAtLogin: m.start_at_login({}, options),
+    checkForUpdates: m.check_for_updates({}, options),
+    about: m.about({}, options),
+    quit: m.quit({}, options),
+  };
+}
+
+// Whitelist of the actions the native tray menu may trigger. A case or spacing
+// variant, a non-string, or the empty string is not an action.
+export function menuAction(action) {
+  const allowed = ["customize", "settings", "about", "check-updates"];
+  return typeof action === "string" && allowed.includes(action) ? action : "";
 }
 
 // Physical-key names for the shortcut recorder, keyed by `KeyboardEvent.code`.
@@ -1222,6 +1868,18 @@ export function shortcutFromKeyEvent(event) {
   return parts.join("+");
 }
 
+// Display-only spelling of a stored shortcut. macOS names the canonical `Win`
+// and `Alt` modifiers "Cmd" and "Option"; the value itself stays "Win+U" so the
+// host still registers it.
+export function displayShortcut(value, os) {
+  const text = String(value || "");
+  if (os !== "macos") return text;
+  return text
+    .split("+")
+    .map((part) => (part === "Win" ? "Cmd" : part === "Alt" ? "Option" : part))
+    .join("+");
+}
+
 // Collapses "system" into the scheme the OS currently prefers.
 export function resolvedTheme(theme) {
   const value = normalizeTheme(theme);
@@ -1240,10 +1898,7 @@ export function applyTheme(theme) {
   document.documentElement.classList.toggle("dark", resolvedTheme(value) === "dark");
 }
 
-export function applyDensity(density) {
-  if (typeof document === "undefined") return;
-  document.documentElement.dataset.density = normalizeDensity(density);
-}
+
 
 function isPlainObject(value) {
   return !!value && typeof value === "object" && !Array.isArray(value);

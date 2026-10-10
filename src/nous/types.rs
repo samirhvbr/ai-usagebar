@@ -16,6 +16,11 @@ const VERIFICATION_URI_COMPLETE: &str = "verification_uri_complete";
 const MAX_OAUTH_FIELD_BYTES: usize = 64 * 1024;
 const MAX_VERIFICATION_URL_BYTES: usize = 8 * 1024;
 const PORTAL_HOST: &str = "portal.nousresearch.com";
+/// A spent allocation comes back as float residue rather than a clean zero
+/// (observed `-1.64e-20` on a drained Ultra plan). Anything within this
+/// distance of zero is treated as zero; a genuine negative balance is still an
+/// error, so the guard against nonsense payloads stays.
+const CREDIT_ZERO_EPSILON: f64 = 1e-6;
 
 /// OAuth device authorization data returned by the portal.
 ///
@@ -378,7 +383,13 @@ fn optional_credit(
             .map_err(|_| "account credit is not numeric".to_string())?,
         _ => return Err("account credit must be a number".into()),
     };
-    if !number.is_finite() || number < 0.0 {
+    if !number.is_finite() {
+        return Err("account credit must be finite and non-negative".into());
+    }
+    if number < 0.0 {
+        if number > -CREDIT_ZERO_EPSILON {
+            return Ok(Some(0.0));
+        }
         return Err("account credit must be finite and non-negative".into());
     }
     Ok(Some(number))

@@ -8,18 +8,44 @@ use ratatui::widgets::Paragraph;
 use ratatui_bubbletea_components::{Help, KeyBinding, ListItem, SelectList};
 
 use crate::format::local_time_hms;
-use crate::tui::app::App;
 use crate::tui::app::TabId;
 use crate::tui::app::TabSource;
 use crate::tui::app::TabState;
+use crate::tui::app::{App, FooterAction, NavTarget};
 use crate::tui::panels;
 use crate::tui::style::{bubble_theme, color, severity_color};
 use crate::vendor::VendorId;
 
 const WIDE_LAYOUT_MIN_WIDTH: u16 = 86;
 const SIDEBAR_WIDTH: u16 = 28;
+const FOOTER_SEPARATOR_WIDTH: u16 = 3;
 
-pub fn draw(f: &mut Frame, app: &App) {
+#[derive(Clone, Copy)]
+struct FooterBinding {
+    action: Option<FooterAction>,
+    key: &'static str,
+    description: &'static str,
+}
+
+impl FooterBinding {
+    fn width(self) -> u16 {
+        (crate::display::text_width(self.key) as u16)
+            .saturating_add(1)
+            .saturating_add(crate::display::text_width(self.description) as u16)
+    }
+}
+
+pub fn draw(f: &mut Frame, app: &mut App) {
+    // Hit targets are rebuilt every frame: a rect from an earlier layout
+    // would otherwise win first-match hit-testing after a scroll, resize or
+    // focus change. The nav/footer draws assign theirs; settings::render
+    // appends to settings_rows.
+    {
+        let mut hit = app.hit.borrow_mut();
+        hit.nav_entries.clear();
+        hit.footer_actions.clear();
+        hit.settings_rows.clear();
+    }
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -33,9 +59,15 @@ pub fn draw(f: &mut Frame, app: &App) {
     draw_body(f, app, chunks[1]);
     draw_footer(f, app, chunks[2]);
 
-    // Settings still floats on top of everything.
-    if let Some(s) = &app.settings {
-        crate::tui::settings::render(f, f.area(), s, &app.theme);
+    // Settings still floats on top of everything. render() scrolls the
+    // overlay body to follow focus, which needs the mutable state.
+    let mut hit = app.hit.borrow_mut();
+
+    if app.settings.is_some() {
+        let theme = app.theme.clone();
+        if let Some(s) = app.settings.as_mut() {
+            crate::tui::settings::render(f, f.area(), s, &theme, &mut hit.settings_rows);
+        }
     }
 }
 
@@ -214,6 +246,30 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
     let mut list = SelectList::new(items).theme(theme);
     list.select(Some(if app.overview { 0 } else { app.active + 1 }));
     f.render_widget(&list, inner);
+
+    // Each list row is exactly one line; the Overview is row 0, tab i is
+    // row i+1. SelectList truncates to inner.height without scrolling, so
+    // only the rows the panel renders get a click target — the rest would
+    // cover the border and the footer below.
+    let bottom = inner.y.saturating_add(inner.height);
+    let mut hits: Vec<(NavTarget, ratatui::layout::Rect)> = Vec::new();
+    if inner.y < bottom {
+        hits.push((
+            NavTarget::Overview,
+            ratatui::layout::Rect::new(inner.x, inner.y, inner.width, 1),
+        ));
+    }
+    for (index, _) in app.tabs_meta.iter().enumerate() {
+        let y = inner.y + 1 + index as u16;
+        if y >= bottom {
+            break;
+        }
+        hits.push((
+            NavTarget::Tab(index),
+            ratatui::layout::Rect::new(inner.x, y, inner.width, 1),
+        ));
+    }
+    app.hit.borrow_mut().nav_entries = hits;
 }
 
 fn draw_top_nav(f: &mut Frame, app: &App, area: Rect) {
@@ -224,11 +280,26 @@ fn draw_top_nav(f: &mut Frame, app: &App, area: Rect) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
+    // Entry list drives both the rendered spans and the mouse hit rects, so a
+    // label/order change can never desync the two.
+    let mut entries: Vec<(NavTarget, String, bool)> =
+        vec![(NavTarget::Overview, "Overview".to_string(), app.overview)];
+    for (index, tab) in app.tabs_meta.iter().enumerate() {
+        let selected = !app.overview && index == app.active;
+        entries.push((NavTarget::Tab(index), compact_tab_label(tab), selected));
+    }
+
     let mut spans = vec![theme.muted(" ")];
-    // Overview entry first, then each vendor tab.
-    let push_entry = |spans: &mut Vec<Span>, first: bool, selected: bool, label: String| {
+    let mut hits: Vec<(NavTarget, ratatui::layout::Rect)> = Vec::new();
+    let mut x = inner.x + 1; // after the leading muted space
+    let mut first = true;
+    for (target, label, selected) in entries {
+        // Column width, not character count: a CJK glyph is two cells and a
+        // combining mark is zero, so a char count misplaces every later rect.
+        let label_w = crate::display::text_width(&label) as u16;
         if !first {
             spans.push(theme.muted("  "));
+            x += 2;
         }
         let marker = if selected {
             theme.symbols.selected
@@ -240,13 +311,16 @@ fn draw_top_nav(f: &mut Frame, app: &App, area: Rect) {
         spans.push(Span::styled(marker, marker_style));
         spans.push(theme.span(" "));
         spans.push(Span::styled(label, label_style));
-    };
-    push_entry(&mut spans, true, app.overview, "Overview".to_string());
-    for (index, tab) in app.tabs_meta.iter().enumerate() {
-        let selected = !app.overview && index == app.active;
-        push_entry(&mut spans, false, selected, compact_tab_label(tab));
+        // Marker + gap + label is the clickable region (symbols are one cell).
+        hits.push((
+            target,
+            ratatui::layout::Rect::new(x, inner.y, label_w + 2, inner.height),
+        ));
+        x += label_w + 2;
+        first = false;
     }
     f.render_widget(Paragraph::new(Line::from(spans)), inner);
+    app.hit.borrow_mut().nav_entries = hits;
 }
 
 fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
@@ -388,17 +462,67 @@ fn draw_footer(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     // 875x600 windows. Keep the footer to just the keybinding hints.
     let theme = bubble_theme(&app.theme);
     let mut bindings = vec![
-        KeyBinding::with_keys(["tab", "h/l"], "switch"),
-        KeyBinding::new("r", "refresh"),
-        KeyBinding::new("R", "refresh all"),
-        KeyBinding::new("s", "settings"),
+        FooterBinding {
+            action: None,
+            key: "tab / shift+tab / ↑ / ↓ / ← / →",
+            description: "switch",
+        },
+        FooterBinding {
+            action: Some(FooterAction::Refresh),
+            key: "r",
+            description: "refresh",
+        },
+        FooterBinding {
+            action: Some(FooterAction::RefreshAll),
+            key: "R",
+            description: "refresh all",
+        },
+        FooterBinding {
+            action: Some(FooterAction::Settings),
+            key: "s",
+            description: "settings",
+        },
     ];
     if app.context_enabled {
-        bindings.push(KeyBinding::new("c", "context"));
+        bindings.push(FooterBinding {
+            action: None,
+            key: "c",
+            description: "context",
+        });
     }
-    bindings.push(KeyBinding::with_keys(["q", "esc"], "quit"));
-    let help = Help::new(bindings).theme(theme);
+    bindings.push(FooterBinding {
+        action: Some(FooterAction::Quit),
+        key: "q/esc",
+        description: "quit",
+    });
+    let help = Help::new(
+        bindings
+            .iter()
+            .map(|binding| KeyBinding::new(binding.key, binding.description)),
+    )
+    .theme(theme);
     f.render_widget(&help, area);
+
+    // Help renders compact bindings as "key description • ". Record the same
+    // cells so click targets stay aligned even when the footer is truncated.
+    let right = area.x.saturating_add(area.width);
+    let mut x = area.x;
+    let mut actions = Vec::new();
+    for binding in bindings {
+        let width = binding.width();
+        if let Some(action) = binding.action
+            && x < right
+        {
+            let visible_width = width.min(right.saturating_sub(x));
+            if visible_width > 0 {
+                actions.push((action, Rect::new(x, area.y, visible_width, area.height)));
+            }
+        }
+        x = x
+            .saturating_add(width)
+            .saturating_add(FOOTER_SEPARATOR_WIDTH);
+    }
+    app.hit.borrow_mut().footer_actions = actions;
 }
 
 #[cfg(test)]
@@ -421,10 +545,12 @@ mod tests {
                 is_free_tier: false,
                 limit: None,
                 limit_remaining: None,
+                recent_models: Vec::new(),
             }),
             stale: false,
             last_error: None,
             fetched_at,
+            display: Default::default(),
         }))
     }
 
@@ -441,6 +567,34 @@ mod tests {
         );
         app.tabs = tabs;
         app
+    }
+
+    /// A settings overlay state covering every field, for hit-rect tests.
+    fn settings_state() -> crate::tui::settings::SettingsState {
+        use crate::tui::settings::{KeyInput, ProviderSwitch, SettingsState};
+
+        SettingsState {
+            focus: crate::tui::settings::Focus::Primary,
+            primary_choices: vec![VendorId::Anthropic],
+            primary: VendorId::Anthropic,
+            keys: crate::tui::settings::KEY_VENDORS
+                .iter()
+                .map(|_| KeyInput::default())
+                .collect(),
+            vendors: VendorId::all()
+                .iter()
+                .map(|_| ProviderSwitch {
+                    enabled: false,
+                    dirty: false,
+                })
+                .collect(),
+            notify_enabled: true,
+            notify_enabled_dirty: false,
+            notify_threshold: KeyInput::from_config(Some("97")),
+            status: String::new(),
+            scroll: 0,
+            picker: None,
+        }
     }
 
     #[test]
@@ -491,7 +645,7 @@ mod tests {
         let tab = app.tabs_meta[0].clone();
         assert!(app.begin_refresh(&tab));
 
-        let out = body_text(&app);
+        let out = body_text(&mut app);
         assert!(out.contains("$0.00"), "ready metrics disappeared: {out}");
         assert!(out.contains('↻'), "refresh indicator missing: {out}");
         assert!(!out.contains("fetching…"), "ready row flickered: {out}");
@@ -509,7 +663,7 @@ mod tests {
         app
     }
 
-    fn body_text(app: &App) -> String {
+    fn body_text(app: &mut App) -> String {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
         let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
@@ -527,7 +681,7 @@ mod tests {
     #[test]
     fn full_layout_takes_the_body_and_hides_the_vendor_sidebar() {
         use crate::config::ContextLayout;
-        let out = body_text(&app_with_context(ContextLayout::Full));
+        let out = body_text(&mut app_with_context(ContextLayout::Full));
         assert!(out.contains("Claude context"), "{out}");
         assert!(
             !out.contains("vendors"),
@@ -539,7 +693,7 @@ mod tests {
     fn split_and_bottom_layouts_keep_the_dashboard_visible() {
         use crate::config::ContextLayout;
         for layout in [ContextLayout::Split, ContextLayout::Bottom] {
-            let out = body_text(&app_with_context(layout));
+            let out = body_text(&mut app_with_context(layout));
             assert!(out.contains("Claude context"), "{layout:?}: {out}");
             assert!(out.contains("vendors"), "{layout:?}: {out}");
         }
@@ -553,7 +707,7 @@ mod tests {
         fn rendered(mut app: App, enabled: bool) -> String {
             app.context_enabled = enabled;
             let mut terminal = Terminal::new(TestBackend::new(160, 24)).unwrap();
-            terminal.draw(|frame| draw(frame, &app)).unwrap();
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
             terminal
                 .backend()
                 .buffer()
@@ -644,5 +798,279 @@ mod tests {
             "vendor nav must be fully hidden: {rows:?}"
         );
         assert!(rows[0].contains(" Overview "), "{:?}", rows[0]);
+    }
+
+    #[test]
+    fn sidebar_records_nav_hit_rects_in_entry_order() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut app = app_with(vec![TabState::Loading, TabState::Loading]);
+        app.overview = true;
+        let mut terminal = Terminal::new(TestBackend::new(160, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let hit = app.hit.borrow();
+        assert_eq!(hit.nav_entries.len(), 3); // Overview + two tabs
+        assert_eq!(hit.nav_entries[0].0, NavTarget::Overview);
+        assert_eq!(hit.nav_entries[1].0, NavTarget::Tab(0));
+        assert_eq!(hit.nav_entries[2].0, NavTarget::Tab(1));
+        // Rows stack vertically, one line each.
+        let (first, second, third) = (
+            hit.nav_entries[0].1,
+            hit.nav_entries[1].1,
+            hit.nav_entries[2].1,
+        );
+        assert_eq!(first.y + 1, second.y);
+        assert_eq!(second.y + 1, third.y);
+        assert_eq!(first.width, second.width);
+        assert_eq!(first.height, 1);
+    }
+
+    #[test]
+    fn sidebar_hit_rects_skip_rows_the_panel_does_not_render() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        // 8 rows: header 3 + body 4 + footer 1. The sidebar's inner height is
+        // 2 (body minus borders), so SelectList renders Overview and the
+        // first tab only; the second tab's row would otherwise sit on the
+        // border and steal footer clicks.
+        let mut app = app_with(vec![TabState::Loading, TabState::Loading]);
+        app.overview = true;
+        let mut terminal = Terminal::new(TestBackend::new(160, 8)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let hit = app.hit.borrow();
+        assert_eq!(hit.nav_entries.len(), 2, "Overview and first tab only");
+        assert_eq!(hit.nav_entries[0].0, NavTarget::Overview);
+        assert_eq!(hit.nav_entries[1].0, NavTarget::Tab(0));
+        for (target, rect) in &hit.nav_entries {
+            assert!(
+                rect.y + rect.height <= 6,
+                "{target:?} escapes the sidebar's inner area: {rect:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn top_nav_records_hit_rects_in_entry_order() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut app = app_with(vec![TabState::Loading, TabState::Loading]);
+        app.overview = true;
+        app.vendor_box = crate::config::VendorBoxStyle::Navbar;
+        let mut terminal = Terminal::new(TestBackend::new(160, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let hit = app.hit.borrow();
+        assert_eq!(hit.nav_entries.len(), 3);
+        assert_eq!(hit.nav_entries[0].0, NavTarget::Overview);
+        // Horizontal layout: entries are separated by a two-column gap, so the
+        // next entry starts right after it.
+        let (first, second) = (hit.nav_entries[0].1, hit.nav_entries[1].1);
+        assert_eq!(first.x + first.width + 2, second.x);
+        assert_eq!(first.y, second.y);
+    }
+
+    #[test]
+    fn top_nav_hit_rect_spans_cjk_label_columns() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        // `漢` is one character but two terminal columns. A char-count width
+        // would make this entry's rect one cell too narrow, so its rightmost
+        // visible cell falls outside the clickable region.
+        let mut app = App::with_theme(
+            vec![TabId {
+                source: TabSource::Custom {
+                    id: "cjk".into(),
+                    name: "漢".into(),
+                    short_name: "漢".into(),
+                },
+                account: None,
+                desktop: false,
+            }],
+            Theme::default(),
+        );
+        app.tabs = vec![TabState::Loading];
+        app.overview = true;
+        app.vendor_box = crate::config::VendorBoxStyle::Navbar;
+        let mut terminal = Terminal::new(TestBackend::new(160, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let hit = app.hit.borrow();
+        let tab = &hit.nav_entries[1];
+        let label = compact_tab_label(&app.tabs_meta[0]);
+        assert_eq!(tab.0, NavTarget::Tab(0));
+        // Marker (1) + gap (1) + label columns == clickable width.
+        assert_eq!(tab.1.width, crate::display::text_width(&label) as u16 + 2);
+        // The rightmost visible label cell is the last cell of the rect.
+        assert_eq!(
+            tab.1.x + tab.1.width - 1,
+            tab.1.x + 1 + crate::display::text_width(&label) as u16
+        );
+    }
+
+    #[test]
+    fn top_nav_hit_rect_does_not_steal_separator_for_combining_mark() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        // `e` + combining acute is two characters but one terminal column. A
+        // char-count width would make this entry's rect one cell too wide and
+        // swallow a separator column that belongs to no entry.
+        let mut app = App::with_theme(
+            vec![TabId {
+                source: TabSource::Custom {
+                    id: "comb".into(),
+                    name: "e\u{0301}".into(),
+                    short_name: "e\u{0301}".into(),
+                },
+                account: None,
+                desktop: false,
+            }],
+            Theme::default(),
+        );
+        app.tabs = vec![TabState::Loading];
+        app.overview = true;
+        app.vendor_box = crate::config::VendorBoxStyle::Navbar;
+        let mut terminal = Terminal::new(TestBackend::new(160, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let hit = app.hit.borrow();
+        let tab = &hit.nav_entries[1];
+        let label = compact_tab_label(&app.tabs_meta[0]);
+        assert_eq!(tab.0, NavTarget::Tab(0));
+        assert_eq!(tab.1.width, crate::display::text_width(&label) as u16 + 2);
+        // Column-aware width (1) means the rect ends exactly at the label, not
+        // into the two-column separator.
+        assert_eq!(tab.1.width, 3);
+    }
+
+    #[test]
+    fn footer_records_click_targets_for_mouse_actions() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = app_with(vec![TabState::Loading, TabState::Loading]);
+        let mut terminal = Terminal::new(TestBackend::new(160, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let hit = app.hit.borrow();
+        assert_eq!(
+            hit.footer_actions
+                .iter()
+                .map(|(action, _)| *action)
+                .collect::<Vec<_>>(),
+            vec![
+                FooterAction::Refresh,
+                FooterAction::RefreshAll,
+                FooterAction::Settings,
+                FooterAction::Quit,
+            ]
+        );
+        assert!(hit.footer_actions.iter().all(|(_, rect)| rect.height == 1));
+    }
+
+    #[test]
+    fn settings_draw_renders_all_key_rows_and_records_hits() {
+        use crate::tui::settings::{Focus as SFocus, SettingsRow};
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = app_with(vec![TabState::Loading, TabState::Loading]);
+        app.settings = Some(settings_state());
+        // Tall enough that the whole body (keys + provider switches +
+        // notifications + save) fits inside the 88%-height modal.
+        let mut terminal = Terminal::new(TestBackend::new(160, 70)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let hit = app.hit.borrow();
+        assert!(
+            hit.settings_rows
+                .iter()
+                .any(|(row, _)| matches!(row, SettingsRow::Focus(SFocus::Save)))
+        );
+        for index in 0..crate::tui::settings::KEY_VENDORS.len() {
+            assert!(
+                hit.settings_rows.iter().any(
+                    |(row, _)| matches!(row, SettingsRow::Focus(SFocus::Key(i)) if *i == index)
+                ),
+                "missing hit target for key provider {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn settings_draw_clamps_hit_rects_on_short_terminals() {
+        use crate::tui::settings::{Focus as SFocus, SettingsRow};
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = app_with(vec![TabState::Loading, TabState::Loading]);
+        app.settings = Some(settings_state());
+        // 12 rows tall: modal body cannot fit all key vendors and the save row
+        let mut terminal = Terminal::new(TestBackend::new(160, 12)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let hit = app.hit.borrow();
+        // Clamped: Save row is clipped and must not be recorded as a clickable hit target
+        assert!(
+            !hit.settings_rows
+                .iter()
+                .any(|(row, _)| matches!(row, SettingsRow::Focus(SFocus::Save)))
+        );
+        // All recorded hit rects must stay within the terminal height
+        for (_, rect) in &hit.settings_rows {
+            assert!(rect.y + rect.height <= 12);
+        }
+    }
+
+    #[test]
+    fn settings_hit_targets_do_not_accumulate_across_redraws() {
+        use crate::tui::settings::{Focus as SFocus, KeyCode, KeyModifiers, SettingsRow};
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = app_with(vec![TabState::Loading, TabState::Loading]);
+        app.settings = Some(settings_state()); // focus: Primary
+        let mut terminal = Terminal::new(TestBackend::new(160, 70)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let one_frame = app.hit.borrow().settings_rows.len();
+        assert!(one_frame > 0);
+
+        // A redraw with the same state replaces the frame's targets instead
+        // of appending another full set.
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(
+            app.hit.borrow().settings_rows.len(),
+            one_frame,
+            "redraw must not accumulate hit targets"
+        );
+
+        // Moving focus swaps the hint links wholesale: Primary's "change
+        // vendor" link (Right) must not survive into the Vendor frame's
+        // rects, where a first-match hit-test would fire it instead of the
+        // rendered "toggle" link.
+        app.settings.as_mut().unwrap().focus = SFocus::Vendor(0);
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let hit = app.hit.borrow();
+        assert!(
+            !hit.settings_rows
+                .iter()
+                .any(|(row, _)| matches!(row, SettingsRow::HintKey(KeyCode::Right, _))),
+            "stale Primary hint link survived the redraw"
+        );
+        let toggles = hit
+            .settings_rows
+            .iter()
+            .filter(|(row, _)| {
+                matches!(
+                    row,
+                    SettingsRow::HintKey(KeyCode::Char(' '), KeyModifiers::NONE)
+                )
+            })
+            .count();
+        assert_eq!(toggles, 1, "exactly one frame's toggle link recorded");
     }
 }

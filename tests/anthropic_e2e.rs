@@ -96,6 +96,7 @@ async fn full_response_renders_expected_waybar_json() {
     let theme = Theme::default(); // One Dark — stable across machines
     let format = DEFAULT_FORMAT.to_string();
     let input = RenderInput {
+        claude_sessions: None,
         outcome: &outcome,
         theme: &theme,
         format: &format,
@@ -146,6 +147,7 @@ async fn no_sonnet_no_extra_renders_minimal_tooltip() {
     let theme = Theme::default();
     let format = DEFAULT_FORMAT.to_string();
     let input = RenderInput {
+        claude_sessions: None,
         outcome: &outcome,
         theme: &theme,
         format: &format,
@@ -203,6 +205,7 @@ async fn http_429_falls_back_to_stale_cache_with_pause_indicator() {
     let theme = Theme::default();
     let format = DEFAULT_FORMAT.to_string();
     let input = RenderInput {
+        claude_sessions: None,
         outcome: &outcome,
         theme: &theme,
         format: &format,

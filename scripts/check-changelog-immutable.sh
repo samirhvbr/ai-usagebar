@@ -45,7 +45,13 @@ for tag in $tags; do
     continue
   fi
   if [ -z "$b" ]; then
-    # The v1.13.0 case: a merge removed the heading entirely.
+    # A release that was retired on purpose (v1.20.0 never shipped; its
+    # entries moved under 1.20.1) has no `[X.Y.Z]:` compare link either. A
+    # merge that drops a heading (the v1.13.0 case) leaves the link behind.
+    if ! grep -q "^\[$v\]: " CHANGELOG.md; then
+      echo "warn: $tag is retired — no [$v] section or link in CHANGELOG.md — skipping"
+      continue
+    fi
     echo "error: the [$v] section is MISSING from CHANGELOG.md but exists in $tag"
     fail=1
     continue
@@ -61,7 +67,8 @@ newest=$(git tag --list 'v*' --sort=-v:refname | head -1)
 if [ -n "$newest" ]; then
   want=${newest#v}
   check_version() {
-    got=$(sed -n "0,/$2/s//\1/p" "$1")
+    # First matching line only; `0,/re/` is GNU-only and BSD sed prints nothing.
+    got=$(sed -n "/$2/{s//\1/p;q;}" "$1")
     [ -z "$got" ] && { echo "error: could not read a version from $1"; fail=1; return; }
     # A release PR bumps past the tag and must pass; going backwards must not.
     if [ "$(printf '%s\n%s\n' "$want" "$got" | sort -V | head -1)" != "$want" ]; then

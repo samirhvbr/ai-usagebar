@@ -31,9 +31,14 @@ gnome-extension/schemas/gschemas.compiled
 
 # Compiled macOS menu bar app (built by macos/build.sh)
 macos/ai-usagebar-menubar
+macos/__pycache__/
 
 # Local screenshots for PR bodies (not tracked; drag into the PR on GitHub)
 macos/printscreen/
 
 windows/popover/node_modules/
 windows/popover/dist/
+windows/popover/tsconfig.tsbuildinfo
+
+# Kilo Code local settings
+.kilo/

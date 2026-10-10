@@ -311,9 +311,16 @@ async fn fetch_live(
             AppError::Transport(format!("kiro token refresh timeout: {}", endpoints.token))
         })?
         .map_err(|e| {
-            AppError::Credentials(format!(
-                "Kiro CLI token refresh failed ({e}). Run `kiro-cli login` again."
-            ))
+            // A refresh that never reached the token endpoint says nothing
+            // about the login: keep it transient, so the cache covers it the
+            // way it covers the usage call's own network failures.
+            if e.is_transient() {
+                e
+            } else {
+                AppError::Credentials(format!(
+                    "Kiro CLI token refresh failed ({e}). Run `kiro-cli login` again."
+                ))
+            }
         })?;
         let expires_in = i64::try_from(refreshed.expires_in)
             .map_err(|_| AppError::Schema("kiro token refresh expiry is out of range".into()))?;
@@ -648,6 +655,33 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(err, AppError::Credentials(_)));
+    }
+
+    /// A refresh that cannot reach the token endpoint is a network failure,
+    /// not a rejected login: it must not record "run `kiro-cli login`" as the
+    /// refresh error, and with no cache to fall back on it stays transient.
+    #[tokio::test]
+    async fn a_refresh_that_cannot_connect_is_not_a_sign_in_error() {
+        let db_dir = TempDir::new().unwrap();
+        let db_path = seed_db(&db_dir, "2000-01-01T00:00:00Z");
+        let (_cache_dir, cache) = cache_fixture();
+
+        let err = fetch_snapshot_at(
+            &reqwest::Client::new(),
+            &db_path,
+            &cache,
+            Duration::ZERO,
+            Some(&Endpoints {
+                usage_limits: "http://127.0.0.1:1".into(),
+                token: "http://127.0.0.1:1/token".into(),
+            }),
+            Utc::now(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.is_transient(), "{err:?}");
+        assert_eq!(cache.read_last_error(), None);
     }
 
     #[tokio::test]

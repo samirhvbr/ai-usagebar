@@ -7,6 +7,8 @@
 //! after the latest usage invalidates that reading until another assistant
 //! response supplies the new context size.
 
+pub mod activity;
+
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};

@@ -22,10 +22,10 @@
     border: 1px solid #262b33;
 }
 
-/* The expanded "Status das APIs" submenu paints its own, lighter background,
-   which reads as a pale slab floating over the dark menu. Sink it *below* the
-   menu instead, so the section reads as inset — the nesting is then legible
-   from the shade alone, without a border. */
+/* An expanded submenu ("Status das APIs", a provider's details) paints its
+   own, lighter background, which reads as a pale slab floating over the dark
+   menu. Sink it *below* the menu instead, so the section reads as inset — the
+   nesting is then legible from the shade alone, without a border. */
 .aiub-menu .popup-sub-menu {
     background-color: #101216;
     box-shadow: none;
@@ -60,42 +60,67 @@
     background-color: #1b2029;
 }
 
-/* Dropdown rows — native St layout, font-independent alignment. */
-.aiub-header {
-    font-weight: bold;
-    padding: 6px 16px 2px 16px;
+/* Bound both long provider lists and wrapped report text. */
+.aiub-providers {
+    width: 380px;
 }
 
-.aiub-row {
+.aiub-provider-content {
+    spacing: 6px;
+}
+
+.aiub-provider.aiub-compact {
+    padding-top: 4px;
+    padding-bottom: 4px;
+}
+
+.aiub-compact .aiub-provider-content {
     spacing: 2px;
-    padding: 7px 16px;
-    min-width: 360px;
 }
 
-.aiub-row-name {
-    font-weight: bold;
+.aiub-overview {
+    spacing: 4px;
+    font-size: 0.85em;
 }
 
-.aiub-row-val {
+.aiub-compact .aiub-overview {
+    spacing: 2px;
+}
+
+.aiub-overview-row {
+    spacing: 8px;
+}
+
+.aiub-overview-value {
+    min-width: 3.6em;
+    max-width: 8em;
+    text-align: right;
     font-feature-settings: "tnum";
 }
 
-/* Drawn usage bar: rounded track + fill + pace marker.
-   Widths, colors and margins are set per-render in extension.js (_drawBar);
-   the track width here MUST match the W constant in that method. */
-.aiub-bar-track {
-    width: 320px;
-    height: 7px;
-    border-radius: 4px;
-    margin: 6px 0 5px 0;
+.aiub-details {
+    spacing: 10px;
+    padding: 8px 20px;
 }
 
-.aiub-bar-fill,
-.aiub-bar-over,
-.aiub-bar-marker {
-    height: 7px;
+.aiub-metric {
+    spacing: 6px;
 }
 
+.aiub-heading {
+    font-weight: bold;
+}
+
+.aiub-detail {
+    font-size: 0.9em;
+}
+
+.aiub-track {
+    background-color: rgba(128, 128, 128, 0.3);
+    border-radius: 3px;
+}
+
+/* Muted one-line subhead ("Status das APIs": where the figures come from). */
 .aiub-row-reset {
     font-size: 0.85em;
     color: #5c6370;
