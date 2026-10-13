@@ -131,6 +131,26 @@ assert.equal(
   i18n.displayNote('ru', 'billing balance and monthly spend'),
   'баланс и месячные траты',
 );
+assert.equal(
+  i18n.displayNote('ru', 'billing credits'),
+  'биллинговые кредиты',
+);
+assert.equal(
+  i18n.displayNote('pt-BR', 'billing credits'),
+  'créditos de faturamento',
+);
+assert.equal(
+  i18n.displayNote('ko', 'billing credits'),
+  '결제 크레딧',
+);
+assert.equal(
+  i18n.displayNote('es', 'billing credits'),
+  'créditos de facturación',
+);
+assert.equal(
+  i18n.displayNote('en', 'billing credits'),
+  'billing credits',
+);
 assert.equal(i18n.displayNote('en', 'ollama.com/settings/keys'), 'ollama.com/settings/keys');
 assert.equal(
   i18n.t('ru', 'hero.settings_detail'),
@@ -288,7 +308,8 @@ assert.match(panelSource, /Model\.brandIconFile\(root\.entry\)/);
 // the panel edge when more providers are configured than fit on one line.
 assert.match(panelSource, /Flow\s*\{[\s\S]*?id:\s*providerList/);
 assert.match(panelSource, /flow:\s*Flow\.LeftToRight/);
-assert.match(panelSource, /height:\s*visible\s*\?\s*childrenRect\.height\s*:\s*0/);
+assert.match(panelSource, /height:\s*visible\s*\?\s*implicitHeight\s*:\s*0/);
+assert.doesNotMatch(panelSource, /childrenRect\.height/, 'childrenRect feeds the item\'s own geometry back — a binding loop');
 assert.match(panelSource, /width:\s*implicitWidth/);
 assert.doesNotMatch(panelSource, /orientation:\s*ListView\.Horizontal/);
 assert.match(panelSource, /providerList\.forceLayout\(\)/);
@@ -579,6 +600,17 @@ assert.doesNotMatch(devinMark, /<(?:script|image|foreignObject|use)\b|\bhref\s*=
 assert.equal(model.brandIconFile({id: 'zai'}), 'zhipu.svg');
 assert.equal(model.brandIconFile({id: 'kimi'}), 'kimi.svg');
 assert.equal(model.brandIconFile({id: 'opencode-go'}), 'opencode.svg');
+assert.equal(model.brandIconFile({id: 'ollama'}), 'ollama.svg');
+assert.equal(model.brandIconFile({id: 'ollama@work'}), 'ollama.svg');
+assert.equal(model.brandIconFile({id: 'custom:ollama', brand: 'ollama'}), 'ollama.svg');
+const ollamaMark = fs.readFileSync(new URL('./icons/ollama.svg', import.meta.url), 'utf8');
+assert.match(ollamaMark, /viewBox="0 0 24 24"/);
+assert.match(ollamaMark, /\bwidth="24"/);
+assert.match(ollamaMark, /\bheight="24"/);
+assert.match(ollamaMark, /<path\s/);
+// White source artwork is needed for BrandMark's runtime colorization.
+assert.match(ollamaMark, /<svg\b[^>]*\bfill="#ffffff"/);
+assert.doesNotMatch(ollamaMark, /currentColor|<(?:script|image|foreignObject|use)\b|\bhref\s*=|\bon\w+\s*=/i);
 assert.equal(model.brandIconFile({id: 'lyceum'}), '');
 assert.equal(model.brandIconFile({id: 'commandcode'}), '');
 assert.equal(model.brandIconFile({id: 'anthropic_api'}), 'anthropic.svg');
@@ -600,7 +632,7 @@ assert.equal(model.brandIconFile({id: 'anthropic', brand: 'openai'}), 'openai.sv
 const slugs = [
   'anthropic', 'anthropic_api', 'openai', 'copilot', 'zai', 'openrouter',
   'deepseek', 'kimi', 'kilo', 'novita', 'moonshot', 'grok', 'supergrok', 'grokbot',
-  'antigravity', 'cursor', 'minimax', 'kiro', 'nous', 'opencode-go', 'lyceum', 'commandcode', 'devin'
+  'antigravity', 'cursor', 'minimax', 'kiro', 'nous', 'opencode-go', 'lyceum', 'commandcode', 'devin', 'ollama'
 ];
 const byMark = {};
 for (const slug of slugs) {

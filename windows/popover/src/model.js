@@ -117,7 +117,7 @@ function normalizeAccent(value) {
   return { light: value.light.toLowerCase(), dark: value.dark.toLowerCase() };
 }
 
-const SWITCHABLE_VENDORS = ["anthropic", "openai"];
+const SWITCHABLE_VENDORS = ["anthropic", "openai", "claude-desktop"];
 
 // Switchable logins per vendor. Only the macOS host sends any; anything absent
 // or malformed means no switch control at all rather than a guessed one.
@@ -137,6 +137,11 @@ function normalizeAccounts(value) {
       target: clean(raw.target, 4096),
       switching: raw.switching === true,
       error: clean(raw.error, 300),
+      prepareEnabled: vendor === "claude-desktop" && raw.prepare_enabled === true,
+      prepareTarget: clean(raw.prepare_target, 4096),
+      preparing: vendor === "claude-desktop" && raw.preparing === true,
+      prepareError: clean(raw.prepare_error, 300),
+      preparedReset: clean(raw.prepared_reset, 64),
     };
   }
   return out;
@@ -157,22 +162,51 @@ export function accountSwitchFor(cardId, accounts) {
   const at = id.indexOf("@");
   if (at <= 0) return null;
   const vendor = id.slice(0, at);
-  const info = accounts && Object.prototype.hasOwnProperty.call(accounts, vendor) ? accounts[vendor] : null;
-  if (!info) return null;
-  // Two labels that only differ past the cut share one card; neither is
-  // offered, since the control could not say which one it switches to.
-  const matches = info.labels.filter((label) => cardIdOf(vendor, label) === id);
-  if (matches.length !== 1) return null;
-  const label = matches[0];
-  const mine = info.target === label;
-  return {
-    vendor,
-    label,
-    active: info.active === label,
-    switching: info.switching && mine,
-    busy: info.switching && !mine,
-    error: mine && !info.switching && info.active !== label ? info.error : "",
-  };
+  // A Claude card the CLI does not know can still be a Claude Desktop login,
+  // whose switch moves the app alone.
+  const sources = vendor === "anthropic" ? [vendor, "claude-desktop"] : vendor === "claude-desktop" ? [] : [vendor];
+  for (const source of sources) {
+    const info = accounts && Object.prototype.hasOwnProperty.call(accounts, source) ? accounts[source] : null;
+    if (!info) continue;
+    // Two labels that only differ past the cut share one card; neither is
+    // offered, since the control could not say which one it switches to.
+    const matches = info.labels.filter((label) => cardIdOf(vendor, label) === id);
+    if (matches.length > 1) return null;
+    if (matches.length === 0) continue;
+    const label = matches[0];
+    const mine = info.target === label;
+    return {
+      vendor: source,
+      label,
+      desktop: source === "claude-desktop",
+      active: info.active === label,
+      switching: info.switching && mine,
+      busy: (info.switching || info.preparing) && !mine,
+      error: mine && !info.switching && info.active !== label ? info.error : "",
+      prepareEnabled: source === "claude-desktop" && info.prepareEnabled === true,
+      preparing: info.preparing && info.prepareTarget === label,
+      prepareError: info.prepareTarget === label && !info.preparing ? info.prepareError : "",
+      preparedReset: info.prepareTarget === label ? info.preparedReset : "",
+    };
+  }
+  return null;
+}
+
+/** A Prepare click is one optional turn, not an automatic quota polling loop. */
+export function desktopPreparation(card, account, nowMs) {
+  if (!account || account.vendor !== "claude-desktop" || !account.prepareEnabled || account.active) return null;
+  if (account.preparing) return { label: "Preparing…", disabled: true, hint: "Preparing this inactive account without switching Claude Desktop." };
+  const session = card.rows.find((row) => row.kind === "metric" && row.window === 18000);
+  const weekly = card.rows.find((row) => row.kind === "metric" && row.window === 604800);
+  const reset = Date.parse(session?.resetAt || "");
+  const confirmed = Date.parse(account.preparedReset || "");
+  const blocked = card.stale || Boolean(card.errorTitle) || (reset > nowMs && session?.usedPercent >= 100) || weekly?.usedPercent >= 100;
+  if (!blocked && (reset > nowMs && session.usedPercent < 100 || confirmed > nowMs)) {
+    return { label: "Ready", disabled: true, hint: "The five-hour window is already running. No additional message is needed." };
+  }
+  return { label: "Prepare", disabled: account.busy || account.switching || blocked, hint: account.prepareError || (blocked
+    ? "Wait for the limit to reset and refresh live usage before preparing."
+    : "Send one short Haiku message using this inactive account. Uses a little quota; no saved conversation or Desktop restart.") };
 }
 
 function githubPage(value) {
@@ -441,7 +475,12 @@ export function paceVerdict(pace, leftPercent) {
   const gap = Number.isFinite(left) ? (100 - left) - Number(pace.elapsedPercent) : 0;
   // Nearly spent and still over the line: the last few percent go fast.
   if (projected > 100 && Number.isFinite(left) && left < PACE_CRITICAL_LEFT) return "critical";
-  if (projected > PACE_CRITICAL_PERCENT && gap >= PACE_CRITICAL_GAP) return "critical";
+  if (projected > PACE_CRITICAL_PERCENT && gap >= PACE_CRITICAL_GAP) {
+    if (Number(pace.elapsedPercent) < 15 && Number.isFinite(left) && left >= METER_YELLOW_BELOW_LEFT) {
+      return "over";
+    }
+    return "critical";
+  }
   if (projected > PACE_OVER_PERCENT && gap >= PACE_OVER_GAP) return "over";
   return "calm";
 }
@@ -670,12 +709,11 @@ export function usageGoalPercent(goal, showAs) {
 }
 
 // Where the "you should be here" tick sits on the meter, as a percent of its
-// width. The meter fills with what is consumed in Used mode and with what
-// remains in Left mode, so the tick follows the same reading.
-export function paceTickPercent(pace, showAs) {
+// width: the elapsed share, because the meter always fills with what is
+// consumed — the Used/Left toggle reads the headline number, never the ink.
+export function paceTickPercent(pace) {
   if (!pace) return null;
-  const elapsed = clampPercent(pace.elapsedPercent);
-  return showAs === "used" ? elapsed : 100 - elapsed;
+  return clampPercent(pace.elapsedPercent);
 }
 
 // One-line pace verdict beside the row label, in OpenUsage's WidgetRowView

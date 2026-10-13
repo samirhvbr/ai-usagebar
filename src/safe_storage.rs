@@ -254,9 +254,7 @@ pub fn encrypt_windows(
 /// Desktop usage source entirely.
 #[cfg(target_os = "macos")]
 pub fn macos_key() -> Result<[u8; KEY_LEN]> {
-    use std::process::Command;
-    let out = Command::new("/usr/bin/security")
-        .args(["find-generic-password", "-s", SERVICE, "-w"])
+    let out = macos_key_command()
         .output()
         .map_err(|e| AppError::Other(format!("could not run `security`: {e}")))?;
     if !out.status.success() {
@@ -266,6 +264,19 @@ pub fn macos_key() -> Result<[u8; KEY_LEN]> {
     }
     let secret = String::from_utf8_lossy(&out.stdout);
     Ok(derive_key(secret.trim().as_bytes()))
+}
+
+/// `security find-generic-password -s <SERVICE> -w`, read-only; the secret
+/// arrives on stdout, never in argv.
+#[cfg(target_os = "macos")]
+fn macos_key_command() -> std::process::Command {
+    let mut command = std::process::Command::new("/usr/bin/security");
+    command.args(["find-generic-password", "-s", SERVICE, "-w"]);
+    // A credential lookup must not inherit this process's provider keys.
+    for var in crate::vendor::vendor_secret_env_vars_to_remove(&[]) {
+        command.env_remove(var);
+    }
+    command
 }
 
 #[cfg(test)]
@@ -522,5 +533,25 @@ mod tests {
         )
         .unwrap();
         assert_eq!(windows_key(&path).unwrap(), WINDOWS_KEY);
+    }
+
+    /// The Keychain lookup must not inherit this process's provider keys, the
+    /// rule every credential lookup in this crate follows.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_key_lookup_scrubs_vendor_secret_env_vars() {
+        let command = macos_key_command();
+        assert_eq!(command.get_program(), "/usr/bin/security");
+        let removed: Vec<String> = command
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(key, _)| key.to_string_lossy().into_owned())
+            .collect();
+        for var in crate::vendor::vendor_secret_env_vars_to_remove(&[]) {
+            assert!(
+                removed.iter().any(|key| key == var),
+                "expected {var} to be scrubbed from the safe-storage keychain lookup"
+            );
+        }
     }
 }

@@ -418,11 +418,31 @@ fn host_facts(config: &Config) -> HostFacts {
     facts
 }
 
-/// Which Claude CLI and Codex logins are active, for the switch control on
-/// each account's card. Read fresh on every report, so a switch made from the
-/// terminal shows up too.
+/// The `accounts` key of the Claude Desktop app's own logins: the switch on a
+/// Claude card the CLI does not know, which moves the app alone.
+const DESKTOP_VENDOR: &str = "claude-desktop";
+
+/// Which Claude CLI, Claude Desktop and Codex logins are active, for the switch
+/// control on each account's card. Read fresh on every report, so a switch made
+/// from the terminal shows up too.
 fn account_facts(config: &Config) -> Vec<AccountSwitchFact> {
     let mut out = Vec::new();
+    if let Some((labels, active)) = crate::claude_desktop::Paths::resolve(&config.anthropic)
+        .ok()
+        .and_then(|paths| crate::claude_desktop::switchable(&paths))
+    {
+        out.push(AccountSwitchFact {
+            vendor: DESKTOP_VENDOR.into(),
+            active,
+            labels,
+            prepare_enabled: config
+                .anthropic
+                .desktop_prepare_binary
+                .as_ref()
+                .is_some_and(|path| path.is_absolute() && path.is_file()),
+            ..AccountSwitchFact::default()
+        });
+    }
     let claude = config.anthropic.all_accounts();
     if config.anthropic.enabled && !claude.is_empty() {
         let active = crate::anthropic::cli_account::home_claude_json()
@@ -464,6 +484,10 @@ fn refresh_account_facts(facts: &SharedFacts) {
                     fact.target.clone_from(&old.target);
                     fact.switching = old.switching;
                     fact.error.clone_from(&old.error);
+                    fact.prepare_target.clone_from(&old.prepare_target);
+                    fact.preparing = old.preparing;
+                    fact.prepare_error.clone_from(&old.prepare_error);
+                    fact.prepared_reset.clone_from(&old.prepared_reset);
                 }
                 fact
             })
@@ -496,8 +520,14 @@ fn run_account_switch(facts: &SharedFacts, vendor: &str, label: &str) {
 fn switch_with(tray: &std::path::Path, vendor: &str, label: &str) -> String {
     let mut command = std::process::Command::new(tray);
     command.args(["account", "switch", "--yes"]);
-    if vendor == "openai" {
-        command.arg("--codex");
+    match vendor {
+        "openai" => {
+            command.arg("--codex");
+        }
+        DESKTOP_VENDOR => {
+            command.arg("--desktop");
+        }
+        _ => {}
     }
     command.arg("--").arg(label);
     match command.stdin(std::process::Stdio::null()).output() {
@@ -590,7 +620,7 @@ fn apply_strip_icon(state: &mut TrayState) {
         }
         StatusItemContent::Chart => {
             state.menu_bar_logo_key = None;
-            let fractions = menu_bar::chart_fractions(&content, state.usage_reading);
+            let fractions = menu_bar::chart_fractions(&content);
             if let Ok(icon) = bars_icon(&fractions) {
                 let _ = state.tray.set_icon_templated(Some(icon));
             }
@@ -853,18 +883,24 @@ fn persist_menu_bar_value(key: &str, value: toml_edit::Value) {
     }
 }
 
+/// A switch the popover asks for is honored only for a vendor and label the
+/// host itself reported, and never while a switch or a prepare is running.
+fn account_switch_allowed(accounts: &[AccountSwitchFact], vendor: &str, label: &str) -> bool {
+    accounts.iter().any(|fact| {
+        fact.vendor == vendor
+            && !fact.switching
+            && !fact.preparing
+            && fact.active.as_deref() != Some(label)
+            && fact.labels.iter().any(|known| known == label)
+    })
+}
+
 /// Start a switch the popover asked for. Only a vendor and label the host
 /// itself reported are accepted, and never while one is already running.
 fn request_account_switch(state: &mut TrayState, value: &Value) {
     let vendor = value.get("vendor").and_then(Value::as_str).unwrap_or("");
     let label = value.get("label").and_then(Value::as_str).unwrap_or("");
-    let allowed = facts_snapshot(&state.facts).accounts.iter().any(|fact| {
-        fact.vendor == vendor
-            && !fact.switching
-            && fact.active.as_deref() != Some(label)
-            && fact.labels.iter().any(|known| known == label)
-    });
-    if !allowed {
+    if !account_switch_allowed(&facts_snapshot(&state.facts).accounts, vendor, label) {
         return;
     }
     with_facts(&state.facts, |f| {
@@ -902,6 +938,87 @@ fn request_account_switch(state: &mut TrayState, value: &Value) {
     }
 }
 
+/// A prepare is Desktop-only, needs an explicit trusted CLI, a known inactive
+/// account and a known active one, and never runs next to a switch.
+fn account_prepare_allowed(accounts: &[AccountSwitchFact], vendor: &str, label: &str) -> bool {
+    vendor == DESKTOP_VENDOR
+        && !accounts.iter().any(|fact| fact.switching || fact.preparing)
+        && accounts.iter().any(|fact| {
+            fact.vendor == vendor
+                && fact.prepare_enabled
+                && fact.active.is_some()
+                && fact.active.as_deref() != Some(label)
+                && fact.labels.iter().any(|known| known == label)
+        })
+}
+
+fn request_account_prepare(state: &mut TrayState, value: &Value) {
+    let vendor = value.get("vendor").and_then(Value::as_str).unwrap_or("");
+    let label = value.get("label").and_then(Value::as_str).unwrap_or("");
+    if !account_prepare_allowed(&facts_snapshot(&state.facts).accounts, vendor, label) {
+        return;
+    }
+    with_facts(&state.facts, |f| {
+        if let Some(fact) = f
+            .accounts
+            .iter_mut()
+            .find(|fact| fact.vendor == DESKTOP_VENDOR)
+        {
+            fact.prepare_target = label.into();
+            fact.preparing = true;
+            fact.prepare_error.clear();
+            fact.prepared_reset.clear();
+        }
+    });
+    apply_facts(state);
+    let facts = state.facts.clone();
+    let proxy = state.proxy.clone();
+    let worker = state.worker.clone();
+    let label = label.to_string();
+    let spawned = std::thread::Builder::new()
+        .name("ai-usagebar-desktop-prepare".into())
+        .spawn(move || {
+            let result = (|| -> crate::Result<crate::claude_desktop::prepare::Preparation> {
+                let config = Config::load()?;
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|_| {
+                        crate::AppError::Other("Could not start preparation worker.".into())
+                    })?
+                    .block_on(crate::claude_desktop::prepare::run(&config, &label))
+            })();
+            with_facts(&facts, |f| {
+                if let Some(fact) = f
+                    .accounts
+                    .iter_mut()
+                    .find(|fact| fact.vendor == DESKTOP_VENDOR)
+                {
+                    fact.preparing = false;
+                    match result {
+                        Ok(done) => fact.prepared_reset = done.reset_at.to_rfc3339(),
+                        Err(error) => fact.prepare_error = error.to_string(),
+                    }
+                }
+            });
+            let _ = proxy.send_event(UserEvent::Facts);
+            let _ = worker.send(WorkerCmd::Refresh);
+        });
+    if spawned.is_err() {
+        with_facts(&state.facts, |f| {
+            if let Some(fact) = f
+                .accounts
+                .iter_mut()
+                .find(|fact| fact.vendor == DESKTOP_VENDOR)
+            {
+                fact.preparing = false;
+                fact.prepare_error = "Could not start preparation worker.".into();
+            }
+        });
+        apply_facts(state);
+    }
+}
+
 fn handle_ipc(state: &mut TrayState, body: &str, control_flow: &mut ControlFlow) {
     let Ok(value) = serde_json::from_str::<Value>(body) else {
         return;
@@ -927,6 +1044,7 @@ fn handle_ipc(state: &mut TrayState, body: &str, control_flow: &mut ControlFlow)
         "toggle-startup" => toggle_startup(state),
         "menu-labels" => state.menu_labels = state.menu_labels.merged(&value),
         "switch-account" => request_account_switch(state, &value),
+        "prepare-account" => request_account_prepare(state, &value),
         "resize" => handle_resize(state, &value),
         "set-shortcut" => {
             let text = value.get("value").and_then(Value::as_str).unwrap_or("");
@@ -1717,16 +1835,22 @@ fn draw_template_bars(dst: NSRect, fractions: &[f64]) {
                 1.0,
             );
         }
-        if fill.fill_w > 0.0
-            && fill.remainder_w > 0.0
+        if fill.remainder_w > 0.0
             && let Some(divider_x) = fill.divider_x
         {
+            // A remainder starting at 0 is the whole track of an empty gauge:
+            // round both ends like the track, not like a tail meeting a fill.
+            let r_left = if divider_x <= 0.0 {
+                layout.rx
+            } else {
+                (layout.rx * 0.2).floor().max(0.0)
+            };
             fill_round_rect(
                 ox + layout.track_x + divider_x,
                 y,
                 fill.remainder_w,
                 layout.track_h,
-                layout.rx,
+                r_left,
                 0.24,
             );
         }
@@ -1815,5 +1939,67 @@ impl SingleInstance {
         file.try_lock_exclusive().ok()?;
         let _ = writeln!(&file, "{}", std::process::id());
         Some(Self { _lock: file })
+    }
+}
+
+#[cfg(test)]
+mod account_switch_tests {
+    use super::*;
+
+    #[test]
+    fn prepares_only_explicit_inactive_desktop_profiles_and_blocks_concurrent_switches() {
+        let mut accounts = vec![AccountSwitchFact {
+            vendor: DESKTOP_VENDOR.into(),
+            active: Some("one".into()),
+            labels: vec!["one".into(), "two".into()],
+            prepare_enabled: true,
+            ..AccountSwitchFact::default()
+        }];
+        assert!(account_prepare_allowed(&accounts, DESKTOP_VENDOR, "two"));
+        assert!(!account_prepare_allowed(&accounts, DESKTOP_VENDOR, "one"));
+        assert!(!account_prepare_allowed(
+            &accounts,
+            DESKTOP_VENDOR,
+            "unknown"
+        ));
+        assert!(!account_prepare_allowed(&accounts, "anthropic", "two"));
+        accounts[0].preparing = true;
+        assert!(!account_prepare_allowed(&accounts, DESKTOP_VENDOR, "two"));
+        assert!(!account_switch_allowed(&accounts, DESKTOP_VENDOR, "two"));
+        accounts[0].preparing = false;
+        accounts[0].switching = true;
+        assert!(!account_prepare_allowed(&accounts, DESKTOP_VENDOR, "two"));
+        accounts[0].switching = false;
+        accounts[0].prepare_enabled = false;
+        assert!(!account_prepare_allowed(&accounts, DESKTOP_VENDOR, "two"));
+        accounts[0].prepare_enabled = true;
+        accounts[0].active = None;
+        assert!(!account_prepare_allowed(&accounts, DESKTOP_VENDOR, "two"));
+    }
+
+    #[test]
+    fn requires_known_inactive_account_and_serializes_switches() {
+        let mut accounts = vec![
+            AccountSwitchFact {
+                vendor: DESKTOP_VENDOR.into(),
+                active: Some("one".into()),
+                labels: vec!["one".into(), "two".into()],
+                ..AccountSwitchFact::default()
+            },
+            AccountSwitchFact {
+                vendor: "anthropic".into(),
+                ..AccountSwitchFact::default()
+            },
+        ];
+        assert!(account_switch_allowed(&accounts, DESKTOP_VENDOR, "two"));
+        assert!(!account_switch_allowed(&accounts, DESKTOP_VENDOR, "one"));
+        assert!(!account_switch_allowed(
+            &accounts,
+            DESKTOP_VENDOR,
+            "unknown"
+        ));
+        assert!(!account_switch_allowed(&accounts, "anthropic", "two"));
+        accounts[0].switching = true;
+        assert!(!account_switch_allowed(&accounts, DESKTOP_VENDOR, "two"));
     }
 }

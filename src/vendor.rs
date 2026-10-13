@@ -48,6 +48,7 @@ pub(crate) const VENDOR_SECRET_ENV_VARS: &[&str] = &[
     "GITHUB_TOKEN",
     "OLLAMA_API_KEY",
     "SHVIA_API_KEY",
+    "CLINE_API_KEY",
 ];
 
 /// Env var names a `[[custom]]` provider reads its token from. They are not
@@ -189,6 +190,7 @@ pub enum VendorId {
     ModelStudio,
     Lyceum,
     Devin,
+    Cline,
 }
 
 /// How a provider authenticates. Drives what a frontend offers a provider that
@@ -247,6 +249,7 @@ impl VendorId {
             VendorId::ModelStudio => "modelstudio",
             VendorId::Lyceum => "lyceum",
             VendorId::Devin => "devin",
+            VendorId::Cline => "cline",
         }
     }
 
@@ -261,6 +264,7 @@ impl VendorId {
             VendorId::Copilot => "GitHub Copilot",
             VendorId::Zai => "Z.AI",
             VendorId::Openrouter => "OpenRouter",
+            VendorId::Cline => "Cline",
             VendorId::Deepseek => "DeepSeek",
             VendorId::Deepinfra => "DeepInfra",
             VendorId::Kimi => "Kimi",
@@ -322,6 +326,7 @@ impl VendorId {
             VendorId::ModelStudio => VendorId::ModelStudio.short_name(),
             VendorId::Lyceum => VendorId::Lyceum.short_name(),
             VendorId::Devin => VendorId::Devin.short_name(),
+            VendorId::Cline => "Cline",
         }
     }
 
@@ -359,6 +364,7 @@ impl VendorId {
             VendorId::ModelStudio => "mst",
             VendorId::Lyceum => "lyc",
             VendorId::Devin => "dvn",
+            VendorId::Cline => "cln",
         }
     }
 
@@ -394,6 +400,7 @@ impl VendorId {
             VendorId::OpenCodeGo => "opencode-go",
             VendorId::CommandCode => "commandcode",
             VendorId::Shvia => "shvia",
+            VendorId::Cline => "cline",
             VendorId::Ollama => "ollama",
             VendorId::OrcaRouter => "orcarouter",
             VendorId::ModelStudio => "modelstudio",
@@ -413,6 +420,7 @@ impl VendorId {
             | VendorId::Openai
             | VendorId::Copilot
             | VendorId::NousResearch
+            | VendorId::Cline
             | VendorId::CommandCode => AuthKind::Oauth,
             VendorId::AnthropicApi
             | VendorId::Zai
@@ -475,6 +483,7 @@ impl VendorId {
             // `api_key_env` field in its config section.
             VendorId::Copilot => "GITHUB_COPILOT_TOKEN",
             VendorId::CommandCode => "COMMANDCODE_API_KEY",
+            VendorId::Cline => "CLINE_API_KEY",
             VendorId::Anthropic
             | VendorId::Openai
             | VendorId::Supergrok
@@ -508,6 +517,7 @@ impl VendorId {
             VendorId::Kiro => "Run `kiro-cli login` in a terminal, then Refresh.",
             VendorId::Kimi => "Run `kimi` in a terminal, or set an API key.",
             VendorId::CommandCode => "Run `commandcode` in a terminal, then Refresh.",
+            VendorId::Cline => "Run `cline` in a terminal, then Refresh.",
             VendorId::NousResearch => {
                 "Run `ai-usagebar auth nous login` in a terminal, then Refresh."
             }
@@ -547,6 +557,7 @@ impl VendorId {
             VendorId::Openai => "codex login",
             VendorId::Copilot => "gh auth login",
             VendorId::CommandCode => "commandcode",
+            VendorId::Cline => "cline",
             VendorId::NousResearch => "ai-usagebar auth nous login",
             VendorId::Kiro => "kiro-cli login",
             // The `bl` CLI's console login is the whole credential.
@@ -614,6 +625,7 @@ impl VendorId {
             VendorId::ModelStudio,
             VendorId::Lyceum,
             VendorId::Devin,
+            VendorId::Cline,
         ]
     }
 

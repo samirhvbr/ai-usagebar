@@ -9,7 +9,10 @@
 There is no Mint frontend on upstream `main` to capture as "before".
 
 This frontend uses the official `ai-usagebar usage --json` report. It does not
-implement provider authentication, quota retrieval or caching. On Cinnamon/X11,
+implement provider authentication, quota retrieval or caching. When the report
+includes `overview_vendors`, cards follow that list — first occurrence of
+each slug — and leave other providers after it. An empty list keeps the
+report order. Without the field, the configured primary stays first. On Cinnamon/X11,
 the GTK status icon opens the dashboard with a left click and the options menu
 with a right click. The dashboard hides when it loses focus and stays out of
 the taskbar. It uses Mint's XApp StatusIcon so the icon appears in the

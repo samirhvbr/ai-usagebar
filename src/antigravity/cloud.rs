@@ -46,6 +46,21 @@ const REFRESH_FAILED: &str = "Antigravity token refresh failed";
 const SESSION_EXPIRED: &str =
     "Antigravity's saved Google session expired; open Antigravity to sign in again";
 
+/// The fixed body [`fetch_quota`] reports for a 403 whose payload carries
+/// `SUBSCRIPTION_REQUIRED` (#256). Shared with `fetch.rs`, which must
+/// recognise exactly this verdict and pass it through.
+const NO_PLAN_QUOTA: &str = "this account's plan has no Antigravity quota — the Cloud Code \
+                             API requires a paid subscription, so there is nothing to \
+                             report (disable [antigravity] if this is expected)";
+
+/// Exactly the plan-verdict 403 [`fetch_quota`] constructs — status *and* the
+/// fixed body, never the upstream's text — so the remote path can pass it
+/// through without a refresh, a retry, or an `agy` run. Any other 403 is a
+/// rejected token and keeps the refresh-and-retry treatment.
+pub(crate) fn is_no_plan_quota(e: &AppError) -> bool {
+    matches!(e, AppError::Http { status: 403, body } if body == NO_PLAN_QUOTA)
+}
+
 /// Where the fallback talks to. Quota and plan each try every base in order
 /// (the daily channel first, as the product does); tests point them at mockito.
 #[derive(Debug, Clone)]
@@ -168,10 +183,7 @@ pub async fn fetch_quota(
                 {
                     return Err(AppError::Http {
                         status: 403,
-                        body: "this account's plan has no Antigravity quota — the Cloud Code \
-                               API requires a paid subscription, so there is nothing to \
-                               report (disable [antigravity] if this is expected)"
-                            .into(),
+                        body: NO_PLAN_QUOTA.into(),
                     });
                 }
                 return Err(AppError::Http {

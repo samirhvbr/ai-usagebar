@@ -158,7 +158,21 @@ const AGENT_KEYCHAIN_ACCOUNT: &str = "cursor-user";
 /// one `cursor-agent` created.
 #[cfg(target_os = "macos")]
 pub fn read_agent_keychain_token() -> Option<String> {
-    let out = std::process::Command::new("/usr/bin/security")
+    let out = agent_keychain_command().output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let token = String::from_utf8(out.stdout).ok()?;
+    let token = token.trim();
+    (!token.is_empty()).then(|| token.to_string())
+}
+
+/// `security find-generic-password -s <service> -a <account> -w`, read-only;
+/// the secret arrives on stdout, never in argv.
+#[cfg(target_os = "macos")]
+fn agent_keychain_command() -> std::process::Command {
+    let mut command = std::process::Command::new("/usr/bin/security");
+    command
         .args([
             "find-generic-password",
             "-s",
@@ -168,15 +182,12 @@ pub fn read_agent_keychain_token() -> Option<String> {
             "-w",
         ])
         .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
+        .stderr(std::process::Stdio::null());
+    // A credential lookup must not inherit this process's provider keys.
+    for var in crate::vendor::vendor_secret_env_vars_to_remove(&[]) {
+        command.env_remove(var);
     }
-    let token = String::from_utf8(out.stdout).ok()?;
-    let token = token.trim();
-    (!token.is_empty()).then(|| token.to_string())
+    command
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -601,5 +612,25 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, AppError::Credentials(_)));
+    }
+
+    /// The Keychain lookup must not inherit this process's provider keys, the
+    /// rule every credential lookup in this crate follows.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn agent_keychain_lookup_scrubs_vendor_secret_env_vars() {
+        let command = agent_keychain_command();
+        assert_eq!(command.get_program(), "/usr/bin/security");
+        let removed: Vec<String> = command
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(key, _)| key.to_string_lossy().into_owned())
+            .collect();
+        for var in crate::vendor::vendor_secret_env_vars_to_remove(&[]) {
+            assert!(
+                removed.iter().any(|key| key == var),
+                "expected {var} to be scrubbed from the cursor-agent keychain lookup"
+            );
+        }
     }
 }

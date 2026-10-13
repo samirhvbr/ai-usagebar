@@ -124,6 +124,14 @@ class TrayRuntimeTest(unittest.TestCase):
             tray.AIUsageTrayApp.show_window(app)
         self.assertEqual(window.presented, [12345])
 
+    def test_wayland_window_ignores_x11_server_time(self):
+        window = FakeWindow()
+        app = type("App", (), {"window": window})()
+        with patch.object(tray, "GdkX11") as x11:
+            x11.x11_get_server_time.side_effect = TypeError("not an X11 window")
+            tray.AIUsageTrayApp.show_window(app)
+        self.assertEqual(window.presented, [tray.Gdk.CURRENT_TIME])
+
 
 if __name__ == "__main__":
     unittest.main()

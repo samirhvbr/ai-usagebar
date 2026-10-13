@@ -21,6 +21,14 @@
 //! its undiscoverable CSRF token is required. Every other local rejection — a
 //! server that is signed out or answering on the wrong protocol — keeps its
 //! own diagnosis.
+//!
+//! That ranking has one sharp edge (#405): a signed-out product's 401/403 is
+//! actionable, so it outranks the `agy` answer that would unlock the fallback
+//! — the running product masks a working saved session. When that product is
+//! the IDE and the user signs it in separately, `[antigravity]
+//! ide_language_server = false` removes the IDE's language server from
+//! discovery, leaving `agy` (and the fallback) to answer as if the IDE were
+//! closed.
 
 use std::time::Duration;
 
@@ -87,7 +95,6 @@ pub enum SavedCredential<'a> {
 /// [`RemoteOverride::default`], which reads the OS keyring, talks to Google,
 /// and probes the local ports discovery finds; a test supplies each of those
 /// instead so it never touches the real keyring, the network, or `/proc`.
-#[derive(Default)]
 pub struct RemoteOverride<'a> {
     /// Where the saved Google session comes from.
     pub credential: SavedCredential<'a>,
@@ -102,6 +109,22 @@ pub struct RemoteOverride<'a> {
     /// default, so only [`fetch_snapshot`] — which asks for discovery — ever
     /// runs the real one.
     pub agy: super::agy::AgyCommand,
+    /// Probe the Antigravity IDE's language server as a candidate. Production
+    /// passes `[antigravity] ide_language_server`; the default keeps it,
+    /// preserving discovery as it has always been.
+    pub ide_language_server: bool,
+}
+
+impl Default for RemoteOverride<'_> {
+    fn default() -> Self {
+        Self {
+            credential: SavedCredential::default(),
+            endpoints: None,
+            local_bases: None,
+            agy: super::agy::AgyCommand::default(),
+            ide_language_server: true,
+        }
+    }
 }
 
 /// One probe target: the listener's base URL and, when it came from
@@ -115,19 +138,33 @@ pub struct Candidate {
     /// Owning pid when the listener was discovered; `None` for a bare test
     /// seam or an override whose port discovery did not see.
     pub pid: Option<u32>,
+    /// The Antigravity IDE's language server, which [`open_session`] never
+    /// probes. A signed-out IDE answers an actionable 401/403 that outranks a
+    /// working `agy` session (#405), so a user who signs the IDE in
+    /// separately skips it. Discovery sets this only when `[antigravity]
+    /// ide_language_server` is false; an explicit `ANTIGRAVITY_LS_ADDRESS`
+    /// stays a candidate regardless.
+    pub ide: bool,
 }
 
 impl From<String> for Candidate {
     fn from(base: String) -> Self {
-        Self { base, pid: None }
+        Self {
+            base,
+            pid: None,
+            ide: false,
+        }
     }
 }
 
+/// `[antigravity] ide_language_server`: probe the IDE's language server as a
+/// candidate (`true`, the default) or leave it out of discovery entirely.
 pub async fn fetch_snapshot(
     client: &reqwest::Client,
     cache: &Cache,
     cache_ttl: Duration,
     oauth: Option<&cloud::OauthClient>,
+    ide_language_server: bool,
 ) -> Result<FetchOutcome> {
     fetch_snapshot_at(
         client,
@@ -136,6 +173,7 @@ pub async fn fetch_snapshot(
         oauth,
         RemoteOverride {
             agy: super::agy::AgyCommand::Discover,
+            ide_language_server,
             ..Default::default()
         },
         Utc::now(),
@@ -166,7 +204,13 @@ pub async fn fetch_snapshot_at(
     // account just as cheaply: reading the keyring is local, and only the
     // quota call itself goes to the network — after the fresh-cache check,
     // like the local RPC.
-    let origin = match open_session(client, remote.local_bases.as_deref()).await {
+    let origin = match open_session(
+        client,
+        remote.local_bases.as_deref(),
+        remote.ide_language_server,
+    )
+    .await
+    {
         Ok(session) => Origin::Local(Ok(session)),
         Err(error) => match remote_fallback_reason(&error) {
             Some(reason) => Origin::Remote(saved_session(remote.credential, reason)),
@@ -281,8 +325,21 @@ fn remote_fallback_reason(error: &AppError) -> Option<RemoteFallbackReason> {
 /// session each run their own — and only some of them are signed in.
 ///
 /// `bases` replaces discovery when given; see [`RemoteOverride::local_bases`].
-async fn open_session(client: &reqwest::Client, bases: Option<&[Candidate]>) -> Result<Session> {
-    let candidates = bases.map_or_else(candidate_bases, <[Candidate]>::to_vec);
+/// Candidates marked as the IDE's language server are excluded before
+/// anything is probed, so an IDE-only machine with `[antigravity]
+/// ide_language_server = false` falls through to the saved session exactly as
+/// if the IDE were closed — its signed-out 401/403 must not mask a working
+/// `agy` session (#405).
+async fn open_session(
+    client: &reqwest::Client,
+    bases: Option<&[Candidate]>,
+    ide_language_server: bool,
+) -> Result<Session> {
+    let candidates = bases.map_or_else(
+        || candidate_bases(ide_language_server),
+        <[Candidate]>::to_vec,
+    );
+    let candidates: Vec<Candidate> = candidates.into_iter().filter(|c| !c.ide).collect();
     if candidates.is_empty() {
         return Err(no_local_server());
     }
@@ -593,8 +650,10 @@ impl Renewal<'_> {
 ///
 /// A rejected token gets one refresh and one retry, unless it was refreshed a
 /// moment ago — then the rejection is Google's verdict on the session, and
-/// the user has to sign in again. The plan name is best-effort: the summary is
-/// the figure, and a missing name must not cost it.
+/// the user has to sign in again. A plan-verdict 403 (`SUBSCRIPTION_REQUIRED`,
+/// #405) is not a rejection: it is passed through untouched, without spending
+/// a refresh or an `agy` run on a session that is fine. The plan name is
+/// best-effort: the summary is the figure, and a missing name must not cost it.
 async fn fetch_remote(
     client: &reqwest::Client,
     cache: &Cache,
@@ -622,6 +681,9 @@ async fn fetch_remote(
         };
 
     let quota = match cloud::fetch_quota(client, endpoints, &access.value).await {
+        // The plan is the problem, not the session: refreshing or running
+        // `agy` would only repeat the same verdict.
+        Err(e) if cloud::is_no_plan_quota(&e) => return Err(e),
         Err(e) if is_auth_rejection(&e) && !access.just_refreshed => {
             access = if oauth.is_none() {
                 let Some(renewed) = renewal.renewed(cache, now).await else {
@@ -635,7 +697,9 @@ async fn fetch_remote(
             cloud::fetch_quota(client, endpoints, &access.value)
                 .await
                 .map_err(|e| {
-                    if is_auth_rejection(&e) {
+                    if cloud::is_no_plan_quota(&e) {
+                        e
+                    } else if is_auth_rejection(&e) {
                         session_expired()
                     } else {
                         e
@@ -906,28 +970,45 @@ fn parse_reset(value: &serde_json::Value, field: &str) -> Result<Option<DateTime
 // Language server discovery
 // ---------------------------------------------------------------------------
 
-/// Base URLs worth probing, most specific first.
-fn candidate_bases() -> Vec<Candidate> {
+/// Base URLs worth probing, most specific first. With `ide_language_server`
+/// false, listeners owned by the Antigravity IDE's language server are marked
+/// so [`open_session`] skips them (#405).
+fn candidate_bases(ide_language_server: bool) -> Vec<Candidate> {
+    let discovered = discover_ls_ports();
+    // Identifying the IDE's listeners costs an extra lookup per pid, so it
+    // runs only when they are actually unwanted.
+    let ide_pids = if ide_language_server {
+        std::collections::HashSet::new()
+    } else {
+        ide_ls_pids(discovered.iter().map(|&(pid, _)| pid).collect())
+    };
     candidate_bases_with(
         std::env::var("ANTIGRAVITY_LS_ADDRESS").ok().as_deref(),
-        discover_ls_ports(),
+        discovered,
+        &ide_pids,
     )
 }
 
-/// Test seam for [`candidate_bases`] — takes the address override and the
-/// discovered `(pid, port)` pairs instead of reading the environment and
-/// `/proc`.
+/// Test seam for [`candidate_bases`] — takes the address override, the
+/// discovered `(pid, port)` pairs, and the pids discovery identified as the
+/// IDE's language server instead of reading the environment and `/proc`.
 fn candidate_bases_with(
     override_addr: Option<&str>,
     discovered: Vec<(u32, u16)>,
+    ide_pids: &std::collections::HashSet<u32>,
 ) -> Vec<Candidate> {
     let mut candidates = Vec::new();
     if let Some(base) = override_addr.and_then(normalize_base) {
         // An override that names a port discovery also saw belongs to that
         // process: its missing-CSRF answer must spare the process's sibling
-        // listeners too.
+        // listeners too. It is never marked as the IDE's — an explicit
+        // address is the user's target and stays a candidate regardless.
         let pid = base_port(&base).and_then(|port| unique_owner(&discovered, port));
-        candidates.push(Candidate { base, pid });
+        candidates.push(Candidate {
+            base,
+            pid,
+            ide: false,
+        });
     }
 
     // No hardcoded fallback port on purpose: the server always binds with
@@ -941,11 +1022,85 @@ fn candidate_bases_with(
             candidates.push(Candidate {
                 base,
                 pid: Some(pid),
+                ide: ide_pids.contains(&pid),
             });
         }
     }
 
     candidates
+}
+
+/// Does this executable belong to the Antigravity IDE rather than the
+/// Antigravity 2.0 desktop app or the `agy` CLI? The IDE's install tree is
+/// the only one that names itself: `antigravity-ide` (Linux packages) or
+/// `Antigravity IDE` (macOS and Windows).
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
+fn is_ide_install(exe: &str) -> bool {
+    let exe = exe.to_lowercase().replace('\\', "/");
+    exe.contains("antigravity-ide") || exe.contains("antigravity ide")
+}
+
+/// The pids, among `pids`, that run the IDE's language server.
+#[cfg(target_os = "linux")]
+fn ide_ls_pids(pids: std::collections::HashSet<u32>) -> std::collections::HashSet<u32> {
+    pids.into_iter()
+        .filter(|pid| {
+            std::fs::read_link(format!("/proc/{pid}/exe"))
+                .map(|path| path.to_string_lossy().into_owned())
+                .is_ok_and(|exe| is_ide_install(&exe))
+        })
+        .collect()
+}
+
+/// `lsof` reports only command names, so the IDE is identified by asking `ps`
+/// for the owning executables — on macOS `comm` is the full path.
+#[cfg(target_os = "macos")]
+fn ide_ls_pids(pids: std::collections::HashSet<u32>) -> std::collections::HashSet<u32> {
+    if pids.is_empty() {
+        return std::collections::HashSet::new();
+    }
+    let list = pids
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let Ok(output) = std::process::Command::new("ps")
+        .args(["-o", "pid=,comm=", "-p", &list])
+        .output()
+    else {
+        return std::collections::HashSet::new();
+    };
+    parse_ps_comm(&String::from_utf8_lossy(&output.stdout))
+        .into_iter()
+        .filter(|(pid, exe)| pids.contains(pid) && is_ide_install(exe))
+        .map(|(pid, _)| pid)
+        .collect()
+}
+
+/// `ps -o pid=,comm=` rows, `<pid> <executable path>`; the path can hold
+/// spaces (`Antigravity IDE.app`), so only the pid is split off.
+#[cfg(any(test, target_os = "macos"))]
+fn parse_ps_comm(output: &str) -> Vec<(u32, String)> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let (pid, exe) = line.trim().split_once(char::is_whitespace)?;
+            Some((pid.parse().ok()?, exe.trim().to_string()))
+        })
+        .collect()
+}
+
+/// ToolHelp reports only the executable's file name, never its install path,
+/// so the IDE's language server cannot be told apart from the 2.0 app's here:
+/// `ide_language_server = false` currently has no effect on Windows.
+#[cfg(target_os = "windows")]
+fn ide_ls_pids(_: std::collections::HashSet<u32>) -> std::collections::HashSet<u32> {
+    std::collections::HashSet::new()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+fn ide_ls_pids(_: std::collections::HashSet<u32>) -> std::collections::HashSet<u32> {
+    std::collections::HashSet::new()
 }
 
 /// The port an already-normalized base targets, when it names one.
@@ -2123,9 +2278,10 @@ mod tests {
         let candidate = |base: &str, pid| Candidate {
             base: base.to_string(),
             pid,
+            ide: false,
         };
         assert_eq!(
-            candidate_bases_with(Some("127.0.0.1:1234"), vec![(10, 5678)]),
+            candidate_bases_with(Some("127.0.0.1:1234"), vec![(10, 5678)], &no_ide()),
             vec![
                 candidate("http://127.0.0.1:1234", None),
                 candidate("http://127.0.0.1:5678", Some(10)),
@@ -2133,7 +2289,7 @@ mod tests {
         );
         // Trailing slashes are trimmed.
         assert_eq!(
-            candidate_bases_with(Some("127.0.0.1:1234/"), vec![(10, 5678)]),
+            candidate_bases_with(Some("127.0.0.1:1234/"), vec![(10, 5678)], &no_ide()),
             vec![
                 candidate("http://127.0.0.1:1234", None),
                 candidate("http://127.0.0.1:5678", Some(10)),
@@ -2142,19 +2298,25 @@ mod tests {
         // Duplicate base URL is omitted — and the override inherits the pid of
         // the process discovery saw on that port.
         assert_eq!(
-            candidate_bases_with(Some("127.0.0.1:5678"), vec![(10, 5678)]),
+            candidate_bases_with(Some("127.0.0.1:5678"), vec![(10, 5678)], &no_ide()),
             vec![candidate("http://127.0.0.1:5678", Some(10))]
         );
         // Duplicate discovered ports are omitted.
         assert_eq!(
-            candidate_bases_with(None, vec![(10, 5678), (10, 5678)]),
+            candidate_bases_with(None, vec![(10, 5678), (10, 5678)], &no_ide()),
             vec![candidate("http://127.0.0.1:5678", Some(10))]
         );
         // An address that already carries a scheme is left alone.
         assert_eq!(
-            candidate_bases_with(Some("https://host:9"), vec![]),
+            candidate_bases_with(Some("https://host:9"), vec![], &no_ide()),
             vec![candidate("https://host:9", None)]
         );
+    }
+
+    /// No IDE-owned pids — what discovery hands over whenever
+    /// `ide_language_server` is left at its default.
+    fn no_ide() -> std::collections::HashSet<u32> {
+        std::collections::HashSet::new()
     }
 
     fn http(status: u16) -> AppError {
@@ -2368,15 +2530,17 @@ mod tests {
     #[test]
     fn every_discovered_port_is_probed_in_order() {
         assert_eq!(
-            candidate_bases_with(None, vec![(10, 33875), (10, 37435)]),
+            candidate_bases_with(None, vec![(10, 33875), (10, 37435)], &no_ide()),
             vec![
                 Candidate {
                     base: "http://127.0.0.1:33875".to_string(),
                     pid: Some(10),
+                    ide: false,
                 },
                 Candidate {
                     base: "http://127.0.0.1:37435".to_string(),
                     pid: Some(10),
+                    ide: false,
                 },
             ]
         );
@@ -2388,8 +2552,8 @@ mod tests {
     /// Antigravity or set ANTIGRAVITY_LS_ADDRESS" error instead.
     #[test]
     fn empty_discovery_yields_no_candidates() {
-        assert!(candidate_bases_with(None, vec![]).is_empty());
-        assert!(candidate_bases_with(Some(""), vec![]).is_empty());
+        assert!(candidate_bases_with(None, vec![], &no_ide()).is_empty());
+        assert!(candidate_bases_with(Some(""), vec![], &no_ide()).is_empty());
     }
 
     #[test]
@@ -2596,15 +2760,16 @@ mod tests {
     fn an_override_with_no_authority_is_dropped_not_probed() {
         for junk in ["/", "///", "http://", "https://", "  /  "] {
             assert_eq!(
-                candidate_bases_with(Some(junk), vec![(10, 4242)]),
+                candidate_bases_with(Some(junk), vec![(10, 4242)], &no_ide()),
                 vec![Candidate {
                     base: "http://127.0.0.1:4242".to_string(),
                     pid: Some(10),
+                    ide: false,
                 }],
                 "{junk:?} should not survive as a candidate"
             );
         }
-        assert!(candidate_bases_with(Some("/"), vec![]).is_empty());
+        assert!(candidate_bases_with(Some("/"), vec![], &no_ide()).is_empty());
     }
 
     #[test]
@@ -2764,11 +2929,78 @@ mod tests {
     #[test]
     fn blank_override_falls_through_to_discovery() {
         assert_eq!(
-            candidate_bases_with(Some("   "), vec![(10, 4242)]),
+            candidate_bases_with(Some("   "), vec![(10, 4242)], &no_ide()),
             vec![Candidate {
                 base: "http://127.0.0.1:4242".to_string(),
                 pid: Some(10),
+                ide: false,
             }]
+        );
+    }
+
+    /// The IDE's install tree is the only one that names itself; the 2.0
+    /// desktop app and the `agy` CLI must never be mistaken for it.
+    #[test]
+    fn only_the_ide_install_is_recognised() {
+        assert!(is_ide_install(
+            "/opt/antigravity-ide/resources/app/extensions/antigravity/bin/language_server_linux_x64"
+        ));
+        assert!(is_ide_install(
+            "/Applications/Antigravity IDE.app/Contents/Resources/app/extensions/antigravity/bin/language_server_darwin_arm64"
+        ));
+        assert!(is_ide_install(
+            r"C:\Users\u\AppData\Local\Programs\Antigravity IDE\language_server_windows_x64.exe"
+        ));
+        assert!(!is_ide_install(
+            "/opt/antigravity/resources/bin/language_server"
+        ));
+        assert!(!is_ide_install("/home/u/.local/bin/agy"));
+        assert!(!is_ide_install("/usr/bin/node"));
+    }
+
+    /// `ps -o pid=,comm=` output keeps paths with spaces in one piece.
+    #[test]
+    fn ps_output_pairs_pids_with_full_paths() {
+        let output = "  101 /opt/antigravity-ide/bin/language_server_linux_x64\n\
+                      202 /Applications/Antigravity IDE.app/Contents/MacOS/Antigravity IDE\n";
+        assert_eq!(
+            parse_ps_comm(output),
+            vec![
+                (
+                    101,
+                    "/opt/antigravity-ide/bin/language_server_linux_x64".to_string()
+                ),
+                (
+                    202,
+                    "/Applications/Antigravity IDE.app/Contents/MacOS/Antigravity IDE".to_string()
+                ),
+            ]
+        );
+        assert!(parse_ps_comm("").is_empty());
+        assert!(parse_ps_comm("not-a-pid /tmp/x").is_empty());
+    }
+
+    /// #405, the enumeration seam: discovery marks the IDE's listeners so
+    /// `open_session` skips them; an explicit override that names the IDE's
+    /// port is the user's own target and is probed regardless.
+    #[test]
+    fn ide_owned_listeners_are_marked_but_an_explicit_override_is_not() {
+        let ide: std::collections::HashSet<u32> = [10].into_iter().collect();
+
+        let candidates = candidate_bases_with(None, vec![(10, 40001), (20, 50001)], &ide);
+        assert_eq!(candidates.len(), 2);
+        assert!(candidates[0].ide, "pid 10 is the IDE's language server");
+        assert!(!candidates[1].ide);
+
+        let candidates = candidate_bases_with(Some("127.0.0.1:40001"), vec![(10, 40001)], &ide);
+        assert_eq!(
+            candidates,
+            vec![Candidate {
+                base: "http://127.0.0.1:40001".to_string(),
+                pid: Some(10),
+                ide: false,
+            }],
+            "ANTIGRAVITY_LS_ADDRESS is an explicit target, never skipped"
         );
     }
 
@@ -3115,10 +3347,12 @@ mod tests {
                     Candidate {
                         base: server1.url(),
                         pid: Some(42),
+                        ide: false,
                     },
                     Candidate {
                         base: server2.url(),
                         pid: Some(42),
+                        ide: false,
                     },
                 ]),
                 ..Default::default()
@@ -3194,10 +3428,12 @@ mod tests {
                     Candidate {
                         base: agy.url(),
                         pid: Some(42),
+                        ide: false,
                     },
                     Candidate {
                         base: ide.url(),
                         pid: Some(7),
+                        ide: false,
                     },
                 ]),
                 ..Default::default()
@@ -3328,6 +3564,104 @@ mod tests {
         assert!(err.to_string().contains("sign in again"), "{err}");
     }
 
+    /// #405: a plan without Antigravity quota is Google's verdict on the plan,
+    /// not on the session. The friendly message must reach the user as-is —
+    /// no refresh round-trip, no `agy` run, no "sign in again" detour.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_subscription_403_surfaces_the_plan_message_without_a_refresh_or_agy_run() {
+        let mut server = mockito::Server::new_async().await;
+        let eps = endpoints(&server);
+        let quota = server
+            .mock("POST", "/daily/quota")
+            .match_header("authorization", "Bearer KEYRING-AT")
+            .with_status(403)
+            .with_body(
+                r#"{"error":{"code":403,"status":"PERMISSION_DENIED","details":
+                     [{"reason":"SUBSCRIPTION_REQUIRED","domain":"cloud.google.com"}]}}"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+        let prod = server
+            .mock("POST", "/prod/quota")
+            .expect(0)
+            .create_async()
+            .await;
+        let token = token_mock(&mut server).expect(0).create_async().await;
+        let (td, cache) = fixture();
+        let file = td.path().join("credential");
+        std::fs::write(&file, keyring_blob(VALID, true)).unwrap();
+        let runs = td.path().join("runs");
+        let agy = fake_agy(td.path(), &runs, &file, &keyring_blob(VALID, true));
+
+        let err = run_without_oauth(
+            &cache,
+            RemoteOverride {
+                credential: SavedCredential::File(&file),
+                endpoints: Some(&eps),
+                local_bases: Some(vec![]),
+                agy: super::super::agy::AgyCommand::At(agy),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("a plan without quota is an error, not a snapshot");
+
+        quota.assert_async().await;
+        prod.assert_async().await;
+        token.assert_async().await;
+        match err {
+            AppError::Http { status, body } => {
+                assert_eq!(status, 403);
+                assert!(body.contains("paid subscription"), "{body}");
+            }
+            other => panic!("expected Http, got {other:?}"),
+        }
+        assert!(
+            !runs.exists(),
+            "a subscription verdict must not spawn `agy`"
+        );
+    }
+
+    /// #405: the pass-through is exactly the subscription verdict — any other
+    /// 403 is still a rejected token: one refresh, one retry, then the session
+    /// verdict.
+    #[tokio::test]
+    async fn a_non_subscription_403_keeps_the_refresh_and_retry_behavior() {
+        let mut server = mockito::Server::new_async().await;
+        let eps = endpoints(&server);
+        let rejected = server
+            .mock("POST", "/daily/quota")
+            .match_header("authorization", "Bearer KEYRING-AT")
+            .with_status(403)
+            .with_body(r#"{"error":{"message":"acl detail"}}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let retried = server
+            .mock("POST", "/daily/quota")
+            .match_header("authorization", "Bearer NEW-AT")
+            .with_status(403)
+            .with_body(r#"{"error":{"message":"acl detail"}}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let token = token_mock(&mut server).expect(1).create_async().await;
+        let blob = keyring_blob(VALID, true);
+        let (_td, cache) = fixture();
+
+        let err = run(&cache, remote(&blob, &eps), Duration::ZERO)
+            .await
+            .expect_err("still a rejected session");
+
+        rejected.assert_async().await;
+        retried.assert_async().await;
+        token.assert_async().await;
+        assert!(matches!(err, AppError::Credentials(_)), "{err}");
+        assert!(err.to_string().contains("sign in again"), "{err}");
+    }
+
     /// `run` with no OAuth client configured, the case `agy` exists for.
     async fn run_without_oauth(cache: &Cache, remote: RemoteOverride<'_>) -> Result<FetchOutcome> {
         fetch_snapshot_at(
@@ -3393,6 +3727,7 @@ mod tests {
                 endpoints: Some(&eps),
                 local_bases: Some(vec![]),
                 agy: super::super::agy::AgyCommand::At(agy),
+                ..Default::default()
             },
         )
         .await
@@ -3420,6 +3755,7 @@ mod tests {
             endpoints: Some(&eps),
             local_bases: Some(vec![]),
             agy: super::super::agy::AgyCommand::At(agy.clone()),
+            ..Default::default()
         };
 
         for _ in 0..2 {
@@ -3530,6 +3866,142 @@ mod tests {
 
         quota.assert_async().await;
         assert!(matches!(err, AppError::Http { status: 401, .. }), "{err}");
+    }
+
+    /// #405: the reporter's exact setup. The IDE is open but its language
+    /// server is signed out (a 403 that would outrank `agy` and mask the
+    /// saved session); `ide_language_server = false` takes the IDE out of
+    /// discovery, so `agy`'s missing-CSRF answer unlocks the saved session —
+    /// which is what closing the IDE did by hand.
+    #[tokio::test]
+    async fn a_signed_out_ide_language_server_is_skipped_so_the_saved_session_answers() {
+        let mut ide = mockito::Server::new_async().await;
+        let mut agy = mockito::Server::new_async().await;
+        let eps = endpoints(&agy);
+        // The IDE must never be probed: its 403 is what masked `agy`.
+        let ide_root = ide.mock("GET", "/").expect(0).create_async().await;
+        let status_path = format!("/{STATUS_RPC}");
+        let ide_status = ide
+            .mock("POST", status_path.as_str())
+            .with_status(403)
+            .expect(0)
+            .create_async()
+            .await;
+        // `agy`: no CSRF page, then its precise missing-CSRF verdict.
+        let agy_root = agy
+            .mock("GET", "/")
+            .with_status(404)
+            .expect(1)
+            .create_async()
+            .await;
+        let agy_status = agy
+            .mock("POST", status_path.as_str())
+            .with_status(401)
+            .with_body(r#"{"code":"unauthenticated","message":"missing CSRF token"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let quota = quota_mock(&mut agy, "KEYRING-AT")
+            .expect(1)
+            .create_async()
+            .await;
+        let plan = agy
+            .mock("POST", "/daily/plan")
+            .match_header("authorization", "Bearer KEYRING-AT")
+            .with_status(200)
+            .with_body(r#"{"currentTier":{"name":"google_ai_pro"}}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let blob = keyring_blob(VALID, true);
+        let (_td, cache) = fixture();
+
+        let outcome = run(
+            &cache,
+            RemoteOverride {
+                credential: SavedCredential::Blob(&blob),
+                endpoints: Some(&eps),
+                local_bases: Some(vec![
+                    Candidate {
+                        base: ide.url(),
+                        pid: Some(7),
+                        ide: true,
+                    },
+                    Candidate {
+                        base: agy.url(),
+                        pid: Some(42),
+                        ide: false,
+                    },
+                ]),
+                ide_language_server: false,
+                ..Default::default()
+            },
+            Duration::ZERO,
+        )
+        .await
+        .expect("with the IDE skipped, agy's missing-CSRF answer unlocks the saved session");
+
+        ide_root.assert_async().await;
+        ide_status.assert_async().await;
+        agy_root.assert_async().await;
+        agy_status.assert_async().await;
+        quota.assert_async().await;
+        plan.assert_async().await;
+        assert_eq!(outcome.snapshot.source, AntigravitySource::Remote);
+        assert_eq!(outcome.snapshot.plan, "Pro");
+    }
+
+    /// With the IDE skipped and nothing else running, the machine behaves as
+    /// if the IDE were closed: "no local server" sends the fetch down the
+    /// saved-session path, never a generic "nothing answered".
+    #[tokio::test]
+    async fn skipping_the_only_ide_candidate_falls_through_to_the_saved_session() {
+        let mut ide = mockito::Server::new_async().await;
+        let eps = endpoints(&ide);
+        let ide_root = ide.mock("GET", "/").expect(0).create_async().await;
+        let status_path = format!("/{STATUS_RPC}");
+        let ide_status = ide
+            .mock("POST", status_path.as_str())
+            .expect(0)
+            .create_async()
+            .await;
+        let quota = quota_mock(&mut ide, "KEYRING-AT")
+            .expect(1)
+            .create_async()
+            .await;
+        let plan = ide
+            .mock("POST", "/daily/plan")
+            .with_status(200)
+            .with_body(r#"{"currentTier":{"name":"Pro"}}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let blob = keyring_blob(VALID, true);
+        let (_td, cache) = fixture();
+
+        let outcome = run(
+            &cache,
+            RemoteOverride {
+                credential: SavedCredential::Blob(&blob),
+                endpoints: Some(&eps),
+                local_bases: Some(vec![Candidate {
+                    base: ide.url(),
+                    pid: Some(7),
+                    ide: true,
+                }]),
+                ide_language_server: false,
+                ..Default::default()
+            },
+            Duration::ZERO,
+        )
+        .await
+        .expect("an IDE-only machine with the IDE skipped uses the saved session");
+
+        ide_root.assert_async().await;
+        ide_status.assert_async().await;
+        quota.assert_async().await;
+        plan.assert_async().await;
+        assert_eq!(outcome.snapshot.source, AntigravitySource::Remote);
     }
 
     /// The remote path falls back exactly like the local one: the last good

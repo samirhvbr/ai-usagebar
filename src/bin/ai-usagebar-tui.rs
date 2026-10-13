@@ -1217,7 +1217,6 @@ mod tests {
         use ratatui::backend::TestBackend;
 
         let moon = vendor_index(VendorId::Moonshot);
-        let novita = vendor_index(VendorId::Novita);
         let mut app = settings_focused_on_provider(moon);
         app.settings.as_mut().unwrap().focus = SFocus::Primary;
         let mut terminal = Terminal::new(TestBackend::new(160, 70)).unwrap();
@@ -1237,16 +1236,33 @@ mod tests {
         terminal.draw(|f| draw_view(f, &mut app)).unwrap();
 
         // A provider row click lands outside the popup: it only closes it.
-        let provider_row = app
-            .hit
-            .borrow()
+        // The popup is centred and grows with the vendor list, so which
+        // provider rows it covers depends on how many vendors the build has
+        // (a fork adding one shifts it over Novita). Take the first provider
+        // row clear of the popup's choice rows, with a margin for its border.
+        let hit = app.hit.borrow();
+        let pick_rows: Vec<u16> = hit
+            .settings_rows
+            .iter()
+            .filter_map(|(row, rect)| matches!(row, SettingsRow::Pick(_)).then_some(rect.y))
+            .collect();
+        let (top, bottom) = (
+            *pick_rows.iter().min().expect("picker records choice rows"),
+            *pick_rows.iter().max().unwrap(),
+        );
+        let provider_row = hit
             .settings_rows
             .iter()
             .find_map(|(row, rect)| match row {
-                SettingsRow::Focus(SFocus::Vendor(v)) if *v == novita => Some(*rect),
+                SettingsRow::Focus(SFocus::Vendor(_))
+                    if rect.y + 2 < top || rect.y > bottom + 2 =>
+                {
+                    Some(*rect)
+                }
                 _ => None,
             })
-            .unwrap();
+            .expect("a provider row outside the picker");
+        drop(hit);
         let _ = handle_mouse(&mut app, &click_at(provider_row.x + 4, provider_row.y));
         let state = app.settings.as_ref().unwrap();
         assert!(state.picker.is_none(), "outside click closes the picker");

@@ -156,8 +156,10 @@ impl TabId {
 
 /// Expand enabled vendors into the tab list. Claude, OpenRouter, and Codex
 /// (OpenAI) yield their default account followed by configured named accounts;
-/// every other vendor is a single tab. With no extra accounts the result equals
-/// `config.enabled_vendors()`, preserving the historical tab set and order.
+/// every other vendor is a single tab. With no extra accounts and
+/// `overview_vendors` unset, the result equals `config.enabled_vendors()` in
+/// canonical order. When the list is set, listed vendors lead and unlisted
+/// enabled vendors follow in that same canonical order.
 ///
 /// Config-only and pure — no Desktop profiles. Production uses
 /// [`tabs_with_desktop`]; this stays for the hermetic unit tests and any caller
@@ -171,6 +173,27 @@ pub fn tabs_from_config(config: &Config) -> Vec<TabId> {
 /// best-effort and macOS-only; anywhere else this equals [`tabs_from_config`].
 pub fn tabs_with_desktop(config: &Config) -> Vec<TabId> {
     build_tabs(config, &desktop_profile_labels(config))
+}
+
+/// Enabled vendors in `[ui] overview_vendors` order. Unlisted vendors keep
+/// the canonical order and follow the listed ones. Unset means canonical.
+fn vendors_for_tabs(config: &Config) -> Vec<VendorId> {
+    let enabled = config.enabled_vendors();
+    let Some(wanted) = config.ui.overview_vendors.as_ref() else {
+        return enabled;
+    };
+    let mut ordered = Vec::with_capacity(enabled.len());
+    for vendor in wanted {
+        if enabled.contains(vendor) && !ordered.contains(vendor) {
+            ordered.push(*vendor);
+        }
+    }
+    for vendor in enabled {
+        if !ordered.contains(&vendor) {
+            ordered.push(vendor);
+        }
+    }
+    ordered
 }
 
 /// Core expansion, parameterized on the Desktop account labels so it stays pure
@@ -188,7 +211,7 @@ pub fn tabs_with_desktop(config: &Config) -> Vec<TabId> {
 fn build_tabs(config: &Config, desktop_labels: &[String]) -> Vec<TabId> {
     let desktop_set: HashSet<&str> = desktop_labels.iter().map(String::as_str).collect();
     let mut tabs = Vec::new();
-    for vendor in config.enabled_vendors() {
+    for vendor in vendors_for_tabs(config) {
         if vendor == VendorId::Anthropic {
             let accounts: Vec<_> = config
                 .anthropic
@@ -522,20 +545,25 @@ impl App {
     /// Tabs the Overview should list: `overview_vendors` filtered against the
     /// live tab set (preserving the config order), or all tabs when unset.
     /// The filter names built-in vendors only, so a configured list excludes
-    /// every custom provider tab; the unset default includes them.
+    /// every custom provider tab; the unset default includes them. A repeated
+    /// vendor is listed once, at its first occurrence.
     pub fn overview_tabs(&self) -> Vec<usize> {
         match &self.overview_vendors {
             None => (0..self.tabs_meta.len()).collect(),
-            Some(wanted) => wanted
-                .iter()
-                .flat_map(|v| {
-                    self.tabs_meta
-                        .iter()
-                        .enumerate()
-                        .filter(move |(_, t)| t.vendor_id() == Some(*v))
-                        .map(|(i, _)| i)
-                })
-                .collect(),
+            Some(wanted) => {
+                let mut seen = HashSet::new();
+                wanted
+                    .iter()
+                    .filter(|vendor| seen.insert(**vendor))
+                    .flat_map(|v| {
+                        self.tabs_meta
+                            .iter()
+                            .enumerate()
+                            .filter(move |(_, t)| t.vendor_id() == Some(*v))
+                            .map(|(i, _)| i)
+                    })
+                    .collect()
+            }
         }
     }
 }
@@ -859,9 +887,14 @@ async fn build_outcome(client: &Client, config: &Config, tab: &TabId) -> Result<
                 config.antigravity.oauth_client_id.as_deref(),
                 config.antigravity.oauth_client_secret.as_deref(),
             );
-            let outcome =
-                crate::antigravity::fetch_snapshot(client, &cache, DEFAULT_TTL, oauth.as_ref())
-                    .await?;
+            let outcome = crate::antigravity::fetch_snapshot(
+                client,
+                &cache,
+                DEFAULT_TTL,
+                oauth.as_ref(),
+                config.antigravity.ide_language_server,
+            )
+            .await?;
             Ok(outcome.into())
         }
         VendorId::Grokbot => {
@@ -965,10 +998,10 @@ async fn build_outcome(client: &Client, config: &Config, tab: &TabId) -> Result<
             ))
         }
         VendorId::OpenCodeGo => {
-            let api_key = crate::config::resolve_api_key(
-                "OpenCode Go",
+            let api_key = crate::opencode_go::creds::resolve_key(
                 &config.opencode_go.api_key_env,
                 config.opencode_go.api_key.as_deref(),
+                config.opencode_go.auth_paths.as_deref(),
             )?;
             let cache = crate::cache::Cache::for_vendor("opencode-go")?;
             let endpoints = crate::opencode_go::fetch::Endpoints::default();
@@ -978,6 +1011,25 @@ async fn build_outcome(client: &Client, config: &Config, tab: &TabId) -> Result<
                 &cache,
                 &endpoints,
                 DEFAULT_TTL,
+            )
+            .await?;
+            Ok(outcome.into())
+        }
+        VendorId::Cline => {
+            let credential = crate::cline::creds::resolve(
+                config.cline.auth_paths.as_deref(),
+                &config.cline.api_key_env,
+                config.cline.api_key.as_deref(),
+            )?;
+            let cache = crate::cache::Cache::for_vendor("cline")?;
+            let endpoints = crate::cline::fetch::Endpoints::default();
+            let outcome = crate::cline::fetch::fetch_snapshot(
+                client,
+                &credential,
+                &cache,
+                &endpoints,
+                DEFAULT_TTL,
+                Utc::now(),
             )
             .await?;
             Ok(outcome.into())
@@ -1210,6 +1262,10 @@ mod tests {
         // A listed-but-absent vendor is simply skipped.
         app.overview_vendors = Some(vec![VendorId::Grok, VendorId::Openai]);
         assert_eq!(app.overview_tabs(), vec![1]);
+
+        // A repeated vendor is listed once, at its first occurrence.
+        app.overview_vendors = Some(vec![VendorId::Anthropic, VendorId::Anthropic]);
+        assert_eq!(app.overview_tabs(), vec![0]);
     }
 
     fn config_with_accounts(labels: &[&str]) -> Config {
@@ -1266,6 +1322,42 @@ mod tests {
                 TabId::vendor(VendorId::Anthropic),
                 TabId::account("work"),
                 TabId::account("personal"),
+            ]
+        );
+    }
+
+    #[test]
+    fn tabs_follow_overview_vendors_and_keep_the_rest() {
+        let mut config = Config::default();
+        config.zai.enabled = false;
+        config.openrouter.enabled = false;
+        config.commandcode.enabled = false;
+        config.supergrok.enabled = true;
+        config.antigravity.enabled = true;
+        config.opencode_go.enabled = true;
+        config.copilot.enabled = true;
+        config.ui.overview_vendors = Some(vec![
+            VendorId::Anthropic,
+            VendorId::Zai,
+            VendorId::Openai,
+            VendorId::Anthropic,
+            VendorId::Supergrok,
+            VendorId::OpenCodeGo,
+            VendorId::Antigravity,
+        ]);
+        let vendors: Vec<VendorId> = tabs_from_config(&config)
+            .iter()
+            .filter_map(TabId::vendor_id)
+            .collect();
+        assert_eq!(
+            vendors,
+            vec![
+                VendorId::Anthropic,
+                VendorId::Openai,
+                VendorId::Supergrok,
+                VendorId::OpenCodeGo,
+                VendorId::Antigravity,
+                VendorId::Copilot,
             ]
         );
     }

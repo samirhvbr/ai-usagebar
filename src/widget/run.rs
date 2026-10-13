@@ -178,6 +178,7 @@ async fn build_output(cli: &Cli) -> Result<WaybarOutput> {
         Vendor::Lyceum => lyceum_output(cli, &config).await,
         Vendor::ModelStudio => modelstudio_output(cli, &config).await,
         Vendor::Devin => devin_output(cli, &config).await,
+        Vendor::Cline => cline_output(cli, &config).await,
     }
 }
 
@@ -231,10 +232,10 @@ async fn nous_output(cli: &Cli) -> Result<WaybarOutput> {
 }
 
 async fn opencode_go_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
-    let api_key = crate::config::resolve_api_key(
-        "OpenCode Go",
+    let api_key = crate::opencode_go::creds::resolve_key(
         &config.opencode_go.api_key_env,
         config.opencode_go.api_key.as_deref(),
+        config.opencode_go.auth_paths.as_deref(),
     )?;
     let client = http_client()?;
     let cache = vendor_cache(cli, "opencode-go")?;
@@ -257,6 +258,44 @@ async fn opencode_go_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> 
     let snapshot = outcome.snapshot.clone();
     let vendor_outcome: VendorOutcome = outcome.into();
     Ok(crate::opencode_go::vendor::render(
+        &vendor_outcome,
+        &snapshot,
+        &theme_from_cli(cli),
+        &RenderOpts::from_cli(cli),
+        Utc::now(),
+    ))
+}
+
+/// Cline reuses the credential the Cline CLI maintains; see
+/// [`crate::cline::creds`] for why this never refreshes it.
+async fn cline_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
+    let credential = crate::cline::creds::resolve(
+        config.cline.auth_paths.as_deref(),
+        &config.cline.api_key_env,
+        config.cline.api_key.as_deref(),
+    )?;
+    let client = http_client()?;
+    let cache = vendor_cache(cli, "cline")?;
+    let endpoints = crate::cline::fetch::Endpoints::default();
+    let outcome = match crate::cline::fetch::fetch_snapshot(
+        &client,
+        &credential,
+        &cache,
+        &endpoints,
+        DEFAULT_TTL,
+        Utc::now(),
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) if error.is_transient() => {
+            return Ok(WaybarOutput::loading(cli.icon.as_deref()));
+        }
+        Err(error) => return Err(error),
+    };
+    let snapshot = outcome.snapshot.clone();
+    let vendor_outcome: VendorOutcome = outcome.into();
+    Ok(crate::cline::vendor::render(
         &vendor_outcome,
         &snapshot,
         &theme_from_cli(cli),
@@ -382,12 +421,19 @@ async fn antigravity_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> 
         config.antigravity.oauth_client_id.as_deref(),
         config.antigravity.oauth_client_secret.as_deref(),
     );
-    let outcome =
-        match antigravity::fetch_snapshot(&client, &cache, DEFAULT_TTL, oauth.as_ref()).await {
-            Ok(o) => o,
-            Err(e) if e.is_transient() => return Ok(WaybarOutput::loading(cli.icon.as_deref())),
-            Err(e) => return Err(e),
-        };
+    let outcome = match antigravity::fetch_snapshot(
+        &client,
+        &cache,
+        DEFAULT_TTL,
+        oauth.as_ref(),
+        config.antigravity.ide_language_server,
+    )
+    .await
+    {
+        Ok(o) => o,
+        Err(e) if e.is_transient() => return Ok(WaybarOutput::loading(cli.icon.as_deref())),
+        Err(e) => return Err(e),
+    };
 
     let theme = theme_from_cli(cli);
     let snap = outcome.snapshot.clone();

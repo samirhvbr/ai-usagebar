@@ -15,7 +15,7 @@ import fcntl
 import time
 from datetime import datetime
 
-from tray_model import metric_display, metric_usage_label, is_not_connected, connection_help, metric_pace, meter_color, report_sections, summary_metric, tr, installed_binary
+from tray_model import metric_display, metric_usage_label, is_not_connected, connection_help, metric_pace, meter_color, report_sections, summary_metric, tr, installed_binary, dashboard_entries
 
 import gi
 gi.require_version('Gtk', '3.0')
@@ -333,8 +333,7 @@ class UsageDashboard(Gtk.Window):
         for child in self.cards_box.get_children():
             self.cards_box.remove(child)
 
-        entries = data.get("entries", [])
-        active_entries = list(entries)
+        active_entries = dashboard_entries(data)
 
         if not active_entries:
             empty_lbl = Gtk.Label(label=tr("No active provider or detected credentials.",
@@ -344,8 +343,6 @@ class UsageDashboard(Gtk.Window):
             self.cards_box.show_all()
             return
 
-        primary = data.get("primary")
-        active_entries.sort(key=lambda e: (e.get("id") != primary and e.get("name") != primary))
         for entry in active_entries:
             group = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
             group.get_style_context().add_class("provider-group")
@@ -560,7 +557,7 @@ class AIUsageTrayApp:
     def build_menu(self, data=None):
         menu = Gtk.Menu()
 
-        entries = (data or {}).get("entries", [])
+        entries = dashboard_entries(data)
         summaries = []
         for entry in entries:
             metric = summary_metric(entry)
@@ -629,8 +626,12 @@ class AIUsageTrayApp:
         self.window.show_all()
         if near_pointer:
             self.position_window_near_pointer()
-        if activate_time == Gdk.CURRENT_TIME and GdkX11 and self.window.get_window():
-            activate_time = GdkX11.x11_get_server_time(self.window.get_window())
+        native = self.window.get_window()
+        if activate_time == Gdk.CURRENT_TIME and GdkX11 and native:
+            try:
+                activate_time = GdkX11.x11_get_server_time(native)
+            except TypeError:
+                pass
         self.window.present_with_time(activate_time)
 
     def position_window_near_pointer(self):

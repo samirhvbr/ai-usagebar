@@ -11,12 +11,15 @@
 # Valid: anthropic | anthropic_api | openai | copilot | zai | openrouter | deepseek
 #        | kimi | kilo | novita | moonshot | grok | supergrok | grokbot | antigravity
 #        | cursor | minimax | kiro | nous | opencode-go | commandcode | ollama
-#        | orcarouter | modelstudio | lyceum | devin | shvia
+#        | orcarouter | modelstudio | lyceum | devin | cline | shvia
 # When unset, the TUI opens on the Overview (all vendors at once); set this to
 # open directly on a vendor's tab instead.
 # primary = "anthropic"
 # Which vendors the Overview lists (the TUI's first tab / the macOS menu-bar's
-# top section), in this order. Omit for every enabled vendor.
+# top section), in this order. The TUI tab bar leads with the same list;
+# enabled vendors left off it follow in the canonical order. A repeated slug
+# keeps its first occurrence. An empty list is set; omit the key for every
+# enabled vendor, in the canonical order.
 # overview_vendors = ["anthropic", "cursor", "openai"]
 # Presentation of vendor tab navigation: sidebar (vertical box) | navbar (top strip) | none (hidden).
 # Default sidebar (falls back to navbar on narrow terminals).
@@ -174,6 +177,11 @@ enabled = true
 # Defaults to the store claude-acc creates (https://github.com/ohmaseclaro/claude-acc);
 # unrelated to accounts_dir above, which is the `claude` CLI's own accounts.
 # desktop_profiles_dir = "~/.claude-acc/profiles"
+# Optional macOS-only Prepare button. Use the official Claude Code executable
+# or a trusted wrapper that preserves your proxy/firewall restrictions.
+# No PATH lookup, automatic requests, or Desktop restart. Requires a recent
+# CLI supporting --safe-mode and --no-session-persistence.
+# desktop_prepare_binary = "~/.local/bin/claude"
 # Or list accounts explicitly:
 # [[anthropic.accounts]]
 # label = "work"
@@ -324,12 +332,12 @@ api_key_env = "DEEPINFRA_API_KEY"
 # headline = "amount"              # "amount" | "percent"
 
 [ollama]
-# Disabled by default. Ollama Cloud quota comes from the same route the
-# official settings page uses — https://ollama.com/api/usage — not from the
-# local Ollama daemon (127.0.0.1:11434 has no quota route). Mint a key at
+# Disabled by default. https://ollama.com/api/balance automatically reports
+# monthly credits (e.g. Pro's $60 included usage) or legacy session/weekly
+# quotas. No plan-mode switch is needed. This is not the local Ollama daemon
+# (127.0.0.1:11434 has no quota route). Mint an API key at
 # https://ollama.com/settings/keys; the CLI's Ed25519 registry key in
-# ~/.ollama is never read. The API reports usage as a fraction of the limit
-# and no plan label — `plan` below is only the tooltip’s display name.
+# ~/.ollama is never read. `plan` below is only a display label.
 enabled = false
 api_key_env = "OLLAMA_API_KEY"  # checked first; if set + non-empty, used
 # api_key = "..."               # fallback; chmod 600 the file if you use it
@@ -524,6 +532,12 @@ enabled = false
 # last used it).
 # oauth_client_id = "<client id>"
 # oauth_client_secret = "<client secret>"   # chmod 600 the file if you set this
+# Set to false when the Antigravity IDE is installed but its sign-in is
+# managed separately: its language server otherwise answers signed-out and
+# that 401/403 outranks — masks — a working `agy` session (#405). Has no
+# effect on Windows, where the IDE's server cannot be told apart on disk.
+# Default: true.
+# ide_language_server = false
 
 # Cursor. No API key: usage is read from the session token the Cursor IDE
 # already wrote to its own local state database after you signed in there —
@@ -656,3 +670,20 @@ enabled = false
 [devin]
 enabled = false
 # credentials_path = "/home/you/.local/share/devin/credentials.toml"
+# Cline / ClinePass (cline.bot). Disabled by default — enable it once the
+# `cline` CLI is signed in. There is no key to paste: the OAuth credential the
+# CLI maintains in ~/.cline/data/settings/providers.json is reused as-is, and
+# it is only ever read, never refreshed or rewritten (refreshing rotates the
+# refresh token and would sign the CLI itself out).
+#
+# The three bars are the limits ClinePass meters — 5 hours, weekly and
+# monthly — read as the percentage Cline itself reports from the dashboard's
+# usage-limits route, with the reset time of each open window; nothing is
+# re-derived from the charge ledger.
+[cline]
+enabled = false
+# api_key_env = "CLINE_API_KEY"   # a key from app.cline.bot → Settings → API
+                                  # Keys, for a machine without the CLI. The
+                                  # environment outranks the credential file.
+# api_key = "[REDACTED]"          # optional inline fallback; prefer the env var
+# auth_paths = ["~/.cline/data/settings/providers.json"]

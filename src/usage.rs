@@ -62,19 +62,6 @@ pub struct UsageWindow {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Cents(pub i64);
 
-impl Cents {
-    /// Format as `[-]$D.CC`. Negative values render `-$D.CC` (not `$-D.CC`),
-    /// matching claudebar's `_fmt_dollars` (claudebar:532-537).
-    pub fn fmt_dollars(self) -> String {
-        let (sign, abs) = if self.0 < 0 {
-            ("-", -self.0)
-        } else {
-            ("", self.0)
-        };
-        format!("{sign}${}.{:02}", abs / 100, abs % 100)
-    }
-}
-
 /// Anthropic-specific snapshot — three rolling windows plus optional
 /// pay-as-you-go credit balance.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -470,6 +457,7 @@ pub enum VendorSnapshot {
     /// that fetched it holds the `CustomProviderConfig`, and the cache
     /// directory is keyed by its `id`.
     Custom(crate::custom::types::CustomSnapshot),
+    Cline(crate::cline::types::Snapshot),
 }
 
 impl VendorSnapshot {
@@ -957,10 +945,9 @@ impl ShviaWindow {
     }
 }
 
-/// Ollama Cloud — the session and weekly usage windows served by
-/// `ollama.com/api/usage`, plus a per-model breakdown. The response also
-/// carries an `activity.cost` string for the current period; we keep it raw
-/// (it is already dollar-formatted upstream) and let the renderer place it.
+/// Ollama Cloud — credit balances or legacy quota windows from
+/// `ollama.com/api/balance`. Older cached `/api/usage` payloads can also
+/// carry per-model counts and activity cost.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OllamaSnapshot {
     /// Display label, taken from the `[ollama] plan` config field. The API
@@ -989,6 +976,16 @@ pub struct OllamaSnapshot {
     /// `activity.period.type` (`"last_4_weeks"` and friends). A short
     /// human-readable label the renderer can show next to the cost.
     pub activity_period: Option<String>,
+    /// Monthly included credits and optional purchased credits, formatted
+    /// through the shared money formatter for all desktop surfaces.
+    pub credits: Option<OllamaCredits>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OllamaCredits {
+    pub balance: String,
+    pub allowance: String,
+    pub purchased: Option<String>,
 }
 
 /// One row of `OllamaSnapshot::{session,weekly}_models`. The API carries the
@@ -1090,8 +1087,8 @@ impl OrcaRouterSnapshot {
     }
 }
 
-/// Alibaba Cloud Model Studio Token Plan — a 5-hour and a weekly ratio
-/// window, either of which the console account may not report. An absent
+/// Alibaba Cloud Model Studio Token Plan — a 5-hour, a weekly and a monthly
+/// ratio window, any of which the console account may not report. An absent
 /// window is no-data (possibly unlimited), never 0%.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelStudioSnapshot {
@@ -1099,6 +1096,11 @@ pub struct ModelStudioSnapshot {
     pub session: Option<UsageWindow>,
     /// Weekly window. `None` when `per1WeekPercentage` was absent.
     pub weekly: Option<UsageWindow>,
+    /// Monthly window. `None` when `per1MonthPercentage` was absent. The
+    /// reset is exact; the cycle length is plan-dependent, so no exact
+    /// window duration is declared for it (same rule as Ollama's calendar
+    /// month) and pacing is omitted wherever it would guess a denominator.
+    pub monthly: Option<UsageWindow>,
 }
 
 /// Devin CLI quota snapshot. The CLI reports remaining percentages, while
@@ -1187,7 +1189,7 @@ mod tests {
         assert_eq!(fmt_minor(14157, 2, Some("USD")), "$141.57");
         // Zero-exponent currency: no decimal point, no /100.
         assert_eq!(fmt_minor(500, 0, Some("JPY")), "¥500");
-        // Sign precedes the symbol, matching `fmt_dollars`.
+        // Sign precedes the symbol, as `format::money` spells it.
         assert_eq!(fmt_minor(-150, 2, Some("BRL")), "-R$1.50");
         // Unknown code stays truthful as a suffix rather than guessing a symbol.
         assert_eq!(fmt_minor(1234, 2, Some("CHF")), "12.34 CHF");
@@ -1212,21 +1214,6 @@ mod tests {
         };
         assert_eq!(capped.fmt_spent(), "$2.50");
         assert_eq!(capped.fmt_limit().as_deref(), Some("$50.00"));
-    }
-
-    #[test]
-    fn cents_format_positive() {
-        assert_eq!(Cents(0).fmt_dollars(), "$0.00");
-        assert_eq!(Cents(50).fmt_dollars(), "$0.50");
-        assert_eq!(Cents(250).fmt_dollars(), "$2.50");
-        assert_eq!(Cents(5000).fmt_dollars(), "$50.00");
-    }
-
-    #[test]
-    fn cents_format_negative_uses_leading_sign() {
-        // claudebar bug-fix: never "$-1.-50" — sign goes before the dollar sign.
-        assert_eq!(Cents(-150).fmt_dollars(), "-$1.50");
-        assert_eq!(Cents(-1).fmt_dollars(), "-$0.01");
     }
 
     #[test]

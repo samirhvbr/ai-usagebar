@@ -54,7 +54,7 @@ dependencies = [
 
 [[package]]
 name = "ai-usagebar"
-version = "1.34.0"
+version = "1.36.0"
 dependencies = [
  "aes",
  "aes-gcm",

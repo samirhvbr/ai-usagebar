@@ -44,6 +44,11 @@ pub struct Probes<'a> {
     /// user signed pi into any provider, so existence alone cannot mean
     /// "signed in" the way the provider-owned files above can.
     pub commandcode_signed_in: &'a dyn Fn(&[PathBuf]) -> bool,
+    /// Whether one of OpenCode Go's auth files holds a live key. Existence
+    /// alone cannot mean "signed in" either: the CLI's `auth.json` holds every
+    /// provider the user has connected, and only the `opencode` entry with a
+    /// key-bearing type is the account this endpoint accepts.
+    pub opencode_go_signed_in: &'a dyn Fn(&[PathBuf]) -> bool,
 }
 
 /// One provider's row in the catalog.
@@ -84,6 +89,11 @@ pub fn statuses(cfg: &Config) -> Vec<VendorStatus> {
             paths
                 .iter()
                 .any(|path| crate::commandcode::creds::read_from(path).is_some())
+        },
+        opencode_go_signed_in: &|paths| {
+            paths
+                .iter()
+                .any(|path| crate::opencode_go::creds::read_key_from(path).is_some())
         },
     };
     statuses_with(cfg, &probes)
@@ -171,6 +181,23 @@ fn credential_present(cfg: &Config, id: VendorId, probes: &Probes) -> bool {
                 Err(_) => false,
             }
         }
+        VendorId::Cline => {
+            let paths = match cfg.cline.auth_paths.as_deref() {
+                Some(paths) if !paths.is_empty() => paths.to_vec(),
+                _ => crate::cline::creds::default_paths().unwrap_or_default(),
+            };
+            paths
+                .iter()
+                .any(|path| crate::cline::creds::read_from(path).is_some())
+                || cfg.cline.api_key.as_deref().is_some_and(|k| !k.is_empty())
+        }
+        VendorId::OpenCodeGo => {
+            match crate::opencode_go::creds::effective_paths(cfg.opencode_go.auth_paths.as_deref())
+            {
+                Ok(paths) => (probes.opencode_go_signed_in)(&paths),
+                Err(_) => false,
+            }
+        }
         VendorId::NousResearch => {
             (probes.exists)(&crate::nous::credentials::default_credentials_path())
         }
@@ -222,7 +249,6 @@ fn credential_present(cfg: &Config, id: VendorId, probes: &Probes) -> bool {
         | VendorId::Moonshot
         | VendorId::Grok
         | VendorId::Minimax
-        | VendorId::OpenCodeGo
         | VendorId::Shvia
         | VendorId::Ollama
         | VendorId::OrcaRouter
@@ -324,12 +350,24 @@ mod tests {
         exists: &'a dyn Fn(&Path) -> bool,
         commandcode_signed_in: &'a dyn Fn(&[PathBuf]) -> bool,
     ) -> Probes<'a> {
+        probes_full(env, exists, commandcode_signed_in, &|_| false)
+    }
+
+    /// [`probes`] with the OpenCode Go file probe supplied, for the tests
+    /// that exercise the CLI credential path.
+    fn probes_full<'a>(
+        env: &'a dyn Fn(&str) -> bool,
+        exists: &'a dyn Fn(&Path) -> bool,
+        commandcode_signed_in: &'a dyn Fn(&[PathBuf]) -> bool,
+        opencode_go_signed_in: &'a dyn Fn(&[PathBuf]) -> bool,
+    ) -> Probes<'a> {
         Probes {
             env_set: env,
             exists,
             keychain_has_claude: &|| false,
             keychain_has_claude_for: &|_| false,
             commandcode_signed_in,
+            opencode_go_signed_in,
         }
     }
 
@@ -454,6 +492,7 @@ mod tests {
             keychain_has_claude: &|| true,
             keychain_has_claude_for: &|_| false,
             commandcode_signed_in: &|_| false,
+            opencode_go_signed_in: &|_| false,
         };
         assert!(row(&statuses_with(&cfg, &with_keychain), "anthropic").configured);
         assert!(!row(&statuses_with(&cfg, &bare()), "anthropic").configured);
@@ -500,6 +539,7 @@ mod tests {
             keychain_has_claude: &|| false,
             keychain_has_claude_for: &|dir| dir == Path::new("/accounts/work"),
             commandcode_signed_in: &|_| false,
+            opencode_go_signed_in: &|_| false,
         };
         assert!(row(&statuses_with(&cfg, &with_named_keychain), "anthropic").configured);
         assert!(!row(&statuses_with(&cfg, &bare()), "anthropic").configured);
@@ -512,6 +552,25 @@ mod tests {
         assert_eq!(codex.kind, AuthKind::Oauth);
         assert!(!codex.configured);
         assert_eq!(codex.login, "codex login");
+    }
+
+    #[test]
+    fn opencode_go_cli_auth_file_counts_as_configured() {
+        let mut cfg = Config::default();
+        cfg.opencode_go
+            .auth_paths
+            .replace(vec![PathBuf::from("/custom/opencode/auth.json")]);
+        let signed_in = |paths: &[PathBuf]| {
+            paths
+                .iter()
+                .any(|path| path.ends_with("opencode/auth.json"))
+        };
+        let rows = statuses_with(
+            &cfg,
+            &probes_full(&|_| false, &|_| false, &|_| false, &signed_in),
+        );
+        assert!(row(&rows, "opencode-go").configured);
+        assert!(!row(&statuses_with(&cfg, &bare()), "opencode-go").configured);
     }
 
     #[test]

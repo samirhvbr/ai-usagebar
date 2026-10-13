@@ -1,6 +1,6 @@
 # ai-usagebar
 
-Native Omarchy Quattro panel, Waybar widget, and tabbed TUI for AI plan usage across **Claude**, **Codex/ChatGPT**, **GitHub Copilot**, **Z.AI (GLM)**, **OpenRouter**, **DeepSeek**, **DeepInfra**, **Kimi**, **Nous Research**, **OpenCode Go**, **Command Code**, **Devin**, and other supported AI coding services.
+Native Omarchy Quattro panel, Waybar widget, and tabbed TUI for AI plan usage across **Claude**, **Codex/ChatGPT**, **GitHub Copilot**, **Z.AI (GLM)**, **OpenRouter**, **DeepSeek**, **DeepInfra**, **Kimi**, **Nous Research**, **OpenCode Go**, **Command Code**, **Devin**, **Cline**, and other supported AI coding services.
 
 ai-usagebar began as a Rust port of
 [`claudebar`](https://github.com/mryll/claudebar) and remains drop-in
@@ -307,10 +307,11 @@ come from environment variables or `config.toml`.
 | Cursor | Existing Cursor IDE or `cursor-agent` login | Opt in and sign in once. `cursor-agent` is the headless fallback. |
 | Kiro CLI | Existing kiro-cli login | Opt in and run `kiro-cli login` once. ai-usagebar refreshes the session when needed. |
 | Nous Research | OAuth device flow | Enable `[nous]`, click **Log in with Nous Research** in the Omarchy settings panel, or run `ai-usagebar auth nous login`. Credentials are kept in ai-usagebar's separate platform config directory (`~/.config/ai-usagebar/credentials.json` on Linux). |
-| OpenCode Go | API key (`OPENCODE_GO_API_KEY` env or `[opencode-go] api_key` in config) | Enable `[opencode-go]`, then enter the key in the Omarchy settings panel or set the environment variable. |
+| OpenCode Go | Existing OpenCode CLI login (read-only `~/.local/share/opencode/auth.json`), or API key (`OPENCODE_GO_API_KEY` env or `[opencode-go] api_key`) | Enable `[opencode-go]`. A signed-in OpenCode CLI is detected on its own; an explicit key is unnecessary then, and wins when set (Settings panel / environment). |
 | Command Code | Existing `commandcode` or pi login | Enable `[commandcode]` and sign in to either one once. No key to paste; `COMMANDCODE_API_KEY` overrides if you prefer one. |
-| Model Studio | Existing `bl auth login --console` (Alibaba Cloud) | Opt in (`[modelstudio]`), install the official `bl` CLI, and run `bl auth login --console` once. Reports the Token Plan's 5-hour and weekly percentage windows with resets, through the same console gateway the CLI uses; the credential file `~/.bailian/config.json` is only ever read. |
+| Model Studio | Existing `bl auth login --console` (Alibaba Cloud) | Opt in (`[modelstudio]`), install the official `bl` CLI, and run `bl auth login --console` once. Reports the Token Plan's 5-hour, weekly and monthly percentage windows with resets, through the same console gateway the CLI uses; the credential file `~/.bailian/config.json` is only ever read. |
 | Devin | Existing official Devin CLI login | Opt in (`[devin]`) after signing in with the Devin CLI. Reuses its existing `credentials.toml` read-only; ai-usagebar never logs in, refreshes, or writes credentials. Reports daily and weekly quota usage and an optional overage balance. |
+| Cline / ClinePass | Existing `cline` CLI login | Enable `[cline]`. No key to paste; the CLI's own credential is reused. `CLINE_API_KEY` overrides it. |
 
 ### Nous credits and OpenCode Go
 
@@ -331,11 +332,44 @@ use mode `0600`; an existing current-user-owned config directory also works when
 it is not group- or world-writable. Windows uses the user's platform config
 directory and inherited per-user access controls.
 
-OpenCode Go uses the official usage endpoint and the `percent` field. Its key can
-be entered through the native Settings panel; stored values are sent to the Rust
-settings command over stdin and are never placed in QML command arguments. Cache
-entries are tied to the endpoint and a one-way key fingerprint, so changing
-accounts cannot reuse another account's fresh or stale usage.
+OpenCode Go uses the official usage endpoint and the `percent` field. Its key is
+resolved from `OPENCODE_GO_API_KEY` / `[opencode-go] api_key` first, or read
+read-only from the credential the official OpenCode CLI already wrote to
+`~/.local/share/opencode/auth.json` (`$XDG_DATA_HOME` is honoured;
+`[opencode-go] auth_paths` overrides the file), so a signed-in CLI needs no
+setup. The file is never written, copied, or cached. Keys entered through the
+native Settings panel are sent to the Rust settings command over stdin and are
+never placed in QML command arguments; cache entries are tied to the endpoint
+and a one-way key fingerprint, so changing accounts cannot reuse another
+account's fresh or stale usage.
+
+### Cline (ClinePass)
+
+ClinePass has three limits — **5 hours, weekly and monthly** — and Cline computes
+them itself. The widget reads `GET /api/v1/users/me/plan/usage-limits`, the call
+the dashboard's "Usage limits" panel makes: for each limit it returns the
+percentage used and, once a window has opened, when it resets. Nothing is
+recomputed here.
+
+These are **fixed windows**: one opens at the first charge after the previous one
+closed and runs its full length. They are *not* rolling sums of the last N days.
+(An earlier version summed the charge ledger over a rolling 30 days; after one
+heavy month it showed 100 % while the dashboard said 2 %.) The figures are whole
+percentages exactly as Cline states them, so they match the dashboard.
+
+**There is no key to enter, and no key field in the settings panel.** Enable
+`[cline]` and it works. The OAuth credential comes from the `cline` CLI's own
+`~/.cline/data/settings/providers.json`, and **is only ever read** — Cline
+rotates its refresh token, so refreshing it from here would sign the user's own
+CLI out. Its access token lives about five hours, and while it is lapsed the
+widget keeps showing the cached answer, marked stale: a window whose reset has
+passed is shown empty, as it is at Cline. `CLINE_API_KEY` (or `[cline] api_key`)
+outranks the credential file for a machine without the CLI.
+
+A plan with no ClinePass entitlement — pay-as-you-go credits, or an
+organisation seat — reports no limits rather than empty ones. Cache entries are
+tied to the endpoint and a one-way fingerprint of the account id, so changing
+accounts cannot reuse another account's figures.
 
 ### Command Code
 
@@ -689,6 +723,12 @@ The report also includes the configured `primary`, resolved to an entry id
 from `entries` — with named accounts, the first entry of the configured
 vendor (so `anthropic` reports `anthropic@claude-me` when that is the entry
 present); a primary naming a vendor with no entries keeps the vendor slug.
+When `[ui] overview_vendors` is set, the report also includes that slug list
+as `overview_vendors`, even when the list is empty, and omits the field
+otherwise. A repeated slug keeps its first occurrence. Frontends that order
+cards should follow the field and leave vendors missing from the list after
+it. An empty list means the report order, not "promote `primary`". The
+`entries` array itself stays in tab order, which now leads with that list.
 Each entry has
 `display_name`, `short_name`, `status`, `stale`, and `fetched_at`; metric rows
 may add `severity`, an absolute `reset_at`, and `window_secs`, the exact length
@@ -890,6 +930,7 @@ Quattro: one chip with the selected provider's logo, short name and highest perc
 | [KDE Plasma 6](kde-plasmoid/README.md) | Whatever `usage --json` reports | Provider tabs in the popup; vendor is per applet instance. |
 | [Linux Mint / Cinnamon](linux-mint/README.md) | Whatever `usage --json` reports | Experimental GTK dashboard with provider icons; left-click the status icon. |
 | [Windows tray](windows/README.md) | Whatever `usage --json` reports | NotifyIcon + WebView2 popover; left-click the tray icon. |
+| [Claude Code mod](claude-code-mod/README.md) | Claude (Desktop accounts) | `/claude-account` in a Claude Code session: switch the Claude Desktop account, each with its quota. macOS. |
 
 The GNOME click menu includes Cursor when enabled in `config.toml`; the
 top bar still supports the providers listed in its preferences.

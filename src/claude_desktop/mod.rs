@@ -22,6 +22,8 @@
 pub mod app;
 pub mod capture;
 pub mod merge;
+#[cfg(any(target_os = "macos", test))]
+pub mod prepare;
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -259,6 +261,24 @@ pub fn label_for_uuid<'a>(profiles: &'a [ProfileMeta], account_uuid: &str) -> Op
         .iter()
         .find(|profile| profile.account_uuid == account_uuid)
         .map(|profile| profile.label.as_str())
+}
+
+/// The saved accounts the Desktop app can switch to, and the one it is signed
+/// in as; `None` without the app's data or a saved account.
+pub fn switchable(paths: &Paths) -> Option<(Vec<String>, Option<String>)> {
+    if !paths.available() {
+        return None;
+    }
+    let profiles = load_profiles(&paths.profiles_dir);
+    if profiles.is_empty() {
+        return None;
+    }
+    let active = active_account_uuid(&paths.config_json())
+        .and_then(|uuid| label_for_uuid(&profiles, &uuid).map(str::to_string));
+    Some((
+        profiles.into_iter().map(|profile| profile.label).collect(),
+        active,
+    ))
 }
 
 /// How many conversations the account's history folder holds.
@@ -1413,6 +1433,32 @@ mod tests {
             paths: Paths::at(data, profiles, backups),
             _root: root,
         }
+    }
+
+    #[test]
+    fn switchable_lists_saved_accounts_and_the_signed_in_one() {
+        let f = fixture();
+        assert_eq!(
+            switchable(&f.paths),
+            Some((vec!["here".into(), "there".into()], Some("here".into())))
+        );
+    }
+
+    #[test]
+    fn switchable_is_none_without_the_app_or_a_saved_account() {
+        let f = fixture();
+        let no_app = Paths::at(
+            f.paths.data_dir.join("missing"),
+            f.paths.profiles_dir.clone(),
+            f.paths.backups_dir.clone(),
+        );
+        assert_eq!(switchable(&no_app), None);
+        let no_profiles = Paths::at(
+            f.paths.data_dir.clone(),
+            f.paths.profiles_dir.join("missing"),
+            f.paths.backups_dir.clone(),
+        );
+        assert_eq!(switchable(&no_profiles), None);
     }
 
     /// `(relative path, length)` for every file under a root, so a test can

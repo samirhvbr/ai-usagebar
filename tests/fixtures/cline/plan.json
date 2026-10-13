@@ -1,0 +1,44 @@
+{
+  "data": {
+    "planHistoryId": "iph-EXAMPLE",
+    "userId": "usr-EXAMPLE",
+    "plan": {
+      "id": "pln-01KSJCW4BF730CP27KRA82CFDN",
+      "name": "Cline Pass (Monthly)[Internal]",
+      "displayName": "Cline Pass (Monthly)",
+      "description": "Cline Pass brings agentic coding to programmers around the world. Offering generous limits and reliable access to the most capable open-source models, so you can build with powerful agents without worrying about cost or availability.",
+      "type": "individual",
+      "interval": "Monthly",
+      "pricePerSeatCents": 999,
+      "priceId": "price_1Tk52FJvJ1E14BGMhDWMHlmv",
+      "maxSeats": 1000000,
+      "features": {
+        "fee_dollars": 0.61,
+        "free_seats": 0,
+        "included": [
+          "Low cost subscription pricing",
+          "Generous limits and reliable access",
+          "Built for as many programmers as possible",
+          "Includes Kimi K3, GLM 5.2, Kimi K2.6, Kimi K2.7 Code, Mimo v2.5, Mimo v2.5 Pro, Minimax M3, Qwen3.7 Plus, Qwen3.7 Max, DeepSeek V4 Pro, and DeepSeek V4 Flash"
+        ]
+      },
+      "entitlements": {
+        "cline_pass": {
+          "enabled": true,
+          "inferenceCapThreshold": {
+            "last5HoursUsageCostUSDPerUser": 1000000000,
+            "last7daysUsageCostUSDPerUser": 2500000000,
+            "last30daysUsageCostUSDPerUser": 5000000000
+          }
+        }
+      },
+      "isActive": true,
+      "createdAt": "2026-05-26T09:34:05.877169Z",
+      "updatedAt": "2026-09-08T10:00:43.285928Z"
+    },
+    "subscriptionId": "sub_EXAMPLE",
+    "currentPeriodStart": "2026-09-01T05:17:51Z",
+    "currentPeriodEnd": "2026-10-01T05:17:51Z"
+  },
+  "success": true
+}

@@ -111,7 +111,9 @@ let FORMAT = "{plan};;{session_pct};;{session_reset};;{weekly_pct};;{weekly_rese
              "{minimax_video_elapsed};;{minimax_video_weekly_pct};;{minimax_video_weekly_reset};;{minimax_video_weekly_elapsed};;" +
              "{copilot_chat_limit};;{copilot_completions_limit};;{copilot_premium_limit};;" +
              "{oll_monthly_pct};;{oll_monthly_reset};;{lyceum_balance};;{dif_balance};;" +
-             "{devin_daily_pct};;{devin_daily_reset};;{devin_daily_elapsed}"
+             "{devin_daily_pct};;{devin_daily_reset};;{devin_daily_elapsed};;" +
+             "{cline_5h_pct};;{cline_5h_reset};;{cline_7d_pct};;{cline_7d_reset};;" +
+             "{cline_30d_pct};;{cline_30d_reset}"
 
 let FORMAT_WITH_SENTINEL = FORMAT + ";;__aiub_end__"
 

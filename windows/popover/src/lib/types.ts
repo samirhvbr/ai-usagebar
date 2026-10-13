@@ -213,12 +213,19 @@ export interface AccountSwitchInfo {
   switching: boolean;
   /** Why that switch failed, or "". */
   error: string;
+  prepareEnabled?: boolean;
+  prepareTarget?: string;
+  preparing?: boolean;
+  prepareError?: string;
+  preparedReset?: string;
 }
 
 /** The switch control on one account's card. */
 export interface CardAccount {
   vendor: string;
   label: string;
+  /** A Claude Desktop login: switching quits and reopens the app, so it asks twice. */
+  desktop: boolean;
   active: boolean;
   /** A switch to this account is running. */
   switching: boolean;
@@ -226,6 +233,10 @@ export interface CardAccount {
   busy: boolean;
   /** Why the last switch to this account failed, or "". */
   error: string;
+  prepareEnabled?: boolean;
+  preparing?: boolean;
+  prepareError?: string;
+  preparedReset?: string;
 }
 
 /** What an update affordance does on click: a host command, or open `url`. */
@@ -242,7 +253,7 @@ export interface Accent {
 }
 
 export interface Payload {
-  /** Switchable logins keyed by vendor slug ("anthropic", "openai"); empty off macOS. */
+  /** Switchable logins keyed by vendor slug ("anthropic", "openai", "claude-desktop"); empty off macOS. */
   accounts: Record<string, AccountSwitchInfo>;
   accent: Accent | null;
   entries: Entry[];

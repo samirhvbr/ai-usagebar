@@ -1,7 +1,7 @@
 # Version — samirhvbr fork of ai-usagebar
 
-**Current version:** `0.2.0`
-**Upstream:** [akitaonrails/ai-usagebar](https://github.com/akitaonrails/ai-usagebar) @ `7eabc94f` (`v1.34.0`) — 67 commits of ours past it
+**Current version:** `0.3.0`
+**Upstream:** [akitaonrails/ai-usagebar](https://github.com/akitaonrails/ai-usagebar) @ `22975d7f` (`v1.36.0`) — 68 commits of ours past it
 
 The **first semver in this file is ours**, and that is not cosmetic: everything
 that reads a version here takes the first one it finds. Pointing that at the
@@ -29,6 +29,38 @@ Where this fork's CI runs: [`docs/ci.md`](docs/ci.md).
 
 Newest first. Each `##` heading is literally the commit subject. The upstream's
 own changelog, where it has one, is left alone: it is their record, not ours.
+
+## 0.3.0 - adopt upstream v1.36.0, with Cline, Ollama credit plans and Claude Desktop switching
+
+Moves the upstream point from `v1.34.0` (`7eabc94f`) to `v1.36.0` (`22975d7f`),
+81 upstream commits. Taken at the release tag rather than `main`, which was
+one `CLAUDE.md` commit past it (`75d2d4a`). Nothing in it was urgent for this
+fork, unlike 0.2.0; it keeps the next sync small. What it brings: Cline
+(ClinePass) as a vendor, Ollama Cloud's credit-based plans through
+`/api/balance`, switching and preparing Claude Desktop accounts from the macOS
+tray, TUI tabs ordered by `[ui] overview_vendors`, the Cursor WAF headers, and
+the placeholder-escaping fixes (Anthropic, OpenAI, Ollama).
+
+Resolution notes, for whoever syncs next:
+
+- Five conflicts, all ShvIA and Cline landing on the same line of a per-vendor
+  list: `config.example.toml`, `src/catalog.rs`, `src/detect.rs`,
+  `src/usage.rs`, `src/vendor.rs`. Both kept. In `catalog.rs` OpenCode Go left
+  the key-only arm upstream (it now reads the OpenCode CLI's `auth.json`), so
+  only ShvIA stays there. In `usage.rs` the Ollama doc comment is upstream's
+  new one.
+- Upstream did not touch `gnome-extension/` in this range, so our extension
+  came across untouched. Our delta over `v1.36.0` is byte-identical to the one
+  we had over `v1.34.0`, apart from the test below.
+- `clicking_outside_the_picker_closes_it_without_selecting` (TUI) clicked the
+  Novita row assuming the centred picker popup left it uncovered. One more
+  vendor (ShvIA, on top of Cline) grows the popup by a row and puts it over
+  Novita, so the click selected Cline. The test now clicks the first provider
+  row clear of the popup's choice rows; it passes on pure `v1.36.0` as well.
+- ShvIA's `{plan}` / `{shvia_plan}` stay unescaped: unlike the plans upstream
+  started escaping, it comes from our own `[shvia] plan` config, not from the
+  API.
+- `CHANGELOG.md` is v1.36.0's, byte for byte.
 
 ## 0.2.0 - adopt upstream v1.34.0, whose Keychain fix stops the morning login hang
 

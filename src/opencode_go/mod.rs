@@ -1,5 +1,6 @@
 //! OpenCode Go subscription quota integration.
 
+pub mod creds;
 pub mod fetch;
 pub mod types;
 pub mod vendor;

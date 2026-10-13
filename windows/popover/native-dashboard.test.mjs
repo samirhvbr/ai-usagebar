@@ -40,11 +40,11 @@ try {
     hostError: '', version: 'test',
   };
 
-  function sectionMarkup(layout, language = 'pt-BR', section = card) {
+  function sectionMarkup(layout, language = 'pt-BR', section = card, account = null) {
     return renderToStaticMarkup(React.createElement(TooltipProvider, {},
       React.createElement(LanguageProvider, { language },
         React.createElement(ProviderSection, {
-          card: section, layout, nowMs,
+          account, card: section, layout, nowMs,
           onCustomize() {}, onRowAction() {}, onRowMenuOpenChange() {},
           onSwitchAccount() {}, onToggleCollapse() {}, onToggleShowAs() {},
         }))));
@@ -65,6 +65,29 @@ try {
     assert.match(withGoal, /class="usage-goal-meter[^\"]*" role="progressbar"/);
     const withoutGoal = sectionMarkup({ ...emptyLayout(), popoverStyle, usageGoal: false });
     assert.doesNotMatch(withoutGoal, /usage-goal-meter|Meta agora/);
+  }
+  // An inactive Claude Desktop account with a trusted CLI configured gets a
+  // Prepare button beside the switch star; both usage windows survive every
+  // prepare state.
+  const desktopCard = { ...card, id: 'anthropic@desktop-2', title: 'Claude · desktop-2 (desktop)',
+    rows: [card.rows[0], { ...card.rows[0], key: 'weekly', label: 'Weekly', window: 604800 }] };
+  const desktopAccount = { vendor: 'claude-desktop', label: 'desktop-2', active: false, switching: false, busy: false, error: '' };
+  for (const popoverStyle of ['classic', 'native']) {
+    const layout = { ...emptyLayout(), popoverStyle };
+    const unusedCard = { ...desktopCard, rows: desktopCard.rows.map((row) => ({ ...row, resetAt: '', usedPercent: 0 })) };
+    const prepareAccount = { ...desktopAccount, prepareEnabled: true };
+    const prepare = sectionMarkup(layout, 'en', unusedCard, prepareAccount);
+    assert.match(prepare, /aria-label="Prepare Claude Desktop account desktop-2"/);
+    assert.match(prepare, /Prepare<\/button>/);
+    assert.match(prepare, />Session</);
+    assert.match(prepare, />Weekly</);
+    assert.doesNotMatch(sectionMarkup(layout, 'en', unusedCard, { ...prepareAccount, active: true }), /Prepare Claude Desktop/);
+    const preparing = sectionMarkup(layout, 'en', unusedCard, { ...prepareAccount, preparing: true, busy: true });
+    assert.match(preparing, /disabled="" aria-label="Preparing… Claude Desktop/);
+    const ready = sectionMarkup(layout, 'en', desktopCard, prepareAccount);
+    assert.match(ready, /disabled="" aria-label="Ready Claude Desktop/);
+    const retry = sectionMarkup(layout, 'en', unusedCard, { ...prepareAccount, prepareError: 'Proxy unavailable' });
+    assert.match(retry, /desktop-account-control is-failed/);
   }
   assert.match(sectionMarkup({ ...emptyLayout(), resetTimes: 'exact', timeFormat: '24' }), /Redefine hoje às 12:00/);
   assert.match(sectionMarkup({ ...emptyLayout(), resetTimes: 'countdown', timeFormat: '24' }), /Redefine em 1h 0m/);

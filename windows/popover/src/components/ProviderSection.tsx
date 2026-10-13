@@ -1,14 +1,17 @@
 import type { DraggableAttributes, DraggableSyntheticListeners } from "@dnd-kit/core";
-import type { ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import MdiAlert from "~icons/mdi/alert";
 import MdiChevronDown from "~icons/mdi/chevron-down";
 import MdiChevronUp from "~icons/mdi/chevron-up";
 import MdiFire from "~icons/mdi/fire";
 import MdiLoading from "~icons/mdi/loading";
 import MdiStar from "~icons/mdi/star";
+import MdiStarHalfFull from "~icons/mdi/star-half-full";
 import MdiStarOutline from "~icons/mdi/star-outline";
 import MdiTune from "~icons/mdi/tune-variant";
 import MdiArrowTopRight from "~icons/mdi/arrow-top-right";
+import MdiClockStart from "~icons/mdi/clock-start";
+import MdiCheck from "~icons/mdi/check";
 import { Chip } from "@/components/Chip";
 import { Hint } from "@/components/Hint";
 import { ProviderIcon } from "@/components/ProviderIcon";
@@ -34,6 +37,7 @@ import {
   cardHasExtras,
   condensedTextRowIndexes,
   displayPlan,
+  desktopPreparation,
   explainError,
   headlineAlternate,
   headlineLabel,
@@ -160,6 +164,7 @@ export function ProviderSection({
         account={account}
         card={card}
         handle={handle}
+        nowMs={nowMs}
         onCustomize={onCustomize}
         onSwitchAccount={onSwitchAccount}
       />
@@ -229,6 +234,7 @@ interface ProviderSectionHeaderProps {
   account?: CardAccount | null;
   card: Card;
   handle?: SectionHandle;
+  nowMs?: number;
   onCustomize?: () => void;
   onSwitchAccount?: () => void;
 }
@@ -244,6 +250,7 @@ export function ProviderSectionHeader({
   account,
   card,
   handle,
+  nowMs = 0,
   onCustomize,
   onSwitchAccount,
 }: ProviderSectionHeaderProps) {
@@ -270,6 +277,7 @@ export function ProviderSectionHeader({
         </MdiAlert>
       ) : null}
       <span className="min-w-[var(--gap-controls)] flex-1" />
+      {account ? <DesktopPrepareControl account={account} card={card} nowMs={nowMs} /> : null}
       {account ? <AccountControl account={account} title={card.title} onSwitch={onSwitchAccount} /> : null}
       {onCustomize ? (
         <HeaderAction icon={<MdiTune />} label={`${m.customize()} ${card.title}`} onClick={onCustomize} />
@@ -284,6 +292,25 @@ interface AccountControlProps {
   onSwitch?: () => void;
 }
 
+/** No account swap: a separate official CLI turn and server-confirmed window. */
+function DesktopPrepareControl({ account, card, nowMs }: { account: CardAccount; card: Card; nowMs: number }) {
+  const state = desktopPreparation(card, account, nowMs);
+  if (!state) return null;
+  return (
+    <Hint content={state.hint}>
+      <span>
+        <button type="button" className={cn("desktop-account-control", account.prepareError && state.label === "Prepare" && "is-failed")}
+          disabled={state.disabled} aria-label={`${state.label} Claude Desktop account ${account.label}`}
+          onClick={() => sendCommand("prepare-account", { vendor: "claude-desktop", label: account.label })}
+          onKeyDown={(event) => event.stopPropagation()} onPointerDown={(event) => event.stopPropagation()}>
+          {account.preparing ? <MdiLoading className="animate-spin" /> : state.label === "Ready" ? <MdiCheck /> : <MdiClockStart />}
+          {state.label}
+        </button>
+      </span>
+    </Hint>
+  );
+}
+
 /**
  * The account switch beside the header shortcuts, in the star language the row menu already
  * uses: the active login is a static filled star, not a button, since there is nothing to do
@@ -291,6 +318,13 @@ interface AccountControlProps {
  * spins in place; a failed one keeps the outline star, tinted red, with the reason as its tooltip.
  */
 function AccountControl({ account, title, onSwitch }: AccountControlProps) {
+  // A Desktop switch quits and reopens Claude.app: the first click arms it.
+  const [armed, setArmed] = useState(false);
+  useEffect(() => {
+    if (!armed) return;
+    const timer = setTimeout(() => setArmed(false), 4000);
+    return () => clearTimeout(timer);
+  }, [armed]);
   if (account.active) {
     const label = `${title} is the active account`;
     return (
@@ -310,13 +344,24 @@ function AccountControl({ account, title, onSwitch }: AccountControlProps) {
   if (!onSwitch || account.busy) return null;
   const label = account.error
     ? `Switch to ${title} failed: ${account.error}`
-    : `Use ${title} (switches the CLI, desktop app and IDE extension)`;
+    : account.desktop && armed
+      ? `Click again to switch the Claude Desktop app to ${title}; it quits and reopens`
+      : account.desktop
+        ? `Use ${title} in the Claude Desktop app (quits and reopens it)`
+        : `Use ${title} (switches the CLI, desktop app and IDE extension)`;
   return (
     <HeaderAction
       className={account.error ? "is-failed" : undefined}
-      icon={<MdiStarOutline />}
+      icon={armed ? <MdiStarHalfFull /> : <MdiStarOutline />}
       label={label}
-      onClick={onSwitch}
+      onClick={() => {
+        if (account.desktop && !armed) {
+          setArmed(true);
+          return;
+        }
+        setArmed(false);
+        onSwitch();
+      }}
     />
   );
 }
@@ -361,9 +406,11 @@ interface MetricRowProps {
  */
 function UsageMetricRow({ demand, layout, nowMs, onToggleShowAs, row }: MetricRowProps) {
   const { language, metricLabel } = useI18n();
-  // The fill follows the headline's reading (WidgetData.fraction): remaining in Left mode,
-  // consumed in Used mode. The color is a verdict and never flips with the toggle.
-  const fill = layout.showAs === "used" ? row.usedPercent : row.leftPercent;
+  // The fill is always the consumed share — ink is consumption, like every usage
+  // gauge. The Used/Left toggle is a reading of the headline number only, and the
+  // color is a verdict; filling with what remains in Left mode painted SuperGrok's
+  // "88% left" as an almost-full red bar that read as nearly spent.
+  const fill = row.usedPercent;
   const spent = row.leftPercent === 0;
   const headline = translateUsage(language, headlineLabel(row, layout.showAs));
   const headlineAlt = translateUsage(language, headlineAlternate(row, layout.showAs));
@@ -380,7 +427,8 @@ function UsageMetricRow({ demand, layout, nowMs, onToggleShowAs, row }: MetricRo
   const warmup = rowPace === null && layout.alwaysShowPace ? paceWarmupText(row, nowMs, language) : "";
   // The flame is for a row that runs out well before its reset, not for any row a hair over the line.
   const behind = paceVerdict(rowPace, row.leftPercent) === "critical";
-  const tick = paceTickPercent(rowPace, layout.showAs);
+  // The tick sits in the meter's space, which always shows the consumed share.
+  const tick = paceTickPercent(rowPace);
   const goal = layout.usageGoal ? usageGoal(row, nowMs) : null;
   const goalLabel = goal ? (goal.estimated ? m.estimated_goal_now() : m.goal_now()) : "";
   // Like the tick, the goal follows the headline's reading so the two numbers compare directly.

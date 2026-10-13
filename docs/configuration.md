@@ -20,11 +20,18 @@ ai-usagebar-tui --config ./config.test.toml
 # Which vendor the widget shows when --vendor is omitted, AND which tab
 # is selected when the TUI opens. Defaults to anthropic when not set.
 # Only a vendor that is enabled can be primary.
-# primary = "anthropic"   # anthropic | anthropic_api | openai | copilot | ollama
+# primary = "anthropic"   # any vendor slug, e.g. anthropic | openai | copilot | ollama | cline
 #                         # | zai | openrouter | deepseek | deepinfra | kimi | kilo | novita
 #                         # | moonshot | grok | supergrok | grokbot | antigravity | cursor
 #                         # | minimax | kiro | nous | opencode-go | commandcode
 #                         # | orcarouter | modelstudio | lyceum | devin
+# Which vendors the Overview lists, in this order. The TUI tab bar leads with
+# the same list; enabled vendors left off it follow in the canonical order.
+# Omit for every enabled vendor. A repeated slug keeps its first occurrence;
+# an empty list is set, and is not the same as omitting the key.
+# `usage --json` includes `overview_vendors` only when this is set, so a
+# frontend can order cards without reading this file.
+# overview_vendors = ["anthropic", "openai", "supergrok"]
 
 [context]
 enabled = false           # opt in, then press c in ai-usagebar-tui
@@ -221,6 +228,12 @@ enabled = false            # opt in after signing in with Antigravity
 #
 # Set ANTIGRAVITY_LS_ADDRESS=host:port only when automatic loopback discovery
 # fails; discovered ports are still tried after this address.
+#
+# ide_language_server = false leaves the Antigravity IDE's language server out
+# of discovery (default: true). Use it when the IDE is installed but its
+# sign-in is managed separately — a signed-out IDE answers 401/403, which
+# outranks and masks a working `agy` session (#405). No effect on Windows,
+# where the IDE's server cannot be told apart from the 2.0 app's on disk.
 
 [cursor]
 enabled = true             # disabled by default; enable once you've signed in to Cursor
@@ -236,6 +249,15 @@ enabled = true             # disabled by default; enable once you've run `kiro-c
 # No API key: reads the AWS SSO OIDC session kiro-cli already wrote to its own
 # data.sqlite3 after you logged in there.
 # db_path = "/home/you/.local/share/kiro-cli/data.sqlite3"
+
+[opencode-go]
+enabled = true             # disabled by default; enable once signed in or configured
+# Reads the API key the official OpenCode CLI already wrote to its own
+# auth.json (default $XDG_DATA_HOME/opencode or ~/.local/share/opencode),
+# read-only, so a signed-in CLI shows up on its own. An explicit key still
+# wins: OPENCODE_GO_API_KEY (or `api_key`) is resolved before the file.
+# api_key = "..."                          # or export OPENCODE_GO_API_KEY
+# auth_paths = ["/custom/opencode/auth.json"]  # non-standard install
 
 [modelstudio]
 enabled = false            # disabled by default; enable after `bl auth login --console`

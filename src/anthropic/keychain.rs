@@ -91,6 +91,16 @@ fn account() -> Option<String> {
 /// `security` exits with the raw OSStatus. 44 is `errSecItemNotFound`.
 const ERR_SEC_ITEM_NOT_FOUND: i32 = 44;
 
+/// A `/usr/bin/security` invocation that does not inherit this process's
+/// provider keys — the rule every credential lookup in this crate follows.
+fn security_command() -> Command {
+    let mut command = Command::new("/usr/bin/security");
+    for var in crate::vendor::vendor_secret_env_vars_to_remove(&[]) {
+        command.env_remove(var);
+    }
+    command
+}
+
 /// Read the raw credentials JSON from the login Keychain.
 ///
 /// Returns `Ok(None)` only when the item genuinely does not exist, so callers
@@ -108,14 +118,19 @@ pub fn read_raw_for(config_dir: &Path) -> Result<Option<String>> {
     read_raw_service(&service_name_for(config_dir)?)
 }
 
-fn read_raw_service(service: &str) -> Result<Option<String>> {
-    let mut cmd = Command::new("/usr/bin/security");
-    cmd.args(["find-generic-password", "-s", service, "-w"]);
-    if let Some(acct) = account() {
-        cmd.args(["-a", &acct]);
+/// `security find-generic-password -s <service> -w [-a <account>]`, read-only;
+/// the secret arrives on stdout, never in argv.
+fn read_command(service: &str, account: Option<&str>) -> Command {
+    let mut command = security_command();
+    command.args(["find-generic-password", "-s", service, "-w"]);
+    if let Some(acct) = account {
+        command.args(["-a", acct]);
     }
+    command
+}
 
-    let out = cmd
+fn read_raw_service(service: &str) -> Result<Option<String>> {
+    let out = read_command(service, account().as_deref())
         .output()
         .map_err(|e| AppError::Other(format!("could not run `security`: {e}")))?;
 
@@ -237,14 +252,22 @@ fn command_for_security_stdin(service: &str, account: &str, json: &str) -> Optio
     command_fits_security_stdin(&command).then_some(command)
 }
 
-/// Feed one composed command to `security -i` over stdin, keeping the secret
-/// out of argv.
-fn write_via_security_stdin(command: &str) -> Result<()> {
-    let mut child = Command::new("/usr/bin/security")
+/// `security -i`, with the composed command fed over stdin: the secret never
+/// enters argv.
+fn write_stdin_command() -> Command {
+    let mut command = security_command();
+    command
         .arg("-i")
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    command
+}
+
+/// Feed one composed command to `security -i` over stdin, keeping the secret
+/// out of argv.
+fn write_via_security_stdin(command: &str) -> Result<()> {
+    let mut child = write_stdin_command()
         .spawn()
         .map_err(|e| AppError::Other(format!("could not run `security`: {e}")))?;
     child
@@ -262,14 +285,11 @@ fn write_via_security_stdin(command: &str) -> Result<()> {
     Err(write_failure(&out))
 }
 
-/// Argv fallback for a blob too long for the `security -i` line cap. The
-/// secret is visible to `ps` for the few milliseconds `security` runs — the
-/// same trade Claude Code makes for this case ("exceeds security -i stdin
-/// limit; using argv"). The alternative, a native `SecItemAdd`, re-stamps the
-/// item with our `cdhash:` partition and brings the Keychain dialog back on
-/// every later read (issue #148).
-fn write_via_security_argv(service: &str, account: &str, json: &str) -> Result<()> {
-    let out = Command::new("/usr/bin/security")
+/// `security add-generic-password -U -a <account> -s <service> -w <json>`: the
+/// argv fallback, where the blob is an argument (see the caller's docs).
+fn write_argv_command(service: &str, account: &str, json: &str) -> Command {
+    let mut command = security_command();
+    command
         .args([
             "add-generic-password",
             "-U",
@@ -281,7 +301,18 @@ fn write_via_security_argv(service: &str, account: &str, json: &str) -> Result<(
             json,
         ])
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    command
+}
+
+/// Argv fallback for a blob too long for the `security -i` line cap. The
+/// secret is visible to `ps` for the few milliseconds `security` runs — the
+/// same trade Claude Code makes for this case ("exceeds security -i stdin
+/// limit; using argv"). The alternative, a native `SecItemAdd`, re-stamps the
+/// item with our `cdhash:` partition and brings the Keychain dialog back on
+/// every later read (issue #148).
+fn write_via_security_argv(service: &str, account: &str, json: &str) -> Result<()> {
+    let out = write_argv_command(service, account, json)
         .output()
         .map_err(|e| AppError::Other(format!("could not run `security`: {e}")))?;
     if out.status.success() {
@@ -352,14 +383,19 @@ fn write_raw_service_as(service: &str, account: &str, json: &str) -> Result<()> 
     }
 }
 
-fn delete_raw_service(service: &str) -> Result<()> {
-    let mut cmd = Command::new("/usr/bin/security");
-    cmd.args(["delete-generic-password", "-s", service]);
-    if let Some(acct) = account() {
-        cmd.args(["-a", &acct]);
+/// `security delete-generic-password -s <service> [-a <account>]`, selecting
+/// the item exactly as the read does.
+fn delete_command(service: &str, account: Option<&str>) -> Command {
+    let mut command = security_command();
+    command.args(["delete-generic-password", "-s", service]);
+    if let Some(acct) = account {
+        command.args(["-a", acct]);
     }
+    command
+}
 
-    let out = cmd
+fn delete_raw_service(service: &str) -> Result<()> {
+    let out = delete_command(service, account().as_deref())
         .output()
         .map_err(|e| AppError::Other(format!("could not run `security`: {e}")))?;
     if out.status.success() || out.status.code() == Some(ERR_SEC_ITEM_NOT_FOUND) {
@@ -786,6 +822,46 @@ mod tests {
                 panic!("a small blob must stay on stdin, keeping the secret out of argv")
             }
         }
+    }
+
+    /// Every `security(1)` spawn — read, both writes, delete — must not inherit
+    /// this process's provider keys, the rule every credential lookup in this
+    /// crate follows.
+    fn assert_vendor_secrets_scrubbed(command: &Command) {
+        assert_eq!(command.get_program(), "/usr/bin/security");
+        let removed: Vec<String> = command
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(key, _)| key.to_string_lossy().into_owned())
+            .collect();
+        for var in crate::vendor::vendor_secret_env_vars_to_remove(&[]) {
+            assert!(
+                removed.iter().any(|key| key == var),
+                "expected {var} to be scrubbed from the credential keychain command"
+            );
+        }
+    }
+
+    #[test]
+    fn keychain_read_scrubs_vendor_secret_env_vars() {
+        assert_vendor_secrets_scrubbed(&read_command(SERVICE, Some("alice")));
+        assert_vendor_secrets_scrubbed(&read_command(SERVICE, None));
+    }
+
+    #[test]
+    fn keychain_write_stdin_scrubs_vendor_secret_env_vars() {
+        assert_vendor_secrets_scrubbed(&write_stdin_command());
+    }
+
+    #[test]
+    fn keychain_write_argv_scrubs_vendor_secret_env_vars() {
+        assert_vendor_secrets_scrubbed(&write_argv_command(SERVICE, "alice", "{}"));
+    }
+
+    #[test]
+    fn keychain_delete_scrubs_vendor_secret_env_vars() {
+        assert_vendor_secrets_scrubbed(&delete_command(SERVICE, Some("alice")));
+        assert_vendor_secrets_scrubbed(&delete_command(SERVICE, None));
     }
 
     /// Opt-in like the round-trip test:

@@ -350,6 +350,9 @@ mod tests {
             VendorId::Shvia => MacosMirror::Generic(CORE),
             // Weekly-only: no 5h window, so it renders through the weekly half.
             VendorId::Grokbot => MacosMirror::Generic(&["plan", "vendor_short", "weekly_pct"]),
+            // Three independent windows (5 h, weekly, monthly); the macOS bar
+            // reads its fields by index, so each gets its own appended slot.
+            VendorId::Cline => MacosMirror::Slot("cline_5h_pct"),
         }
     }
 
@@ -443,6 +446,39 @@ mod tests {
                      placeholder any more — it was renamed on one side only"
                 );
             }
+        }
+    }
+
+    /// Every `;;`-separated FORMAT field is exactly one `{token}` — a single-`;`
+    /// joint merges two fields and shifts every index after it (#411 nearly
+    /// shipped a Devin regression that the contains-check above cannot see).
+    #[test]
+    fn macos_format_fields_are_single_tokens_between_separators() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("macos/ai-usagebar-menubar.swift");
+        let Ok(swift) = std::fs::read_to_string(&path) else {
+            return;
+        };
+        let expr = swift
+            .split_once("let FORMAT = ")
+            .and_then(|(_, rest)| rest.split_once("let FORMAT_WITH_SENTINEL"))
+            .map(|(expr, _)| expr)
+            .expect("macOS menubar FORMAT string not found");
+        // Collapse the literal concatenation: quotes, ` +` joints, whitespace.
+        let flat: String = expr
+            .chars()
+            .filter(|c| !c.is_whitespace() && *c != '"' && *c != '+')
+            .collect();
+        let flat = flat.strip_suffix(';').map(str::to_string).unwrap_or(flat);
+        for field in flat.split(";;") {
+            assert!(
+                field.starts_with('{')
+                    && field.ends_with('}')
+                    && field[1..field.len() - 1]
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'),
+                "macOS FORMAT field is not exactly one placeholder: {field:?}"
+            );
         }
     }
 

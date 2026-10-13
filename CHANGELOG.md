@@ -1,5 +1,234 @@
 ## [Unreleased]
 
+## [1.36.0] — 2026-10-12
+
+### Added
+
+- **Cline (ClinePass)** as a vendor: the three limits ClinePass meters —
+  5 hours, weekly, monthly — read as the percentage Cline itself reports from
+  the dashboard's `usage-limits` route (undocumented, the same calls the web
+  dashboard and the official `cline` CLI make), with the reset time of each
+  open window; the plan's billing period comes from the documented
+  `/api/v1/users/me/plan`. Enable `[cline]`; the credential is the one the
+  `cline` CLI already holds, and is only ever read — an expired token is
+  flagged, never refreshed (refreshing would sign the CLI out), and a blank
+  token is a credentials error naming `cline auth`. Figures are the server's
+  own percentages: no usage is re-derived from the charge ledger, and anything
+  outside the reported shape is schema drift, never a silent 0%.
+
+
+- **Prepare an inactive Claude Desktop account without switching to it (macOS).**
+  A Desktop account's card gains a Prepare action that opens the account's
+  5-hour window server-side: one short turn with the profile's token in an
+  isolated temporary home (no tools, MCP, history persistence, or project
+  context; the directory is deleted afterward). The app is neither switched
+  nor restarted. Contributed by GuohuaQiu1999 as the prepare half of #392;
+  the switch half shipped separately in v1.35.0.
+### Changed
+
+- **TUI tabs follow `[ui] overview_vendors`.** Listed vendors lead the sidebar
+  in that order. Enabled vendors left off the list keep the canonical order
+  after them. The Overview tab still lists only the named vendors.
+  `usage --json` includes `overview_vendors` when the list is set, including
+  an empty list, and omits the field otherwise. `entries` follow the tab
+  order, so a consumer that renders the payload in order follows the list
+  too. Frontends keep a repeated slug's first occurrence. The Linux Mint dashboard
+  reads that field instead of `config.toml`. When the field is absent it
+  still leads with `primary`; an empty list does not.
+
+### Fixed
+
+- **Linux Mint dashboard opens on Wayland.** Asking an X11 server time no
+  longer crashes when WSLg (or any Wayland session) hands back a Wayland
+  window.
+
+
+- **Cursor usage requests send the full browser header set.** cursor.com sits
+  behind Vercel's WAF, which negotiates client hints and denies
+  automated-looking TLS fingerprints outright, so a risk-based 403 appeared as
+  "authentication rejected" on a session cookie the same request accepted from
+  curl. The summary call now sends the complete header set a browser sends,
+  and a 403 reads as "authentication failed or an edge block" instead of
+  blaming the credentials (#410).
+
+- **Antigravity can skip the IDE's language server in discovery.** With the
+  Antigravity IDE open but signed out, its language server answered an
+  actionable 403 that masked the working `agy` saved-session fallback (#405).
+  `[antigravity] ide_language_server = false` excludes IDE-owned candidates
+  before any probe, so the fallback answers exactly as if the IDE were closed.
+  The default keeps today's discovery; an explicit `ANTIGRAVITY_LS_ADDRESS` is
+  never skipped. A no-op on Windows (the IDE cannot be told apart by filename).
+## [1.35.0] — 2026-10-11
+
+### Added
+
+- **Claude Desktop accounts switch from their card in the macOS tray.** A
+  Claude card for an account only the Desktop app knows (saved with
+  `ai-usagebar account add <label> --desktop`) now carries the same star as a
+  Claude Code account's card. The star switches the app alone through
+  `account switch --desktop`: Claude.app quits, the local history moves to
+  that account, and the app reopens. Because the app restarts, it takes a
+  second click. The tray offered the star only for Claude Code and Codex
+  logins, so a Desktop-only account could not be switched from the menu bar
+  as the old Swift app's Preferences allowed.
+
+- **Ollama Cloud provider mark in the Omarchy bar and panel.** Ship the
+  monochrome Lobe Icons SVG under MIT, with source provenance and the
+  existing LobeHub licence notice. The same mark is used for custom
+  providers that declare `brand = "ollama"`.
+
+
+- **OpenCode Go reads the official CLI's own credential.** A signed-in OpenCode
+  CLI (`opencode auth login`) now shows up on its own: the key is read
+  read-only from `~/.local/share/opencode/auth.json` (`$XDG_DATA_HOME`
+  honoured; `[opencode-go] auth_paths` overrides the file), and an explicit
+  `OPENCODE_GO_API_KEY` / `[opencode-go] api_key` still wins. Detection, waybar,
+  and the TUI follow the same resolution, and the CLI file is never written,
+  copied, or cached.
+
+- **Claude Code mod to switch the Claude Desktop account** (`claude-code-mod/`).
+  `/claude-account` in a Claude Code session opens a pane with the saved
+  Desktop accounts, each with its quota windows, and switches the app with
+  `account switch --desktop` after a dry run. The switch is handed to launchd
+  so it outlives Claude.app quitting, which takes the session down with it.
+### Changed
+
+- **Meters fill with what is consumed in both readings.** PR #389 made the
+  bar geometry follow the Show Usage As toggle, so in Left mode the fill
+  painted what *remained* while the color and the verdict kept speaking about
+  consumption — SuperGrok's "88% left" drew as an almost-full red bar that
+  read as nearly spent, and the monochrome menu-bar bars told the story
+  backwards too: the healthiest windows carried the most ink while a spent
+  one shrank to a barely visible track. The fill is now always the consumed
+  share on the popover and the compact bars alike; the Used/Left toggle reads
+  only the headline number, the chips, and the tooltip, and the pace tick
+  keeps sitting at the elapsed share of the window.
+
+- **Ollama Cloud quota now comes from `/api/balance`.** `/api/usage` returned
+  request and token history rather than quota, so the provider reads the
+  documented balance route instead. Both account shapes are served there —
+  verified against a real capture from a session/weekly account — so existing
+  quota users see no change beyond the source.
+
+### Fixed
+
+- **Windows tray icon no longer turns red for a Claude Code session row.**
+  The icon takes the hottest metric of every entry, and that count
+  included the context session rows under the Claude entry's "Sessions"
+  heading, so a session at 90% of its context window painted the tray
+  critical while the quota windows sat at 29%. The icon now ranks the
+  ungrouped quota windows first, grouped rows standing in only when an
+  entry has nothing else, the partition the Omarchy, Mint and KDE
+  frontends and the macOS menu bar already apply.
+
+- **Custom format placeholders escape the remaining API-controlled text.**
+  Claude's `{plan}` (built from the credentials file) and `{scoped_model}`
+  (the API's model display name), Codex's `{oai_credit_balance}` (kept as
+  the string OpenAI sent when it is not a plain number) and Ollama's
+  `{oll_cost}` were substituted into the bar text and a custom
+  `--tooltip-format` unescaped, and Ollama's default tooltip printed the
+  activity period raw. All of them reach Waybar's Pango markup, where an `&`
+  or `<` breaks the module. They are now escaped at the projection boundary,
+  the rule every other provider's plan and model placeholders already
+  follow.
+
+- **Omarchy settings view localizes Lyceum's billing credits note.**
+  The Lyceum API key card note ("billing credits") was missing from the
+  Omarchy I18n dictionary and fell back to raw English. It is now mapped
+  and localized across all supported languages (ru, pt-BR, ko, es, and en).
+
+- **An empty menu-bar bar draws a visible capsule.** A 0% row used to
+  vanish against the dark menu bar — its bare track was all but invisible
+  there. It now draws the whole track at the remainder's strength, like the
+  popover's empty meter.
+- **Early-window weekly usage no longer triggers a false critical pace alert.**
+  In long reset windows (such as SuperGrok, Grok Bot, or Claude/Codex weekly),
+  normal session usage during the opening stretch of a cycle (< 15% elapsed,
+  e.g. the first ~25 hours of a week) previously pushed the ratio past 130%
+  and the absolute gap past 5 percentage points, marking the metric as critical
+  (flame icon, and run-out date). In the opening 15% of a window with at least
+  50% allowance remaining, accelerated usage now warns as "over" pace (yellow)
+  rather than a run-out crisis (#390).
+
+- **KDE plasmoid displays value headlines as their value.** A metric declaring
+  `headline: "value"` with a non-null consumed percentage (such as prepaid
+  balances or credit spend) previously rendered as a percentage across panel
+  cells, card gauges, and popup rows. It now honors the headline and displays
+  the value string, falling back to the percentage only when the value is empty.
+
+- **KDE plasmoid: a Claude Code session row no longer colours the vendor
+  card.** The card view took its accent from the worst severity of every
+  metric row, grouped or not, so a context session at 90% of its window
+  painted the Claude card critical while the quota windows sat at 29%. The
+  accent now applies the same partition the headline and the panel cells
+  do: ungrouped quota rows first, grouped rows standing in only when an
+  entry has nothing else.
+
+
+- **Omarchy panel no longer logs a binding loop for the Flow layouts.** Both
+  provider-list and Cursor pool-toggle Flows bound `height` to
+  `childrenRect.height`, feeding their own geometry back through their content
+  rect; they now bind `implicitHeight`.
+
+- **Antigravity's 'plan has no quota' message reaches the user again.** The
+  friendly subscription 403 (#256) was misclassified as an auth rejection on
+  the full remote path, so a free-plan account watched a token refresh burn
+  and then read 'session expired' — the re-sign-in-for-nothing the fix was
+  meant to prevent. The subscription verdict now passes straight through, no
+  refresh, no retry, no `agy` spawn; every other 403 keeps the existing
+  behavior (#405).
+
+- **Ollama Cloud credit-based Pro plans no longer show an empty quota.**
+  Fetch the documented `/api/balance` endpoint instead of `/api/usage`, which
+  now returns request/token history. Automatically detect monthly included
+  credits (such as Pro's $60 allowance) or legacy session/weekly limits.
+  Show remaining/allowance dollars and purchased credits, derive monthly
+  utilization from included credits, and preserve billing resets and actual
+  period lengths. Historical quota caches remain readable; usage-history
+  payloads are rejected rather than silently accepted as empty limits.
+
+- **Model Studio reads the Token Plan's monthly window, not just the 5-hour
+  and weekly ones.** The gateway's `per1MonthPercentage`/`per1MonthResetTime`
+  fields were already present on accounts that report no 5-hour or weekly
+  quota (the individual Token Plan is one such shape), but neither
+  ai-usagebar nor the upstream `bl` CLI parsed them, leaving those accounts
+  on "no usage windows reported". Two things were wrong and both are fixed:
+  the tolerant unwrap reproduced the CLI verbatim (`data.DataV2?.data?.data
+  ?? …` — starting from the outer `data` the dispatcher always emits, never
+  a bare top-level `DataV2`), and the monthly window is parsed, cached,
+  rendered and documented. The monthly window draws its own bar with the
+  exact reset countdown in the widget, TUI, report JSON and popover cards.
+  Like OpenCode Go's monthly, it keeps the reset but no pace glyph — the
+  cycle length is plan-dependent (28–31 days), so pacing would guess a
+  denominator. New `30d {mst_monthly_pct}%` default bar text and
+  `{mst_monthly_pct|reset|elapsed|pace|pace_indicator}` placeholders.
+
+- **Nous Research credit amounts no longer display a trailing decimal point.**
+  When a credit balance had a fractional remainder that rounded to zero within
+  six decimal places (such as floating-point residue near a whole number),
+  trimming trailing zeros stripped the digits but retained the decimal point,
+  displaying values like "1." or "0.". Trailing dots are now stripped so whole
+  and rounded credit values format cleanly.
+
+- **The placeholder reference covers Nous Research.** `docs/format-placeholders.md`
+  had a section for every provider except Nous, so `{nous_pct}`,
+  `{nous_renewal}`, `{nous_plan}` and the six credit placeholders were
+  discoverable only in the source. The new section states what each carries,
+  how credits are formatted, the default format, and which shared placeholders
+  alias them.
+
+
+### Security
+
+- **Credential keyring lookups no longer inherit provider keys.** Antigravity's
+  saved-session read spawns `secret-tool` (Linux) / `security` (macOS), and the
+  Cursor database, Claude Desktop safe-storage, and Anthropic keychain reads,
+  writes and deletes spawn `security` — each child inherited every vendor
+  secret variable of this process (`ZAI_API_KEY`, `OPENROUTER_API_KEY`, the
+  named accounts' `api_key_env` names) it has no use for. They are dropped
+  before the lookup runs, the scrub the Grok Bot keyring lookups, `claude`,
+  `codex login`, `gh` and `agy` already apply (#402).
+
 ## [1.34.0] — 2026-10-08
 
 ### Added
@@ -2223,7 +2452,6 @@
   still names the buckets it did receive. `docs/vendor-endpoints.md` gains the
   Antigravity row it never had — it was the only provider missing from that
   table — and the placeholder reference no longer promises all four windows.
-
 ## [1.9.1] — 2026-08-30
 
 ### Fixed
@@ -4091,7 +4319,9 @@ vendors. Highlights:
 - Live API smoke test suite (`make smoke`) that exercises the real
   undocumented endpoints to detect schema drift before users do.
 
-[Unreleased]: https://github.com/akitaonrails/ai-usagebar/compare/v1.34.0...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-usagebar/compare/v1.36.0...HEAD
+[1.36.0]: https://github.com/akitaonrails/ai-usagebar/compare/v1.35.0...v1.36.0
+[1.35.0]: https://github.com/akitaonrails/ai-usagebar/compare/v1.34.0...v1.35.0
 [1.34.0]: https://github.com/akitaonrails/ai-usagebar/compare/v1.33.0...v1.34.0
 [1.33.0]: https://github.com/akitaonrails/ai-usagebar/compare/v1.32.0...v1.33.0
 [1.32.0]: https://github.com/akitaonrails/ai-usagebar/compare/v1.31.0...v1.32.0

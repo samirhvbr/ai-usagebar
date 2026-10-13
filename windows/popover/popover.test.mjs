@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import {
   accountSwitchFor,
+  desktopPreparation,
   formatDuration,
   nextUpdateLabel,
   parseHostPayload,
@@ -632,7 +633,10 @@ assert.equal(meterColor(NaN), 'blue');
   assert.equal(verdict(6, early), 'calm'); // ~126%, 1.2 pp
   assert.equal(verdict(7, early), 'calm'); // ~147%, 2.2 pp
   assert.equal(verdict(9, early), 'over'); // ~189%, 4.2 pp
-  assert.equal(verdict(10, early), 'critical'); // ~210%, 5.2 pp
+  assert.equal(verdict(10, early), 'over'); // ~210%, 5.2 pp: early in week with 90% left is over pace, not critical
+  assert.equal(color(10, early), 'yellow');
+  assert.equal(verdict(55, early), 'critical'); // heavy burn (>50% spent in 8h) is critical
+  assert.equal(color(55, early), 'red');
   assert.equal(color(7, early), 'blue');
   // Past 130% but only 3-5 points over the tick is a look, not a run-out.
   assert.equal(verdict(8, early), 'over'); // ~168%, 3.2 pp
@@ -927,8 +931,7 @@ assert.equal(resetAlternate(badStampRow, 'exact', resetNow, utc), '');
   // a spent meter (100%, "Limit reached") has no pace at all: no tick, no text, not visible
   const spent = pace(row(100, 2 * 3600_000), now);
   assert.equal(spent, null);
-  assert.equal(paceTickPercent(spent, 'used'), null);
-  assert.equal(paceTickPercent(spent, 'left'), null);
+  assert.equal(paceTickPercent(spent), null);
   assert.equal(paceText(spent, now), '');
   assert.equal(paceVisible(spent, { alwaysShowPace: true }), false);
   assert.equal(pace(row(100.5, 2 * 3600_000), now), null); // past the limit is still spent
@@ -936,24 +939,20 @@ assert.equal(resetAlternate(badStampRow, 'exact', resetNow, utc), '');
   const almostSpent = pace(row(99, 2 * 3600_000), now);
   assert.equal(almostSpent.state, 'behind');
   assert.equal(almostSpent.elapsedPercent, 40);
-  assert.equal(paceTickPercent(almostSpent, 'used'), 40);
-  assert.equal(paceTickPercent(almostSpent, 'left'), 60);
+  assert.equal(paceTickPercent(almostSpent), 40);
   // behind without a run-out instant has no text: the flame alone
   const noRunOut = { state: 'behind', sparePercent: -100, projectedPercent: 200, runsOutMs: null, elapsedPercent: 40 };
   assert.equal(paceText(noRunOut, now), '');
   assert.equal(paceText(noRunOut, now, { resetTimes: 'exact', timeZone: 'UTC' }), '');
 
-  // ASSERT: the tick follows the meter's reading — elapsed in Used mode, remaining in Left mode
-  assert.equal(paceTickPercent(behind, 'used'), 40);
-  assert.equal(paceTickPercent(behind, 'left'), 60);
-  assert.equal(paceTickPercent(ahead, 'used'), 50);
-  assert.equal(paceTickPercent(ahead, undefined), 50);
-  assert.equal(paceTickPercent({ ...ahead, elapsedPercent: 250 }, 'used'), 100);
-  assert.equal(paceTickPercent({ ...ahead, elapsedPercent: 250 }, 'left'), 0);
-  assert.equal(paceTickPercent({ ...ahead, elapsedPercent: -5 }, 'used'), 0);
-  assert.equal(paceTickPercent({ ...ahead, elapsedPercent: -5 }, 'left'), 100);
-  assert.equal(paceTickPercent({ ...ahead, elapsedPercent: NaN }, 'used'), 0);
-  assert.equal(paceTickPercent(null, 'used'), null);
+  // ASSERT: the tick sits in the meter's space, which always fills with the
+  // consumed share — the Used/Left toggle reads the headline, never the ink
+  assert.equal(paceTickPercent(behind), 40);
+  assert.equal(paceTickPercent(ahead), 50);
+  assert.equal(paceTickPercent({ ...ahead, elapsedPercent: 250 }), 100);
+  assert.equal(paceTickPercent({ ...ahead, elapsedPercent: -5 }), 0);
+  assert.equal(paceTickPercent({ ...ahead, elapsedPercent: NaN }), 0);
+  assert.equal(paceTickPercent(null), null);
 
   // ASSERT: no signal → null
   assert.equal(pace(row(50, 30_000), now), null); // 30s in: under the 1% / 60s floor
@@ -1791,6 +1790,30 @@ assert.equal(resolvedTheme('system'), 'light');
   assert.deepEqual(parseHostPayload(JSON.stringify({ entries: [] })).accounts, {});
 }
 
+// A Claude card the CLI does not know falls back to the Claude Desktop login
+// of the same label, whose switch moves the app alone and asks twice; a label
+// the CLI knows keeps the CLI switch.
+{
+  const payload = parseHostPayload(JSON.stringify({
+    entries: [],
+    accounts: {
+      anthropic: { active: 'work', labels: ['work'] },
+      'claude-desktop': { active: 'home', labels: ['home', 'work', 'club'], target: 'club', switching: true },
+    },
+  }));
+  assert.equal(accountSwitchFor('anthropic@work', payload.accounts).vendor, 'anthropic');
+  assert.equal(accountSwitchFor('anthropic@work', payload.accounts).desktop, false);
+  const home = accountSwitchFor('anthropic@home', payload.accounts);
+  assert.equal(home.vendor, 'claude-desktop');
+  assert.equal(home.desktop, true);
+  assert.equal(home.active, true);
+  const club = accountSwitchFor('anthropic@club', payload.accounts);
+  assert.equal(club.switching, true);
+  assert.equal(accountSwitchFor('anthropic@other', payload.accounts), null);
+  assert.equal(accountSwitchFor('openai@home', payload.accounts), null);
+  assert.equal(accountSwitchFor('claude-desktop@home', payload.accounts), null);
+}
+
 // Every card that renders keeps its switch control: as many accounts as there
 // are cards, and a label longer than a card id matched through the id's cut.
 {
@@ -1917,3 +1940,37 @@ assert.equal(resolvedTheme('system'), 'light');
 }
 
 console.log('ok');
+
+// Manual preparation belongs only to inactive Desktop cards. Fresh server
+// windows suppress repeated messages even while tiny usage rounds to 0%.
+{
+  const now = Date.parse('2026-10-10T14:00:01Z');
+  const card = { stale: false, errorTitle: '', rows: [
+    { kind: 'metric', window: 18000, usedPercent: 0, resetAt: '' },
+    { kind: 'metric', window: 604800, usedPercent: 20, resetAt: '' },
+  ] };
+  const account = { vendor: 'claude-desktop', label: 'two', active: false, prepareEnabled: true, busy: false };
+  assert.equal(desktopPreparation(card, { ...account, active: true }, now), null);
+  assert.equal(desktopPreparation(card, { ...account, vendor: 'anthropic' }, now), null);
+  assert.equal(desktopPreparation(card, { ...account, prepareEnabled: false }, now), null);
+  assert.equal(desktopPreparation(card, account, now).label, 'Prepare');
+  assert.equal(desktopPreparation(card, account, now).disabled, false);
+  assert.equal(desktopPreparation(card, { ...account, busy: true }, now).disabled, true);
+  assert.equal(desktopPreparation(card, { ...account, preparing: true }, now).label, 'Preparing…');
+  const running = { ...card, rows: [{ ...card.rows[0], resetAt: '2026-10-10T19:00:00Z' }, card.rows[1]] };
+  assert.equal(desktopPreparation(running, account, now).label, 'Ready');
+  assert.equal(desktopPreparation(running, account, now).disabled, true);
+  const exhausted = { ...running, rows: [{ ...running.rows[0], usedPercent: 100 }, card.rows[1]] };
+  assert.equal(desktopPreparation(exhausted, { ...account, preparedReset: '2026-10-10T19:00:00Z' }, now).label, 'Prepare');
+  assert.equal(desktopPreparation(exhausted, account, now).disabled, true);
+  assert.equal(desktopPreparation({ ...card, stale: true }, account, now).disabled, true);
+  assert.equal(desktopPreparation({ ...card, errorTitle: 'Offline' }, account, now).disabled, true);
+  assert.equal(desktopPreparation({ ...card, rows: [card.rows[0], { ...card.rows[1], usedPercent: 100 }] }, account, now).disabled, true);
+  assert.equal(desktopPreparation(card, { ...account, prepareError: 'Proxy unavailable' }, now).hint, 'Proxy unavailable');
+  const payload = parseHostPayload({ accounts: { 'claude-desktop': {
+    active: 'one', labels: ['one', 'two'], prepare_enabled: true, prepare_target: 'two', preparing: true,
+  } } });
+  assert.equal(accountSwitchFor('anthropic@two', payload.accounts).preparing, true);
+  assert.equal(accountSwitchFor('anthropic@one', payload.accounts).busy, true);
+  assert.equal(accountSwitchFor('anthropic@one', payload.accounts).active, true);
+}

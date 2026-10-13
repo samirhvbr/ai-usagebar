@@ -310,7 +310,10 @@ async fn fetch_live(
     access_token: &str,
 ) -> Result<CursorSnapshot> {
     // usage-summary keys off the session cookie alone (no `?user=` param); the
-    // browser-ish headers get past its CORS gate.
+    // browser-ish headers get past its CORS gate. The endpoint sits behind
+    // Vercel's WAF, which negotiates client hints (`accept-ch`) and denies
+    // automated-looking clients outright (#410) — send the full set a browser
+    // sends, not only the UA.
     let resp = tokio::time::timeout(
         HTTP_TIMEOUT,
         client
@@ -322,6 +325,17 @@ async fn fetch_live(
             .header("Origin", BASE_URL)
             .header("Referer", format!("{BASE_URL}/dashboard"))
             .header("User-Agent", BROWSER_UA)
+            .header("Accept", "application/json, text/plain, */*")
+            .header("Accept-Language", "en-US,en;q=0.9")
+            .header(
+                "sec-ch-ua",
+                "\"Not_A Brand\";v=\"8\", \"Chromium\";v=\"120\", \"Google Chrome\";v=\"120\"",
+            )
+            .header("sec-ch-ua-mobile", "?0")
+            .header("sec-ch-ua-platform", "\"macOS\"")
+            .header("sec-fetch-dest", "empty")
+            .header("sec-fetch-mode", "cors")
+            .header("sec-fetch-site", "same-origin")
             .send(),
     )
     .await
@@ -329,10 +343,15 @@ async fn fetch_live(
 
     let status = resp.status();
     if !status.is_success() {
-        let body = if matches!(status.as_u16(), 401 | 403) {
-            "Cursor authentication failed".into()
-        } else {
-            format!("Cursor API returned HTTP {}", status.as_u16())
+        let body = match status.as_u16() {
+            401 => "Cursor authentication failed".into(),
+            // cursor.com is behind Vercel's WAF, which denies non-browser TLS
+            // fingerprints outright (#410): a 403 here can be an edge block on
+            // a perfectly good session, not a credential verdict.
+            403 => "Cursor request denied: authentication failed or an edge block \
+                    (cursor.com gates non-browser clients)"
+                .into(),
+            other => format!("Cursor API returned HTTP {other}"),
         };
         return Err(AppError::Http {
             status: status.as_u16(),
@@ -471,6 +490,15 @@ mod tests {
                 "cookie",
                 format!("WorkosCursorSessionToken=user_123%3A%3A{token}").as_str(),
             )
+            // The WAF-facing browser header set (#410): the endpoint negotiates
+            // client hints and denies automated-looking clients, so the full
+            // set is part of the request contract.
+            .match_header("user-agent", BROWSER_UA)
+            .match_header("accept", "application/json, text/plain, */*")
+            .match_header("accept-language", "en-US,en;q=0.9")
+            .match_header("sec-ch-ua-mobile", "?0")
+            .match_header("sec-ch-ua-platform", "\"macOS\"")
+            .match_header("sec-fetch-site", "same-origin")
             .with_status(200)
             .with_body(sample_json())
             .create_async()

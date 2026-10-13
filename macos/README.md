@@ -180,7 +180,9 @@ Settings persist in `UserDefaults` and apply **live, no rebuild**.
 
 `[ui] overview_vendors = ["anthropic", "cursor", "openai"]` in
 `config.toml` limits and orders the Overview on macOS exactly as it does in the
-TUI. Requesting `anthropic` includes every configured named Claude account.
+TUI. The TUI tab bar also leads with that list; enabled vendors left off it
+follow in the canonical order. Requesting `anthropic` includes every configured
+named Claude account.
 
 In Overview mode, each dropdown row is a **checkbox**: click it to drop that
 provider from the always-visible top-bar summary (checkmark = shown; unchecked +
@@ -251,6 +253,12 @@ Preferences rather than the dropdown so that someone who uses only one of them,
 or neither, does not carry two permanent menu rows. A dim line under the
 dropdown header still shows both active accounts at a glance —
 `Desktop: work · Code: personal`.
+
+In the tray (AI Usage.app), each Claude account's card has a star: filled for
+the signed-in account, an outline on the others that makes that one active.
+A card for an account that only the Desktop app knows switches the app alone
+(`account switch --desktop`); because Claude.app quits and reopens, the first
+click arms it and the second switches.
 
 Switching the Desktop app **quits and reopens Claude.app**, so Preferences
 confirms first; your local history is merged into the target account and a

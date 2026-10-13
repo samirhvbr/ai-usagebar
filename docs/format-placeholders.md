@@ -21,7 +21,7 @@ metrics expand to an empty string unless noted otherwise.
 | Kiro CLI | `kir` | Nous Research | `nrs` |
 | OpenCode Go | `ocg` | Command Code | `cmc` |
 | Ollama Cloud | `oll` | SuperGrok | `sgk` |
-| Devin | `dvn` | | |
+| Devin | `dvn` | Cline | `cln` |
 
 The same codes ride the `ai-usagebar usage --json` report as each entry's
 `short_name`, so a native frontend can draw a Waybar-style provider tag without
@@ -31,7 +31,8 @@ Use `{session_pct}`, `{session_reset}`, `{weekly_pct}`, and `{weekly_reset}`
 when one format must work across providers. Providers without matching time
 windows return neutral values. Cursor maps Cursor Models to the session slot
 and Other Models to the weekly slot; both reset with the billing cycle. Kiro
-has one pool, so it maps `kiro_pct` to both percentage slots.
+has one pool, so it maps `kiro_pct` to both percentage slots, and Nous Research
+maps `nous_pct` and `nous_renewal` the same way.
 
 Claude and Codex also provide `*_elapsed`, `*_pace`, and `*_bar` families.
 Z.AI, MiniMax, OpenCode Go, and Cursor provide elapsed aliases plus provider-specific pace families.
@@ -179,13 +180,22 @@ cumulative usage (the API reports it in US cents; `275` renders as `$2.75`).
 `{mst_session_elapsed}`, `{mst_session_pace}`,
 `{mst_session_pace_indicator}`, `{mst_weekly_pct}`, `{mst_weekly_reset}`,
 `{mst_weekly_elapsed}`, `{mst_weekly_pace}`,
-`{mst_weekly_pace_indicator}`
+`{mst_weekly_pace_indicator}`, `{mst_monthly_pct}`, `{mst_monthly_reset}`,
+`{mst_monthly_elapsed}`, `{mst_monthly_pace}`,
+`{mst_monthly_pace_indicator}`
 
-The default bar format is `5h {mst_session_pct}% · 7d {mst_weekly_pct}%`.
+The default bar format is `5h {mst_session_pct}% · 7d {mst_weekly_pct}%`, with
+the `30d {mst_monthly_pct}%` window appended when the account reports it, and
+`30d {mst_monthly_pct}%` as the whole bar for a monthly-only account (the
+individual Token Plan's shape).
 `{session_*}` and `{weekly_*}` are cross-provider aliases. The API has no plan
 name, so `{mst_plan}` is always `Model Studio`. An absent window (no-data,
 possibly unlimited) expands to the empty string — never `0%`. The percentages
 are whole numbers: the wire carries ratios in `[0,1]` (`0.4217` → `42`).
+`{mst_monthly_elapsed}`, `{mst_monthly_pace}` and
+`{mst_monthly_pace_indicator}` are always empty: the monthly cycle length is
+plan-dependent (28–31 days), so pacing would guess a denominator rather than
+measure one.
 `{orc_limit}` and `{orc_remaining}` render `unlimited` for unlimited-quota
 keys — the API's `100000000` sentinel is collapsed to "no limit" rather than a
 $100M wallet, and `{orc_consumed_pct}` renders `—`. `{orc_expires}` counts
@@ -399,6 +409,31 @@ rotated credentials in an account-scoped `kiro/oauth.json` file. That file is
 mode `0600` on Unix. kiro-cli's database is opened read-only and is never
 modified.
 
+## Nous Research
+
+`{nous_plan}`, `{nous_pct}`, `{nous_renewal}`, `{nous_credits_remaining}`,
+`{nous_monthly_credits}`, `{nous_purchased_credits_remaining}`,
+`{nous_top_up_credits_remaining}`, `{nous_total_usable_credits}`,
+`{nous_rollover_credits}`
+
+These describe the Portal account the OAuth login reads. `{nous_pct}` is the
+consumed share of the monthly subscription-credit pool, a whole number held to
+0..=100 and computed from the subscription credits alone, never from top-up
+credits; it is `—` when the Portal omits the monthly allocation or the
+subscription credits remaining. `{nous_renewal}` counts down to the end of the
+current period (`—` when none is stated). The credit placeholders are plain
+numbers without a currency symbol: whole credits print without decimals,
+fractions keep up to six decimal places with trailing zeros trimmed, and a
+value the Portal does not report is `—`. `{nous_top_up_credits_remaining}`
+aliases `{nous_purchased_credits_remaining}`.
+
+The default format is `{nous_pct}% · {nous_renewal}`; with no `format`
+configured and no percentage available, the bar shows the renewal countdown
+alone. Nous has one pool and one period, so `{session_pct}` and
+`{weekly_pct}` alias `{nous_pct}`, `{session_reset}` and `{weekly_reset}`
+alias `{nous_renewal}`, and `{plan}` aliases `{nous_plan}`. There are no
+elapsed or pace placeholders.
+
 ## Command Code
 
 `{cc_plan}`, `{cc_session_pct}`, `{cc_session_reset}`, `{cc_session_used}`,
@@ -435,23 +470,28 @@ interpretation; its currency contract is not verified for all accounts.
 `{oll_session_pct}`, `{oll_session_reset}`, `{oll_session_pace}`,
 `{oll_weekly_pct}`, `{oll_weekly_reset}`, `{oll_weekly_pace}`,
 `{oll_monthly_pct}`, `{oll_monthly_reset}`, `{oll_monthly_pace}`,
-`{oll_plan}`, `{oll_cost}`
+`{oll_plan}`, `{oll_cost}`, `{oll_balance}`, `{oll_allowance}`, `{oll_purchased}`
 
-Ollama Cloud reports either a 5-hour session + weekly pair, or a single
-calendar-month window, as a fraction of the plan limit — never both in the
-same response — so all three percentage placeholders are whole numbers
-after clamping to 0..=100. A window the account did not report is an empty
-string, not `0`: native surfaces key off that emptiness so an omitted 5h/7d
-pair cannot become a confident 0% bar, and a present monthly window at 0%
-used still renders `0`. The default bar follows the same rule
-(`{oll_session_pct}% · {oll_weekly_pct}%w` when those exist,
-`{oll_monthly_pct}%` when only the month is present). The API does not
-publish reset timestamps, pace deltas, or a plan label: `{oll_plan}` falls
-back to the `plan` string from your config, and the reset/pace families
-render `—` when the window exists but has no timestamp, or stay empty when
-the window is absent. `{oll_cost}` is the dollar figure the settings page
-reports for the last four weeks of activity. `{session_pct}` and
-`{weekly_pct}` alias the session and weekly windows.
+The documented `/api/balance` endpoint automatically selects credit-based
+monthly plans or legacy session/weekly plans. Credit plans default to
+`{oll_balance} / {oll_allowance}` (remaining / included allowance, e.g.
+`$45.00 / $60.00`); `{oll_purchased}` is the separate purchased credit balance.
+These money placeholders include `$` and two decimal places and are empty
+for legacy quota snapshots. `{oll_monthly_pct}` is the included allowance's
+used percentage, excluding purchased credits; a zero allowance has no
+percentage window. The monthly reset and pacing use the API's billing period.
+
+Legacy plans keep `{oll_session_pct}% · {oll_weekly_pct}%w` as the default.
+Their remaining percentages are converted to used percentages, with resets
+preserved. All percentage placeholders are whole numbers clamped to 0..=100.
+An absent window is empty, not a fabricated `0`; `{session_pct}` and
+`{weekly_pct}` alias only the actual session and weekly windows.
+
+`{oll_plan}` remains the config-supplied label. Historical `/api/usage` quota
+caches remain readable, including monthly-only windows, activity cost, and
+missing resets (`—`). The current usage-history response is not quota data
+and is rejected. Live balance snapshots have no activity cost, so `{oll_cost}`
+is `—`. See [ollama-setup.md](ollama-setup.md).
 
 ## Lyceum
 
@@ -459,3 +499,12 @@ reports for the last four weeks of activity. `{session_pct}` and
 balance values returned by Lyceum, formatted with `$` and two decimal places.
 Lyceum reports no quota percentage or reset, so the shared session/weekly
 percentage placeholders are empty and reset placeholders are neutral.
+
+## Cline
+
+`{cline_5h_pct}`, `{cline_5h_reset}`, `{cline_7d_pct}`, `{cline_7d_reset}`,
+`{cline_30d_pct}`, and `{cline_30d_reset}` carry the three ClinePass limits as
+the percentage Cline reports and each open window's reset; `{cline_plan}` is
+the plan name and `{cline_period_end}` the billing period's end. A limit the
+account does not report leaves its placeholders empty rather than guessing a
+figure.

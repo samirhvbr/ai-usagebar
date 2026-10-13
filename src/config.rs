@@ -78,6 +78,7 @@ pub struct Config {
     pub notifications: NotificationsConfig,
     /// User-defined providers, one `[[custom]]` table each.
     pub custom: Vec<CustomProviderConfig>,
+    pub cline: ClineConfig,
 }
 
 /// UI / dispatch preferences. Currently just `primary` — which vendor the
@@ -89,8 +90,9 @@ pub struct UiConfig {
     /// `None` → fall back to anthropic for backward compatibility.
     pub primary: Option<VendorId>,
     /// Which vendors the Overview shows (the TUI's first tab and the macOS
-    /// menu-bar's top section), in this order. `None` → every enabled vendor,
-    /// in the canonical order.
+    /// menu-bar's top section), in this order. The TUI tab bar leads with the
+    /// same list; enabled vendors left off it follow in the canonical order.
+    /// `None` → every enabled vendor, in the canonical order.
     pub overview_vendors: Option<Vec<VendorId>>,
     /// Layout style for vendor navigation in the TUI: sidebar | navbar | none.
     pub vendor_box: Option<VendorBoxStyle>,
@@ -301,6 +303,9 @@ pub struct AnthropicConfig {
     /// reads and writes that layout so the two tools stay interchangeable.
     /// Unrelated to `accounts_dir`, which is the `claude` CLI's own accounts.
     pub desktop_profiles_dir: Option<PathBuf>,
+    /// Explicit trusted official Claude Code CLI/wrapper for a manual, isolated
+    /// preparation turn. None disables the action; never resolved via PATH.
+    pub desktop_prepare_binary: Option<PathBuf>,
 }
 
 impl Default for AnthropicConfig {
@@ -312,6 +317,7 @@ impl Default for AnthropicConfig {
             accounts_dir: None,
             show_default_account: true,
             desktop_profiles_dir: None,
+            desktop_prepare_binary: None,
         }
     }
 }
@@ -1171,6 +1177,35 @@ pub struct OpenCodeGoConfig {
     pub enabled: bool,
     pub api_key_env: String,
     pub api_key: Option<String>,
+    /// Override the search list for the official OpenCode CLI's `auth.json`
+    /// (`$XDG_DATA_HOME/opencode` or `~/.local/share/opencode`), for a
+    /// non-standard install. The key is read read-only, never copied.
+    pub auth_paths: Option<Vec<PathBuf>>,
+}
+
+/// Cline reads the OAuth credential the Cline CLI maintains in
+/// `~/.cline/data/settings/providers.json`, so it needs no API key of its own;
+/// `api_key`/`api_key_env` exist for a machine without the CLI, where a key
+/// from app.cline.bot stands in. `auth_paths` overrides the search list for a
+/// non-standard install.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ClineConfig {
+    pub enabled: bool,
+    pub auth_paths: Option<Vec<PathBuf>>,
+    pub api_key_env: String,
+    pub api_key: Option<String>,
+}
+
+impl Default for ClineConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            auth_paths: None,
+            api_key_env: crate::cline::creds::API_KEY_ENV.to_string(),
+            api_key: None,
+        }
+    }
 }
 
 /// Command Code reads the OAuth credential from the official CLI or pi, so it
@@ -1184,7 +1219,7 @@ pub struct CommandCodeConfig {
     pub auth_paths: Option<Vec<PathBuf>>,
 }
 
-/// Ollama Cloud (`ollama.com/api/usage`). Disabled by default: the local
+/// Ollama Cloud (`ollama.com/api/balance`). Disabled by default: the local
 /// `ollama` daemon is the product most users reach for, and it has no quota
 /// route to query. Cloud quota is opt-in, with the key taken from
 /// `OLLAMA_API_KEY` (or `api_key` as a fallback for `chmod 600` configs).
@@ -1274,6 +1309,7 @@ impl Default for OpenCodeGoConfig {
             enabled: false,
             api_key_env: "OPENCODE_GO_API_KEY".to_string(),
             api_key: None,
+            auth_paths: None,
         }
     }
 }
@@ -1771,7 +1807,7 @@ fn default_grok_binary() -> PathBuf {
 /// OAuth client id and secret, which are not shipped in source: set them here
 /// (they are public installed-app credentials) or the fallback only lasts as
 /// long as the saved access token does.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct AntigravityConfig {
     pub enabled: bool,
@@ -1781,6 +1817,22 @@ pub struct AntigravityConfig {
     /// installed-app secret is not confidential by Google's definition, but
     /// it is still treated as an inline credential for file-permission purposes.
     pub oauth_client_secret: Option<String>,
+    /// Probe the Antigravity IDE's own language server as a quota source
+    /// (default true). Set false when the IDE is installed but its sign-in is
+    /// managed separately: a signed-out IDE language server answers 401/403,
+    /// which outranks and masks a working `agy` session (#405).
+    pub ide_language_server: bool,
+}
+
+impl Default for AntigravityConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            oauth_client_id: None,
+            oauth_client_secret: None,
+            ide_language_server: true,
+        }
+    }
 }
 
 /// Cursor reads its quota through a session token the Cursor IDE already
@@ -2319,6 +2371,7 @@ impl Config {
         expand_tilde_opt(&mut self.anthropic.credentials_path);
         expand_tilde_opt(&mut self.anthropic.accounts_dir);
         expand_tilde_opt(&mut self.anthropic.desktop_profiles_dir);
+        expand_tilde_opt(&mut self.anthropic.desktop_prepare_binary);
         expand_tilde_opt(&mut self.openai.codex_auth_path);
         expand_tilde_opt(&mut self.cursor.db_path);
         expand_tilde_opt(&mut self.cursor.agent_auth_path);
@@ -2331,6 +2384,11 @@ impl Config {
         expand_tilde_opt(&mut self.supergrok.auth_path);
         expand_tilde_opt(&mut self.supergrok.config_path);
         expand_tilde_opt(&mut self.copilot.gh_binary);
+        if let Some(paths) = &mut self.cline.auth_paths {
+            for path in paths {
+                *path = expand_tilde(path);
+            }
+        }
         for account in &mut self.anthropic.accounts {
             account.credentials_path = expand_tilde(&account.credentials_path);
         }
@@ -2367,6 +2425,7 @@ impl Config {
             self.lyceum.api_key.as_deref(),
             self.shvia.api_key.as_deref(),
             self.antigravity.oauth_client_secret.as_deref(),
+            self.cline.api_key.as_deref(),
         ]
         .into_iter()
         .chain(
@@ -2462,6 +2521,7 @@ impl Config {
             VendorId::Minimax => self.minimax.enabled,
             VendorId::Kiro => self.kiro.enabled,
             VendorId::NousResearch => self.nous.enabled,
+            VendorId::Cline => self.cline.enabled,
             VendorId::OpenCodeGo => self.opencode_go.enabled,
             VendorId::CommandCode => self.commandcode.enabled,
             VendorId::Shvia => self.shvia.enabled,
@@ -2509,6 +2569,7 @@ impl Config {
             | VendorId::Kiro
             | VendorId::NousResearch
             | VendorId::CommandCode
+            | VendorId::Cline
             | VendorId::ModelStudio
             | VendorId::Devin => id.api_key_env(),
         }
@@ -2535,6 +2596,7 @@ impl Config {
             VendorId::Shvia => self.shvia.api_key.as_deref(),
             VendorId::OrcaRouter => self.orcarouter.api_key.as_deref(),
             VendorId::Lyceum => self.lyceum.api_key.as_deref(),
+            VendorId::Cline => self.cline.api_key.as_deref(),
             VendorId::Anthropic
             | VendorId::Openai
             | VendorId::Copilot
@@ -3241,6 +3303,28 @@ enabled = true
         .unwrap();
         assert!(bare.antigravity.oauth_client_id.is_none());
         assert!(bare.antigravity.oauth_client_secret.is_none());
+    }
+
+    /// #405: the IDE language-server opt-out parses, and the default keeps
+    /// probing it so discovery is unchanged for everyone else.
+    #[test]
+    fn antigravity_ide_language_server_defaults_to_probing() {
+        assert!(Config::default().antigravity.ide_language_server);
+        let bare: Config = toml::from_str(
+            "[antigravity]
+enabled = true
+",
+        )
+        .unwrap();
+        assert!(bare.antigravity.ide_language_server);
+        let opted_out: Config = toml::from_str(
+            "[antigravity]
+enabled = true
+ide_language_server = false
+",
+        )
+        .unwrap();
+        assert!(!opted_out.antigravity.ide_language_server);
     }
 
     #[cfg(unix)]
