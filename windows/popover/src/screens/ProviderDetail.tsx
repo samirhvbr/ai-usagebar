@@ -9,6 +9,8 @@ import {
 import { restrictToVerticalAxis } from "@dnd-kit/modifiers";
 import { useRef, useState } from "react";
 import { DragHandle } from "@/components/DragHandle";
+import { AccountTabs } from "@/components/AccountTabs";
+import { IconButton } from "@/components/IconButton";
 import { TruncatedText } from "@/components/TruncatedText";
 import {
   handleRowDragEnd,
@@ -30,8 +32,13 @@ import { isStarred, prefsForCard, rowKey } from "../model.js";
 
 interface ProviderDetailProps {
   card?: Card;
+  /** The provider's accounts, when it has two or more: the tabs sit above the sections. */
+  cards?: Card[];
+  /** The provider's display name (the catalog's), for the tab labels. */
+  providerName?: string;
   layout: Layout;
   starError?: string;
+  onSelectAccount?: (cardId: string) => void;
   onReorderRows: (lists: RowLists) => void;
   onToggleRow: (key: string, on: boolean) => void;
   onToggleStar: (key: string) => void;
@@ -41,13 +48,15 @@ interface ProviderDetailProps {
  * CustomizeProviderDetailView (L2): Always Visible and On Demand grouped cards. Rows drag within
  * a card or across the divider; an empty card shows the dashed "Drag metrics here" target.
  */
-export function ProviderDetail({ card, layout, starError, onReorderRows, onToggleRow, onToggleStar }: ProviderDetailProps) {
+export function ProviderDetail({ card, cards, providerName, layout, starError, onSelectAccount, onReorderRows, onToggleRow, onToggleStar }: ProviderDetailProps) {
   const { metricLabel } = useI18n();
   const sensors = useTraySensors();
   const [activeId, setActiveId] = useState<string | null>(null);
   const [draft, setDraft] = useState<RowLists | null>(null);
   const listsRef = useRef<RowLists>({ always: [], demand: [] });
   if (!card) return null;
+  const multi = cards && cards.length > 1;
+  const name = providerName || card.title;
   const prefs = prefsForCard(card, layout);
   const byKey = new Map<string, Row>((card.rows || []).map((row: Row) => [rowKey(row), row]));
   const lists: RowLists = draft || { always: prefs.always, demand: prefs.demand };
@@ -90,6 +99,14 @@ export function ProviderDetail({ card, layout, starError, onReorderRows, onToggl
       }}
     >
       <div className="flex flex-col gap-[var(--section-gap)]">
+        {multi && cards ? (
+          <AccountTabs
+            cards={cards.map((item) => ({ id: item.id, title: item.title }))}
+            providerName={name}
+            selected={card.id}
+            onSelect={(id) => onSelectAccount?.(id)}
+          />
+        ) : null}
         <MetricSection
           byKey={byKey}
           cardId={card.id}
@@ -196,15 +213,13 @@ function MetricTuneRow({ enabled, handle, row, starred, onStar, onToggle }: Metr
       <DragHandle attributes={handle?.attributes} listeners={handle?.listeners} />
       <TruncatedText className="min-w-0 flex-1">{title}</TruncatedText>
       {onStar ? (
-        <button
-          type="button"
-          aria-label={starred ? `${m.unstar()} ${title}` : `${m.star()} ${title} ${m.for_menu_bar()}`}
+        <IconButton
+          label={starred ? `${m.unstar()} ${title}` : `${m.star()} ${title} ${m.for_menu_bar()}`}
           aria-pressed={starred === true}
-          className="hover-icon inline-flex size-[var(--row-icon-box)] items-center justify-center text-label-2 hover:text-foreground"
           onClick={onStar}
         >
-          {starred ? <MdiStar className="size-[var(--icon-row)] text-primary" /> : <MdiStarOutline className="size-[var(--icon-row)]" />}
-        </button>
+          {starred ? <MdiStar /> : <MdiStarOutline />}
+        </IconButton>
       ) : null}
       <Switch checked={enabled} aria-label={`${m.show()} ${title}`} onCheckedChange={(on) => onToggle?.(on === true)} />
     </div>

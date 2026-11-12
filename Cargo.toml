@@ -1,6 +1,6 @@
 [package]
 name = "ai-usagebar"
-version = "1.36.0"
+version = "1.50.0"
 edition = "2024"
 rust-version = "1.90"
 license = "MIT"
@@ -51,7 +51,7 @@ path = "src/bin/ai-usagebar-tray.rs"
 tokio = { version = "1", features = ["rt", "macros", "time", "fs", "process", "signal", "io-util"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "rustls-tls-native-roots"], default-features = false }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
 toml = "1.1"
 toml_edit = "0.25"
 clap = { version = "4", features = ["derive", "env"] }
@@ -75,6 +75,9 @@ pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"] }
 sha1 = { version = "0.11", default-features = false }
 sha2 = { version = "0.11", default-features = false }
 hmac = { version = "0.13", default-features = false }
+# Reads the IHDR header of the card image the popover posts with the `copy-image` IPC
+# (the tray hosts validate it before the system clipboard).
+png = "0.18"
 ratatui = "0.30.1"
 ratatui-bubbletea-components = "0.2"
 ratatui-bubbletea-theme = "0.2"
@@ -82,9 +85,13 @@ ratatui-bubbletea-theme = "0.2"
 # the OAuth token the Cursor IDE already wrote there. "bundled" statically
 # links SQLite via cc, so no system libsqlite3-dev is required — keeping the
 # AUR source build's hermeticity (see CLAUDE.md's release checklist).
-rusqlite = { version = "0.40", default-features = false, features = ["bundled"] }
+rusqlite = { version = "0.41", default-features = false, features = ["bundled"] }
 unicode-width = "0.2"
 getrandom = "0.4.3"
+# Official Model Context Protocol SDK. Only the local stdio server surface is
+# enabled: no HTTP transport, client, OAuth, sampling, or remote listener.
+rmcp = { version = "3.6.0", default-features = false, features = ["server", "transport-io", "macros"] }
+schemars = "1.2.3"
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["process"] }
@@ -94,7 +101,7 @@ rustix = { version = "1", features = ["process"] }
 tao = "0.37"
 wry = "0.57"
 tray-icon = "0.26.1"
-global-hotkey = "0.8"
+global-hotkey = "0.9"
 objc2 = "0.6"
 objc2-foundation = "0.3"
 block2 = "0.6"
@@ -116,6 +123,7 @@ objc2-app-kit = { version = "0.3.2", features = [
     "NSImageRep",
     "NSFont",
     "NSFontDescriptor",
+    "NSPasteboard",
     "NSResponder",
     "NSScreen",
     "NSStatusBarButton",
@@ -126,7 +134,6 @@ objc2-app-kit = { version = "0.3.2", features = [
     "block2",
 ] }
 objc2-quartz-core = { version = "0.3.2", features = ["CALayer"] }
-png = "0.18"
 
 # Only the opt-in Keychain tests use it (item counting). Production writes go
 # through `security(1)`, so a native Keychain write cannot creep back in
@@ -143,8 +150,10 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_Networking_WinSock",
     "Win32_Security_Credentials",
     "Win32_Security_Cryptography",
+    "Win32_System_DataExchange",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
     "Win32_System_Registry",
     "Win32_System_Threading",
     "Win32_UI_Input_KeyboardAndMouse",
@@ -157,7 +166,7 @@ wry = "0.57"
 tray-icon = "0.26.1"
 # Global toggle shortcut for the popover: owns a message-only window and
 # delivers WM_HOTKEY on the event-loop thread, the same pattern tray-icon uses.
-global-hotkey = "0.8"
+global-hotkey = "0.9"
 
 [dev-dependencies]
 mockito = "1"

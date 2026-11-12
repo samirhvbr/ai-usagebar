@@ -11,7 +11,7 @@
 # Valid: anthropic | anthropic_api | openai | copilot | zai | openrouter | deepseek
 #        | kimi | kilo | novita | moonshot | grok | supergrok | grokbot | antigravity
 #        | cursor | minimax | kiro | nous | opencode-go | commandcode | ollama
-#        | orcarouter | modelstudio | lyceum | devin | cline | shvia
+#        | orcarouter | modelstudio | lyceum | devin | cline | muse-code | droid | synthetic | mistral | shvia
 # When unset, the TUI opens on the Overview (all vendors at once); set this to
 # open directly on a vendor's tab instead.
 # primary = "anthropic"
@@ -56,43 +56,17 @@
 # used = "/requests/used"        # used + limit → "used of limit" under the bar...
 # limit = "/requests/limit"
 # # percent = "/requests/pct"    # ...or a ready-made percentage instead of both
+# # currency = "USD"             # optional 3-letter uppercase code; formats both as money
 # resets_at = "/requests/reset"  # RFC 3339 string, or epoch seconds / milliseconds
 # window_secs = 3600             # window length for pacing (>= 60)
 # [[custom.texts]]               # a free-text row
 # label = "Tier"
 # value = "/account/tier"        # string, number or boolean
+# # currency = "USD"             # optional 3-letter uppercase code; numeric values only
 #
-# Recipe: Meta Muse (Muse Spark) local spend. Meta publishes no quota or
-# billing endpoint for api.meta.ai (see docs/vendor-endpoints.md), so there
-# is no native vendor — but Muse Code writes per-call token usage
-# (`model_completed` events) to ~/.local/share/muse/sessions, and a small
-# loopback server can tally it into this shape. Uncomment and point `url`
-# at your tally server:
-# [[custom]]
-# id = "muse"
-# name = "Muse"
-# short_name = "mus"             # exactly 3 lowercase letters, unique
-# enabled = true
-# url = "http://127.0.0.1:41837/usage"
-# allow_http = true              # loopback only
-# api_key_env = ""
-# api_key = "local"              # loopback only; the tally server ignores it
-# auth_header = "Authorization"
-# auth_scheme = ""               # "" sends the bare key
-# plan = "Muse Spark (local)"
-# cache_ttl_secs = 300
-# [[custom.metrics]]
-# label = "Cache miss"           # low-is-good reads correctly in severity colors
-# percent = "/cache/miss_pct"
-# [[custom.texts]]
-# label = "Today"
-# value = "/spend/today_usd"
-# [[custom.texts]]
-# label = "30 days"
-# value = "/spend/last30_usd"
-# [[custom.texts]]
-# label = "Calls today"
-# value = "/calls/today"
+# Muse Code subscription quota is now a native provider: see [muse-code]
+# below and docs/muse-code.md. Legacy custom counters may retain id = "muse"
+# and short_name = "mus"; the native provider uses "muse-code" / "msc".
 
 # Windows/macOS tray. The macOS menu bar also writes its options here from the
 # popover Settings → Menu Bar.
@@ -102,13 +76,14 @@
 # Command and Option keys are accepted as Cmd/Command and Option, and shown as
 # Cmd/Option.
 # shortcut = "Ctrl+Shift+U"
-# How often the tray re-reads every provider: 1, 5 or 10 minutes; the panel's
+# How often the tray re-reads every provider: 1, 5, 10, 15, 30 or 60 minutes; the panel's
 # Refresh button is always immediate.
 # refresh_minutes = 5
 # New releases: auto (download, verify and restart unattended) | notify
 # (banner with an Install button; default) | off (no background checks).
 # updates = "notify"
-# macOS menu bar: "bars" (default) draws the usage chart; "provider" draws each
+# macOS menu bar: "icon" shows the app gauge without changing favorites;
+# "bars" (default) draws the usage chart; "provider" draws each
 # provider's logo followed by its value; "quattro" draws one chip, the logo, the
 # short name (cld, cdx, …) and the highest percentage among all the windows of
 # the provider selected in the popover, like the Quattro bar, leaving out any
@@ -198,11 +173,10 @@ enabled = true
 # real total spend. See
 # https://platform.claude.com/docs/en/manage-claude/usage-cost-api
 #
-# Opt-in (disabled until you set a key). Requires a Console *Admin key*
-# (`sk-ant-admin01-...`, sent as the `x-api-key` header), distinct from an
-# inference key. Admin keys exist only for ORGANIZATION accounts: set one up
-# first (Console > Settings > Organization) — the .../settings/admin-keys page
-# 404s for individual accounts.
+# Opt-in organization cost reports. Use an Admin API key or a personal/service
+# account key with organization scope and the required report permissions.
+# Availability depends on account type and roles; see docs/anthropic-api.md.
+# This reports spend, not prepaid balance.
 [anthropic_api]
 enabled = false
 api_key_env = "ANTHROPIC_ADMIN_KEY"  # checked first; if set + non-empty, used
@@ -425,6 +399,16 @@ api_key_env = "NOVITA_API_KEY"     # checked first; if set + non-empty, used
 # display_limit = 200              # tank size in USD; see the group note above
 # headline = "amount"              # "amount" | "percent"
 
+[synthetic]
+# Disabled by default. Reads the regenerating weekly credit budget (the sole
+# plan metric) from https://api.synthetic.new/v2/quotas.
+enabled = false
+api_key_env = "SYNTHETIC_API_KEY"
+# api_key = "..."                  # fallback; chmod 600 the file if used
+# Optional display-only plan label — the quotas API carries no tier
+# identifier, so set it to one of: Go / Standard / Big.
+# plan_tier = "Standard"
+
 [lyceum]
 # Disabled by default; this reads only the credits endpoint, not inference.
 enabled = false
@@ -482,16 +466,18 @@ api_key_env = "XAI_MANAGEMENT_KEY" # checked first; if set + non-empty, used
 # headline = "amount"              # "amount" | "percent"
 
 # SuperGrok subscription usage — distinct from [grok] above. No API key of
-# its own: the official Grok Build CLI owns login, OIDC/provider refresh,
-# account scope, proxy settings, and credential locking. Billing and banked
-# resets use the `key` already in auth.json (read-only, sent in an
-# Authorization header, never copied or rewritten). The ACP `x.ai/billing`
-# extension is a fallback when the HTTPS billing endpoint is unavailable.
+# its own: the official Grok CLI owns login, OIDC refresh, account scope,
+# and credential locking. Billing uses the `key` already in auth.json
+# (read-only, sent in an Authorization header, never copied or rewritten).
+# The HTTPS call is the one the CLI makes for `/usage`; the ACP `x.ai/billing`
+# extension is the fallback. See docs/grok.md. docs.x.ai has no route for
+# this weekly pool.
 [supergrok]
-# Disabled by default — enable after installing official Grok Build and running
-# `grok login` at least once. This is included *usage* (overall % plus
-# Build/Chat/Imagine slices from the billing document), not the `[grok]`
-# Management API prepaid dollar balance.
+# Disabled by default — enable after installing the official Grok CLI and
+# running `grok login` once. This is included usage (overall % plus
+# Build/Chat/Imagine slices, and additional usage when the billing document
+# reports on-demand spend or a cap). The `[grok]` row is Management API
+# prepaid dollars, a different bill.
 enabled = false
 # Defaults to $GROK_HOME/bin/grok or ~/.grok/bin/grok, avoiding unrelated PATH
 # programs with the same name. Override only for a trusted official install.
@@ -524,8 +510,13 @@ enabled = false
 [antigravity]
 enabled = false
 # With no local product — or when `agy` cannot supply its CSRF token — quota
-# comes from Google's Cloud Code API using the session Antigravity saved in the
-# OS keyring or in `~/.gemini/antigravity-cli/antigravity-oauth-token`.
+# comes from `agy` itself when it is installed (`agy -p "/quota"`, at most every
+# two minutes), and otherwise from Google's Cloud Code API using the session
+# Antigravity saved in the OS keyring or in
+# `~/.gemini/antigravity-cli/antigravity-oauth-token`.
+# By default `agy` is discovered on PATH and in ~/.local/bin. Pin the exact
+# executable when the refresh process must not trust the ambient PATH:
+# agy_binary = "~/.local/bin/agy"
 # Renewing that session needs Antigravity's own OAuth client (a public
 # installed-app client; it is not shipped in source). Without it the fallback
 # works only while the saved access token lasts (about an hour after the CLI
@@ -627,12 +618,17 @@ enabled = false
 # keeps the meter, the severity colour and the detail line either way.
 # headline = "amount"
 
-# OpenCode Go — usage from /zen/go/v1/usage. Opt in only after exporting the
-# API key under this variable; the key itself is never written to this example.
+# OpenCode Go — usage from /zen/go/v1/usage. Opt in after signing into the
+# official OpenCode CLI or configuring an API key.
 [opencode-go]
 enabled = false
 api_key_env = "OPENCODE_GO_API_KEY"
-# api_key = "[REDACTED]"  # optional inline fallback; prefer the environment
+# Without an explicit key, reads auth.json, then OpenCode 2's opencode.db,
+# under $XDG_DATA_HOME/opencode or ~/.local/share/opencode (read-only).
+# Only the active opencode database row is used (key or unexpired OAuth).
+# OpenCode owns refresh; renew an expired OAuth session in the CLI.
+# api_key = "..."            # or export OPENCODE_GO_API_KEY; wins over CLI stores
+# auth_paths = ["/custom/opencode/opencode.db"]  # replaces the search list
 
 # Command Code (commandcode.ai). Leave disabled if you do not use it. To opt in,
 # set enabled = true; the OAuth credential written by the official `commandcode`
@@ -670,6 +666,34 @@ enabled = false
 [devin]
 enabled = false
 # credentials_path = "/home/you/.local/share/devin/credentials.toml"
+# show_default_account = true
+#
+# [[devin.accounts]]
+# label = "work"
+# credentials_path = "~/.zapdevin/devin/credentials.toml"
+
+# Factory Droid (`droid` CLI) subscription quota. Reuses the login the
+# CLI already holds: the session in ~/.factory/auth.v2.keyring is opened
+# with the `Factory CLI/auth-encryption-key` Secret Service item, read-only.
+# Linux only — the other auth.v2.* stores and other platforms' storage are
+# not supported. ai-usagebar never refreshes or writes the token itself.
+# Near expiry it runs `droid doctor --checks auth` (no model call, at most
+# every 15 minutes), which makes the CLI renew its own login; with that off,
+# or when it fails, an expired login tells you to run `droid` once.
+[droid]
+enabled = false
+# cli_renewal = true
+# cli_path = "/home/you/.local/bin/droid"   # default: `droid` on PATH
+
+# Muse Code subscription quota. Requires the official CLI's existing
+# file-based OAuth login and already-issued key; neither is rewritten.
+# No Keychain-only login support in this initial integration. Requests are
+# bounded to one per login every five minutes, including forced refreshes.
+# Missing quota (possible while the session is idle) is unknown, never zero.
+[muse-code]
+enabled = false
+# credentials_path = "~/.config/muse/auth.json"
+
 # Cline / ClinePass (cline.bot). Disabled by default — enable it once the
 # `cline` CLI is signed in. There is no key to paste: the OAuth credential the
 # CLI maintains in ~/.cline/data/settings/providers.json is reused as-is, and
@@ -687,3 +711,26 @@ enabled = false
                                   # environment outranks the credential file.
 # api_key = "[REDACTED]"          # optional inline fallback; prefer the env var
 # auth_paths = ["~/.cline/data/settings/providers.json"]
+
+[deeprelay]
+# Disabled by default — enable once you've set a key (env var or inline).
+# Reads the monthly plan from https://api.deeprelay.ai/v1/billing/subscription
+# (scope `billing:read`, which the dashboard's default key carries): the
+# monthly input/output allowance, the rolling 7-day caps (which have no reset
+# date — they slide), the per-period dollar usage ceiling, and the
+# pay-as-you-go wallet when it matters. Token figures are weighted by each
+# model's usage factor, so they are directly comparable with the limits.
+enabled = false
+api_key_env = "DEEPRELAY_API_KEY"   # checked first; if set + non-empty, used
+# api_key = "deeprelay_live_..."     # fallback; chmod 600 the file if you use it
+
+[mistral]
+# Disabled by default — enable once you've set a key. Reads the monthly API
+# and Vibe Code budgets from https://api.mistral.ai/v1/billing/budget, the
+# routes the official mistral-vibe CLI uses; the documented Admin API is
+# Enterprise-only. The key is supplied explicitly; credentials are never
+# discovered from another app's store. The key needs the
+# `see_org_inference_usage` permission.
+enabled = false
+api_key_env = "MISTRAL_API_KEY"   # checked first; if set + non-empty, used
+# api_key = "mst-..."             # fallback; chmod 600 the file if you use it

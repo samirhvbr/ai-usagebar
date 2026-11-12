@@ -224,7 +224,7 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
         with:
           key: ${{ matrix.target }}
 
@@ -238,7 +238,7 @@ jobs:
 
       - name: Install cross (aarch64 cross-compile via Docker)
         if: runner.os == 'Linux' && matrix.builder == 'cross'
-        uses: taiki-e/install-action@183e4297cca2404691e9380e1307288dced5c82a # v2.87.25
+        uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
         with:
           tool: cross
 
@@ -279,7 +279,7 @@ jobs:
       # so the popover's dependencies must be installed before cargo runs.
       - name: Set up Node (Windows; the tray popover is a Vite build)
         if: runner.os == 'Windows'
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
           cache: npm
@@ -298,6 +298,7 @@ jobs:
           node gnome-extension/marker-logic.test.mjs
           node gnome-extension/layout.test.mjs
           node gnome-extension/report-model.test.mjs
+          node gnome-extension/prefs.test.mjs
           node kde-plasmoid/plasmoid-logic.test.mjs
           node windows/popover/popover.test.mjs
 
@@ -364,7 +365,7 @@ jobs:
       # build.rs runs `npm run build` for the tray popover on macOS too.
       - name: Set up Node (macOS; the tray popover is a Vite build)
         if: runner.os == 'macOS'
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
           cache: npm
@@ -416,7 +417,7 @@ jobs:
           sidecar ${{ matrix.artifact }}.tar.gz
           rm -rf "$STAGE"
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ matrix.artifact }}
           # Linux produces the tarball pair; Windows the zip, the bare exes
@@ -448,7 +449,7 @@ jobs:
           ref: ${{ inputs.ref || github.ref }}
           fetch-depth: 0
 
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: artifacts
           merge-multiple: true
@@ -676,7 +677,7 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
 
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: artifacts
           merge-multiple: true
@@ -766,11 +767,12 @@ jobs:
           SCOOP_BUCKET_TOKEN: ${{ secrets.SCOOP_BUCKET_TOKEN }}
         run: |
           if [ -z "$SCOOP_BUCKET_TOKEN" ]; then
-            echo "set=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::Skipping Scoop bucket push — no SCOOP_BUCKET_TOKEN secret set"
-          else
-            echo "set=true" >> "$GITHUB_OUTPUT"
+            # Fail loudly: a green release with a silently skipped channel is
+            # how the bucket sat at v1.45.0 through three releases (#568).
+            echo "::error::No SCOOP_BUCKET_TOKEN secret set — the Scoop bucket cannot be published. Set the secret (a PAT with push access to akitaonrails/scoop-bucket) and re-run this workflow."
+            exit 1
           fi
+          echo "set=true" >> "$GITHUB_OUTPUT"
 
       # Pin the in-tree manifest template to this tag. The hash is recomputed
       # from the release's published `.sha256` sidecar, never from the

@@ -18,30 +18,40 @@ use tray_icon::{
     Icon, MouseButton, MouseButtonState, Rect, TrayIcon, TrayIconBuilder, TrayIconEvent,
 };
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND,
+    CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, GlobalFree, HANDLE, HGLOBAL, HWND,
 };
 use windows_sys::Win32::Graphics::Dwm::{
     DWMSBT_NONE, DWMSBT_TRANSIENTWINDOW, DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_WINDOW_CORNER_PREFERENCE,
     DWMWCP_ROUND, DwmSetWindowAttribute,
 };
 use windows_sys::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITORINFO};
+use windows_sys::Win32::System::DataExchange::{
+    CloseClipboard, EmptyClipboard, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
+};
+use windows_sys::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
 use windows_sys::Win32::System::Threading::{CreateMutexW, GetCurrentProcessId};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON, VK_RBUTTON};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetClassNameW, GetCursorPos, GetForegroundWindow, GetSystemMetrics, GetWindowRect,
     GetWindowTextW, GetWindowThreadProcessId, SM_CXSMICON, WindowFromPoint,
 };
+use windows_sys::w;
 use wry::http::{Request, Response, StatusCode, header::CONTENT_TYPE};
-use wry::{WebContext, WebView, WebViewBuilder};
+use wry::{NewWindowResponse, WebContext, WebView, WebViewBuilder};
 
 use super::blur::{self, Blur, Foreground, PressHide, Verdict};
+use super::browse;
 use super::hotkey::{self, HotkeyBinding};
 use super::icon::{Ink, Severity, apply_ink, tray_icon_rgba};
+use super::ipc_origin;
 use super::options_menu::{self, OptionsAction, OptionsLabels};
 use super::payload::{
     HostFacts, SharedFacts, facts_snapshot, host_payload, with_facts, worst_severity, wrap_report,
 };
 use super::placement::{self, Area, Insets};
+use super::strip::{
+    Stars, UsageReading, content_from_payload, parse_strip_ipc, tooltip, truncate_utf16,
+};
 use super::style::PopoverStyle;
 use super::updates::Updates;
 use super::{RELAUNCH_ENV, now_ms, profile, startup, taskbar_theme, tui_launch, update_flow};
@@ -85,6 +95,8 @@ const RELAUNCH_WAIT: Duration = Duration::from_secs(10);
 /// Shown on the NotifyIcon when WebView2 is missing (older Windows 10).
 /// The popover cannot open; the icon and right-click menu still work.
 const WEBVIEW2_MISSING: &str = "Install the WebView2 Evergreen Runtime to open the popover.";
+/// `NOTIFYICONDATAW::szTip` holds 128 UTF-16 units including its terminator.
+const TOOLTIP_MAX_UTF16: usize = 127;
 
 enum UserEvent {
     Tray(TrayIconEvent),
@@ -111,8 +123,12 @@ enum UserEvent {
 
 enum WorkerCmd {
     Refresh,
+    /// Re-read the provider catalog alone, without a report.
+    Providers,
     Detect,
-    CheckUpdate { manual: bool },
+    CheckUpdate {
+        manual: bool,
+    },
     InstallUpdate,
     SnoozeUpdate,
     SetUpdates(UpdateMode),
@@ -166,6 +182,9 @@ struct TrayState {
     worker: mpsc::Sender<WorkerCmd>,
     proxy: EventLoopProxy<UserEvent>,
     payload: Value,
+    stars: Stars,
+    strip_order: Vec<String>,
+    usage_reading: UsageReading,
     js_ready: bool,
     popover_open: bool,
     /// Blurs before this instant are the ones our own show/focus calls
@@ -313,6 +332,9 @@ fn run_loop() -> Result<(), String> {
         worker: cmd_tx,
         proxy: proxy.clone(),
         payload: empty,
+        stars: Stars::new(),
+        strip_order: Vec::new(),
+        usage_reading: UsageReading::Used,
         js_ready: false,
         popover_open: false,
         blur_guard_until: None,
@@ -407,6 +429,8 @@ fn run_loop() -> Result<(), String> {
             }
             Event::LoopDestroyed => {
                 let _ = state.worker.send(WorkerCmd::Shutdown);
+                // A sign-in CLI would otherwise outlive the tray, polling.
+                super::device_login::stop_all();
             }
             _ => {}
         }
@@ -459,6 +483,11 @@ fn spawn_worker(
                     let wait = deadline.saturating_duration_since(Instant::now());
                     match rx.recv_timeout(wait) {
                         Ok(WorkerCmd::Refresh) | Err(mpsc::RecvTimeoutError::Timeout) => break,
+                        Ok(WorkerCmd::Providers) => {
+                            if super::providers::refresh_due(&facts) {
+                                let _ = proxy.send_event(UserEvent::Facts);
+                            }
+                        }
                         Ok(WorkerCmd::Detect) => {
                             run_detection(true);
                             break;
@@ -502,6 +531,7 @@ fn host_facts(config: &Config) -> HostFacts {
 }
 
 async fn push_report(proxy: &EventLoopProxy<UserEvent>, facts: &SharedFacts) {
+    super::providers::refresh_due(facts);
     let mut snapshot = facts_snapshot(facts);
     snapshot.accent = super::accent::read_accent();
     snapshot.startup_enabled = startup::is_enabled();
@@ -521,15 +551,21 @@ fn apply_payload(state: &mut TrayState, payload: Value) {
     ));
     state.payload = payload;
     refresh_icon(state);
-    // No hover tip: the popover is the readout. The one exception names the
-    // missing WebView2 runtime, because without it there is no popover.
-    if state.webview.is_none() {
-        let _ = state.tray.set_tooltip(Some(WEBVIEW2_MISSING));
-    }
+    refresh_tooltip(state);
     stamp_facts(state);
     if state.js_ready {
         push_to_webview(state);
     }
+}
+
+fn refresh_tooltip(state: &mut TrayState) {
+    if state.webview.is_none() {
+        let _ = state.tray.set_tooltip(Some(WEBVIEW2_MISSING));
+        return;
+    }
+    let content = content_from_payload(&state.payload, &state.stars, &state.strip_order);
+    let text = truncate_utf16(&tooltip(&content, state.usage_reading), TOOLTIP_MAX_UTF16);
+    let _ = state.tray.set_tooltip(Some(&text));
 }
 
 /// Copy the shared facts onto the payload in place, so a shortcut or update
@@ -540,17 +576,8 @@ fn stamp_facts(state: &mut TrayState) {
     let Some(obj) = state.payload.as_object_mut() else {
         return;
     };
-    for key in [
-        "shortcut",
-        "shortcut_error",
-        "updates",
-        "update",
-        "update_checked_at",
-        "refresh_minutes",
-        "repository",
-        "version",
-    ] {
-        obj.insert(key.into(), stamped[key].clone());
+    for key in super::payload::STAMPED_FACTS {
+        obj.insert((*key).into(), stamped[*key].clone());
     }
 }
 
@@ -691,6 +718,93 @@ fn push_to_webview(state: &TrayState) {
     let _ = webview.evaluate_script(&script);
 }
 
+/// The `copy-image` answer: the page installs `__AIUB_IMAGE_COPIED__` on load, so with no
+/// webview there is nothing to evaluate it in. The script is built by
+/// `clipboard_image::copied_reply_script` with the request's id, so the page matches the
+/// reply to its own request instead of its position in a queue.
+fn reply_image_copied(state: &TrayState, id: Option<&str>, copied: bool) {
+    if let Some(webview) = state.webview.as_ref() {
+        let _ = webview.evaluate_script(&super::clipboard_image::copied_reply_script(id, copied));
+    }
+}
+
+/// Puts the validated PNG on the system clipboard as the registered `"PNG"` format. This slice
+/// registers only that format — `CF_DIB`/`CF_DIBV5` are deliberately absent.
+fn copy_png_to_clipboard(window: &Window, bytes: &[u8]) -> bool {
+    // SAFETY: `w!` yields a NUL-terminated wide string that outlives the call.
+    put_on_clipboard(
+        window,
+        || unsafe { RegisterClipboardFormatW(w!("PNG")) },
+        bytes,
+    )
+}
+
+/// `CF_UNICODETEXT`, a standard clipboard format. Spelled out rather than
+/// imported so the host keeps its `windows-sys` feature list.
+const CF_UNICODETEXT: u32 = 13;
+
+/// Puts plain text on the system clipboard: the sign-in sheet's one-time code.
+fn copy_text_to_clipboard(window: &Window, text: &str) -> bool {
+    let bytes: Vec<u8> = text
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .flat_map(u16::to_ne_bytes)
+        .collect();
+    put_on_clipboard(window, || CF_UNICODETEXT, &bytes)
+}
+
+/// Replaces the clipboard with `bytes` under the format `format` names (asked
+/// once the clipboard is open, so a registration happens only when it is
+/// used). Any failure frees the `HGLOBAL` that did not reach the clipboard,
+/// closes it, and answers `false`.
+fn put_on_clipboard(window: &Window, format: impl FnOnce() -> u32, bytes: &[u8]) -> bool {
+    let hwnd = window.hwnd() as HWND;
+    // SAFETY: `hwnd` is the live popover window; the clipboard APIs only need a window
+    // handle as their owner.
+    if unsafe { OpenClipboard(hwnd) } == 0 {
+        // Someone else holds the clipboard; nothing was allocated, nothing to clean up.
+        return false;
+    }
+
+    // From here, every failure falls through with the `HGLOBAL` still ours; only a successful
+    // `SetClipboardData` hands it to the system. The shared `CloseClipboard` at the end is
+    // reached on every path.
+    let mut hglobal: HGLOBAL = std::ptr::null_mut();
+    let mut delivered = false;
+    unsafe {
+        if EmptyClipboard() != 0 {
+            let format = format();
+            // A format of 0 means the registration failed; `SetClipboardData` would reject it.
+            if format != 0 {
+                hglobal = GlobalAlloc(GMEM_MOVEABLE, bytes.len());
+                let start = if hglobal.is_null() {
+                    std::ptr::null_mut()
+                } else {
+                    GlobalLock(hglobal)
+                };
+                if !start.is_null() {
+                    // SAFETY: `start` is the writable, locked view of `hglobal`, sized exactly
+                    // for `bytes`; `bytes` outlives the copy.
+                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), start.cast(), bytes.len());
+                    GlobalUnlock(hglobal);
+                    delivered = !SetClipboardData(format, hglobal).is_null();
+                }
+            }
+        }
+    }
+    if !delivered && !hglobal.is_null() {
+        // SAFETY: `hglobal` came from `GlobalAlloc` above and `SetClipboardData` never took it.
+        unsafe {
+            GlobalFree(hglobal);
+        }
+    }
+    // SAFETY: the clipboard was opened above and is still owned by this thread.
+    unsafe {
+        CloseClipboard();
+    }
+    delivered
+}
+
 fn handle_tray(state: &mut TrayState, event: TrayIconEvent) {
     match event {
         TrayIconEvent::Click {
@@ -745,6 +859,7 @@ fn handle_menu(state: &mut TrayState, event: &MenuEvent, control_flow: &mut Cont
             let _ = state.worker.send(WorkerCmd::Refresh);
         }
         OptionsAction::Detect => {
+            super::providers::request();
             let _ = state.worker.send(WorkerCmd::Detect);
         }
         OptionsAction::OpenTui => tui_launch::open(),
@@ -771,10 +886,62 @@ fn handle_ipc(state: &mut TrayState, body: &str, control_flow: &mut ControlFlow)
             }
         }
         "detect" => {
+            super::providers::request();
             let _ = state.worker.send(WorkerCmd::Detect);
+        }
+        "providers" => {
+            super::providers::request();
+            let _ = state.worker.send(WorkerCmd::Providers);
         }
         "refresh" => {
             let _ = state.worker.send(WorkerCmd::Refresh);
+        }
+        "set-provider-enabled" => {
+            super::providers::set_enabled(&value, &state.facts);
+            apply_facts(state);
+            let _ = state.worker.send(WorkerCmd::Refresh);
+        }
+        "sign-in-provider" => super::providers::sign_in(&value),
+        "set-api-key" => {
+            let proxy = state.proxy.clone();
+            let worker = state.worker.clone();
+            match super::providers::request_key_check(&state.facts, &value, move || {
+                let _ = proxy.send_event(UserEvent::Facts);
+                let _ = worker.send(WorkerCmd::Refresh);
+            }) {
+                // `Ok(None)` is an ignored request: nothing to publish.
+                Ok(_) => apply_facts(state),
+                Err(fact) => {
+                    with_facts(&state.facts, |f| f.key_check = Some(fact));
+                    apply_facts(state);
+                }
+            }
+        }
+        "start-sign-in" => {
+            let push = state.proxy.clone();
+            let worker = state.worker.clone();
+            super::device_login::start(
+                &state.facts,
+                &value,
+                move || {
+                    let _ = push.send_event(UserEvent::Facts);
+                },
+                move || {
+                    let _ = worker.send(WorkerCmd::Refresh);
+                },
+            );
+            apply_facts(state);
+        }
+        "cancel-sign-in" => {
+            if super::device_login::cancel(&state.facts, &value) {
+                apply_facts(state);
+            }
+        }
+        "open-sign-in-page" => super::device_login::open_page(&state.facts, &value),
+        "copy-sign-in-code" => {
+            if let Some(code) = super::device_login::code_to_copy(&state.facts, &value) {
+                copy_text_to_clipboard(&state.window, &code);
+            }
         }
         "open-tui" => tui_launch::open(),
         "close" => {
@@ -798,7 +965,13 @@ fn handle_ipc(state: &mut TrayState, body: &str, control_flow: &mut ControlFlow)
                 set_refresh(state, minutes);
             }
         }
-        "strip" => {}
+        "strip" => {
+            let (_, stars, order) = parse_strip_ipc(&value);
+            state.stars = stars;
+            state.strip_order = order;
+            state.usage_reading = UsageReading::from_strip_ipc(&value);
+            refresh_tooltip(state);
+        }
         "open-url" => {
             if let Some(url) = value.get("url").and_then(Value::as_str) {
                 super::browse::open(url);
@@ -812,6 +985,18 @@ fn handle_ipc(state: &mut TrayState, body: &str, control_flow: &mut ControlFlow)
         }
         "snooze-update" => {
             let _ = state.worker.send(WorkerCmd::SnoozeUpdate);
+        }
+        "copy-image" => {
+            let id = super::clipboard_image::copy_request_id(&value);
+            // No valid id: no `png_from_ipc`, no clipboard — the reply is `null, false`.
+            let copied = match id {
+                Some(_) => match super::clipboard_image::png_from_ipc(&value) {
+                    Ok(bytes) => copy_png_to_clipboard(&state.window, &bytes),
+                    Err(_reason) => false,
+                },
+                None => false,
+            };
+            reply_image_copied(state, id, copied);
         }
         _ => {}
     }
@@ -1337,12 +1522,46 @@ fn build_webview(
         })
         .with_url("http://aiub.localhost/index.html")
         .with_ipc_handler(move |request| {
+            // The bridge now writes to `config.toml` (`set-api-key`), so only
+            // the popover's own frame may use it. wry stamps the message with
+            // the sending script's absolute URL (`request.uri()`); any other
+            // origin is dropped before the parse, without a reply.
+            let uri = request.uri().to_string();
+            if !ipc_origin::is_popover_origin(&uri, ipc_origin::Os::Windows) {
+                return;
+            }
             let body = request.body().clone();
             let _ = proxy.send_event(UserEvent::Ipc(body));
+        })
+        // The WebView never leaves the popover's origin: other web URLs go to
+        // the default browser (the `open-url` command's path), the rest is
+        // denied.
+        .with_navigation_handler(|url| navigation_allowed(&url))
+        .with_new_window_req_handler(|url, _features| {
+            if navigation_allowed(&url) {
+                NewWindowResponse::Allow
+            } else {
+                NewWindowResponse::Deny
+            }
         })
         .with_transparent(true)
         .build(window)
         .map_err(|error| error.to_string())
+}
+
+/// What the WebView may do with a navigation or a `window.open` to `url`:
+/// the popover's own origin loads in place; another web URL is handed to
+/// `browse::open` (the `open-url` command's path) and denied in place; anything
+/// else is denied.
+fn navigation_allowed(url: &str) -> bool {
+    match ipc_origin::navigation(url, ipc_origin::Os::Windows) {
+        ipc_origin::Navigation::Allow => true,
+        ipc_origin::Navigation::OpenExternal => {
+            browse::open(url);
+            false
+        }
+        ipc_origin::Navigation::Deny => false,
+    }
 }
 
 fn protocol_response(request: Request<Vec<u8>>) -> Response<Cow<'static, [u8]>> {

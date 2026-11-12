@@ -61,8 +61,9 @@ pub(crate) fn is_no_plan_quota(e: &AppError) -> bool {
     matches!(e, AppError::Http { status: 403, body } if body == NO_PLAN_QUOTA)
 }
 
-/// Where the fallback talks to. Quota and plan each try every base in order
-/// (the daily channel first, as the product does); tests point them at mockito.
+/// Where the fallback talks to. Quota and plan each try every base in order —
+/// quota from prod, the plan from the daily channel as the product does (see
+/// [`Endpoints::default`]); tests point them at mockito.
 #[derive(Debug, Clone)]
 pub struct Endpoints {
     pub quota: Vec<String>,
@@ -73,9 +74,16 @@ pub struct Endpoints {
 impl Default for Endpoints {
     fn default() -> Self {
         Self {
+            // Quota leads with prod: the daily channel answers 200 but serves
+            // an incomplete summary (no Gemini group), which the lenient
+            // parser would accept as zeros-where-it-has-no-buckets and hide
+            // real Gemini usage behind the third-party pool's figures. Daily
+            // stays as failover, the role it already played for transport
+            // failures. The plan lookup keeps its original order — a label
+            // has no per-group hole to hide.
             quota: vec![
-                format!("{DAILY_BASE}{QUOTA_PATH}"),
                 format!("{PROD_BASE}{QUOTA_PATH}"),
+                format!("{DAILY_BASE}{QUOTA_PATH}"),
             ],
             load_code_assist: vec![
                 format!("{DAILY_BASE}{LOAD_CODE_ASSIST_PATH}"),
@@ -489,20 +497,20 @@ mod tests {
     fn endpoints(server: &mockito::Server) -> Endpoints {
         let base = server.url();
         Endpoints {
-            quota: vec![format!("{base}/daily/quota"), format!("{base}/prod/quota")],
+            quota: vec![format!("{base}/prod/quota"), format!("{base}/daily/quota")],
             load_code_assist: vec![format!("{base}/daily/plan"), format!("{base}/prod/plan")],
             token: format!("{base}/token"),
         }
     }
 
     #[test]
-    fn default_endpoints_try_daily_then_prod() {
+    fn default_endpoints_try_prod_then_daily_for_quota() {
         let e = Endpoints::default();
         assert_eq!(
             e.quota,
             vec![
-                "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
                 "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
+                "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
             ]
         );
         assert_eq!(
@@ -533,10 +541,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn quota_falls_through_from_daily_to_prod() {
+    async fn quota_falls_through_from_prod_to_daily() {
         let mut server = mockito::Server::new_async().await;
-        let daily = server
-            .mock("POST", "/daily/quota")
+        let prod = server
+            .mock("POST", "/prod/quota")
             .match_header("authorization", "Bearer AT")
             .match_header("content-type", "application/json")
             .match_header("accept", "application/json")
@@ -547,8 +555,8 @@ mod tests {
             .expect(1)
             .create_async()
             .await;
-        let prod = server
-            .mock("POST", "/prod/quota")
+        let daily = server
+            .mock("POST", "/daily/quota")
             .match_header("authorization", "Bearer AT")
             .match_header("user-agent", "antigravity")
             .with_status(200)
@@ -561,22 +569,22 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(value["response"]["buckets"][0]["remainingFraction"], 0.5);
-        daily.assert_async().await;
         prod.assert_async().await;
+        daily.assert_async().await;
     }
 
     #[tokio::test]
     async fn quota_401_stops_without_trying_the_next_base() {
         let mut server = mockito::Server::new_async().await;
-        let daily = server
-            .mock("POST", "/daily/quota")
+        let prod = server
+            .mock("POST", "/prod/quota")
             .with_status(401)
             .with_body(r#"{"error":{"message":"sensitive detail"}}"#)
             .expect(1)
             .create_async()
             .await;
-        let prod = server
-            .mock("POST", "/prod/quota")
+        let daily = server
+            .mock("POST", "/daily/quota")
             .with_status(200)
             .with_body("{}")
             .expect(0)
@@ -603,8 +611,8 @@ mod tests {
         // session is fine, the plan is the problem. The wording must say so
         // instead of sending the user to re-sign-in for nothing.
         let mut server = mockito::Server::new_async().await;
-        let daily = server
-            .mock("POST", "/daily/quota")
+        let prod = server
+            .mock("POST", "/prod/quota")
             .with_status(403)
             .with_body(
                 r#"{"error":{"code":403,"status":"PERMISSION_DENIED","details":
@@ -613,8 +621,8 @@ mod tests {
             .expect(1)
             .create_async()
             .await;
-        let prod = server
-            .mock("POST", "/prod/quota")
+        let daily = server
+            .mock("POST", "/daily/quota")
             .with_status(200)
             .with_body("{}")
             .expect(0)
@@ -662,12 +670,12 @@ mod tests {
     async fn quota_reports_the_last_error_when_every_base_fails() {
         let mut server = mockito::Server::new_async().await;
         server
-            .mock("POST", "/daily/quota")
+            .mock("POST", "/prod/quota")
             .with_status(500)
             .create_async()
             .await;
         server
-            .mock("POST", "/prod/quota")
+            .mock("POST", "/daily/quota")
             .with_status(503)
             .with_body("private upstream text")
             .create_async()

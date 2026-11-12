@@ -19,6 +19,25 @@ use super::types::Snapshot;
 pub const DEFAULT_FORMAT: &str = "{copilot_premium_pct}% · {copilot_reset}";
 const UNAVAILABLE: &str = "—";
 
+/// Formats for a plan that does not include every bucket. Copilot Free has no
+/// premium entitlement, so [`DEFAULT_FORMAT`] would read "—% · 29d 4h".
+const CHAT_FORMAT: &str = "{copilot_chat_pct}% · {copilot_reset}";
+const COMPLETIONS_FORMAT: &str = "{copilot_completions_pct}% · {copilot_reset}";
+
+/// The bar text used when `--format` is omitted: the first bucket the plan
+/// actually includes. Premium is the headline wherever it exists; Copilot Free
+/// reports it as a zero entitlement, which `parse_quota` drops, and the bar
+/// would otherwise show the unavailable marker instead of a figure.
+pub fn default_format(snap: &Snapshot) -> &'static str {
+    if snap.premium.is_some() {
+        DEFAULT_FORMAT
+    } else if snap.chat.is_some() {
+        CHAT_FORMAT
+    } else {
+        COMPLETIONS_FORMAT
+    }
+}
+
 impl From<FetchOutcome> for VendorOutcome {
     fn from(outcome: FetchOutcome) -> Self {
         outcome.map(crate::usage::VendorSnapshot::Copilot)
@@ -99,7 +118,10 @@ pub fn render(
     now: DateTime<Utc>,
 ) -> WaybarOutput {
     let severity = severity(snap);
-    let format = opts.format.as_deref().unwrap_or(DEFAULT_FORMAT);
+    let format = opts
+        .format
+        .as_deref()
+        .unwrap_or_else(|| default_format(snap));
     let mut values = build_placeholders(snap, now);
     for key in ["plan", "copilot_plan"] {
         if let Some(value) = values.get_mut(key) {
@@ -191,6 +213,7 @@ fn render_tooltip(
 mod tests {
     use super::*;
     use crate::copilot::types::Quota;
+    use chrono::TimeZone;
 
     fn sample() -> Snapshot {
         Snapshot {
@@ -237,5 +260,57 @@ mod tests {
         );
         assert!(output.text.contains("85%"));
         assert!(output.tooltip.contains("GitHub Copilot Pro"));
+    }
+    /// Copilot Free has no premium entitlement, so that bucket is absent. The
+    /// bar must still show a figure rather than the unavailable marker.
+    #[test]
+    fn a_plan_without_premium_puts_its_next_quota_on_the_bar() {
+        // One fixed instant for both the reset and the render clock. Taking
+        // two `Utc::now()` readings made the countdown depend on the gap
+        // between them: on a coarse clock the delta stayed exactly 29 days and
+        // the bar read "29d 0h" instead of "28d 23h".
+        let now = Utc.with_ymd_and_hms(2026, 11, 3, 0, 0, 0).unwrap();
+        let free = Snapshot {
+            plan: "Free".into(),
+            premium: None,
+            chat: Some(Quota {
+                percent_remaining: 60,
+                entitlement: Some(50),
+                remaining: Some(30),
+                unlimited: false,
+            }),
+            completions: None,
+            reset_at: Some(now + chrono::Duration::days(29)),
+        };
+        assert_eq!(default_format(&free), CHAT_FORMAT);
+        assert_eq!(default_format(&sample()), DEFAULT_FORMAT);
+
+        let outcome = VendorOutcome::fresh(crate::usage::VendorSnapshot::Copilot(free.clone()));
+        let output = render(
+            &outcome,
+            &free,
+            &Theme::default(),
+            &RenderOpts {
+                format: None,
+                tooltip_format: None,
+                icon: None,
+                pace_tolerance: 5,
+                format_pace_color: false,
+                tooltip_pace_pts: false,
+            },
+            now,
+        );
+        // The chat figure, not the premium bucket's unavailable marker.
+        assert!(output.text.contains("40% \u{b7} 29d 0h"), "{}", output.text);
+        assert!(!output.text.contains(UNAVAILABLE), "{}", output.text);
+
+        // Completions-only is the last fallback; an empty snapshot never
+        // reaches the renderer (`to_snapshot` rejects it).
+        let completions_only = Snapshot {
+            chat: None,
+            completions: free.chat.clone(),
+            ..free
+        };
+        assert_eq!(default_format(&completions_only), COMPLETIONS_FORMAT);
     }
 }

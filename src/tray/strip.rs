@@ -1,6 +1,11 @@
 //! Menu-bar strip: starred metrics, OpenUsage bar geometry, and a template
 //! RGBA glyph. Pure JSON in, pixels out — no AppKit, no HWND.
 
+#![cfg_attr(
+    not(any(target_os = "macos", target_os = "windows", test)),
+    allow(dead_code)
+)]
+
 use std::collections::BTreeMap;
 
 use serde_json::Value;
@@ -71,6 +76,9 @@ pub struct StripMetric {
     /// Under a group heading (SuperGrok's product slices, the Claude entry's
     /// CLI sessions): a breakdown, not a quota window of its own.
     pub grouped: bool,
+    /// The report's `model_pool`: one model's own limit (Antigravity's
+    /// "Gemini 4 Argon"), not a window the whole provider shares.
+    pub model_pool: bool,
 }
 
 /// One provider's visible metrics: entry id, display name, and metrics.
@@ -101,6 +109,86 @@ impl StripContent {
         }
         parts.join("   ")
     }
+}
+
+/// How a frontend reads a quota percentage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageReading {
+    Used,
+    Left,
+}
+
+impl UsageReading {
+    /// Read the popover's `show_as` preference. Unknown values keep the
+    /// historical used-percentage behavior.
+    pub fn from_strip_ipc(value: &Value) -> Self {
+        match value.get("show_as").and_then(Value::as_str) {
+            Some("left") => Self::Left,
+            _ => Self::Used,
+        }
+    }
+}
+
+/// A metric's text in `reading`: its remaining share in Left when available,
+/// otherwise the report's own display value.
+pub fn metric_text(metric: &StripMetric, reading: UsageReading) -> &str {
+    match (reading, metric.left_value.as_deref()) {
+        (UsageReading::Left, Some(left)) => left,
+        _ => metric.value.trim(),
+    }
+}
+
+/// Remove control characters before report-derived text reaches a native UI.
+pub fn safe_text(value: &str) -> String {
+    value
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect::<String>()
+        .trim()
+        .to_owned()
+}
+
+/// Build native tooltip lines from the same starred groups every host uses.
+pub fn tooltip(content: &StripContent, reading: UsageReading) -> String {
+    let lines: Vec<String> = content
+        .groups
+        .iter()
+        .filter_map(|(_, name, metrics)| {
+            let values: Vec<String> = metrics
+                .iter()
+                .map(|metric| safe_text(metric_text(metric, reading)))
+                .filter(|value| !value.is_empty())
+                .collect();
+            if values.is_empty() {
+                return None;
+            }
+            Some(format!("{} · {}", safe_text(name), values.join(" ")))
+        })
+        .collect();
+    if lines.is_empty() {
+        "AI Usage".into()
+    } else {
+        lines.join("\n")
+    }
+}
+
+/// Truncate without splitting a Unicode scalar value. Windows' NotifyIcon
+/// stores its tooltip in a fixed UTF-16 buffer, so the limit is measured in
+/// code units rather than UTF-8 bytes or Rust chars.
+#[cfg(any(windows, test))]
+pub fn truncate_utf16(value: &str, max_units: usize) -> String {
+    let mut units = 0;
+    value
+        .chars()
+        .take_while(|ch| {
+            let next = units + ch.len_utf16();
+            if next > max_units {
+                return false;
+            }
+            units = next;
+            true
+        })
+        .collect()
 }
 
 /// Fill geometry for one bar of the compact glyph. A 1:1 port of OpenUsage
@@ -192,9 +280,10 @@ pub fn parse_strip_ipc(value: &Value) -> (StripStyle, Stars, Vec<String>) {
                     }
                 }
             }
-            if !list.is_empty() {
-                stars.insert(id.to_string(), list);
-            }
+            // An empty list is an explicit preference: the user removed the
+            // provider's last star. Keep the tombstone so resolving content
+            // does not mistake an all-empty map for first-launch defaults.
+            stars.insert(id.to_string(), list);
         }
     }
     let mut order = Vec::new();
@@ -290,7 +379,9 @@ pub fn content_from_payload(payload: &Value, stars: &Stars, order: &[String]) ->
 
 /// Every quota window of one payload entry that has a value, stars aside,
 /// the set the Quattro bar's `selectMetric` picks from: grouped rows only
-/// when the entry has nothing else. The Quattro look draws its chip from this,
+/// when the entry has nothing else, and a per-model pool only when nothing
+/// the provider shares is left — an exhausted Gemini 4 Argon is one model's
+/// limit, not the provider's (#453). The Quattro look draws its chip from this,
 /// so it agrees with the popover tab that selects it, whichever window is
 /// the busiest (Z.AI's third, monthly MCP window counts like its 5h and
 /// weekly ones). A metric whose key is in `hidden` (switched off in the
@@ -312,6 +403,8 @@ pub fn quota_group(payload: &Value, id: &str, hidden: &[String]) -> Option<Strip
         .into_iter()
         .filter(|m| !m.value.trim().is_empty() && !hidden.contains(&m.key))
         .collect();
+    let shared: Vec<StripMetric> = shown.iter().filter(|m| !m.model_pool).cloned().collect();
+    let shown = if shared.is_empty() { shown } else { shared };
     let windows: Vec<StripMetric> = shown.iter().filter(|m| !m.grouped).cloned().collect();
     let metrics = if windows.is_empty() { shown } else { windows };
     (!metrics.is_empty()).then(|| (id.to_string(), name, metrics))
@@ -423,6 +516,7 @@ fn metrics_for_entry(entry: &Value, id: &str, name: &str) -> Vec<StripMetric> {
             left_value,
             value_headline,
             grouped: !effective_group.is_empty(),
+            model_pool: section.get("model_pool").and_then(Value::as_bool) == Some(true),
         });
     }
     rows
@@ -925,6 +1019,63 @@ mod tests {
         assert_eq!(stars["openai"], vec!["metric:Codex weekly".to_string()]);
         assert!(!stars.contains_key(""));
         assert!(order.is_empty());
+    }
+
+    #[test]
+    fn parse_strip_ipc_preserves_explicit_empty_stars() {
+        let (_, stars, _) = parse_strip_ipc(&json!({"stars": {
+            "anthropic": [],
+            "openai": []
+        }}));
+        assert_eq!(stars.len(), 2);
+        assert!(stars["anthropic"].is_empty());
+        assert!(content_from_payload(&sample_payload(), &stars, &[]).is_empty());
+    }
+
+    #[test]
+    fn tooltip_uses_stars_order_and_reading() {
+        let content = content_from_payload(&sample_payload(), &Stars::new(), &[]);
+        assert_eq!(
+            tooltip(&content, UsageReading::Used),
+            "Claude · 19% 41%\nCodex · 2%"
+        );
+        assert_eq!(
+            tooltip(&content, UsageReading::Left),
+            "Claude · 81% 59%\nCodex · 98%"
+        );
+        assert_eq!(
+            UsageReading::from_strip_ipc(&json!({"show_as": "left"})),
+            UsageReading::Left
+        );
+    }
+
+    #[test]
+    fn tooltip_sanitizes_untrusted_native_text() {
+        let payload = json!({"entries": [{
+            "id": "provider",
+            "display_name": "Bad\nName",
+            "status": "ready",
+            "sections": [{"type": "metric", "label": "Weekly", "percent": 9, "value": "9%\r"}]
+        }]});
+        let content = content_from_payload(&payload, &Stars::new(), &[]);
+        assert_eq!(tooltip(&content, UsageReading::Used), "BadName · 9%");
+        assert_eq!(
+            tooltip(
+                &StripContent {
+                    groups: vec![],
+                    bars: vec![]
+                },
+                UsageReading::Used
+            ),
+            "AI Usage"
+        );
+    }
+
+    #[test]
+    fn utf16_truncation_never_splits_a_surrogate_pair() {
+        assert_eq!(truncate_utf16("a😀b", 3), "a😀");
+        assert_eq!(truncate_utf16("a😀b", 2), "a");
+        assert_eq!(truncate_utf16("abc", 127), "abc");
     }
 
     #[test]

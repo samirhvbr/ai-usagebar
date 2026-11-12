@@ -21,6 +21,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -56,6 +57,7 @@ pub struct Config {
     pub kimi: KimiConfig,
     pub kilo: KiloConfig,
     pub novita: NovitaConfig,
+    pub synthetic: SyntheticConfig,
     pub moonshot: MoonshotConfig,
     pub grok: GrokConfig,
     pub supergrok: SuperGrokConfig,
@@ -74,11 +76,16 @@ pub struct Config {
     pub modelstudio: ModelStudioConfig,
     pub lyceum: LyceumConfig,
     pub devin: DevinConfig,
+    pub droid: DroidConfig,
+    #[serde(rename = "muse-code")]
+    pub muse: MuseConfig,
     /// Quota-threshold desktop notifications (`[notifications]`).
     pub notifications: NotificationsConfig,
     /// User-defined providers, one `[[custom]]` table each.
     pub custom: Vec<CustomProviderConfig>,
     pub cline: ClineConfig,
+    pub deeprelay: DeepRelayConfig,
+    pub mistral: MistralConfig,
 }
 
 /// UI / dispatch preferences. Currently just `primary` — which vendor the
@@ -113,13 +120,13 @@ pub struct TrayConfig {
     /// Global shortcut that toggles the popover, in the canonical
     /// "Ctrl+Shift+U" spelling. `None` → no shortcut registered.
     pub shortcut: Option<String>,
-    /// How often the tray re-reads every provider, in minutes: 1, 5 or 10.
+    /// How often the tray re-reads every provider, in minutes: 1, 5, 10, 15, 30 or 60.
     /// The footer's Refresh is always immediate. `None` → 5.
     pub refresh_minutes: Option<u64>,
     /// What the tray does when a newer release is published.
     pub updates: Option<UpdateMode>,
-    /// macOS menu-bar presentation: `bars` (default), `provider` (logos) or
-    /// `name` (the selected provider's logo, short name and value).
+    /// macOS menu-bar presentation: `icon`, `bars` (default), `provider`
+    /// (logos) or `quattro` (selected provider's logo, short name and value).
     pub menu_bar_style: Option<String>,
     /// Whether the `name` style draws the short name beside the logo.
     /// `None` → shown. A provider with no logo shows its name regardless.
@@ -128,7 +135,7 @@ pub struct TrayConfig {
 
 /// Poll intervals the tray offers, in minutes. The provider cache TTL is
 /// 60 s regardless; this only decides how often the tray asks.
-pub const TRAY_REFRESH_MINUTES: [u64; 3] = [1, 5, 10];
+pub const TRAY_REFRESH_MINUTES: [u64; 6] = [1, 5, 10, 15, 30, 60];
 const DEFAULT_TRAY_REFRESH_MINUTES: u64 = 5;
 
 /// Quota-threshold desktop notifications. On by default at 97%: the bar's
@@ -673,7 +680,7 @@ pub(crate) fn set_bool(
     let table = doc
         .entry(section)
         .or_insert_with(toml_edit::table)
-        .as_table_mut()
+        .as_table_like_mut()
         .ok_or_else(|| AppError::Other(format!("config.toml: [{section}] is not a table")))?;
 
     if let Some(item) = table.get_mut(key)
@@ -708,7 +715,7 @@ pub(crate) fn set_value(
     let table = doc
         .entry(section)
         .or_insert_with(toml_edit::table)
-        .as_table_mut()
+        .as_table_like_mut()
         .ok_or_else(|| AppError::Other(format!("config.toml: [{section}] is not a table")))?;
 
     let Some(mut new_value) = new_value else {
@@ -736,13 +743,7 @@ pub(crate) fn set_value(
 /// (`"notify"` stays a string, `5` stays an integer). The tray host is the
 /// only writer.
 pub fn set_tray_value(path: &Path, key: &str, value: Option<toml_edit::Value>) -> Result<()> {
-    let mut doc = read_config_document(path)?;
-    let before = doc.to_string();
-    set_value(&mut doc, "tray", key, value)?;
-    if doc.to_string() == before {
-        return Ok(());
-    }
-    write_config_document(path, &doc)
+    edit_config_document(path, |doc| set_value(doc, "tray", key, value))
 }
 
 /// Persist one validated notification preference without disturbing other
@@ -757,13 +758,9 @@ pub fn set_notification_value(path: &Path, key: &str, value: toml_edit::Value) -
             )));
         }
     }
-    let mut doc = read_config_document(path)?;
-    let before = doc.to_string();
-    set_value(&mut doc, "notifications", key, Some(value))?;
-    if doc.to_string() == before {
-        return Ok(());
-    }
-    write_config_document(path, &doc)
+    edit_config_document(path, |doc| {
+        set_value(doc, "notifications", key, Some(value))
+    })
 }
 
 /// Flip one provider's `enabled` switch in the config at `path`, creating the
@@ -774,13 +771,7 @@ pub fn set_notification_value(path: &Path, key: &str, value: toml_edit::Value) -
 /// [`set_vendor_enabled_in_doc`], so no caller can create an arbitrary
 /// section or reach a `[[custom]]` entry from here.
 pub fn set_vendor_enabled(path: &Path, slug: &str, enabled: bool) -> Result<()> {
-    let mut doc = read_config_document(path)?;
-    let before = doc.to_string();
-    set_vendor_enabled_in_doc(&mut doc, slug, enabled)?;
-    if doc.to_string() == before {
-        return Ok(());
-    }
-    write_config_document(path, &doc)
+    edit_config_document(path, |doc| set_vendor_enabled_in_doc(doc, slug, enabled))
 }
 
 /// The validated core of [`set_vendor_enabled`], over an already-open
@@ -842,7 +833,9 @@ pub(crate) fn read_config_document(path: &Path) -> Result<toml_edit::DocumentMut
 
 /// Persist an edited config document: parent dir created, atomic
 /// tempfile-and-rename write, and `chmod 600` on Unix because the file may
-/// carry inline credentials. The one write path for every config editor.
+/// carry inline credentials. The one write path for every config editor;
+/// production writers reach it only through [`edit_config_document`], which
+/// holds the cross-process lock across the read-modify-write.
 pub(crate) fn write_config_document(path: &Path, doc: &toml_edit::DocumentMut) -> Result<()> {
     let bytes = doc.to_string();
     crate::cache::atomic_write(path, bytes.as_bytes())?;
@@ -858,6 +851,96 @@ pub(crate) fn write_config_document(path: &Path, doc: &toml_edit::DocumentMut) -
     Ok(())
 }
 
+/// How long a config edit waits for another process's save before failing:
+/// long enough to ride out a normal save (milliseconds), short enough that a
+/// wedged lock never makes a settings surface hang.
+pub(crate) const CONFIG_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The file every config save locks: `<config>.lock` beside the config
+/// itself (`~/.config/ai-usagebar/config.toml.lock`), the same sibling-lock
+/// pattern the vendor caches use for their `.fetch.lock`. Its content is
+/// unused — only the flock matters.
+pub(crate) fn config_lock_path(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("config.toml");
+    path.with_file_name(format!("{name}.lock"))
+}
+
+/// One cross-process-locked read-modify-write of the config at `path`: take
+/// the exclusive flock on [`config_lock_path`], read the document, run
+/// `edit`, and — only when `edit` returned `Ok` and the document actually
+/// changed — persist it through [`write_config_document`]. A failed `edit`
+/// writes nothing, and the lock is released on the guard's drop, success or
+/// failure.
+///
+/// Every config writer goes through here — the tray's key check, the TUI's
+/// settings save, the CLI's `settings` commands — so their read-modify-write
+/// cycles queue on the same lock instead of clobbering each other: a save
+/// that lands between another writer's read and its rename used to be
+/// silently overwritten by that writer's stale document. When the wait
+/// outlives [`CONFIG_LOCK_TIMEOUT`] the edit fails with "config.toml is
+/// being saved by another process; try again." and the file is left
+/// untouched.
+///
+/// The lock is held only across the read-modify-write, never across a fetch
+/// or other long work, and `edit` must not take the lock again (no
+/// reentrance — the exclusive flock would block the caller until its own
+/// timeout). An edit that leaves the document empty removes the file:
+/// [`read_config_document`] maps a missing file to the empty document, so
+/// the two are the same config, and persisting "nothing" leaves nothing
+/// behind — the key check's restore relies on it to take back a file the
+/// check created.
+pub(crate) fn edit_config_document<T>(
+    path: &Path,
+    edit: impl FnOnce(&mut toml_edit::DocumentMut) -> Result<T>,
+) -> Result<T> {
+    edit_config_document_within(path, CONFIG_LOCK_TIMEOUT, edit)
+}
+
+/// [`edit_config_document`] with the lock timeout injected — the seam the
+/// tests use to exercise the timeout without waiting five seconds.
+fn edit_config_document_within<T>(
+    path: &Path,
+    timeout: Duration,
+    edit: impl FnOnce(&mut toml_edit::DocumentMut) -> Result<T>,
+) -> Result<T> {
+    // `acquire_lock`'s I/O failures carry their path; it reports only the
+    // lock timeout as `AppError::Other`. That timeout is this operation's
+    // "another process is saving right now".
+    let _guard = match crate::cache::acquire_lock(&config_lock_path(path), timeout) {
+        Ok(guard) => guard,
+        Err(AppError::Other(message)) if message.starts_with("cache lock timeout") => {
+            return Err(AppError::Other(
+                "config.toml is being saved by another process; try again.".to_string(),
+            ));
+        }
+        Err(error) => return Err(error),
+    };
+    let mut doc = read_config_document(path)?;
+    let before = doc.to_string();
+    let value = edit(&mut doc)?;
+    if doc.to_string() != before {
+        if doc.to_string().trim().is_empty() {
+            // Nothing is left in the config, not even a comment: remove the
+            // file. A missing file and an empty one load identically, so a
+            // reader sees nothing change — but the file the edit's own earlier
+            // write created is gone, which is what the key check's restore
+            // wants. A file that still holds the user's comments is written.
+            match std::fs::remove_file(path) {
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                    return Err(error.into());
+                }
+                _ => {}
+            }
+        } else {
+            write_config_document(path, &doc)?;
+        }
+    }
+    Ok(value)
+}
+
 /// Flip `enabled = true` for each vendor's section in the config at `path`,
 /// creating the file when it doesn't exist and leaving every other line —
 /// comments, keys, unrelated sections — exactly as it was. Never writes
@@ -866,21 +949,17 @@ pub(crate) fn write_config_document(path: &Path, doc: &toml_edit::DocumentMut) -
 /// already enabled) is not rewritten, so an idempotent call doesn't touch the
 /// file's mtime or race a concurrent editor.
 pub fn enable_vendors_in(path: &Path, vendors: &[VendorId]) -> Result<Vec<VendorId>> {
-    let mut doc = read_config_document(path)?;
-    let before = doc.to_string();
-    let written: Vec<VendorId> = vendors
-        .iter()
-        .copied()
-        .filter(|vendor| !is_explicitly_disabled(&doc, *vendor))
-        .collect();
-    for vendor in &written {
-        set_bool(&mut doc, vendor.config_section(), "enabled", true)?;
-    }
-    if doc.to_string() == before {
-        return Ok(written);
-    }
-    write_config_document(path, &doc)?;
-    Ok(written)
+    edit_config_document(path, |doc| {
+        let written: Vec<VendorId> = vendors
+            .iter()
+            .copied()
+            .filter(|vendor| !is_explicitly_disabled(doc, *vendor))
+            .collect();
+        for vendor in &written {
+            set_bool(doc, vendor.config_section(), "enabled", true)?;
+        }
+        Ok(written)
+    })
 }
 
 /// Whether the config *says* `enabled = false` for this vendor, as opposed to
@@ -1119,6 +1198,30 @@ impl CopilotConfig {
         )
     }
 
+    /// Async report path: environment overrides remain immediate; the `gh`
+    /// credential helper has its own deadline and never blocks the reactor.
+    pub async fn resolve_token_async(&self, label: Option<&str>) -> Result<String> {
+        let user = self.resolve_user(label)?;
+        if let Some(value) = std::env::var_os("GITHUB_COPILOT_TOKEN") {
+            let token = value.into_string().map_err(|_| {
+                AppError::Credentials(
+                    "GitHub Copilot: GITHUB_COPILOT_TOKEN is not valid UTF-8.".into(),
+                )
+            })?;
+            if !token.is_empty() {
+                if let Some(label) = label {
+                    return Err(AppError::Credentials(format!(
+                        "GitHub Copilot: GITHUB_COPILOT_TOKEN is set, so it is unclear whether \
+                         --account {label:?} should use that token or {user:?}'s `gh` login. \
+                         Unset the variable to use named accounts."
+                    )));
+                }
+                return Ok(token);
+            }
+        }
+        crate::copilot::credentials::resolve_async(self.gh_binary.as_deref(), user).await
+    }
+
     fn resolve_token_with(
         &self,
         environment: impl Fn(&str) -> Option<std::ffi::OsString>,
@@ -1178,6 +1281,7 @@ pub struct OpenCodeGoConfig {
     pub api_key_env: String,
     pub api_key: Option<String>,
     /// Override the search list for the official OpenCode CLI's `auth.json`
+    /// and OpenCode 2's `opencode.db`
     /// (`$XDG_DATA_HOME/opencode` or `~/.local/share/opencode`), for a
     /// non-standard install. The key is read read-only, never copied.
     pub auth_paths: Option<Vec<PathBuf>>,
@@ -1291,9 +1395,32 @@ pub struct ModelStudioConfig {
     pub config_dir: Option<PathBuf>,
 }
 
-/// Devin CLI quota — reuses its existing credentials file read-only. The
-/// provider is opt-in and stores only a path override in ai-usagebar config.
+/// Muse Code subscription quota from the CLI's existing file-based login.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct MuseConfig {
+    pub enabled: bool,
+    pub credentials_path: Option<PathBuf>,
+}
+
+/// One named Devin account.
+///
+/// ```toml
+/// [[devin.accounts]]
+/// label = "work"
+/// credentials_path = "~/.zapdevin/devin/credentials.toml"
+/// ```
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct DevinAccount {
+    /// Stable name used on the CLI (`--account <label>`) and as the cache
+    /// subdir (`~/.cache/ai-usagebar/devin/<label>`).
+    pub label: String,
+    /// Devin CLI credentials file for this account.
+    pub credentials_path: PathBuf,
+}
+
+/// Devin CLI quota — reuses its existing credentials file read-only.
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct DevinConfig {
     pub enabled: bool,
@@ -1301,6 +1428,60 @@ pub struct DevinConfig {
     /// `%APPDATA%\devin\credentials.toml` on Windows and
     /// `${XDG_DATA_HOME:-~/.local/share}/devin/credentials.toml` elsewhere.
     pub credentials_path: Option<PathBuf>,
+    /// Extra Devin logins, each its own `credentials.toml`.
+    #[serde(default)]
+    pub accounts: Vec<DevinAccount>,
+    /// Whether the default (unnamed) Devin login gets its own tab. Defaults to
+    /// `true`. Set `false` once every login is a named account. Ignored when
+    /// there are no named accounts, so Devin never loses its only tab.
+    pub show_default_account: bool,
+}
+
+impl Default for DevinConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            credentials_path: None,
+            accounts: Vec::new(),
+            show_default_account: true,
+        }
+    }
+}
+
+impl DevinConfig {
+    /// The credentials file for `label`, or the default path when `label` is
+    /// `None`.
+    pub fn resolve_credentials_path(&self, label: Option<&str>) -> Result<PathBuf> {
+        let Some(label) = label else {
+            return crate::devin::credentials_path(self);
+        };
+        self.accounts
+            .iter()
+            .find(|account| account.label == label)
+            .map(|account| account.credentials_path.clone())
+            .ok_or_else(|| {
+                AppError::Credentials(format!(
+                    "no Devin account named {label:?}. Add it under \
+                     [[devin.accounts]], or drop --account to use the default login."
+                ))
+            })
+    }
+}
+
+/// Factory Droid (`droid` CLI) quota — reuses the login the CLI keeps in the
+/// Linux Secret Service keyring, read-only. The provider is opt-in and takes
+/// no key: it only reads the CLI's documented `~/.factory` store.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct DroidConfig {
+    pub enabled: bool,
+    /// When the login is about to expire, run `droid doctor --checks auth`
+    /// so the CLI renews it itself (at most every 15 minutes). Off by
+    /// default — renewal is opt-in; an expired login is left to the user,
+    /// who runs `droid` once.
+    pub cli_renewal: bool,
+    /// The `droid` executable for that renewal; `droid` on `PATH` by default.
+    pub cli_path: Option<PathBuf>,
 }
 
 impl Default for OpenCodeGoConfig {
@@ -1397,7 +1578,7 @@ impl Default for OpenRouterConfig {
 /// shares. OpenRouter shipped it first (#221); the other API-key vendors
 /// follow the same array. The default account continues to use the singular
 /// `api_key_env` / `api_key` fields under the vendor's own section.
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct ApiKeyAccount {
     /// Stable CLI/report label and account-scoped cache subdirectory.
     pub label: String,
@@ -1412,6 +1593,13 @@ pub struct ApiKeyAccount {
     /// consults it.
     #[serde(default)]
     pub management_api_key_env: Option<String>,
+    /// Monthly USD spend limit for this account's organization. Only
+    /// `[[anthropic_api.accounts]]` consults it: each Console organization has
+    /// its own limit, so a named account falls back to the section-wide
+    /// `[anthropic_api] monthly_limit` only when it sets none (see
+    /// [`Config::anthropic_api_monthly_limit`]).
+    #[serde(default)]
+    pub monthly_limit: Option<f64>,
 }
 
 /// The `[[<slug>.accounts]]` lookup behind every API-key vendor: find a named
@@ -1608,6 +1796,28 @@ impl Default for NovitaConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
+pub struct SyntheticConfig {
+    pub enabled: bool,
+    pub api_key_env: String,
+    pub api_key: Option<String>,
+    /// Optional plan tier label (go/standard/big) — display-only. The
+    /// quotas API carries no tier identifier, so the label is manual.
+    pub plan_tier: Option<String>,
+}
+
+impl Default for SyntheticConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            api_key_env: "SYNTHETIC_API_KEY".into(),
+            api_key: None,
+            plan_tier: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
 pub struct LyceumConfig {
     pub enabled: bool,
     pub accounts: Vec<ApiKeyAccount>,
@@ -1622,6 +1832,49 @@ impl Default for LyceumConfig {
             accounts: Vec::new(),
             show_default_account: true,
             api_key_env: "LYCEUM_API_KEY".into(),
+            api_key: None,
+        }
+    }
+}
+
+/// DeepRelay's monthly plan meters (`GET /v1/billing/subscription`).
+///
+/// Key-only and opt-in: the key needs the `billing:read` scope, which the
+/// dashboard's default key carries.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct DeepRelayConfig {
+    pub enabled: bool,
+    pub api_key_env: String,
+    pub api_key: Option<String>,
+}
+impl Default for DeepRelayConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            api_key_env: "DEEPRELAY_API_KEY".into(),
+            api_key: None,
+        }
+    }
+}
+
+/// Mistral's monthly API and Vibe Code budgets (`GET /v1/billing/budget`).
+///
+/// Key-only and opt-in. The key comes from `MISTRAL_API_KEY` or an inline
+/// `api_key`; ai-usagebar never discovers credentials on its own, so the
+/// configuring agent (or the user) supplies the key.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct MistralConfig {
+    pub enabled: bool,
+    pub api_key_env: String,
+    pub api_key: Option<String>,
+}
+impl Default for MistralConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            api_key_env: "MISTRAL_API_KEY".into(),
             api_key: None,
         }
     }
@@ -1811,6 +2064,9 @@ fn default_grok_binary() -> PathBuf {
 #[serde(default)]
 pub struct AntigravityConfig {
     pub enabled: bool,
+    /// Exact `agy` executable to run for quota and saved-session renewal.
+    /// Unset preserves discovery on `PATH` and in `~/.local/bin`.
+    pub agy_binary: Option<PathBuf>,
     /// OAuth client id used to refresh the keyring session.
     pub oauth_client_id: Option<String>,
     /// OAuth client secret paired with `oauth_client_id`. An
@@ -1828,6 +2084,7 @@ impl Default for AntigravityConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            agy_binary: None,
             oauth_client_id: None,
             oauth_client_secret: None,
             ide_language_server: true,
@@ -1912,8 +2169,19 @@ impl Default for ShviaConfig {
 #[serde(default)]
 pub struct AnthropicApiConfig {
     pub enabled: bool,
-    /// Env var for the Console **Admin key** (`sk-ant-admin01-…`), distinct from
-    /// an inference key and from the Claude Code OAuth login.
+    /// Extra Console organizations beyond the default key. An Admin key
+    /// belongs to exactly one organization, so a second organization needs a
+    /// second key. Each account gets its own tab, report entry
+    /// (`anthropic_api@<label>`) and cache directory; the fetch's
+    /// organization fingerprint keeps one account's cache from answering for
+    /// another.
+    pub accounts: Vec<ApiKeyAccount>,
+    /// Whether aggregate views include the default (unnamed) key when named
+    /// accounts exist. Ignored when `accounts` is empty so the section never
+    /// loses its only tab.
+    pub show_default_account: bool,
+    /// Env var for a Console key authorized to read organization cost reports.
+    /// This is separate from the Claude Code OAuth login.
     pub api_key_env: String,
     pub api_key: Option<String>,
     /// Monthly USD spend limit, used only for the spend-vs-limit % display. The
@@ -1923,9 +2191,11 @@ pub struct AnthropicApiConfig {
 
 impl Default for AnthropicApiConfig {
     fn default() -> Self {
-        // Opt-in: needs an explicit Admin key.
+        // Opt-in: needs an explicit organization report credential.
         Self {
             enabled: false,
+            accounts: Vec::new(),
+            show_default_account: true,
             api_key_env: "ANTHROPIC_ADMIN_KEY".to_string(),
             api_key: None,
             monthly_limit: None,
@@ -2041,6 +2311,8 @@ pub struct CustomMetricSpec {
     pub resets_at: Option<String>,
     /// Window length for pacing, at least 60.
     pub window_secs: Option<u64>,
+    /// Three-letter uppercase currency code used to format `used` and `limit` as money.
+    pub currency: Option<String>,
 }
 
 /// One free-text row: a string, number, or boolean at `value`.
@@ -2049,6 +2321,8 @@ pub struct CustomMetricSpec {
 pub struct CustomTextSpec {
     pub label: String,
     pub value: String,
+    /// Three-letter uppercase currency code used to format numeric values as money.
+    pub currency: Option<String>,
 }
 
 impl CustomProviderConfig {
@@ -2198,6 +2472,15 @@ impl CustomProviderConfig {
                     metric.label
                 )));
             }
+            if metric.currency.is_some() && metric.percent.is_some() {
+                return Err(bad(format!(
+                    "metric {:?} cannot combine `currency` with `percent`",
+                    metric.label
+                )));
+            }
+            if let Some(currency) = &metric.currency {
+                validate_currency(&section, &format!("metric {:?}", metric.label), currency)?;
+            }
             for (field, pointer) in [
                 ("used", &metric.used),
                 ("limit", &metric.limit),
@@ -2224,6 +2507,9 @@ impl CustomProviderConfig {
                 return Err(bad(format!("duplicate text label {:?}", text.label)));
             }
             validate_pointer(&section, "value", &text.value)?;
+            if let Some(currency) = &text.currency {
+                validate_currency(&section, &format!("text {:?}", text.label), currency)?;
+            }
         }
         Ok(())
     }
@@ -2260,6 +2546,15 @@ fn validate_custom_label(section: &str, field: &str, label: &str) -> Result<()> 
     Ok(())
 }
 
+fn validate_currency(section: &str, context: &str, currency: &str) -> Result<()> {
+    if currency.len() != 3 || !currency.bytes().all(|b| b.is_ascii_uppercase()) {
+        return Err(AppError::Other(format!(
+            "{section}: {context} currency {currency:?} must be a 3-letter uppercase code (e.g. \"USD\")"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_header_name(section: &str, field: &str, name: &str) -> Result<()> {
     if name.is_empty() || reqwest::header::HeaderName::from_bytes(name.as_bytes()).is_err() {
         return Err(AppError::Other(format!(
@@ -2287,8 +2582,16 @@ pub fn resolve_api_key(
 /// an absent API key is a legitimate state rather than an error — Kimi accepts
 /// a Kimi Code CLI subscription login instead.
 pub fn optional_api_key(env_var_name: &str, inline: Option<&str>) -> Option<String> {
+    optional_api_key_with(env_var_name, inline, |name| std::env::var(name).ok())
+}
+
+fn optional_api_key_with(
+    env_var_name: &str,
+    inline: Option<&str>,
+    environment: impl FnOnce(&str) -> Option<String>,
+) -> Option<String> {
     if is_valid_env_var_name(env_var_name)
-        && let Ok(v) = std::env::var(env_var_name)
+        && let Some(v) = environment(env_var_name)
         && !v.is_empty()
     {
         return Some(v);
@@ -2373,6 +2676,7 @@ impl Config {
         expand_tilde_opt(&mut self.anthropic.desktop_profiles_dir);
         expand_tilde_opt(&mut self.anthropic.desktop_prepare_binary);
         expand_tilde_opt(&mut self.openai.codex_auth_path);
+        expand_tilde_opt(&mut self.antigravity.agy_binary);
         expand_tilde_opt(&mut self.cursor.db_path);
         expand_tilde_opt(&mut self.cursor.agent_auth_path);
         expand_tilde_opt(&mut self.kiro.db_path);
@@ -2380,6 +2684,7 @@ impl Config {
         expand_tilde_opt(&mut self.grokbot.secrets_path);
         expand_tilde_opt(&mut self.modelstudio.config_dir);
         expand_tilde_opt(&mut self.devin.credentials_path);
+        expand_tilde_opt(&mut self.muse.credentials_path);
         self.supergrok.grok_binary = expand_tilde(&self.supergrok.grok_binary);
         expand_tilde_opt(&mut self.supergrok.auth_path);
         expand_tilde_opt(&mut self.supergrok.config_path);
@@ -2395,11 +2700,20 @@ impl Config {
         for account in &mut self.openai.accounts {
             account.codex_auth_path = expand_tilde(&account.codex_auth_path);
         }
+        for account in &mut self.devin.accounts {
+            account.credentials_path = expand_tilde(&account.credentials_path);
+        }
         if let Some(paths) = &mut self.commandcode.auth_paths {
             for path in paths {
                 *path = expand_tilde(path);
             }
         }
+        if let Some(paths) = &mut self.opencode_go.auth_paths {
+            for path in paths {
+                *path = expand_tilde(path);
+            }
+        }
+        expand_tilde_opt(&mut self.droid.cli_path);
     }
 
     /// Explicitly enumerate every inline credential field. Adding a new
@@ -2415,6 +2729,7 @@ impl Config {
             self.kimi.api_key.as_deref(),
             self.kilo.api_key.as_deref(),
             self.novita.api_key.as_deref(),
+            self.synthetic.api_key.as_deref(),
             self.minimax.api_key.as_deref(),
             self.moonshot.api_key.as_deref(),
             self.grok.api_key.as_deref(),
@@ -2426,6 +2741,8 @@ impl Config {
             self.shvia.api_key.as_deref(),
             self.antigravity.oauth_client_secret.as_deref(),
             self.cline.api_key.as_deref(),
+            self.deeprelay.api_key.as_deref(),
+            self.mistral.api_key.as_deref(),
         ]
         .into_iter()
         .chain(
@@ -2512,6 +2829,7 @@ impl Config {
             VendorId::Kimi => self.kimi.enabled,
             VendorId::Kilo => self.kilo.enabled,
             VendorId::Novita => self.novita.enabled,
+            VendorId::Synthetic => self.synthetic.enabled,
             VendorId::Moonshot => self.moonshot.enabled,
             VendorId::Grok => self.grok.enabled,
             VendorId::Supergrok => self.supergrok.enabled,
@@ -2530,6 +2848,10 @@ impl Config {
             VendorId::ModelStudio => self.modelstudio.enabled,
             VendorId::Lyceum => self.lyceum.enabled,
             VendorId::Devin => self.devin.enabled,
+            VendorId::Droid => self.droid.enabled,
+            VendorId::MuseCode => self.muse.enabled,
+            VendorId::DeepRelay => self.deeprelay.enabled,
+            VendorId::Mistral => self.mistral.enabled,
         }
     }
 
@@ -2549,6 +2871,7 @@ impl Config {
             VendorId::Kimi => &self.kimi.api_key_env,
             VendorId::Kilo => &self.kilo.api_key_env,
             VendorId::Novita => &self.novita.api_key_env,
+            VendorId::Synthetic => &self.synthetic.api_key_env,
             VendorId::Moonshot => &self.moonshot.api_key_env,
             VendorId::Grok => &self.grok.api_key_env,
             VendorId::Minimax => &self.minimax.api_key_env,
@@ -2557,6 +2880,9 @@ impl Config {
             VendorId::Shvia => &self.shvia.api_key_env,
             VendorId::OrcaRouter => &self.orcarouter.api_key_env,
             VendorId::Lyceum => &self.lyceum.api_key_env,
+            VendorId::DeepRelay => &self.deeprelay.api_key_env,
+            VendorId::Mistral => &self.mistral.api_key_env,
+            VendorId::Cline => &self.cline.api_key_env,
             // Fixed names: OAuth-first providers whose environment override is
             // not user-renameable, and the providers with no key at all.
             VendorId::Anthropic
@@ -2569,9 +2895,10 @@ impl Config {
             | VendorId::Kiro
             | VendorId::NousResearch
             | VendorId::CommandCode
-            | VendorId::Cline
             | VendorId::ModelStudio
-            | VendorId::Devin => id.api_key_env(),
+            | VendorId::Devin
+            | VendorId::MuseCode
+            | VendorId::Droid => id.api_key_env(),
         }
     }
 
@@ -2588,6 +2915,7 @@ impl Config {
             VendorId::Kimi => self.kimi.api_key.as_deref(),
             VendorId::Kilo => self.kilo.api_key.as_deref(),
             VendorId::Novita => self.novita.api_key.as_deref(),
+            VendorId::Synthetic => self.synthetic.api_key.as_deref(),
             VendorId::Moonshot => self.moonshot.api_key.as_deref(),
             VendorId::Grok => self.grok.api_key.as_deref(),
             VendorId::Minimax => self.minimax.api_key.as_deref(),
@@ -2596,6 +2924,8 @@ impl Config {
             VendorId::Shvia => self.shvia.api_key.as_deref(),
             VendorId::OrcaRouter => self.orcarouter.api_key.as_deref(),
             VendorId::Lyceum => self.lyceum.api_key.as_deref(),
+            VendorId::DeepRelay => self.deeprelay.api_key.as_deref(),
+            VendorId::Mistral => self.mistral.api_key.as_deref(),
             VendorId::Cline => self.cline.api_key.as_deref(),
             VendorId::Anthropic
             | VendorId::Openai
@@ -2608,7 +2938,9 @@ impl Config {
             | VendorId::NousResearch
             | VendorId::CommandCode
             | VendorId::ModelStudio
-            | VendorId::Devin => None,
+            | VendorId::Devin
+            | VendorId::MuseCode
+            | VendorId::Droid => None,
         };
         raw.filter(|key| !key.is_empty())
     }
@@ -2616,7 +2948,8 @@ impl Config {
     /// The API-key vendors that take a `[[<vendor>.accounts]]` array —
     /// OpenRouter's (#221), generalized. Kimi is left out on purpose: its
     /// fallback is the Kimi Code CLI's single OAuth login, not a key.
-    pub const API_KEY_ACCOUNT_VENDORS: [VendorId; 11] = [
+    pub const API_KEY_ACCOUNT_VENDORS: [VendorId; 12] = [
+        VendorId::AnthropicApi,
         VendorId::Zai,
         VendorId::Openrouter,
         VendorId::Deepseek,
@@ -2634,6 +2967,7 @@ impl Config {
     /// has no such array (see [`Self::API_KEY_ACCOUNT_VENDORS`]).
     pub fn api_key_accounts(&self, id: VendorId) -> Option<&[ApiKeyAccount]> {
         match id {
+            VendorId::AnthropicApi => Some(&self.anthropic_api.accounts),
             VendorId::Zai => Some(&self.zai.accounts),
             VendorId::Openrouter => Some(&self.openrouter.accounts),
             VendorId::Deepseek => Some(&self.deepseek.accounts),
@@ -2653,6 +2987,7 @@ impl Config {
     /// `true` for every vendor without an accounts array.
     pub fn show_default_api_key_account(&self, id: VendorId) -> bool {
         match id {
+            VendorId::AnthropicApi => self.anthropic_api.show_default_account,
             VendorId::Zai => self.zai.show_default_account,
             VendorId::Openrouter => self.openrouter.show_default_account,
             VendorId::Deepseek => self.deepseek.show_default_account,
@@ -2678,6 +3013,8 @@ impl Config {
         // "Zai", and its section is derived from this spelling.
         let name = match id {
             VendorId::Zai => "Zai",
+            // Its section is derived from this spelling (`[anthropic_api]`).
+            VendorId::AnthropicApi => "Anthropic_API",
             other => other.display_name(),
         };
         let Some(label) = label else {
@@ -2709,6 +3046,22 @@ impl Config {
             None => self.openrouter.management_api_key_env.as_str(),
         };
         optional_api_key(env_name, None)
+    }
+
+    /// The monthly USD limit for the default or a named Anthropic API
+    /// account. Each Console organization has its own spend limit, so a named
+    /// account's own `monthly_limit` wins and the section-wide value is only
+    /// the fallback; the default account always uses the section-wide one.
+    pub fn anthropic_api_monthly_limit(&self, label: Option<&str>) -> Option<f64> {
+        label
+            .and_then(|label| {
+                self.anthropic_api
+                    .accounts
+                    .iter()
+                    .find(|account| account.label == label)
+            })
+            .and_then(|account| account.monthly_limit)
+            .or(self.anthropic_api.monthly_limit)
     }
 
     /// Bar-number settings for one vendor.
@@ -2757,7 +3110,7 @@ impl Config {
             && !TRAY_REFRESH_MINUTES.contains(&minutes)
         {
             return Err(AppError::Other(format!(
-                "[tray] refresh_minutes must be one of 1, 5 or 10, got {minutes}"
+                "[tray] refresh_minutes must be one of 1, 5, 10, 15, 30 or 60, got {minutes}"
             )));
         }
         if !(1..=100).contains(&self.notifications.threshold) {
@@ -2791,6 +3144,17 @@ impl Config {
                  remove it to show spend without a limit"
                     .into(),
             ));
+        }
+        for account in &self.anthropic_api.accounts {
+            if let Some(limit) = account.monthly_limit
+                && (!limit.is_finite() || limit <= 0.0)
+            {
+                return Err(AppError::Other(format!(
+                    "[[anthropic_api.accounts]] {:?} monthly_limit must be finite and \
+                     greater than zero; remove it to use the [anthropic_api] value",
+                    account.label
+                )));
+            }
         }
         // Same rule as `monthly_limit` above: a tank size that cannot divide is
         // a typo, and silently ignoring it would draw a meter the user never
@@ -2833,6 +3197,16 @@ impl Config {
                 "[supergrok] grok_binary must not be empty".into(),
             ));
         }
+        if self
+            .antigravity
+            .agy_binary
+            .as_ref()
+            .is_some_and(|path| path.as_os_str().is_empty())
+        {
+            return Err(AppError::Other(
+                "[antigravity] agy_binary must not be empty".into(),
+            ));
+        }
         let mut labels = HashSet::new();
         for account in &self.anthropic.accounts {
             validate_account_label(&account.label)?;
@@ -2853,6 +3227,16 @@ impl Config {
                 )));
             }
         }
+        let mut devin_labels = HashSet::new();
+        for account in &self.devin.accounts {
+            validate_account_label_for("devin", &account.label)?;
+            if !devin_labels.insert(&account.label) {
+                return Err(AppError::Credentials(format!(
+                    "duplicate devin account label {:?}",
+                    account.label
+                )));
+            }
+        }
         // Every `[[<vendor>.accounts]]` array follows OpenRouter's rules: labels
         // become cache subdirectories, stay unique as CLI selectors and tab
         // identities, and each entry names a key source.
@@ -2861,6 +3245,15 @@ impl Config {
             let mut labels = HashSet::new();
             for account in self.api_key_accounts(id).unwrap_or(&[]) {
                 validate_account_label_for(slug, &account.label)?;
+                // `monthly_limit` lives on the shared account type but only the
+                // Anthropic API reads it; elsewhere it would be silently ignored.
+                if id != VendorId::AnthropicApi && account.monthly_limit.is_some() {
+                    return Err(AppError::Other(format!(
+                        "[[{slug}.accounts]] {:?}: monthly_limit is only supported \
+                         on [[anthropic_api.accounts]]",
+                        account.label
+                    )));
+                }
                 if !labels.insert(&account.label) {
                     return Err(AppError::Credentials(format!(
                         "duplicate {slug} account label {:?}",
@@ -3239,6 +3632,8 @@ mod tests {
             VendorId::OrcaRouter,
             VendorId::ModelStudio,
             VendorId::Devin,
+            VendorId::Droid,
+            VendorId::Mistral,
         ] {
             assert!(!c.is_enabled(opt_in), "{opt_in:?}");
         }
@@ -3266,6 +3661,9 @@ mod tests {
         assert_eq!(config.opencode_go.api_key_env, "OPENCODE_GO_API_KEY");
         assert!(config.opencode_go.api_key.is_none());
         assert!(!config.is_enabled(VendorId::Copilot));
+        assert!(!config.is_enabled(VendorId::Mistral));
+        assert_eq!(config.mistral.api_key_env, "MISTRAL_API_KEY");
+        assert!(config.mistral.api_key.is_none());
     }
 
     #[cfg(unix)]
@@ -3327,6 +3725,35 @@ ide_language_server = false
         assert!(!opted_out.antigravity.ide_language_server);
     }
 
+    #[test]
+    fn antigravity_agy_binary_is_optional_and_tilde_expanded() {
+        assert!(Config::default().antigravity.agy_binary.is_none());
+        let file = write_toml(
+            r#"
+            [antigravity]
+            enabled = true
+            agy_binary = "~/bin/agy"
+            "#,
+        );
+        let config = Config::load_from(file.path()).unwrap();
+        assert_eq!(
+            config.antigravity.agy_binary,
+            Some(crate::cache::home_dir().unwrap().join("bin/agy"))
+        );
+    }
+
+    #[test]
+    fn antigravity_agy_binary_must_not_be_empty() {
+        let file = write_toml(
+            r#"
+            [antigravity]
+            agy_binary = ""
+            "#,
+        );
+        let error = Config::load_from(file.path()).unwrap_err().to_string();
+        assert!(error.contains("[antigravity] agy_binary must not be empty"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn antigravity_inline_oauth_secret_receives_config_file_protection() {
@@ -3346,6 +3773,7 @@ ide_language_server = false
             api_key_env: None,
             api_key: Some("<redacted>".into()),
             management_api_key_env: None,
+            monthly_limit: None,
         });
         assert!(config.has_inline_secrets());
     }
@@ -3480,6 +3908,19 @@ enabled = false
         assert_eq!(
             inline_key_permission_decision(0o604),
             InlineKeyPermissionDecision::Tighten
+        );
+    }
+
+    #[test]
+    fn monthly_limit_is_rejected_on_other_api_key_accounts() {
+        let config: Config = toml::from_str(
+            "[[deepseek.accounts]]\nlabel = \"work\"\napi_key_env = \"DS_WORK\"\nmonthly_limit = 5\n",
+        )
+        .unwrap();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("only supported on [[anthropic_api.accounts]]"),
+            "{err}"
         );
     }
 
@@ -3731,6 +4172,23 @@ enabled = false
     }
 
     #[test]
+    fn droid_is_opt_in_and_takes_no_api_key() {
+        let defaults = DroidConfig::default();
+        assert!(!defaults.enabled);
+        assert!(!defaults.cli_renewal);
+        assert_eq!(defaults.cli_path, None);
+
+        let config = Config::default();
+        assert_eq!(config.api_key_env_for(VendorId::Droid), "");
+        assert_eq!(config.inline_api_key(VendorId::Droid), None);
+
+        let file = write_toml("[droid]\nenabled = true\n");
+        let config = Config::load_from(file.path()).unwrap();
+        assert!(config.is_enabled(VendorId::Droid));
+        assert!(config.enabled_vendors().contains(&VendorId::Droid));
+    }
+
+    #[test]
     fn devin_is_opt_in_and_takes_no_api_key() {
         let defaults = DevinConfig::default();
         assert!(!defaults.enabled);
@@ -3760,6 +4218,106 @@ enabled = false
             "{}",
             path.display()
         );
+    }
+
+    #[test]
+    fn devin_without_accounts_resolves_the_singular_path() {
+        let explicit = DevinConfig {
+            credentials_path: Some(PathBuf::from("/tmp/devin/credentials.toml")),
+            ..DevinConfig::default()
+        };
+        assert_eq!(
+            explicit.resolve_credentials_path(None).unwrap(),
+            PathBuf::from("/tmp/devin/credentials.toml")
+        );
+    }
+
+    #[test]
+    fn devin_named_accounts_resolve_their_own_credentials_file() {
+        let config: Config = toml::from_str(
+            r#"
+            [devin]
+            credentials_path = "/tmp/personal/credentials.toml"
+            [[devin.accounts]]
+            label = "work"
+            credentials_path = "/tmp/work/credentials.toml"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.devin.resolve_credentials_path(Some("work")).unwrap(),
+            PathBuf::from("/tmp/work/credentials.toml")
+        );
+        assert_eq!(
+            config.devin.resolve_credentials_path(None).unwrap(),
+            PathBuf::from("/tmp/personal/credentials.toml")
+        );
+    }
+
+    #[test]
+    fn devin_named_accounts_reject_an_unregistered_label() {
+        let config = DevinConfig {
+            accounts: vec![crate::config::DevinAccount {
+                label: "work".into(),
+                credentials_path: PathBuf::from("/tmp/work/credentials.toml"),
+            }],
+            ..DevinConfig::default()
+        };
+        let err = config
+            .resolve_credentials_path(Some("nope"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("nope"), "{err}");
+        assert!(err.contains("[[devin.accounts]]"), "{err}");
+    }
+
+    #[test]
+    fn devin_account_credentials_paths_are_tilde_expanded_on_load() {
+        let f = write_toml(
+            r#"
+            [[devin.accounts]]
+            label = "work"
+            credentials_path = "~/.devin-work/credentials.toml"
+            "#,
+        );
+        let c = Config::load_from(f.path()).unwrap();
+        let home = crate::cache::home_dir().unwrap();
+        assert_eq!(
+            c.devin.accounts[0].credentials_path,
+            home.join(".devin-work/credentials.toml")
+        );
+    }
+
+    #[test]
+    fn devin_rejects_duplicate_account_labels() {
+        let f = write_toml(
+            r#"
+            [[devin.accounts]]
+            label = "work"
+            credentials_path = "/tmp/work1/credentials.toml"
+            [[devin.accounts]]
+            label = "work"
+            credentials_path = "/tmp/work2/credentials.toml"
+            "#,
+        );
+        let err = Config::load_from(f.path()).unwrap_err().to_string();
+        assert!(
+            err.contains("duplicate devin account label \"work\""),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn devin_rejects_invalid_account_labels() {
+        let f = write_toml(
+            r#"
+            [[devin.accounts]]
+            label = "../bad"
+            credentials_path = "/tmp/bad/credentials.toml"
+            "#,
+        );
+        assert!(Config::load_from(f.path()).is_err());
     }
 
     #[test]
@@ -3808,12 +4366,26 @@ api_key = "synthetic-account"
         );
         assert_eq!(optional_api_key("9INVALID", None), None);
         assert_eq!(optional_api_key("9INVALID", Some("")), None);
-        // An unusable `api_key_env` still lets an inline key through, exactly
-        // as `resolve_api_key` does.
+    }
+
+    #[test]
+    fn optional_api_key_prefers_env_and_falls_through_to_inline() {
+        let from_env = |name: &str| (name == "TEST_API_KEY").then(|| "from-env".to_string());
         assert_eq!(
-            optional_api_key("9INVALID", Some("inline")),
-            Some("inline".to_string())
+            optional_api_key_with("TEST_API_KEY", Some("from-config"), from_env),
+            Some("from-env".to_string())
         );
+        assert_eq!(
+            optional_api_key_with("TEST_API_KEY", Some("from-config"), |_| None),
+            Some("from-config".to_string())
+        );
+        assert_eq!(
+            optional_api_key_with("TEST_API_KEY", Some("from-config"), |_| {
+                Some(String::new())
+            }),
+            Some("from-config".to_string())
+        );
+        assert_eq!(optional_api_key_with("TEST_API_KEY", None, |_| None), None);
     }
 
     #[test]
@@ -4358,6 +4930,7 @@ api_key = "synthetic-account"
             api_key_env: None,
             api_key: Some("work-secret".into()),
             management_api_key_env: None,
+            monthly_limit: None,
         });
         let message = config
             .resolve_account_api_key_for(VendorId::Openrouter, Some("missing"))
@@ -4376,6 +4949,7 @@ api_key = "synthetic-account"
             api_key_env: Some("sk_pasted_secret".into()),
             api_key: None,
             management_api_key_env: None,
+            monthly_limit: None,
         });
         let _g = env_guard();
         unsafe { std::env::remove_var("sk_pasted_secret") };
@@ -4396,12 +4970,14 @@ api_key = "synthetic-account"
                 api_key_env: None,
                 api_key: Some("work-key".into()),
                 management_api_key_env: Some("AI_USAGEBAR_TEST_OR_MGMT_WORK".into()),
+                monthly_limit: None,
             },
             ApiKeyAccount {
                 label: "plain".into(),
                 api_key_env: None,
                 api_key: Some("plain-key".into()),
                 management_api_key_env: None,
+                monthly_limit: None,
             },
         ];
         let _g = env_guard();
@@ -4436,6 +5012,120 @@ api_key = "synthetic-account"
         unsafe { std::env::remove_var("OPENROUTER_MANAGEMENT_API_KEY") };
         unsafe { std::env::remove_var("AI_USAGEBAR_TEST_OR_MGMT_WORK") };
         unsafe { std::env::remove_var("AI_USAGEBAR_TEST_OR_MGMT_DEFAULT") };
+    }
+
+    #[test]
+    fn anthropic_api_accounts_parse_with_their_own_monthly_limit() {
+        let config: Config = toml::from_str(
+            r#"
+[anthropic_api]
+enabled = true
+monthly_limit = 1000
+
+[[anthropic_api.accounts]]
+label = "work"
+api_key_env = "ANTHROPIC_WORK_ADMIN_KEY"
+monthly_limit = 500
+
+[[anthropic_api.accounts]]
+label = "side"
+api_key = "sk-ant-admin01-side"
+"#,
+        )
+        .unwrap();
+        config.validate().unwrap();
+        let accounts = config.api_key_accounts(VendorId::AnthropicApi).unwrap();
+        assert_eq!(accounts.len(), 2);
+        assert_eq!(accounts[0].label, "work");
+        assert_eq!(accounts[0].monthly_limit, Some(500.0));
+        assert_eq!(accounts[1].monthly_limit, None);
+    }
+
+    #[test]
+    fn anthropic_api_account_limit_falls_back_to_the_section_limit() {
+        let mut config = Config::default();
+        config.anthropic_api.monthly_limit = Some(1000.0);
+        config.anthropic_api.accounts = vec![
+            ApiKeyAccount {
+                label: "work".into(),
+                api_key_env: None,
+                api_key: Some("k".into()),
+                management_api_key_env: None,
+                monthly_limit: Some(500.0),
+            },
+            ApiKeyAccount {
+                label: "side".into(),
+                api_key_env: None,
+                api_key: Some("k".into()),
+                management_api_key_env: None,
+                monthly_limit: None,
+            },
+        ];
+        assert_eq!(config.anthropic_api_monthly_limit(None), Some(1000.0));
+        assert_eq!(
+            config.anthropic_api_monthly_limit(Some("work")),
+            Some(500.0)
+        );
+        assert_eq!(
+            config.anthropic_api_monthly_limit(Some("side")),
+            Some(1000.0)
+        );
+    }
+
+    #[test]
+    fn anthropic_api_account_monthly_limit_must_be_positive_and_finite() {
+        for value in ["0", "-5", "nan"] {
+            let config: Config = toml::from_str(&format!(
+                "[[anthropic_api.accounts]]\nlabel = \"work\"\napi_key = \"k\"\n\
+                 monthly_limit = {value}\n"
+            ))
+            .unwrap();
+            let message = config.validate().unwrap_err().to_string();
+            assert!(message.contains("monthly_limit"), "{value}: {message}");
+        }
+    }
+
+    #[test]
+    fn anthropic_api_without_accounts_keeps_the_single_key_behavior() {
+        let config: Config =
+            toml::from_str("[anthropic_api]\nenabled = true\nmonthly_limit = 42\n").unwrap();
+        config.validate().unwrap();
+        assert!(config.anthropic_api.accounts.is_empty());
+        assert!(config.show_default_api_key_account(VendorId::AnthropicApi));
+        assert_eq!(config.anthropic_api_monthly_limit(None), Some(42.0));
+    }
+
+    #[test]
+    fn anthropic_api_accounts_resolve_distinct_keys_and_missing_key_names_the_section() {
+        let _g = env_guard();
+        unsafe { std::env::set_var("AI_USAGEBAR_TEST_ANT_WORK", "sk-ant-admin01-work") };
+        let mut config = Config::default();
+        config.anthropic_api.api_key = Some("sk-ant-admin01-default".into());
+        config.anthropic_api.api_key_env = "AI_USAGEBAR_TEST_ANT_UNSET".into();
+        config.anthropic_api.accounts = vec![ApiKeyAccount {
+            label: "work".into(),
+            api_key_env: Some("AI_USAGEBAR_TEST_ANT_WORK".into()),
+            api_key: None,
+            management_api_key_env: None,
+            monthly_limit: None,
+        }];
+        let id = VendorId::AnthropicApi;
+        assert_eq!(
+            config.resolve_account_api_key_for(id, None).unwrap(),
+            "sk-ant-admin01-default"
+        );
+        assert_eq!(
+            config
+                .resolve_account_api_key_for(id, Some("work"))
+                .unwrap(),
+            "sk-ant-admin01-work"
+        );
+        let unknown = config
+            .resolve_account_api_key_for(id, Some("nope"))
+            .unwrap_err()
+            .to_string();
+        assert!(unknown.contains("[[anthropic_api.accounts]]"), "{unknown}");
+        unsafe { std::env::remove_var("AI_USAGEBAR_TEST_ANT_WORK") };
     }
 
     #[test]
@@ -4498,6 +5188,7 @@ api_key = "synthetic-account"
             api_key_env: Some("AI_USAGEBAR_TEST_DEEPSEEK_WORK".into()),
             api_key: Some("work-inline".into()),
             management_api_key_env: None,
+            monthly_limit: None,
         });
         let _g = env_guard();
         unsafe { std::env::set_var("AI_USAGEBAR_TEST_DEEPSEEK_WORK", "work-env") };
@@ -5234,6 +5925,29 @@ api_key = "synthetic-account"
     }
 
     #[test]
+    fn opencode_go_and_droid_paths_are_tilde_expanded() {
+        let file = write_toml(
+            r#"
+            [opencode-go]
+            auth_paths = ["~/.local/share/opencode/opencode.db", "/etc/opencode/auth.json"]
+
+            [droid]
+            cli_path = "~/.local/bin/droid"
+            "#,
+        );
+        let config = Config::load_from(file.path()).unwrap();
+        let home = crate::cache::home_dir().unwrap();
+        assert_eq!(
+            config.opencode_go.auth_paths,
+            Some(vec![
+                home.join(".local/share/opencode/opencode.db"),
+                PathBuf::from("/etc/opencode/auth.json"),
+            ])
+        );
+        assert_eq!(config.droid.cli_path, Some(home.join(".local/bin/droid")));
+    }
+
+    #[test]
     fn kiro_db_path_is_tilde_expanded() {
         let f = write_toml(
             r#"
@@ -5485,11 +6199,13 @@ value = "/tier"
         assert_eq!(c.metrics[0].used.as_deref(), Some("/requests/used"));
         assert_eq!(c.metrics[0].limit.as_deref(), Some("/requests/limit"));
         assert_eq!(c.metrics[0].percent, None);
+        assert_eq!(c.metrics[0].currency, None);
         assert_eq!(c.metrics[0].resets_at.as_deref(), Some("/requests/reset"));
         assert_eq!(c.metrics[0].window_secs, Some(3600));
         assert_eq!(c.texts.len(), 1);
         assert_eq!(c.texts[0].label, "Tier");
         assert_eq!(c.texts[0].value, "/tier");
+        assert_eq!(c.texts[0].currency, None);
         assert_eq!(c.section_label(), r#"[[custom]] id = "mytool""#);
     }
 
@@ -5817,6 +6533,60 @@ url = "https://example.test/u"
     }
 
     #[test]
+    fn custom_metric_and_text_parse_currency() {
+        let toml = custom_with(
+            "window_secs = 3600\n",
+            "window_secs = 3600\ncurrency = \"USD\"\n",
+        )
+        .replace(
+            "value = \"/tier\"\n",
+            "value = \"/tier\"\ncurrency = \"EUR\"\n",
+        );
+        let config = Config::load_from(write_toml(&toml).path()).unwrap();
+        assert_eq!(config.custom[0].metrics[0].currency.as_deref(), Some("USD"));
+        assert_eq!(config.custom[0].texts[0].currency.as_deref(), Some("EUR"));
+    }
+
+    #[test]
+    fn custom_rejects_an_invalid_currency_code() {
+        let toml = custom_with(
+            "window_secs = 3600\n",
+            "window_secs = 3600\ncurrency = \"usd\"\n",
+        );
+        assert_custom_rejected(
+            &toml,
+            "metric \"Requests\" currency \"usd\" must be a 3-letter uppercase code",
+        );
+
+        let toml = custom_with(
+            "value = \"/tier\"\n",
+            "value = \"/tier\"\ncurrency = \"USDT\"\n",
+        );
+        assert_custom_rejected(
+            &toml,
+            "text \"Tier\" currency \"USDT\" must be a 3-letter uppercase code",
+        );
+    }
+
+    #[test]
+    fn custom_rejects_a_metric_mixing_currency_with_percent() {
+        let toml = r#"
+            [[custom]]
+            id = "bare"
+            short_name = "bre"
+            url = "https://example.test/u"
+            [[custom.metrics]]
+            label = "Quota"
+            percent = "/pct"
+            currency = "USD"
+        "#;
+        assert_custom_rejected(
+            toml,
+            "metric \"Quota\" cannot combine `currency` with `percent`",
+        );
+    }
+
+    #[test]
     fn enabled_custom_and_custom_by_id_select_entries() {
         let two = format!(
             "{}{}",
@@ -5927,6 +6697,23 @@ url = "https://example.test/u"
         );
     }
 
+    /// `[cline] api_key_env` is read by the fetch, so the shared resolver has
+    /// to answer the same name: the catalog reports and probes it, and the
+    /// scrub list is built from it. Cline's arm sat with the fixed-name
+    /// providers, so a renamed variable configured the fetch alone.
+    #[test]
+    fn loading_a_config_resolves_and_scrubs_a_renamed_cline_env_var() {
+        let renamed = "AI_USAGEBAR_CLINE_RENAMED_SCRUB_TEST_2F8A";
+        assert!(!crate::vendor::vendor_secret_env_vars_to_remove(&[]).contains(&renamed));
+        let file = write_toml(&format!("[cline]\napi_key_env = \"{renamed}\"\n"));
+        let config = Config::load_from(file.path()).unwrap();
+        assert_eq!(config.api_key_env_for(VendorId::Cline), renamed);
+        assert!(
+            crate::vendor::vendor_secret_env_vars_to_remove(&[]).contains(&renamed),
+            "a renamed Cline key variable must be scrubbed from subprocesses"
+        );
+    }
+
     /// `VendorId::config_section` is what every by-name config writer uses;
     /// this proves each section name is one the parser actually recognizes
     /// (the `deny_unknown_fields` on `Config` makes a misspelling fail loudly)
@@ -6000,11 +6787,11 @@ enabled = true
 
     #[test]
     fn tray_refresh_minutes_rejects_values_outside_the_menu() {
-        for minutes in ["3", "0"] {
+        for minutes in ["3", "0", "120"] {
             let file = write_toml(&format!("[tray]\nrefresh_minutes = {minutes}\n"));
             let error = Config::load_from(file.path()).unwrap_err().to_string();
             assert!(error.contains("[tray] refresh_minutes"), "{error}");
-            assert!(error.contains("1, 5 or 10"), "{error}");
+            assert!(error.contains("1, 5, 10, 15, 30 or 60"), "{error}");
         }
     }
 
@@ -6194,6 +6981,14 @@ enabled = true
     }
 
     #[test]
+    fn set_value_updates_fields_in_a_toml_inline_table() {
+        let mut doc: toml_edit::DocumentMut =
+            "tray = { shortcut = \"Ctrl+U\" } # mine\n".parse().unwrap();
+        set_value(&mut doc, "tray", "shortcut", Some("Alt+U".into())).unwrap();
+        assert_eq!(doc.to_string(), "tray = { shortcut = \"Alt+U\" } # mine\n");
+    }
+
+    #[test]
     fn enable_vendors_in_creates_a_missing_config() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("sub").join("config.toml");
@@ -6298,6 +7093,20 @@ api_key = \"k\"
     }
 
     #[test]
+    fn enable_vendors_in_enables_a_toml_inline_table() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "grok = { api_key = \"k\" }\n").unwrap();
+
+        let written = enable_vendors_in(&path, &[VendorId::Grok]).unwrap();
+
+        assert_eq!(written, vec![VendorId::Grok]);
+        assert!(Config::load_from(&path).unwrap().is_enabled(VendorId::Grok));
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("grok = {"));
+    }
+
+    #[test]
     fn enable_vendors_in_is_textually_idempotent() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("config.toml");
@@ -6327,5 +7136,175 @@ enabled = true
         enable_vendors_in(&path, &[]).unwrap();
 
         assert!(!path.exists());
+    }
+
+    /// The whole point of the lock: two processes (here, threads) doing
+    /// read-modify-write on the same file must serialize, so no increment is
+    /// lost. Fifty increments each, one hundred in the end — an unlocked
+    /// read-modify-write races and comes up short.
+    #[test]
+    fn edit_config_document_serializes_concurrent_increments_without_loss() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[counter]\ncount = 0\n").unwrap();
+
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let path = path.clone();
+                std::thread::spawn(move || -> Result<()> {
+                    for _ in 0..50 {
+                        edit_config_document(&path, |doc| {
+                            let count = doc
+                                .get("counter")
+                                .and_then(|table| table.get("count"))
+                                .and_then(|value| value.as_integer())
+                                .unwrap_or(0);
+                            set_value(
+                                doc,
+                                "counter",
+                                "count",
+                                Some(toml_edit::Value::from(count + 1)),
+                            )
+                        })?;
+                    }
+                    Ok(())
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
+
+        let doc = read_config_document(&path).unwrap();
+        let count = doc
+            .get("counter")
+            .and_then(|table| table.get("count"))
+            .and_then(|value| value.as_integer())
+            .unwrap();
+        assert_eq!(count, 100, "no increment may be lost");
+    }
+
+    /// A lock held past the timeout (100 ms here; the production timeout is
+    /// [`CONFIG_LOCK_TIMEOUT`]) fails with the retry message and leaves the
+    /// file byte-for-byte untouched — and the next edit after the holder
+    /// drops the lock goes through.
+    #[test]
+    fn edit_config_document_times_out_and_leaves_the_file_untouched() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        let original = "[ui]\nprimary = \"zai\"\n";
+        std::fs::write(&path, original).unwrap();
+        let lock_path = config_lock_path(&path);
+
+        let held = crate::cache::acquire_lock(&lock_path, Duration::from_secs(30)).unwrap();
+        let error = edit_config_document_within(&path, Duration::from_millis(100), |doc| {
+            set_value(doc, "tray", "updates", Some(toml_edit::Value::from("auto")))
+        })
+        .expect_err("a lock held past the timeout must fail the edit");
+        assert_eq!(
+            error.user_message(),
+            "config.toml is being saved by another process; try again."
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        drop(held);
+
+        edit_config_document(&path, |doc| {
+            set_value(doc, "tray", "updates", Some(toml_edit::Value::from("auto")))
+        })
+        .unwrap();
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains(r#"updates = "auto""#)
+        );
+        assert!(lock_path.exists(), "the lock file lives beside the config");
+    }
+
+    /// A failed edit writes nothing: the file keeps its original bytes, and
+    /// the lock is released so the next edit goes through.
+    #[test]
+    fn edit_config_document_writes_nothing_when_the_edit_fails() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        let original = "[ui]\nprimary = \"zai\"\n";
+        std::fs::write(&path, original).unwrap();
+
+        let error = edit_config_document(&path, |_doc| -> Result<()> {
+            Err(AppError::Other("the edit refused".into()))
+        })
+        .expect_err("a failed edit must fail the call");
+        assert_eq!(error.user_message(), "the edit refused");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+
+        // The lock did not stick: a follow-up edit under the lock succeeds.
+        set_vendor_enabled(&path, "deepseek", true).unwrap();
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("enabled = true")
+        );
+    }
+
+    /// An edit that leaves the document empty removes the file: the empty
+    /// document is the missing file's twin, and the key check's restore uses
+    /// this to take back a file the check created.
+    #[test]
+    fn edit_config_document_removes_the_file_when_the_document_is_left_empty() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[ui]\nprimary = \"zai\"\n").unwrap();
+
+        edit_config_document(&path, |doc| {
+            doc.clear();
+            Ok(())
+        })
+        .unwrap();
+        assert!(
+            !path.exists(),
+            "an emptied config must not linger as an empty file"
+        );
+    }
+
+    /// A config that holds only the user's comments is not an empty one: an
+    /// edit that adds a section and takes it back (the key check's write and
+    /// restore) leaves the file in place, byte for byte.
+    #[test]
+    fn edit_config_document_keeps_a_file_that_still_holds_comments() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        let original = "# my notes\n# [zai]\n# enabled = true\n";
+        std::fs::write(&path, original).unwrap();
+
+        edit_config_document(&path, |doc| {
+            doc["zai"] = toml_edit::table();
+            doc["zai"]["api_key"] = toml_edit::value("candidate");
+            Ok(())
+        })
+        .unwrap();
+        edit_config_document(&path, |doc| {
+            doc.remove("zai");
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    /// An unchanged document is not rewritten (the writers' old
+    /// before/after rule, now inside the lock): the file's mtime is
+    /// untouched.
+    #[test]
+    fn edit_config_document_skips_the_write_when_the_document_is_unchanged() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[deepseek]\nenabled = true\n").unwrap();
+        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        set_vendor_enabled(&path, "deepseek", true).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            before,
+            "an unchanged document must not be rewritten"
+        );
     }
 }

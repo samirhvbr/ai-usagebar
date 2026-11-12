@@ -59,6 +59,11 @@ pub fn has_local_credentials(vendor: VendorId, config: &Config) -> bool {
         VendorId::Kimi => crate::kimi::resolve_auth(&config.kimi).is_ok(),
         VendorId::Kilo => key_present(config, vendor),
         VendorId::Novita => key_present(config, vendor),
+        VendorId::Synthetic => key_present(config, vendor),
+        VendorId::DeepRelay => key_present(config, vendor),
+        // Mistral is opt-in and key-only: the environment or an inline key is
+        // the whole credential, never a credential store it did not own.
+        VendorId::Mistral => key_present(config, vendor),
         VendorId::Moonshot => key_present(config, vendor),
         VendorId::Grok => key_present(config, vendor),
         VendorId::Supergrok => crate::supergrok::scope::ScopePaths::with_overrides(
@@ -119,7 +124,23 @@ pub fn has_local_credentials(vendor: VendorId, config: &Config) -> bool {
         VendorId::ModelStudio => crate::modelstudio::config_path(&config.modelstudio)
             .map(|path| crate::modelstudio::creds::config_present_at(&path))
             .unwrap_or(false),
-        VendorId::Devin => crate::devin::credentials_path(&config.devin)
+        VendorId::MuseCode => crate::muse::creds::path(&config.muse)
+            .map(|path| path.is_file())
+            .unwrap_or(false),
+        VendorId::Devin => {
+            crate::devin::credentials_path(&config.devin)
+                .map(|path| path.is_file())
+                .unwrap_or(false)
+                || config
+                    .devin
+                    .accounts
+                    .iter()
+                    .any(|a| a.credentials_path.is_file())
+        }
+        // File-exists only: the keyring decrypt happens at fetch time, which
+        // reports the real failure honestly. Droid is opt-in, so this probe
+        // only feeds `detect` reporting, never auto-enable.
+        VendorId::Droid => crate::droid::keyring_path()
             .map(|path| path.is_file())
             .unwrap_or(false),
     }
@@ -301,7 +322,7 @@ pub struct DetectReport {
 /// The pure decision. Candidates are `all` minus `state.known`, or every
 /// vendor in `all` when `force`. A candidate is enabled when `probe` says it
 /// has credentials and the config doesn't already enable it. A vendor that is
-/// not [`VendorId::auto_detectable`] (Devin) is neither probed nor counted:
+/// not [`VendorId::auto_detectable`] (Devin, Muse Code) is neither probed nor counted:
 /// its credentials are discoverable, but it is opt-in and detection, including
 /// `--all`, must not activate it. `known` becomes the union of the old set and
 /// `all`, in [`VendorId::all`] order, deduped — so a vendor is considered once
@@ -474,6 +495,15 @@ mod tests {
         assert!(!has_local_credentials(VendorId::Lyceum, &config));
     }
 
+    #[test]
+    fn mistral_credential_detection_uses_only_an_explicit_key() {
+        let mut config = Config::default();
+        config.mistral.api_key_env.clear(); // prevents reading any ambient variable
+        assert!(!has_local_credentials(VendorId::Mistral, &config));
+        config.mistral.api_key = Some("mst-test".into());
+        assert!(has_local_credentials(VendorId::Mistral, &config));
+    }
+
     /// Vendors detection may probe: everything except opt-in-only providers.
     fn detectable_count() -> usize {
         VendorId::all()
@@ -558,11 +588,11 @@ mod tests {
             assert!(!probed_vendors.borrow().contains(&VendorId::Devin));
             assert!(plan.known.contains(&VendorId::Devin));
         }
-        assert!(
-            VendorId::all()
-                .iter()
-                .all(|vendor| vendor.auto_detectable() == (*vendor != VendorId::Devin))
-        );
+        assert!(VendorId::all().iter().all(|vendor| vendor.auto_detectable()
+            != matches!(
+                vendor,
+                VendorId::Devin | VendorId::MuseCode | VendorId::Droid | VendorId::Mistral
+            )));
     }
 
     #[test]
@@ -677,6 +707,7 @@ mod tests {
             api_key_env: None,
             api_key: Some("work-key".into()),
             management_api_key_env: None,
+            monthly_limit: None,
         });
         assert!(key_present(&config, VendorId::Deepseek));
         // Another vendor's array is not this vendor's credential.

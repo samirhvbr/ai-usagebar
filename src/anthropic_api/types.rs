@@ -38,6 +38,8 @@ pub struct CostReport {
 /// with no spend).
 #[derive(Debug, Clone, Deserialize)]
 pub struct Bucket {
+    #[serde(default)]
+    pub ending_at: Option<String>,
     pub results: Vec<CostResult>,
 }
 
@@ -71,6 +73,36 @@ pub fn page_dollars(report: &CostReport) -> Result<f64> {
     Ok(cents / 100.0)
 }
 
+/// Last UTC day wholly represented by this page's daily buckets. A bucket
+/// ending at midnight on Oct 18 covers Oct 17, not the still-running 18th.
+pub fn page_covered_through(report: &CostReport) -> Result<Option<chrono::NaiveDate>> {
+    report
+        .data
+        .iter()
+        .filter_map(|bucket| bucket.ending_at.as_deref())
+        .map(|raw| {
+            chrono::DateTime::parse_from_rfc3339(raw)
+                .map_err(|e| {
+                    AppError::Schema(format!(
+                        "anthropic-api: invalid cost_report ending_at {raw:?}: {e}"
+                    ))
+                })
+                .and_then(|ending| {
+                    ending
+                        .with_timezone(&chrono::Utc)
+                        .date_naive()
+                        .pred_opt()
+                        .ok_or_else(|| {
+                            AppError::Schema(
+                                "anthropic-api: cost_report ending_at underflow".into(),
+                            )
+                        })
+                })
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(|dates| dates.into_iter().max())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -94,6 +126,19 @@ mod tests {
         // 100.0 + 34.5 = 134.5 cents = $1.345
         assert!((page_dollars(&report).unwrap() - 1.345).abs() < 1e-9);
         assert!(!report.has_more);
+        assert_eq!(
+            page_covered_through(&report).unwrap(),
+            Some(chrono::NaiveDate::from_ymd_opt(2026, 7, 1).unwrap())
+        );
+    }
+
+    #[test]
+    fn invalid_bucket_end_is_schema_drift_not_a_false_coverage_claim() {
+        let report: CostReport = serde_json::from_str(
+            r#"{"data":[{"ending_at":"today","results":[]}],"has_more":false}"#,
+        )
+        .unwrap();
+        assert!(page_covered_through(&report).is_err());
     }
 
     #[test]

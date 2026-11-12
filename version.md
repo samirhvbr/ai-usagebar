@@ -1,7 +1,7 @@
 # Version — samirhvbr fork of ai-usagebar
 
-**Current version:** `0.3.0`
-**Upstream:** [akitaonrails/ai-usagebar](https://github.com/akitaonrails/ai-usagebar) @ `22975d7f` (`v1.36.0`) — 68 commits of ours past it
+**Current version:** `0.4.0`
+**Upstream:** [akitaonrails/ai-usagebar](https://github.com/akitaonrails/ai-usagebar) @ `a983efd` (`v1.50.0`) — 71 commits of ours past it
 
 The **first semver in this file is ours**, and that is not cosmetic: everything
 that reads a version here takes the first one it finds. Pointing that at the
@@ -29,6 +29,46 @@ Where this fork's CI runs: [`docs/ci.md`](docs/ci.md).
 
 Newest first. Each `##` heading is literally the commit subject. The upstream's
 own changelog, where it has one, is left alone: it is their record, not ours.
+
+## 0.4.0 - fetch upstream tags locally for fork changelog validation
+
+The first CI run of the sync found only the fork's early remote tags and
+compared old release sections instead of the current upstream releases.
+Linux and macOS now fetch the official `v*` tags into their disposable
+checkouts before the unchanged changelog gate. This never pushes tags or
+starts the fork's Release workflow; upstream released history stays intact.
+
+## 0.4.0 - adopt upstream v1.50.0, preserving ShvIA and GNOME account panels
+
+Moves the upstream point from `v1.36.0` (`22975d7f`) to `v1.50.0`
+(`a983efd`), 504 upstream commits. This includes the Console organization
+support, app-icon menu-bar mode, columned usage report, new providers, and
+quota/cache/account reliability fixes released in that interval.
+
+Resolution notes, for whoever syncs next:
+
+- Six files conflicted: the example provider list, the TUI outside-click
+  test, and GNOME's extension, marker tests, preferences and stylesheet.
+  ShvIA stays registered alongside the new upstream providers. The TUI test
+  adopts upstream's newer geometry-based fix for the same growing-picker
+  problem that our previous sync worked around.
+- GNOME adopts upstream's tabbed provider menu and per-provider indicators,
+  while keeping named Claude account selection, "Status das APIs", the dark
+  menu and the saved `panel-entries` combined strip. A nonempty combined
+  selection still draws exactly one indicator; an empty selection uses the
+  new provider switches. Existing setting keys are retained.
+- Named selections still pass `--account` separately to the binary. Only the
+  first indicator owns the background API-refresh timer, so additional
+  provider indicators do not multiply those requests. The empty combined
+  strip retains its icon fallback without duplicating separate indicators'
+  already-prepended brand marks.
+- GNOME contract tests exercise both selection modes, named-account command
+  arguments, the icon fallback and the single background timer. Desktop,
+  Omarchy, Mint and macOS packaging model tests pass locally. The GNOME
+  extension has not been exercised in a live GNOME Shell on this macOS host.
+- `CHANGELOG.md` and upstream version fields are v1.50.0's, byte for byte.
+  The immutable-changelog gate passes without a fork exception or changes
+  to released history.
 
 ## 0.3.0 - adopt upstream v1.36.0, with Cline, Ollama credit plans and Claude Desktop switching
 

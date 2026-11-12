@@ -6,13 +6,20 @@
 
 mod accent;
 mod browse;
+mod device_login;
 pub mod hotkey;
 mod icon;
+// Which origin the tray's IPC bridge and the WebView accept. Pure decisions, compiled
+// everywhere like `blur` so the tests run on every OS; only the macOS and Windows hosts
+// apply them (the guard + navigation handlers of their WebView builders).
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+mod ipc_origin;
 mod marks;
 #[cfg(any(target_os = "macos", test))]
 mod menu_bar;
 mod panel;
 mod payload;
+mod providers;
 mod strip;
 
 #[cfg(windows)]
@@ -43,10 +50,15 @@ mod updates;
 // run on every CI job; only the Windows host calls it.
 #[cfg_attr(not(windows), allow(dead_code))]
 mod placement;
-// When the Windows popover closes on a blur or a press outside it. Pure decisions, compiled
-// everywhere like `placement`; only the Windows host calls them.
+// When the popover closes on a blur or a press outside it. Pure decisions, compiled everywhere
+// like `placement`; the Windows host calls most of them, the macOS host only `macos_verdict`.
 #[cfg_attr(not(windows), allow(dead_code))]
 mod blur;
+// The `copy-image` IPC's validation: the page posts the card's PNG as base64 and the host
+// puts it on the system clipboard. Pure decisions over the received JSON, compiled everywhere
+// like `blur` so its tests run on every CI job; the tray hosts call it.
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+mod clipboard_image;
 // Where the Windows popover's WebView2 profile lives, and the one-time adoption of the old one.
 // Paths and file copies, compiled everywhere like `placement`; only the Windows host calls it.
 mod profile;

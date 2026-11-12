@@ -2,7 +2,7 @@
 
 use std::future::Future;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -86,6 +86,17 @@ where
     {
         return Ok(outcome);
     }
+    // An ended period or an unverifiable login cannot be shown, but neither
+    // makes another billing request safe while the shared backoff is armed.
+    if let Some(remaining) = cache.backoff_remaining() {
+        return Err(AppError::Http {
+            status: 429,
+            body: format!(
+                "rate limited; next attempt in {}",
+                crate::cache::human_backoff(remaining)
+            ),
+        });
+    }
 
     match fetch_billing().await {
         Ok(response) => {
@@ -137,6 +148,12 @@ struct CachedSnapshot {
     reset_credits: crate::usage::ResetCredits,
     #[serde(default)]
     products: Vec<crate::usage::SuperGrokProduct>,
+    /// Absent on caches written before additional usage was recorded. Those
+    /// still load; the line stays hidden until the next refresh.
+    #[serde(default)]
+    on_demand_used_cents: Option<i64>,
+    #[serde(default)]
+    on_demand_cap_cents: Option<i64>,
 }
 
 impl CachedEnvelope {
@@ -157,6 +174,8 @@ impl CachedEnvelope {
                 prepaid_balance: snapshot.prepaid_balance,
                 reset_credits: snapshot.reset_credits.clone(),
                 products: snapshot.products.clone(),
+                on_demand_used_cents: snapshot.on_demand_used_cents,
+                on_demand_cap_cents: snapshot.on_demand_cap_cents,
             },
         }
     }
@@ -225,6 +244,16 @@ fn parse_cache(bytes: &[u8], account_scope: &str) -> Result<SuperGrokSnapshot> {
             ));
         }
     }
+    for (name, cents) in [
+        ("on-demand spend", cached.snapshot.on_demand_used_cents),
+        ("on-demand cap", cached.snapshot.on_demand_cap_cents),
+    ] {
+        if cents.is_some_and(|cents| cents < 0) {
+            return Err(AppError::Schema(format!(
+                "SuperGrok cached {name} is invalid"
+            )));
+        }
+    }
 
     Ok(SuperGrokSnapshot {
         plan: cached.snapshot.plan,
@@ -235,6 +264,8 @@ fn parse_cache(bytes: &[u8], account_scope: &str) -> Result<SuperGrokSnapshot> {
         prepaid_balance: cached.snapshot.prepaid_balance,
         reset_credits: cached.snapshot.reset_credits,
         products: cached.snapshot.products,
+        on_demand_used_cents: cached.snapshot.on_demand_used_cents,
+        on_demand_cap_cents: cached.snapshot.on_demand_cap_cents,
     })
 }
 
@@ -261,6 +292,11 @@ fn fallback(
     now: DateTime<Utc>,
     original: AppError,
 ) -> Result<FetchOutcome> {
+    // A 429 must stop the next request even when there is no usable figure to
+    // attach an error to (a cold cache, an ended period, or a changed login).
+    if matches!(original, AppError::Http { status: 429, .. }) {
+        cache.note_rate_limit_at(SystemTime::now());
+    }
     let Some(account_scope) = account_scope else {
         return Err(original);
     };
@@ -399,6 +435,59 @@ mod tests {
         });
         let snapshot = parse_cache(cached.to_string().as_bytes(), "scope-a").unwrap();
         assert!(snapshot.reset_credits.is_empty());
+        assert!(snapshot.additional_usage_text().is_none());
+    }
+
+    /// Additional usage is part of the billing snapshot, so a cache hit has to
+    /// keep it. A cache from before the field existed stays valid and silent.
+    #[tokio::test]
+    async fn additional_usage_survives_the_cache_round_trip() {
+        let (_td, cache) = fixture();
+        let mut response = weekly_response(10.0);
+        response.config.as_mut().unwrap().on_demand_used = Some(types::Cent { val: 250 });
+        response.config.as_mut().unwrap().on_demand_cap = Some(types::Cent { val: 5000 });
+        let fresh = fetch_snapshot_with(
+            &cache,
+            Duration::from_secs(3600),
+            now(),
+            || Some("scope-a".into()),
+            || async { Ok(response) },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            fresh.snapshot.additional_usage_text().as_deref(),
+            Some("$2.50 / $50.00")
+        );
+
+        let cached = fetch_snapshot_with(
+            &cache,
+            Duration::from_secs(3600),
+            now(),
+            || Some("scope-a".into()),
+            || async { panic!("a fresh cache must not refetch") },
+        )
+        .await
+        .unwrap();
+        assert_eq!(cached.snapshot.on_demand_used_cents, Some(250));
+        assert_eq!(cached.snapshot.on_demand_cap_cents, Some(5000));
+    }
+
+    #[test]
+    fn a_negative_cached_on_demand_amount_is_rejected() {
+        let cached = serde_json::json!({
+            "schema": CACHE_SCHEMA,
+            "scope": "scope-a",
+            "snapshot": {
+                "plan": "SuperGrok",
+                "percent": 5,
+                "period": "weekly",
+                "reset_at": null,
+                "prepaid_balance": null,
+                "on_demand_used_cents": -1
+            }
+        });
+        assert!(parse_cache(cached.to_string().as_bytes(), "scope-a").is_err());
     }
 
     #[tokio::test]
@@ -611,6 +700,100 @@ mod tests {
         )
         .await;
         assert!(outcome.is_err());
+    }
+
+    #[tokio::test]
+    async fn an_active_backoff_survives_an_ended_period_or_unusable_scope() {
+        for scope in [Some("scope-a"), Some("scope-b"), None] {
+            let (_td, cache) = fixture();
+            let snapshot = types::to_snapshot(weekly_response(88.0), "scope-a").unwrap();
+            cache
+                .write_payload(
+                    &serde_json::to_vec(&CachedEnvelope::from_snapshot("scope-a", &snapshot))
+                        .unwrap(),
+                )
+                .unwrap();
+            cache.write_last_error(429, "billing limited");
+            let marker = std::fs::read(cache.retry_after_path()).unwrap();
+            let error = fetch_snapshot_with(
+                &cache,
+                Duration::ZERO,
+                snapshot.reset_at.unwrap(),
+                || scope.map(str::to_string),
+                || async { panic!("billing must not be called during backoff") },
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(error, AppError::Http { status: 429, .. }));
+            assert!(error.to_string().contains("next attempt in"));
+            assert_eq!(std::fs::read(cache.retry_after_path()).unwrap(), marker);
+            assert_eq!(
+                cache.read_last_error(),
+                Some((429, "billing limited".into()))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_429_after_the_period_ends_arms_backoff_without_a_usable_cache() {
+        let (_td, cache) = fixture();
+        let snapshot = types::to_snapshot(weekly_response(88.0), "scope-a").unwrap();
+        cache
+            .write_payload(
+                &serde_json::to_vec(&CachedEnvelope::from_snapshot("scope-a", &snapshot)).unwrap(),
+            )
+            .unwrap();
+        let calls = AtomicUsize::new(0);
+        for attempt in 0..2 {
+            let error = fetch_snapshot_with(
+                &cache,
+                Duration::ZERO,
+                snapshot.reset_at.unwrap(),
+                || Some("scope-a".into()),
+                || async {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Err(AppError::Http {
+                        status: 429,
+                        body: "billing limited".into(),
+                    })
+                },
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(error, AppError::Http { status: 429, .. }));
+            if attempt == 0 {
+                assert!(error.to_string().contains("billing limited"));
+            } else {
+                assert!(error.to_string().contains("next attempt in"));
+            }
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(cache.backoff_remaining().is_some());
+        assert!(cache.read_last_error().is_none());
+    }
+
+    #[tokio::test]
+    async fn an_active_backoff_keeps_a_current_same_scope_period_visible() {
+        let (_td, cache) = fixture();
+        let snapshot = types::to_snapshot(weekly_response(33.0), "scope-a").unwrap();
+        cache
+            .write_payload(
+                &serde_json::to_vec(&CachedEnvelope::from_snapshot("scope-a", &snapshot)).unwrap(),
+            )
+            .unwrap();
+        cache.write_last_error(429, "billing limited");
+        let outcome = fetch_snapshot_with(
+            &cache,
+            Duration::from_secs(60),
+            now(),
+            || Some("scope-a".into()),
+            || async { panic!("a usable cache must be served during backoff") },
+        )
+        .await
+        .unwrap();
+        assert!(outcome.stale);
+        assert_eq!(outcome.snapshot.weekly_pct, 33);
+        assert_eq!(outcome.last_error, Some((429, "billing limited".into())));
     }
 
     #[test]

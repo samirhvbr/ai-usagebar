@@ -50,6 +50,12 @@ pub fn build_placeholders(snap: &AnthropicApiSnapshot) -> HashMap<&'static str, 
         ("aapi_headline", headline(snap)),
         ("aapi_spent", usd(snap.spent)),
         (
+            "aapi_through",
+            snap.covered_through
+                .map(|date| date.to_string())
+                .unwrap_or_default(),
+        ),
+        (
             "aapi_limit",
             snap.limit
                 .map(|l| format!("${l:.0}"))
@@ -126,7 +132,8 @@ fn render_tooltip(
     lines.push(TooltipLine::Body("".into()));
 
     lines.push(TooltipLine::Body(format!(
-        " <span foreground='{fg}'>  󰉹  Spend this month</span>"
+        " <span foreground='{fg}'>  󰉹  {}</span>",
+        escape(&snap.coverage_label())
     )));
     lines.push(TooltipLine::Body(format!(
         "   <span font_weight='bold' foreground='{color}'>{spent}</span>",
@@ -179,12 +186,23 @@ fn render_tooltip(
             "     <span foreground='{dim}'>{}</span>",
             escape(msg)
         )));
-        if *code == 401 || *code == 403 {
+        let guidance: &[&str] = match *code {
+            401 => &["Check that the organization report key is valid and not expired."],
+            403 => &[
+                "Check organization roles, report permissions and key scope.",
+                "Prepaid credit does not grant access.",
+            ],
+            _ => &[],
+        };
+        if !guidance.is_empty() {
+            for line in guidance {
+                lines.push(TooltipLine::Body(format!(
+                    "     <span foreground='{dim}'>{}</span>",
+                    escape(line)
+                )));
+            }
             lines.push(TooltipLine::Body(format!(
-                "     <span foreground='{dim}'>needs an org Admin key (sk-ant-admin01-); set up an</span>"
-            )));
-            lines.push(TooltipLine::Body(format!(
-                "     <span foreground='{dim}'>organization in Console → Settings → Organization</span>"
+                "     <span foreground='{dim}'>Setup and troubleshooting: docs/anthropic-api.md</span>"
             )));
         }
     }
@@ -211,7 +229,11 @@ mod tests {
     use crate::usage::AnthropicApiSnapshot;
 
     fn outcome(spent: f64, limit: Option<f64>) -> (AnthropicApiSnapshot, VendorOutcome) {
-        let snap = AnthropicApiSnapshot { spent, limit };
+        let snap = AnthropicApiSnapshot {
+            spent,
+            limit,
+            covered_through: Some(chrono::NaiveDate::from_ymd_opt(2026, 10, 17).unwrap()),
+        };
         let o = VendorOutcome {
             snapshot: crate::usage::VendorSnapshot::AnthropicApi(snap.clone()),
             stale: false,
@@ -245,6 +267,17 @@ mod tests {
         let out = render(&o, &snap, &Theme::default(), &opts(), Utc::now());
         assert!(out.text.contains("$1.34/mo"));
         assert!(out.tooltip.contains("no monthly limit set"));
+        assert!(out.tooltip.contains("Month to date (through Oct 17)"));
+    }
+
+    #[test]
+    fn an_undated_report_does_not_claim_to_include_the_live_day() {
+        let snap = AnthropicApiSnapshot {
+            spent: 1.34,
+            limit: None,
+            covered_through: None,
+        };
+        assert_eq!(snap.coverage_label(), "Completed daily buckets this month");
     }
 
     #[test]
@@ -252,23 +285,56 @@ mod tests {
         assert_eq!(
             severity(&AnthropicApiSnapshot {
                 spent: 950.0,
-                limit: Some(1000.0)
+                limit: Some(1000.0),
+                covered_through: None,
             }),
             PaceSeverity::Critical
         );
         assert_eq!(
             severity(&AnthropicApiSnapshot {
                 spent: 1.0,
-                limit: Some(1000.0)
+                limit: Some(1000.0),
+                covered_through: None,
             }),
             PaceSeverity::Low
         );
         assert_eq!(
             severity(&AnthropicApiSnapshot {
                 spent: 500.0,
-                limit: None
+                limit: None,
+                covered_through: None,
             }),
             PaceSeverity::Low
         );
+    }
+
+    #[test]
+    fn rejected_report_tooltips_explain_credentials_without_requiring_an_admin_prefix() {
+        for status in [401, 403] {
+            let (snap, mut outcome) = outcome(7.0, None);
+            outcome.stale = true;
+            outcome.last_error = Some((status, crate::error::AUTH_FAILURE_MESSAGE.into()));
+            let tooltip = render(
+                &outcome,
+                &snap,
+                &Theme::default(),
+                &opts(),
+                chrono::NaiveDate::from_ymd_opt(2026, 7, 19)
+                    .unwrap()
+                    .and_hms_opt(12, 0, 0)
+                    .unwrap()
+                    .and_utc(),
+            )
+            .tooltip;
+            assert!(tooltip.contains("docs/anthropic-api.md"));
+            assert!(!tooltip.contains("needs an org Admin key"));
+            assert!(!tooltip.contains("sk-ant-admin01-"));
+            if status == 401 {
+                assert!(tooltip.contains("valid and not expired"));
+            } else {
+                assert!(tooltip.contains("report permissions and key scope"));
+                assert!(tooltip.contains("Prepaid credit does not grant access"));
+            }
+        }
     }
 }

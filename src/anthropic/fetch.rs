@@ -25,14 +25,16 @@ pub const USAGE_BETA_HEADER: &str = "oauth-2025-04-20";
 /// server reads the *surface* from the `claude-cli/<version> (external, cli)`
 /// shape (the older `claude-code/<version>` form answers
 /// `ineligible_reason: "surface"`), then the version itself against a floor —
-/// 2.1.279 is refused as `"cli_version"` where 2.1.280 is accepted.
+/// 2.1.279 is refused as `"cli_version"` where 2.1.280 is accepted; later the
+/// floor moved again and 2.1.281 answers `429` while the published 2.1.319 is
+/// accepted.
 ///
 /// So this pins a real published release (`latest` on npm at the time of
 /// writing), not a synthesized one: identifying as a client version that was
 /// never cut would be a lie to the server *and* to the next reader. If
 /// Anthropic raises the floor again this reverts to `ineligible`, the block
 /// arrives empty, and nothing but the resets row disappears.
-pub const USAGE_USER_AGENT: &str = "claude-cli/2.1.281 (external, cli)";
+pub const USAGE_USER_AGENT: &str = "claude-cli/2.1.319 (external, cli)";
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 const REFRESH_TIMEOUT: Duration = Duration::from_secs(25);
 const LOCK_TIMEOUT: Duration = Duration::from_secs(45);
@@ -460,7 +462,10 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(outcome.snapshot.session.utilization_pct, 42);
+        assert_eq!(
+            outcome.snapshot.session.as_ref().unwrap().utilization_pct,
+            42
+        );
         assert_ne!(outcome.snapshot.plan, "Unknown");
         assert!(!outcome.stale);
     }
@@ -490,7 +495,10 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(outcome.snapshot.session.utilization_pct, 42);
+        assert_eq!(
+            outcome.snapshot.session.as_ref().unwrap().utilization_pct,
+            42
+        );
         assert!(!outcome.stale);
     }
 
@@ -523,7 +531,10 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(outcome.snapshot.session.utilization_pct, 50);
+        assert_eq!(
+            outcome.snapshot.session.as_ref().unwrap().utilization_pct,
+            50
+        );
         assert!(!outcome.stale);
         m.assert_async().await;
         // Cache should now exist.
@@ -564,7 +575,10 @@ mod tests {
         .await
         .unwrap();
         assert!(outcome.stale);
-        assert_eq!(outcome.snapshot.session.utilization_pct, 12);
+        assert_eq!(
+            outcome.snapshot.session.as_ref().unwrap().utilization_pct,
+            12
+        );
         assert_eq!(outcome.last_error.as_ref().map(|(c, _)| *c), Some(429));
         assert_eq!(
             outcome.last_error.as_ref().map(|(_, m)| m.as_str()),
@@ -624,7 +638,10 @@ mod tests {
         .unwrap();
 
         assert!(!outcome.stale);
-        assert_eq!(outcome.snapshot.session.utilization_pct, 61);
+        assert_eq!(
+            outcome.snapshot.session.as_ref().unwrap().utilization_pct,
+            61
+        );
         assert!(
             outcome.last_error.is_none(),
             "empty-refresh path must not poison .last_error, got {:?}",
@@ -728,7 +745,10 @@ mod tests {
         .unwrap();
 
         assert!(outcome.stale);
-        assert_eq!(outcome.snapshot.session.utilization_pct, 17);
+        assert_eq!(
+            outcome.snapshot.session.as_ref().unwrap().utilization_pct,
+            17
+        );
         assert!(outcome.last_error.is_none());
         assert!(cache.read_last_error().is_none());
         refresh.assert_async().await;
@@ -757,7 +777,7 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.is_transient(), "expected transient error, got {err:?}");
-        assert_eq!(err.plan(), Some("Claude Max 5x"));
+        assert_eq!(err.plan(), Some("Claude Max"));
     }
 
     #[tokio::test]
@@ -789,7 +809,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert_eq!(err.plan(), Some("Claude Max 5x"));
+        assert_eq!(err.plan(), Some("Claude Max"));
         let message = err.user_message();
         assert!(message.contains("401"), "{message}");
         assert!(

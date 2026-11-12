@@ -36,9 +36,24 @@ pub const RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(5 * 60);
 /// Per-vendor cache directory and helper API.
 ///
 /// Construct with [`Cache::for_vendor`]; the directory is created lazily.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Cache {
     dir: PathBuf,
+    /// The key the fetch under this cache uses, attached with
+    /// [`Cache::redacting`]: a `.last_error` that quotes it is redacted at
+    /// the first point of writing, before the provider's answer is persisted.
+    redacting: Option<String>,
+}
+
+impl std::fmt::Debug for Cache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The redacting secret is the API key itself: report that it is
+        // attached, never what it is.
+        f.debug_struct("Cache")
+            .field("dir", &self.dir)
+            .field("redacting", &self.redacting.is_some())
+            .finish()
+    }
 }
 
 impl Cache {
@@ -46,7 +61,10 @@ impl Cache {
     /// `$XDG_CACHE_HOME` when set).
     pub fn for_vendor(vendor: &str) -> Result<Self> {
         let base = xdg_cache_dir()?.join("ai-usagebar").join(vendor);
-        Ok(Self { dir: base })
+        Ok(Self {
+            dir: base,
+            redacting: None,
+        })
     }
 
     /// Cache for a specific named account of a vendor, rooted at
@@ -58,12 +76,29 @@ impl Cache {
             .join("ai-usagebar")
             .join(vendor)
             .join(label);
-        Ok(Self { dir: base })
+        Ok(Self {
+            dir: base,
+            redacting: None,
+        })
     }
 
     /// Cache rooted at an arbitrary directory — for tests.
     pub fn at(path: PathBuf) -> Self {
-        Self { dir: path }
+        Self {
+            dir: path,
+            redacting: None,
+        }
+    }
+
+    /// Attach the key the fetch under this cache uses, so a `.last_error`
+    /// that the provider's answer quotes is redacted at the first point of
+    /// writing: [`Self::write_last_error`] strips it before the control-char
+    /// cleanup and before the atomic write, and returns the redacted pair so
+    /// the in-memory copy and the file agree. The secret is held without a
+    /// `Debug` that prints it.
+    pub(crate) fn redacting(mut self, secret: &str) -> Self {
+        self.redacting = Some(secret.to_string());
+        self
     }
 
     /// Ensure the directory exists. Safe to call repeatedly.
@@ -118,7 +153,12 @@ impl Cache {
     ///    without touching the network. With nothing worth showing this returns
     ///    an [`AppError::Http`] with status 429 whose body names the time until
     ///    the next attempt; the vendor's `?` propagates it and the network is
-    ///    never reached. `.last_error` is left as the vendor wrote it.
+    ///    never reached. `.last_error` is left as the vendor wrote it. A
+    ///    wire-only read (`ttl = 0`) never serves a payload in either branch:
+    ///    its answer must be a reading made now, and one left by another
+    ///    producer is not. Claude Desktop's prepare also reads with a zero
+    ///    TTL and refuses a cached reading either way; under a backoff it now
+    ///    gets the 429 that says when to retry.
     /// 2. Otherwise the ordinary TTL check runs unchanged.
     pub fn fresh_payload(&self, ttl: Duration) -> Result<Option<Vec<u8>>> {
         self.fresh_payload_at(ttl, SystemTime::now())
@@ -129,7 +169,11 @@ impl Cache {
     /// clock via [`Cache::payload_age`].
     pub fn fresh_payload_at(&self, ttl: Duration, now: SystemTime) -> Result<Option<Vec<u8>>> {
         if let Some(remaining) = self.backoff_remaining_at(now) {
-            if self.payload_age().is_some_and(|age| age <= MAX_STALE) {
+            // The wire-only read skips the backoff's serve branch: a payload
+            // another producer left is not a reading made under the key this
+            // caller just wrote, even though the bar's ordinary callers keep
+            // their last good figure.
+            if !ttl.is_zero() && self.payload_age().is_some_and(|age| age <= MAX_STALE) {
                 return self.read_payload().map(Some);
             }
             return Err(AppError::Http {
@@ -223,7 +267,44 @@ impl Cache {
 
     /// Atomically write a new payload. Uses `tempfile + persist` (POSIX
     /// rename), matching claudebar's `mktemp + mv` invariant.
+    ///
+    /// A cache attached to a key via [`Cache::redacting`] redacts the
+    /// payload too: a provider's *successful* answer can quote the key the
+    /// fetch was sent with (Z.AI carries `msg` inside an HTTP 200), and the
+    /// payload is the second sink. See [`redact_payload`]: a JSON payload is
+    /// redacted on its decoded strings (an escaped echo counts, and numbers
+    /// and structure are never touched); a payload that is not JSON and
+    /// quotes the key is not persisted at all — the fetch still returns its
+    /// in-memory value, and the cache is left exactly as it was. The
+    /// partial-echo heuristic does not apply here: a payload is data, and
+    /// replacing its whole text would destroy it. Caches without an
+    /// attached secret are untouched.
     pub fn write_payload(&self, bytes: &[u8]) -> Result<()> {
+        let owned;
+        let bytes = match self
+            .redacting
+            .as_deref()
+            .map(|secret| redact_payload(bytes, secret))
+        {
+            None | Some(PayloadRedaction::Keep) => bytes,
+            Some(PayloadRedaction::Replace(redacted)) => {
+                owned = redacted;
+                &owned
+            }
+            Some(PayloadRedaction::Skip) => return Ok(()),
+        };
+        // The parse above sees one value per object key and stops at a depth
+        // limit, so a duplicate key or a deep document can hide an echo from
+        // it. Before anything is written, every JSON string literal in the
+        // bytes is decoded and checked (a payload that is not JSON was
+        // already checked for the literal secret above).
+        if self
+            .redacting
+            .as_deref()
+            .is_some_and(|secret| !secret.is_empty() && json_strings_contain(bytes, secret))
+        {
+            return Ok(());
+        }
         self.ensure_dir()?;
         let mut tmp = tempfile::Builder::new()
             .prefix(".usage.")
@@ -264,6 +345,54 @@ impl Cache {
         self.clear_backoff();
     }
 
+    /// [`Cache::forget`] with the removals surfaced: the same files are
+    /// removed, and the first error that is not `NotFound` is returned. A
+    /// missing file is not a failure. The key check uses this so an
+    /// invalidation it could not prove (a read-only cache directory) cannot
+    /// be mistaken for one: a payload left in place would be served as a
+    /// reading made under the key just written.
+    pub fn try_forget(&self) -> std::io::Result<()> {
+        for path in [
+            self.payload_path(),
+            self.stale_path(),
+            self.last_error_path(),
+            self.retry_after_path(),
+        ] {
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    /// Rewrite the `.last_error` in place with the scrubbed content — the
+    /// key check's last resort when the final [`Cache::try_forget`] fails:
+    /// the file already holds the provider's answer, which may name the
+    /// key. Opens the existing file for writing with truncate and never
+    /// creates one: a cache directory may be read-only for creation while
+    /// the file itself is still writable. A missing file is not a failure —
+    /// there is nothing to scrub — and so is content the scrub leaves
+    /// unchanged.
+    pub fn scrub_last_error(&self, scrub: impl Fn(&str) -> String) -> std::io::Result<()> {
+        let path = self.last_error_path();
+        let original = match fs::read_to_string(&path) {
+            Ok(original) => original,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let scrubbed = scrub(&original);
+        if scrubbed == original {
+            return Ok(());
+        }
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&path)?;
+        file.write_all(scrubbed.as_bytes())
+    }
+
     /// Write the `.last_error` marker — first line `code`, everything after it
     /// `msg`. Best-effort, never errors (matches claudebar:478-486 which
     /// silently continues if the cache dir isn't writable).
@@ -286,7 +415,17 @@ impl Cache {
         } else {
             msg
         };
-        let msg = crate::display::sanitize_untrusted_field(msg);
+        // A provider can quote the key the fetch was sent with in its answer
+        // (Z.AI puts the failure reason, and with it the key, in `msg` on an
+        // HTTP 200). The first point of writing is here, so a cache attached
+        // to that key redacts the message before the cleanup below and before
+        // the write, and the pair returned is the redacted one.
+        let msg = if let Some(secret) = &self.redacting {
+            crate::display::redact_secret(msg, secret)
+        } else {
+            msg.to_string()
+        };
+        let msg = crate::display::sanitize_untrusted_field(&msg);
         let body = format!("{code}\n{msg}");
         let _ = atomic_write(&path, body.as_bytes());
         if code == 429 {
@@ -318,7 +457,7 @@ impl Cache {
 /// minutes rounded *up* above it (`4m01s` reads as `5m` — promising less
 /// wait than the real one would make the next poll look broken), and hours
 /// once the minutes pass sixty (`1h 2m`, `1h`).
-fn human_backoff(remaining: Duration) -> String {
+pub(crate) fn human_backoff(remaining: Duration) -> String {
     let secs = remaining.as_secs();
     if secs < 60 {
         return format!("{secs}s");
@@ -363,11 +502,25 @@ pub fn acquire_lock(path: &Path, timeout: Duration) -> Result<LockGuard> {
         .open(path)
         .map_err(|e| AppError::io_at(path, e))?;
 
+    wait_for_lock(path, timeout, || f.try_lock_exclusive())?;
+    Ok(LockGuard { file: f })
+}
+
+/// Inject only the lock syscall so unsupported filesystems are testable
+/// without touching a real user's credentials or requiring a WSL mount.
+fn wait_for_lock(
+    path: &Path,
+    timeout: Duration,
+    mut try_lock: impl FnMut() -> std::io::Result<()>,
+) -> Result<()> {
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        match f.try_lock_exclusive() {
-            Ok(()) => return Ok(LockGuard { file: f }),
-            Err(_) => {
+        match try_lock() {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || error.raw_os_error() == fs2::lock_contended_error().raw_os_error() =>
+            {
                 if std::time::Instant::now() >= deadline {
                     return Err(AppError::Other(format!(
                         "cache lock timeout after {:?}",
@@ -376,6 +529,7 @@ pub fn acquire_lock(path: &Path, timeout: Duration) -> Result<LockGuard> {
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
+            Err(error) => return Err(AppError::io_at(path, error)),
         }
     }
 }
@@ -415,6 +569,158 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     tmp.persist(path)
         .map_err(|e| AppError::io_at(path, e.error))?;
     Ok(())
+}
+
+/// Whether [`Cache::write_payload`] may redact the attached secret at the
+/// byte level: the payload is the raw JSON bytes the provider sent, and a
+/// replacement is exact and structure-safe only when the secret is built
+/// from characters that cannot change inside a JSON string — no quote that
+/// closes the string, no backslash that escapes, no control that must be
+/// escaped, and no non-ASCII whose UTF-8 bytes a byte-level scan could
+/// straddle.
+/// What [`Cache::write_payload`] persists for a payload and the secret
+/// attached to the cache.
+#[derive(Debug, PartialEq, Eq)]
+enum PayloadRedaction {
+    /// The payload does not quote the secret: write it as it arrived.
+    Keep,
+    /// A JSON payload whose strings quoted the secret, re-serialized with
+    /// every occurrence replaced by `[key]`.
+    Replace(Vec<u8>),
+    /// The payload quotes the secret where it cannot be replaced safely (it
+    /// is not JSON, or an object key holds it): do not persist it.
+    Skip,
+}
+
+/// Decide on the decoded value, never on the raw bytes: a JSON string may
+/// carry the secret escaped (`\u0074…`, a quote as `\"`), and a byte-level
+/// replace could also hit a number that happens to equal a short secret.
+/// So a JSON payload is parsed, every string value with the secret gets it
+/// replaced, and the document is re-serialized only when something changed;
+/// numbers and structure are never touched. A payload that is not JSON is
+/// only checked for the literal secret, and skipped when it holds it.
+fn redact_payload(bytes: &[u8], secret: &str) -> PayloadRedaction {
+    if secret.is_empty() {
+        return PayloadRedaction::Keep;
+    }
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return if find_bytes(bytes, secret.as_bytes()).is_some() {
+            PayloadRedaction::Skip
+        } else {
+            PayloadRedaction::Keep
+        };
+    };
+    let mut changed = false;
+    if !redact_json_strings(&mut value, secret, &mut changed) {
+        return PayloadRedaction::Skip;
+    }
+    if !changed {
+        return PayloadRedaction::Keep;
+    }
+    match serde_json::to_vec(&value) {
+        Ok(redacted) => PayloadRedaction::Replace(redacted),
+        Err(_) => PayloadRedaction::Skip,
+    }
+}
+
+/// Whether any JSON string literal in `bytes`, decoded (escapes, `\u`
+/// surrogate pairs), contains `secret`. A scan over the raw text rather than
+/// a parse: it sees every literal, duplicates and any depth included, and
+/// never fails on a document a parser would refuse.
+fn json_strings_contain(bytes: &[u8], secret: &str) -> bool {
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'"' {
+            i += 1;
+            continue;
+        }
+        i += 1;
+        let mut text = String::new();
+        let mut run_start = i;
+        let mut pending_high: Option<u16> = None;
+        while i < bytes.len() && bytes[i] != b'"' {
+            if bytes[i] != b'\\' {
+                i += 1;
+                continue;
+            }
+            text.push_str(&String::from_utf8_lossy(&bytes[run_start..i]));
+            let Some(&escape) = bytes.get(i + 1) else {
+                i = bytes.len();
+                run_start = i;
+                break;
+            };
+            i += 2;
+            let decoded = match escape {
+                b'n' => Some('\n'),
+                b't' => Some('\t'),
+                b'r' => Some('\r'),
+                b'b' => Some('\u{8}'),
+                b'f' => Some('\u{c}'),
+                b'u' => {
+                    let unit = bytes
+                        .get(i..i + 4)
+                        .and_then(|hex| std::str::from_utf8(hex).ok())
+                        .and_then(|hex| u16::from_str_radix(hex, 16).ok());
+                    i = (i + 4).min(bytes.len());
+                    match (unit, pending_high.take()) {
+                        (Some(low @ 0xDC00..=0xDFFF), Some(high)) => char::from_u32(
+                            0x10000
+                                + ((u32::from(high) - 0xD800) << 10)
+                                + (u32::from(low) - 0xDC00),
+                        ),
+                        (Some(high @ 0xD800..=0xDBFF), _) => {
+                            pending_high = Some(high);
+                            None
+                        }
+                        (Some(unit), _) => char::from_u32(u32::from(unit)),
+                        (None, _) => None,
+                    }
+                }
+                other => Some(char::from(other)),
+            };
+            if let Some(ch) = decoded {
+                text.push(ch);
+            }
+            run_start = i;
+        }
+        text.push_str(&String::from_utf8_lossy(&bytes[run_start..i]));
+        if text.contains(secret) {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Replace the secret in every string of `value`; `false` when an object
+/// key holds it (a key cannot be rewritten without changing the data's
+/// shape, so the payload is skipped instead).
+fn redact_json_strings(value: &mut serde_json::Value, secret: &str, changed: &mut bool) -> bool {
+    match value {
+        serde_json::Value::String(text) if text.contains(secret) => {
+            *text = text.replace(secret, "[key]");
+            *changed = true;
+            true
+        }
+        serde_json::Value::Array(items) => items
+            .iter_mut()
+            .all(|item| redact_json_strings(item, secret, changed)),
+        serde_json::Value::Object(map) => {
+            if map.keys().any(|key| key.contains(secret)) {
+                return false;
+            }
+            map.values_mut()
+                .all(|item| redact_json_strings(item, secret, changed))
+        }
+        _ => true,
+    }
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 pub(crate) fn xdg_cache_dir() -> Result<PathBuf> {
@@ -519,6 +825,108 @@ mod tests {
         assert!(cache.read_last_error().is_none());
         assert!(cache.backoff_remaining().is_none());
         assert!(cache.dir().is_dir());
+    }
+
+    #[test]
+    fn try_forget_removes_the_same_files_and_ignores_absent_ones() {
+        let (_td, cache) = fixture();
+        cache.write_payload(b"previous login").unwrap();
+        cache.mark_stale();
+        cache.write_last_error(401, "expired");
+        cache.note_rate_limit_at(SystemTime::now());
+        // Same files as `forget`, and a missing file is not a failure.
+        cache.try_forget().unwrap();
+        assert!(cache.maybe_payload().unwrap().is_none());
+        assert!(!cache.is_stale());
+        assert!(cache.read_last_error().is_none());
+        assert!(cache.backoff_remaining().is_none());
+        // A second pass over the now-empty directory still succeeds.
+        cache.try_forget().unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn try_forget_surfaces_the_first_error_that_is_not_not_found() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_td, cache) = fixture();
+        cache.write_payload(b"previous login").unwrap();
+        cache.write_last_error(0, "still here");
+        // A read-only directory cannot remove its files: `forget` would
+        // swallow that and leave the old payload to be served, but
+        // `try_forget` must hand the failure back.
+        let dir = cache.dir().to_path_buf();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+        let error = cache.try_forget().unwrap_err();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(
+            cache.payload_path().exists(),
+            "the removal must not claim success"
+        );
+    }
+
+    #[test]
+    fn fresh_payload_zero_ttl_never_serves_a_fresh_payload() {
+        let (_td, cache) = fixture();
+        cache.write_payload(b"previous reading").unwrap();
+        // Written this same millisecond: the age is zero, and `age < ttl`
+        // is false for a zero `ttl`, so the ordinary path cannot serve it.
+        assert!(cache.fresh_payload(Duration::ZERO).unwrap().is_none());
+        // ...and neither through the backoff branch, which would otherwise
+        // serve a payload inside MAX_STALE with the TTL "notwithstanding".
+        cache.note_rate_limit_at(SystemTime::now());
+        let error = cache.fresh_payload(Duration::ZERO).unwrap_err();
+        assert!(error.to_string().contains("rate limited"), "{error}");
+        // The ordinary callers keep their behavior: with a positive TTL the
+        // backoff still serves the fresh payload.
+        assert!(cache.fresh_payload(DEFAULT_TTL).unwrap().is_some());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn scrub_last_error_rewrites_the_file_in_place_in_a_read_only_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_td, cache) = fixture();
+        cache.write_last_error(0, "key is test-key-value");
+        // The bust this scrub backs up failed: the directory refuses
+        // removals.
+        let dir = cache.dir().to_path_buf();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+        cache.try_forget().unwrap_err();
+        // The last resort: the directory refuses new files, but the
+        // existing one is still writable in place.
+        cache
+            .scrub_last_error(|raw| raw.replace("test-key-value", "[key]"))
+            .unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        let raw = fs::read_to_string(cache.last_error_path()).unwrap();
+        assert!(
+            !raw.contains("test-key-value"),
+            "the key must be gone: {raw}"
+        );
+        assert!(raw.contains("[key]"), "{raw}");
+        assert!(raw.starts_with("0\n"), "the code line must survive: {raw}");
+    }
+
+    #[test]
+    fn scrub_last_error_of_a_missing_file_is_not_a_failure() {
+        let (_td, cache) = fixture();
+        cache.scrub_last_error(|raw| raw.to_string()).unwrap();
+        assert!(!cache.last_error_path().exists(), "no file may be created");
+    }
+
+    #[test]
+    fn scrub_last_error_untouched_content_leaves_the_file_alone() {
+        let (_td, cache) = fixture();
+        cache.write_last_error(0, "nothing to hide");
+        let before = cache.last_error_path();
+        let mtime_before = fs::metadata(&before).unwrap().modified().unwrap();
+        cache.scrub_last_error(|raw| raw.to_string()).unwrap();
+        let mtime_after = fs::metadata(&before).unwrap().modified().unwrap();
+        assert_eq!(
+            mtime_before, mtime_after,
+            "an unchanged file must not be rewritten"
+        );
     }
 
     #[test]
@@ -651,14 +1059,20 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        // Under backoff the same payload is the answer.
+        // Under backoff the same payload is the answer for the ordinary
+        // callers: a positive TTL keeps its policy unchanged...
         assert_eq!(
             cache
-                .fresh_payload_at(Duration::ZERO, t0())
+                .fresh_payload_at(DEFAULT_TTL, t0())
                 .unwrap()
                 .as_deref(),
             Some(&b"last good"[..])
         );
+        // ...but a wire-only read (zero TTL) never serves a payload: its
+        // answer must be a reading made now, and the backoff still refuses
+        // the network.
+        let error = cache.fresh_payload_at(Duration::ZERO, t0()).unwrap_err();
+        assert!(error.to_string().contains("rate limited"), "{error}");
     }
 
     #[test]
@@ -925,6 +1339,184 @@ mod tests {
         }
     }
 
+    /// A provider that quotes the key a fetch was sent with (Z.AI returns
+    /// the reason in `msg` on an HTTP 200) must not persist it: the cache
+    /// attached to that key redacts at the first point of writing — before
+    /// the control-char cleanup and before the atomic write — and the
+    /// returned pair is the redacted one, so file and memory agree.
+    #[test]
+    fn write_last_error_redacts_the_attached_secret() {
+        let (_td, cache) = fixture();
+        let cache = cache.redacting("test-key-value");
+
+        let (code, msg) = cache.write_last_error(0, "msg test-key-value");
+        assert_eq!(code, 0);
+        assert_eq!(msg, "msg [key]");
+        assert!(!msg.contains("test-key-value"), "{msg}");
+        let on_disk = fs::read_to_string(cache.last_error_path()).unwrap();
+        assert!(!on_disk.contains("test-key-value"), "{on_disk}");
+        // What a later run would read is exactly what the call returned.
+        assert_eq!((code, msg), cache.read_last_error().unwrap());
+
+        // A partial echo of a key of eight characters or more is the key
+        // with a missing tail: the whole message is the fixed note.
+        let key = "abcdefghijklmnop";
+        let (_td2, cache2) = fixture();
+        let cache2 = cache2.redacting(key);
+        let (_, msg) = cache2.write_last_error(0, "bad key abcdefgh…");
+        assert_eq!(
+            msg,
+            "The provider's answer quoted the key, so it is not shown."
+        );
+        let on_disk = fs::read_to_string(cache2.last_error_path()).unwrap();
+        assert!(!on_disk.contains(key), "{on_disk}");
+
+        // 401/403 keep the fixed authentication message.
+        let (code, msg) = cache.write_last_error(401, "msg test-key-value");
+        assert_eq!(code, 401);
+        assert_eq!(msg, AUTH_FAILURE_MESSAGE);
+    }
+
+    /// A provider's *successful* answer can quote the key it was sent with
+    /// (Z.AI carries `msg` inside an HTTP 200): the cache attached to that
+    /// key redacts the payload at the first point of writing, on its decoded
+    /// strings — every occurrence is replaced, the JSON survives, and the
+    /// partial-echo heuristic does not reach the payload (it would destroy
+    /// data).
+    #[test]
+    fn write_payload_redacts_the_attached_secret() {
+        let (_td, cache) = fixture();
+        let cache = cache.redacting("test-key-value");
+
+        cache
+            .write_payload(br#"{"msg":"ok test-key-value"}"#)
+            .unwrap();
+        let on_disk = fs::read(cache.payload_path()).unwrap();
+        assert_eq!(on_disk, br#"{"msg":"ok [key]"}"#);
+
+        // Every exact occurrence is replaced, not only the first.
+        let (_td, cache) = fixture();
+        let cache = cache.redacting("test-key-value");
+        cache
+            .write_payload(br#"{"a":"test-key-value","b":"test-key-value"}"#)
+            .unwrap();
+        let on_disk = fs::read(cache.payload_path()).unwrap();
+        assert_eq!(on_disk, br#"{"a":"[key]","b":"[key]"}"#);
+
+        // No attached secret: the bytes are persisted as they arrived.
+        let (_td, cache) = fixture();
+        let raw = br#"{"msg":"ok test-key-value"}"#;
+        cache.write_payload(raw).unwrap();
+        assert_eq!(fs::read(cache.payload_path()).unwrap(), raw);
+    }
+
+    /// The decision is made on decoded strings, not raw bytes: an echo that
+    /// arrives escaped in valid JSON is still redacted, a secret with a quote
+    /// is redacted inside its (escaped) string, and a number equal to a
+    /// short secret is not a string, so the payload is written unchanged.
+    #[test]
+    fn write_payload_redacts_escaped_echoes_and_leaves_numbers_alone() {
+        // `\u0074` is `t`: the bytes never hold the key literally.
+        let (_td, cache) = fixture();
+        let cache = cache.redacting("test-key-value");
+        cache
+            .write_payload(br#"{"msg":"ok \u0074est-key-value"}"#)
+            .unwrap();
+        assert_eq!(
+            fs::read(cache.payload_path()).unwrap(),
+            br#"{"msg":"ok [key]"}"#
+        );
+
+        // A quote in the key: valid JSON escapes it, and it is redacted.
+        let (_td, cache) = fixture();
+        let cache = cache.redacting("a\"b");
+        cache.write_payload(br#"{"msg":"ok a\"b"}"#).unwrap();
+        assert_eq!(
+            fs::read(cache.payload_path()).unwrap(),
+            br#"{"msg":"ok [key]"}"#
+        );
+
+        // A short numeric key equal to a number: numbers are not strings,
+        // so the payload is written exactly as it arrived.
+        let (_td, cache) = fixture();
+        let cache = cache.redacting("12");
+        let raw = br#"{"used":12,"msg":"fine"}"#;
+        cache.write_payload(raw).unwrap();
+        assert_eq!(fs::read(cache.payload_path()).unwrap(), raw);
+    }
+
+    /// A payload that is not JSON and quotes the secret cannot be redacted
+    /// safely, so it is not persisted at all — the fetch still returns its
+    /// in-memory value, only the cache keeps no payload of that answer — and
+    /// the rest of the cache is left exactly as it was: an older payload is
+    /// not clobbered, and the success side effects do not run. An object key
+    /// that holds the secret is skipped the same way.
+    #[test]
+    fn write_payload_skips_a_payload_it_cannot_redact() {
+        let secret = "test-key-value";
+
+        // A cold cache stays cold: no payload file is written.
+        let (_td, cache) = fixture();
+        let cache = cache.redacting(secret);
+        cache.write_payload(b"plain text test-key-value").unwrap();
+        assert!(
+            cache.maybe_payload().unwrap().is_none(),
+            "a non-JSON payload quoting the secret must not be persisted"
+        );
+        assert!(!cache.payload_path().exists());
+
+        // An existing payload survives untouched, and no side effect ran.
+        let (_td, cache) = fixture();
+        let cache = cache.redacting(secret);
+        cache.write_payload(br#"{"msg":"last good"}"#).unwrap();
+        cache.mark_stale();
+        cache.write_last_error(500, "an older failure");
+        cache.write_payload(br#"{"test-key-value":1}"#).unwrap();
+        assert_eq!(
+            fs::read(cache.payload_path()).unwrap(),
+            br#"{"msg":"last good"}"#
+        );
+        assert!(cache.is_stale());
+        assert!(cache.read_last_error().is_some());
+    }
+
+    /// What the parse cannot see is caught on the bytes before writing: a
+    /// duplicate key whose first value quotes the secret (the parsed tree
+    /// keeps only the last value) and an escaped echo inside a document too
+    /// deep for the parser are both left out of the cache.
+    #[test]
+    fn write_payload_skips_an_echo_the_parse_cannot_see() {
+        let (_td, cache) = fixture();
+        let cache = cache.redacting("test-key-value");
+        cache
+            .write_payload(br#"{"note":"test-key-value","note":"fine","data":1}"#)
+            .unwrap();
+        assert!(
+            !cache.payload_path().exists(),
+            "a duplicate key hid the echo"
+        );
+
+        let deep = format!(
+            r#"{{"data":1,"extra":{}"ok \u0074est-key-value"{}}}"#,
+            "[".repeat(160),
+            "]".repeat(160)
+        );
+        assert!(serde_json::from_str::<serde_json::Value>(&deep).is_err());
+        let (_td, cache) = fixture();
+        let cache = cache.redacting("test-key-value");
+        cache.write_payload(deep.as_bytes()).unwrap();
+        assert!(
+            !cache.payload_path().exists(),
+            "a deep document hid the echo"
+        );
+
+        // The scan decodes escapes and surrogate pairs, and skips numbers.
+        assert!(json_strings_contain(br#""a\u0062c""#, "abc"));
+        assert!(json_strings_contain(br#""x \ud83d\ude00 y""#, "\u{1f600}"));
+        assert!(json_strings_contain(br#""say \"hi\"""#, "\"hi\""));
+        assert!(!json_strings_contain(br#"{"n":12}"#, "12"));
+    }
+
     /// The regression this guards: vendors write the raw HTTP body, which is
     /// usually multi-line JSON. The reader kept only line 2, so the tooltip
     /// showed `{` and dropped the actual API explanation.
@@ -977,6 +1569,44 @@ mod tests {
         // A non-numeric first line is still no error at all, never a fake 0.
         fs::write(cache.last_error_path(), "not-a-code\nboom").unwrap();
         assert!(cache.read_last_error().is_none());
+    }
+
+    #[test]
+    fn unsupported_lock_preserves_io_error_instead_of_timeout() {
+        let path = Path::new("synthetic-credentials.lock");
+        let mut attempts = 0;
+        let result = wait_for_lock(path, Duration::ZERO, || {
+            attempts += 1;
+            Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+        });
+        assert_eq!(attempts, 1);
+        match result {
+            Err(AppError::Io {
+                path: actual,
+                source,
+            }) => {
+                assert_eq!(actual, path);
+                assert_eq!(source.kind(), std::io::ErrorKind::Unsupported);
+            }
+            _ => panic!("unsupported locking must preserve the I/O error"),
+        }
+    }
+
+    #[test]
+    fn permission_denied_lock_is_not_retried_as_contention() {
+        let result = wait_for_lock(Path::new("synthetic.lock"), Duration::ZERO, || {
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        });
+        assert!(matches!(result, Err(AppError::Io { source, .. })
+            if source.kind() == std::io::ErrorKind::PermissionDenied));
+    }
+
+    #[test]
+    fn contended_lock_still_reports_timeout() {
+        let result = wait_for_lock(Path::new("synthetic.lock"), Duration::ZERO, || {
+            Err(fs2::lock_contended_error())
+        });
+        assert!(matches!(result, Err(AppError::Other(message)) if message.contains("timeout")));
     }
 
     #[test]

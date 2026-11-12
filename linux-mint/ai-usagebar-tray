@@ -15,7 +15,7 @@ import fcntl
 import time
 from datetime import datetime
 
-from tray_model import metric_display, metric_usage_label, is_not_connected, connection_help, metric_pace, meter_color, report_sections, summary_metric, tr, installed_binary, dashboard_entries
+from tray_model import metric_display, metric_usage_label, is_not_connected, connection_help, metric_pace, meter_color, report_sections, summary_lines, icon_label, icon_tooltip, tr, installed_binary, dashboard_entries
 
 import gi
 gi.require_version('Gtk', '3.0')
@@ -558,14 +558,7 @@ class AIUsageTrayApp:
         menu = Gtk.Menu()
 
         entries = dashboard_entries(data)
-        summaries = []
-        for entry in entries:
-            metric = summary_metric(entry)
-            if metric is None:
-                continue
-            name = entry.get("display_name") or entry.get("name", tr("Provider", "Provedor"))
-            suffix = tr(" · stale", " · antigo") if entry.get("stale") else ""
-            summaries.append(f"{name}: {metric_display(metric)}{suffix}")
+        summaries = summary_lines(data)
         for summary in summaries[:4]:
             row = Gtk.MenuItem(label=summary)
             row.set_sensitive(False)
@@ -613,6 +606,16 @@ class AIUsageTrayApp:
 
     def update_menu_summary(self, data):
         self.build_menu(data)
+        tooltip = icon_tooltip(data)
+        label = icon_label(data)
+        if self.xapp_icon:
+            self.xapp_icon.set_tooltip_text(tooltip)
+            self.xapp_icon.set_label(label)
+        if self.status_icon:
+            self.status_icon.set_tooltip_text(tooltip)
+        if self.indicator:
+            # The guide string reserves the label's width so the panel does not resize.
+            self.indicator.set_label(label, "100%")
 
     def toggle_window(self, near_pointer=False, activate_time=Gdk.CURRENT_TIME):
         if self.window.is_visible() and self.window.is_active():

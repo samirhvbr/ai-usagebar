@@ -33,6 +33,7 @@ pub(crate) const VENDOR_SECRET_ENV_VARS: &[&str] = &[
     "KIMI_API_KEY",
     "KILO_API_KEY",
     "NOVITA_API_KEY",
+    "SYNTHETIC_API_KEY",
     "MINIMAX_API_KEY",
     "MOONSHOT_API_KEY",
     "XAI_MANAGEMENT_KEY",
@@ -43,12 +44,14 @@ pub(crate) const VENDOR_SECRET_ENV_VARS: &[&str] = &[
     "COMMANDCODE_API_KEY",
     "ORCAROUTER_API_KEY",
     "LYCEUM_API_KEY",
+    "MISTRAL_API_KEY",
     "GITHUB_COPILOT_TOKEN",
     "GH_TOKEN",
     "GITHUB_TOKEN",
     "OLLAMA_API_KEY",
     "SHVIA_API_KEY",
     "CLINE_API_KEY",
+    "DEEPRELAY_API_KEY",
 ];
 
 /// Env var names a `[[custom]]` provider reads its token from. They are not
@@ -170,6 +173,7 @@ pub enum VendorId {
     Kimi,
     Kilo,
     Novita,
+    Synthetic,
     Moonshot,
     Grok,
     Supergrok,
@@ -191,6 +195,11 @@ pub enum VendorId {
     Lyceum,
     Devin,
     Cline,
+    #[serde(rename = "muse-code")]
+    MuseCode,
+    Droid,
+    DeepRelay,
+    Mistral,
 }
 
 /// How a provider authenticates. Drives what a frontend offers a provider that
@@ -232,6 +241,7 @@ impl VendorId {
             VendorId::Kimi => "kimi",
             VendorId::Kilo => "kilo",
             VendorId::Novita => "novita",
+            VendorId::Synthetic => "synthetic",
             VendorId::Moonshot => "moonshot",
             VendorId::Grok => "grok",
             VendorId::Supergrok => "supergrok",
@@ -249,7 +259,11 @@ impl VendorId {
             VendorId::ModelStudio => "modelstudio",
             VendorId::Lyceum => "lyceum",
             VendorId::Devin => "devin",
+            VendorId::MuseCode => "muse-code",
             VendorId::Cline => "cline",
+            VendorId::Droid => "droid",
+            VendorId::DeepRelay => "deeprelay",
+            VendorId::Mistral => "mistral",
         }
     }
 
@@ -270,6 +284,7 @@ impl VendorId {
             VendorId::Kimi => "Kimi",
             VendorId::Kilo => "Kilo",
             VendorId::Novita => "Novita",
+            VendorId::Synthetic => "Synthetic",
             VendorId::Moonshot => "Moonshot",
             VendorId::Grok => "Grok",
             VendorId::Supergrok => "SuperGrok",
@@ -287,6 +302,10 @@ impl VendorId {
             VendorId::ModelStudio => "Model Studio",
             VendorId::Lyceum => "Lyceum",
             VendorId::Devin => "Devin",
+            VendorId::MuseCode => "Muse Code",
+            VendorId::Droid => "Droid",
+            VendorId::DeepRelay => "DeepRelay",
+            VendorId::Mistral => "Mistral",
         }
     }
 
@@ -306,6 +325,7 @@ impl VendorId {
             VendorId::Kimi => VendorId::Kimi.short_name(),
             VendorId::Kilo => "󰭟",
             VendorId::Novita => "󰄔",
+            VendorId::Synthetic => VendorId::Synthetic.short_name(),
             VendorId::Moonshot => VendorId::Moonshot.short_name(),
             VendorId::Grok | VendorId::Supergrok => "󰇷",
             VendorId::Grokbot => VendorId::Grokbot.short_name(),
@@ -326,7 +346,14 @@ impl VendorId {
             VendorId::ModelStudio => VendorId::ModelStudio.short_name(),
             VendorId::Lyceum => VendorId::Lyceum.short_name(),
             VendorId::Devin => VendorId::Devin.short_name(),
-            VendorId::Cline => "Cline",
+            VendorId::MuseCode => VendorId::MuseCode.short_name(),
+            VendorId::Cline => VendorId::Cline.short_name(),
+            VendorId::Droid => VendorId::Droid.short_name(),
+            // No distinct Nerd Font mark for DeepRelay; `drl` is unique by
+            // construction and cannot render as tofu.
+            VendorId::DeepRelay => VendorId::DeepRelay.short_name(),
+            // Same story for Mistral: the `mis` short name is unique.
+            VendorId::Mistral => VendorId::Mistral.short_name(),
         }
     }
 
@@ -347,6 +374,7 @@ impl VendorId {
             VendorId::Kimi => "kmi",
             VendorId::Kilo => "klo",
             VendorId::Novita => "nvt",
+            VendorId::Synthetic => "syn",
             VendorId::Moonshot => "msh",
             VendorId::Grok => "grk",
             VendorId::Supergrok => "sgk",
@@ -364,7 +392,11 @@ impl VendorId {
             VendorId::ModelStudio => "mst",
             VendorId::Lyceum => "lyc",
             VendorId::Devin => "dvn",
+            VendorId::MuseCode => "msc",
             VendorId::Cline => "cln",
+            VendorId::Droid => "drd",
+            VendorId::DeepRelay => "drl",
+            VendorId::Mistral => "mis",
         }
     }
 
@@ -388,6 +420,7 @@ impl VendorId {
             VendorId::Kimi => "kimi",
             VendorId::Kilo => "kilo",
             VendorId::Novita => "novita",
+            VendorId::Synthetic => "synthetic",
             VendorId::Moonshot => "moonshot",
             VendorId::Grok => "grok",
             VendorId::Supergrok => "supergrok",
@@ -406,6 +439,10 @@ impl VendorId {
             VendorId::ModelStudio => "modelstudio",
             VendorId::Lyceum => "lyceum",
             VendorId::Devin => "devin",
+            VendorId::MuseCode => "muse-code",
+            VendorId::Droid => "droid",
+            VendorId::DeepRelay => "deeprelay",
+            VendorId::Mistral => "mistral",
         }
     }
 
@@ -430,6 +467,7 @@ impl VendorId {
             | VendorId::Kimi
             | VendorId::Kilo
             | VendorId::Novita
+            | VendorId::Synthetic
             | VendorId::Moonshot
             | VendorId::Grok
             | VendorId::Minimax
@@ -437,7 +475,9 @@ impl VendorId {
             | VendorId::Shvia
             | VendorId::Ollama
             | VendorId::OrcaRouter
-            | VendorId::Lyceum => AuthKind::ApiKey,
+            | VendorId::Lyceum
+            | VendorId::DeepRelay
+            | VendorId::Mistral => AuthKind::ApiKey,
             // No credential of their own: another local product's session is
             // the login. Antigravity has no credential file at all (the binary
             // probes whichever local server answers), Cursor and Kiro read the
@@ -445,14 +485,17 @@ impl VendorId {
             // CLI's login, Grok Bot reads the desktop app's own
             // OSCrypt-protected session file, and Model Studio reads the `bl`
             // CLI's own console-login file. Devin reads only the existing
-            // official CLI credential key in memory, without refresh/writeback.
+            // official CLI credential key in memory, without refresh/writeback;
+            // Droid does the same with the `droid` CLI's keyring-sealed login.
             VendorId::Supergrok
             | VendorId::Antigravity
             | VendorId::Cursor
             | VendorId::Kiro
             | VendorId::Grokbot
             | VendorId::ModelStudio
-            | VendorId::Devin => AuthKind::Local,
+            | VendorId::Devin
+            | VendorId::MuseCode
+            | VendorId::Droid => AuthKind::Local,
         }
     }
 
@@ -470,6 +513,7 @@ impl VendorId {
             VendorId::Kimi => "KIMI_API_KEY",
             VendorId::Kilo => "KILO_API_KEY",
             VendorId::Novita => "NOVITA_API_KEY",
+            VendorId::Synthetic => "SYNTHETIC_API_KEY",
             VendorId::Moonshot => "MOONSHOT_API_KEY",
             VendorId::Grok => "XAI_MANAGEMENT_KEY",
             VendorId::Minimax => "MINIMAX_API_KEY",
@@ -478,6 +522,8 @@ impl VendorId {
             VendorId::Ollama => "OLLAMA_API_KEY",
             VendorId::OrcaRouter => "ORCAROUTER_API_KEY",
             VendorId::Lyceum => "LYCEUM_API_KEY",
+            VendorId::DeepRelay => "DEEPRELAY_API_KEY",
+            VendorId::Mistral => "MISTRAL_API_KEY",
             // OAuth-first, with an environment override for CI and headless
             // use. Neither name is configurable, so neither has an
             // `api_key_env` field in its config section.
@@ -493,7 +539,9 @@ impl VendorId {
             | VendorId::Kiro
             | VendorId::NousResearch
             | VendorId::ModelStudio
-            | VendorId::Devin => "",
+            | VendorId::Devin
+            | VendorId::MuseCode
+            | VendorId::Droid => "",
         }
     }
 
@@ -523,13 +571,15 @@ impl VendorId {
             }
             VendorId::Cursor => "Sign in to the Cursor app, then Refresh.",
             VendorId::Antigravity => "Open Antigravity or run `agy`, then Refresh.",
-            VendorId::Grok | VendorId::Supergrok => "Sign in with `grok`, then Refresh.",
+            VendorId::Supergrok => "Sign in with `grok`, then Refresh.",
             VendorId::Grokbot => "Install and sign in to the Grok Bot desktop app, then Refresh.",
             // Local login through the official CLI's own console session.
             VendorId::ModelStudio => {
                 "Install the official `bl` CLI and run `bl auth login --console`, then Refresh."
             }
             VendorId::Devin => "Sign in with the official Devin CLI, then Refresh.",
+            VendorId::Droid => "Sign in with `droid` on Linux, then Refresh.",
+            VendorId::MuseCode => "Run `muse login` in a terminal, then Refresh.",
             // Key-only providers: there is nothing to log into, only a key to
             // put in the config. Ollama Cloud's key is minted at
             // ollama.com/settings/keys; the local `ollama` CLI's Ed25519 key
@@ -541,13 +591,17 @@ impl VendorId {
             | VendorId::Deepinfra
             | VendorId::Kilo
             | VendorId::Novita
+            | VendorId::Synthetic
             | VendorId::Moonshot
+            | VendorId::Grok
             | VendorId::Minimax
             | VendorId::OpenCodeGo
             | VendorId::Shvia
             | VendorId::Ollama
             | VendorId::OrcaRouter
-            | VendorId::Lyceum => "Add an API key in Settings, then Refresh.",
+            | VendorId::Lyceum
+            | VendorId::DeepRelay
+            | VendorId::Mistral => "Add an API key in Settings, then Refresh.",
         }
     }
 
@@ -563,6 +617,8 @@ impl VendorId {
             // The `bl` CLI's console login is the whole credential.
             VendorId::ModelStudio => "bl auth login --console",
             VendorId::Devin => "",
+            VendorId::Droid => "droid",
+            VendorId::MuseCode => "muse login",
             // Kimi takes a key *or* the Kimi Code CLI's own OAuth login, which
             // is what a subscriber already has locally.
             VendorId::Kimi => "kimi",
@@ -573,6 +629,7 @@ impl VendorId {
             | VendorId::Deepinfra
             | VendorId::Kilo
             | VendorId::Novita
+            | VendorId::Synthetic
             | VendorId::Moonshot
             | VendorId::Grok
             | VendorId::Supergrok
@@ -584,15 +641,21 @@ impl VendorId {
             | VendorId::Shvia
             | VendorId::Ollama
             | VendorId::OrcaRouter
-            | VendorId::Lyceum => "",
+            | VendorId::Lyceum
+            | VendorId::DeepRelay
+            | VendorId::Mistral => "",
         }
     }
 
     /// Whether first-run detection may enable this provider from local
-    /// credentials. Devin is opt-in: its CLI credential file is discoverable,
-    /// but finding one must never switch on a provider that sends the key.
+    /// credentials. Devin, Muse Code, Droid and Mistral stay opt-in even when
+    /// a credential is findable: Mistral's key is supplied by the configuring
+    /// agent, never discovered on its own.
     pub const fn auto_detectable(self) -> bool {
-        !matches!(self, VendorId::Devin)
+        !matches!(
+            self,
+            VendorId::Devin | VendorId::MuseCode | VendorId::Droid | VendorId::Mistral
+        )
     }
 
     pub const fn all() -> &'static [VendorId] {
@@ -608,6 +671,7 @@ impl VendorId {
             VendorId::Kimi,
             VendorId::Kilo,
             VendorId::Novita,
+            VendorId::Synthetic,
             VendorId::Moonshot,
             VendorId::Grok,
             VendorId::Supergrok,
@@ -626,6 +690,10 @@ impl VendorId {
             VendorId::Lyceum,
             VendorId::Devin,
             VendorId::Cline,
+            VendorId::MuseCode,
+            VendorId::Droid,
+            VendorId::DeepRelay,
+            VendorId::Mistral,
         ]
     }
 
@@ -745,6 +813,7 @@ mod tests {
         assert_eq!(VendorId::Openai.bar_icon(), "󱢆");
         assert_eq!(VendorId::Supergrok.bar_icon(), VendorId::Grok.bar_icon());
         assert_eq!(VendorId::CommandCode.bar_icon(), "cmc");
+        assert_eq!(VendorId::Cline.bar_icon(), "cln");
     }
 
     #[test]
@@ -761,6 +830,36 @@ mod tests {
         assert_eq!(VendorId::Devin.display_name(), "Devin");
         assert_eq!(VendorId::Devin.short_name(), "dvn");
         assert_eq!(VendorId::Devin.auth_kind(), AuthKind::Local);
+        assert_eq!(VendorId::Droid.slug(), "droid");
+        assert_eq!(VendorId::Droid.display_name(), "Droid");
+        assert_eq!(VendorId::Droid.short_name(), "drd");
+        assert_eq!(VendorId::Droid.auth_kind(), AuthKind::Local);
+        assert_eq!(VendorId::Cline.slug(), "cline");
+        assert_eq!(VendorId::Cline.display_name(), "Cline");
+        assert_eq!(VendorId::Cline.short_name(), "cln");
+        assert_eq!(VendorId::Cline.auth_kind(), AuthKind::Oauth);
+    }
+
+    #[test]
+    fn key_only_vendors_prompt_for_settings_api_key() {
+        for vendor in VendorId::all() {
+            if vendor.auth_kind() == AuthKind::ApiKey && vendor.login_command().is_empty() {
+                assert_eq!(
+                    vendor.sign_in_hint(),
+                    "Add an API key in Settings, then Refresh.",
+                    "{}",
+                    vendor.slug()
+                );
+            }
+        }
+        assert_eq!(
+            VendorId::Supergrok.sign_in_hint(),
+            "Sign in with `grok`, then Refresh."
+        );
+        assert_eq!(
+            VendorId::Grok.sign_in_hint(),
+            "Add an API key in Settings, then Refresh."
+        );
     }
 
     #[test]
@@ -774,6 +873,7 @@ mod tests {
             "KIMI_API_KEY",
             "KILO_API_KEY",
             "NOVITA_API_KEY",
+            "SYNTHETIC_API_KEY",
             "MINIMAX_API_KEY",
             "MOONSHOT_API_KEY",
             "XAI_MANAGEMENT_KEY",
@@ -781,6 +881,7 @@ mod tests {
             "GITHUB_COPILOT_TOKEN",
             "ORCAROUTER_API_KEY",
             "LYCEUM_API_KEY",
+            "MISTRAL_API_KEY",
         ];
         for name in configured_defaults {
             assert!(VENDOR_SECRET_ENV_VARS.contains(&name), "missing {name}");

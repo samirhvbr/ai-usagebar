@@ -486,6 +486,25 @@ mod tests {
         env.check_ok().unwrap();
     }
 
+    /// Regression (2026-10-17): z.ai answers an invalid key with HTTP 200 and
+    /// a body that parses as a perfectly shaped envelope — every field has a
+    /// serde default, `code: 1000`, `"Authentication Failed"`. It must be
+    /// rejected as a failure, never cached or rendered as usage. The incident
+    /// was a stale inline `[zai] api_key` the bar's process fell through to
+    /// (its shell lacked the valid `ZAI_API_KEY` env var that masked it
+    /// everywhere else).
+    #[test]
+    fn check_ok_rejects_the_http200_auth_failure_envelope() {
+        let body = r#"{"code":1000,"msg":"Authentication Failed"}"#;
+        let env: Envelope = serde_json::from_str(body).unwrap();
+        let err = env.check_ok().unwrap_err().to_string();
+        assert!(err.contains("1000"), "error names the API code: {err}");
+        assert!(
+            err.contains("Authentication Failed"),
+            "error carries the API message: {err}"
+        );
+    }
+
     #[test]
     fn reset_time_zero_or_null_becomes_none() {
         let body = r#"{"data":{"limits":[

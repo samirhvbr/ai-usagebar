@@ -65,8 +65,9 @@ visible.
 | Click `52% left` under a bar | Flip Used ⟷ Left everywhere (hover shows the other reading) |
 | Click `Resets in …` | Timeline popover with the exact reset time and countdown (Settings → Reset Times switches the row text itself) |
 | Options → Customize (or Return) | Provider list: toggle, drag the grip to reorder, open a provider |
+| All providers (Customize, or Settings → Providers in Native) | Every provider, enabled or not: the switch writes `enabled` to config.toml; Sign in / Open app / Add key for one with no credential; Add Claude Code / Desktop / Codex account (macOS) |
 | Provider Customize | Always Visible vs On Demand rows (toggle + drag across the divider); Reset in the top bar |
-| Options → Settings | Launch at Login, Refresh Every (1/5/10 min), Global Shortcut, Theme, Time Format, Show Usage As, Reset Times, Always Show Pacing, Updates |
+| Options → Settings | Launch at Login, Refresh Every (1/5/10/15/30/60 min), Global Shortcut, Theme, Time Format, Show Usage As, Reset Times, Always Show Pacing, Updates |
 | Provider header icon (right) | Customize that provider's rows (Reset to the defaults is in that screen's top bar) |
 | Right-click a row | Hide row · Star for menu bar (macOS glyph) · Always show / Show on demand · Customize provider |
 | Drag a provider header | Reorder provider sections |
@@ -190,7 +191,8 @@ Kiro `data.sqlite3`; Kimi `~/.kimi-code/credentials`; SuperGrok
 `GITHUB_COPILOT_TOKEN` or the `gh` CLI `hosts.yml`; Antigravity a running
 local product; Nous Research the saved OAuth credential; and every API-key
 vendor (Z.AI, OpenRouter, DeepSeek, Grok, Kilo, Novita, Moonshot, MiniMax,
-OpenCode Go, Anthropic API) its env var or the `api_key` in `config.toml`.
+OpenCode Go, Anthropic API, Mistral) its env var or the `api_key` in
+`config.toml`.
 
 The first report with data then seeds the popover layout the way OpenUsage
 does: providers whose only problem is a missing API key start hidden, and a
@@ -214,7 +216,7 @@ a provider without a mark shows its initials — including `[[custom]]`
 providers from `config.toml` (see the root README, "Custom providers").
 
 The tray re-reads every provider every 5 minutes by default (**Settings →
-Refresh Every**: 1, 5 or 10; `[tray] refresh_minutes`). The cache TTL stays
+Refresh Every**: 1, 5, 10, 15, 30 or 60; `[tray] refresh_minutes`). The cache TTL stays
 60 s, so the footer's Refresh is always allowed to fetch. A stale or failed vendor is
 shown on its card. The global shortcut, the poll interval and the update mode
 are the keys of the `[tray]` section in `config.toml`; the popover's Settings

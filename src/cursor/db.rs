@@ -5,10 +5,13 @@
 //! reads the same place: a SQLite key-value store the Cursor IDE itself
 //! maintains at `.../User/globalStorage/state.vscdb` (the same `state.vscdb`
 //! every VS Code-family app uses for `ItemTable`-shaped extension/global
-//! state), under the key `cursorAuth/accessToken`. That value is a JWT whose
-//! `sub` claim (`auth0|<userId>`) is combined with the raw token into the
-//! `WorkosCursorSessionToken` cookie the dashboard's own usage call expects —
-//! see `fetch.rs`.
+//! state), under the key `cursorAuth/accessToken`. That value has historically
+//! been a JWT whose `sub` claim (`auth0|<userId>`) is combined with the raw
+//! token into the `WorkosCursorSessionToken` cookie the dashboard's own usage
+//! call expects — see `fetch.rs`. Cursor 3.27.12 began writing an opaque
+//! `curs…` token instead (#503); the account identity then comes from
+//! `cursorAuth/cachedScopedProfile`'s `authId`, which carries the same
+//! `issuer|userId` shape, and the cookie is built unchanged.
 
 use std::path::{Path, PathBuf};
 use std::{hash::Hash, hash::Hasher};
@@ -19,6 +22,9 @@ use crate::display::sanitize_untrusted_path;
 use crate::error::{AppError, Result};
 
 const TOKEN_KEY: &str = "cursorAuth/accessToken";
+/// The IDE's cached account identity (`{"authId":"<issuer>|<userId>"}`);
+/// the identity source when the access token is opaque (#503).
+const SCOPED_PROFILE_KEY: &str = "cursorAuth/cachedScopedProfile";
 
 /// Default location of Cursor's local state database. This is Cursor's own
 /// per-OS convention (same one every VS Code-family app uses for its user
@@ -210,11 +216,52 @@ pub fn read_agent_keychain_token() -> Option<String> {
 /// location: a config override (or a test's temp file) names a specific
 /// source and must not be widened to the machine's own login.
 pub fn resolve_access_token(db_path: &Path, agent_auth_path: &Path) -> Result<String> {
+    Ok(resolve_access_tokens(db_path, agent_auth_path)?.primary)
+}
+
+/// Primary token plus an optional `cursor-agent` fallback. The IDE remains
+/// authoritative for normal operation; the fallback is exposed so the fetch
+/// layer can retry only after Cursor rejects an opaque IDE token (#503).
+pub struct AccessTokens {
+    pub primary: String,
+    pub agent_fallback: Option<String>,
+}
+
+pub fn resolve_access_tokens(db_path: &Path, agent_auth_path: &Path) -> Result<AccessTokens> {
     let default_agent = default_agent_auth_path().ok();
     let ambient = default_agent.as_deref() == Some(agent_auth_path);
-    resolve_access_token_with(db_path, agent_auth_path, || {
-        ambient.then(read_agent_keychain_token).flatten()
-    })
+    match read_access_token(db_path) {
+        Ok(primary) => {
+            let agent_fallback = read_agent_access_token(agent_auth_path)
+                .ok()
+                .or_else(|| ambient.then(read_agent_keychain_token).flatten())
+                .filter(|token| token != &primary);
+            Ok(AccessTokens {
+                primary,
+                agent_fallback,
+            })
+        }
+        Err(ide_err) if !db_path.exists() => {
+            let primary = if agent_auth_path.exists() {
+                read_agent_access_token(agent_auth_path).or_else(|agent_err| {
+                    ambient
+                        .then(read_agent_keychain_token)
+                        .flatten()
+                        .ok_or(agent_err)
+                })?
+            } else {
+                ambient
+                    .then(read_agent_keychain_token)
+                    .flatten()
+                    .ok_or(ide_err)?
+            };
+            Ok(AccessTokens {
+                primary,
+                agent_fallback: None,
+            })
+        }
+        Err(ide_err) => Err(ide_err),
+    }
 }
 
 /// [`resolve_access_token`] with the Keychain reader injected.
@@ -254,19 +301,64 @@ pub struct SessionAuth {
 
 /// Derive [`SessionAuth`] from the raw access token. Fails when the token
 /// isn't a decodable JWT or its `sub` claim doesn't have the `issuer|userId`
-/// shape every Cursor account token carries — either way the token is
-/// unusable, so this is a credentials error, not a schema error (the *shape*
-/// of the wire endpoint isn't in play yet at this point).
+/// shape every Cursor JWT carries — either way the token alone is unusable,
+/// so this is a credentials error, not a schema error.
 pub fn session_auth(token: &str) -> Result<SessionAuth> {
-    let claims = crate::jwt::claims(token).ok_or_else(|| {
-        AppError::Credentials(
-            "Cursor session token could not be decoded. Sign in to the Cursor IDE again.".into(),
-        )
-    })?;
+    let claims = crate::jwt::claims(token).ok_or_else(opaque_token_error)?;
     let sub = claims
         .get("sub")
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| AppError::Credentials("Cursor session token has no `sub` claim.".into()))?;
+    auth_from_sub(token, sub)
+}
+
+/// [`session_auth`] with the IDE database as a second identity source.
+///
+/// Cursor 3.27.12 replaced the JWT in `cursorAuth/accessToken` with an opaque
+/// `curs…` token, which carries no claims to decode (#503). The account
+/// identity is still on disk: `cursorAuth/cachedScopedProfile` holds
+/// `{"authId":"<issuer>|<userId>", …}` — the same value the JWT used to carry
+/// in `sub`. When the token does not decode, that `authId` supplies the user
+/// id and the cookie is built exactly as before (`userId::<token>`); the
+/// opaque token is otherwise used verbatim.
+pub fn session_auth_for(db_path: &Path, token: &str) -> Result<SessionAuth> {
+    match session_auth(token) {
+        Ok(auth) => Ok(auth),
+        Err(jwt_err) => match read_cached_auth_id(db_path) {
+            Some(auth_id) => auth_from_sub(token, &auth_id),
+            None => Err(jwt_err),
+        },
+    }
+}
+
+/// The `authId` from `cursorAuth/cachedScopedProfile`, when Cursor stored one.
+/// Best-effort: a missing file, table, row, or field is simply no identity
+/// source here, and the caller keeps its original error.
+fn read_cached_auth_id(path: &Path) -> Option<String> {
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
+    let profile: String = conn
+        .query_row(
+            "SELECT value FROM ItemTable WHERE key = ?1",
+            [SCOPED_PROFILE_KEY],
+            |row| row.get(0),
+        )
+        .ok()?;
+    let value: serde_json::Value = serde_json::from_str(&profile).ok()?;
+    value
+        .get("authId")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+}
+
+fn opaque_token_error() -> AppError {
+    AppError::Credentials(
+        "Cursor session token could not be decoded. Sign in to the Cursor IDE again.".into(),
+    )
+}
+
+/// Build the identity from an `issuer|userId` value: the JWT `sub` or the
+/// stored `authId`, which share the shape.
+fn auth_from_sub(token: &str, sub: &str) -> Result<SessionAuth> {
     let user_id = sub
         .split('|')
         .nth(1)
@@ -314,6 +406,77 @@ mod tests {
             )
             .unwrap();
         }
+    }
+
+    /// Add a `cachedScopedProfile` row, the identity source for opaque tokens.
+    fn seed_scoped_profile(path: &Path, profile: &str) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute(
+            "INSERT INTO ItemTable (key, value) VALUES (?1, ?2)",
+            rusqlite::params![SCOPED_PROFILE_KEY, profile],
+        )
+        .unwrap();
+    }
+
+    // #503: Cursor 3.27.12 writes an opaque `curs…` token with no claims. The
+    // user id still comes from the IDE's cached profile, and the cookie keeps
+    // the `userId::token` shape the dashboard expects.
+    #[test]
+    fn an_opaque_token_uses_the_cached_profile_identity() {
+        let td = TempDir::new().unwrap();
+        let path = td.path().join("state.vscdb");
+        let opaque = format!("curs_{}", "a".repeat(400));
+        seed_db(&path, None);
+        seed_scoped_profile(
+            &path,
+            r#"{"authId":"grok|user_01M4473VZ67Q3X6HF8WZFE3SMW","displayName":"Someone"}"#,
+        );
+        let auth = session_auth_for(&path, &opaque).unwrap();
+        assert_eq!(auth.user_id, "user_01M4473VZ67Q3X6HF8WZFE3SMW");
+        assert_eq!(
+            auth.cookie_value,
+            format!("user_01M4473VZ67Q3X6HF8WZFE3SMW%3A%3A{opaque}")
+        );
+    }
+
+    #[test]
+    fn an_opaque_token_without_a_profile_keeps_the_decode_error() {
+        let td = TempDir::new().unwrap();
+        let path = td.path().join("state.vscdb");
+        seed_db(&path, None);
+        let err = session_auth_for(&path, "curs_opaque_without_profile").unwrap_err();
+        assert!(err.to_string().contains("could not be decoded"), "{err}");
+    }
+
+    #[test]
+    fn a_jwt_still_wins_over_the_cached_profile() {
+        let td = TempDir::new().unwrap();
+        let path = td.path().join("state.vscdb");
+        seed_db(&path, None);
+        seed_scoped_profile(&path, r#"{"authId":"grok|user_from_profile"}"#);
+        let jwt = fake_jwt(serde_json::json!({"sub": "auth0|user_from_jwt"}));
+        let auth = session_auth_for(&path, &jwt).unwrap();
+        assert_eq!(auth.user_id, "user_from_jwt");
+    }
+
+    #[test]
+    fn a_profile_without_a_usable_auth_id_is_not_an_identity() {
+        let td = TempDir::new().unwrap();
+        let path = td.path().join("state.vscdb");
+        seed_db(&path, None);
+        seed_scoped_profile(&path, r#"{"authId":"no-pipe-here"}"#);
+        assert!(session_auth_for(&path, "curs_opaque").is_err());
+        seed_scoped_profile(&path, r#"{"displayName":"no auth id"}"#);
+        assert!(session_auth_for(&path, "curs_opaque").is_err());
+    }
+
+    #[test]
+    fn a_missing_profile_row_falls_back_to_the_jwt_path() {
+        let td = TempDir::new().unwrap();
+        let path = td.path().join("state.vscdb");
+        seed_db(&path, None);
+        let jwt = fake_jwt(serde_json::json!({"sub": "auth0|only_jwt"}));
+        assert_eq!(session_auth_for(&path, &jwt).unwrap().user_id, "only_jwt");
     }
 
     #[test]

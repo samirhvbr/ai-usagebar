@@ -2,6 +2,23 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
 
+function qmlBlocks(source, component) {
+  const blocks = [];
+  const start = new RegExp(`(^|\\n)\\s*${component}\\s*\\{`, 'g');
+  for (const match of source.matchAll(start)) {
+    const open = source.indexOf('{', match.index);
+    let depth = 0;
+    for (let i = open; i < source.length; i++) {
+      if (source[i] === '{') depth++;
+      else if (source[i] === '}' && --depth === 0) {
+        blocks.push(source.slice(open + 1, i));
+        break;
+      }
+    }
+  }
+  return blocks;
+}
+
 const source = fs.readFileSync(new URL('./Model.js', import.meta.url), 'utf8');
 const model = {};
 vm.createContext(model);
@@ -120,8 +137,8 @@ assert.equal(
 );
 assert.equal(i18n.displaySecretLabel('ru', 'API key'), 'API-ключ');
 assert.equal(
-  i18n.displayNote('ru', 'admin key — monthly spend'),
-  'admin-ключ — месячные траты',
+  i18n.displayNote('ru', 'organization report key — monthly spend'),
+  'ключ отчётов организации — месячные траты',
 );
 assert.equal(
   i18n.displayNote('ru', 'management key, not the inference key'),
@@ -169,6 +186,64 @@ assert.match(i18n.formatReset(nextDayReset, dayBeforeMs, 'ko'), /^1일 2시간 �
 assert.match(i18n.formatReset(nextDayReset, dayBeforeMs, 'es'), /^Se reinicia en 1d 2h · 3 oct 14:00$/);
 assert.match(i18n.formatReset(resetAt, nowMs, 'ru'), /^Сброс через /);
 assert.match(i18n.formatReset(resetAt, nowMs, 'pt-BR'), /^Redefine em /);
+// Refill-style windows name the amount they regenerate instead of "Resets".
+assert.equal(i18n.formatReset(resetAt, nowMs, 'en', '2%'), 'Regenerates 2% in 4h 0m · 12:00');
+assert.match(i18n.formatReset(resetAt, nowMs, 'ru', '2%'), /^Восстановление 2% через /);
+assert.match(i18n.formatReset(resetAt, nowMs, 'pt-BR', '2%'), /^Regenera 2% em /);
+assert.match(i18n.formatReset(resetAt, nowMs, 'ko', '2%'), /^4시간 0분 후 2% 재생성 · /);
+assert.match(i18n.formatReset(resetAt, nowMs, 'es', '2%'), /^Regenera 2% en /);
+assert.equal(model.formatReset(resetAt, nowMs, '2%'), 'Regenerates 2% in 4h 0m · 12:00');
+assert.equal(model.formatReset(resetAt, nowMs), 'Resets in 4h 0m · 12:00');
+
+// Decimal-precise percentages print with at most one decimal; the rounded
+// integer remains the fallback for older reports.
+assert.equal(model.percentText(30, 'left', 29.52), '70.5%');
+assert.equal(model.percentText(30, 'used', 29.52), '29.5%');
+assert.equal(model.percentText(30, 'left'), '70%');
+assert.equal(model.percentText(30, 'used', null), '30%');
+assert.equal(model.percentText(70, undefined, 70), '70%');
+// Objects built inside the vm live in another realm — copy fields out before
+// comparing (same reason the locale catalogs are copied above).
+var leftView = model.metricValueView({percent: 30, value: '30%', percent_precise: 29.52}, 'left');
+assert.equal(leftView.text, '70.5%');
+assert.equal(leftView.left, true);
+assert.equal(leftView.percent, 70.5);
+var leftIntView = model.metricValueView({percent: 30, value: '30%'}, 'left');
+assert.equal(leftIntView.text, '70%');
+assert.equal(leftIntView.percent, 70);
+// The used reading echoes the report's value string, which the binary
+// already prints at the vendor's decimal precision.
+assert.equal(
+  model.metricValueView({percent: 30, value: '29.5%', percent_precise: 29.52}, 'used').text,
+  '29.5%',
+);
+// An older report that only carries whole numbers keeps showing them.
+assert.equal(
+  model.metricValueView({percent: 30, value: '30%', percent_precise: null}, 'used').text,
+  '30%',
+);
+// A refill-style metric carries reading "left": it reads as a fuel gauge
+// whatever the widget's global setting, and other metrics follow the setting.
+assert.equal(model.metricShowAs({reading: 'left'}, 'used'), 'left');
+assert.equal(model.metricShowAs({reading: ''}, 'left'), 'left');
+assert.equal(model.metricShowAs({}, 'used'), 'used');
+var refill = model.metricValueView({percent: 30, value: '30%', reading: 'left'}, 'used');
+assert.equal(refill.text, '70%');
+assert.equal(refill.left, true);
+var refillPrecise = model.metricValueView(
+  {percent: 30, value: '29.5%', percent_precise: 29.52, reading: 'left'},
+  'used',
+);
+assert.equal(refillPrecise.text, '70.5%');
+assert.equal(refillPrecise.left, true);
+assert.equal(
+  model.metricDetail({detail: 'Regenerates 2% in 3h 4m', reset_at: resetAt, regen: '2%'}),
+  '',
+);
+assert.equal(
+  model.metricDetail({detail: 'Regenerates 0.6 credits in 3h 4m · extra note', reset_at: resetAt}),
+  'extra note',
+);
 assert.equal(i18n.formatUpdated('', nowMs, 'pt-BR'), i18n.t('pt-BR', 'updated.unavailable'));
 assert.equal(i18n.formatUpdated(new Date(nowMs - 30_000).toISOString(), nowMs, 'ru'),
   i18n.t('ru', 'updated.just_now'));
@@ -264,7 +339,7 @@ assert.match(barWidgetSource, /function\s+triggerPress\s*\(buttonCode\)/);
 assert.match(barWidgetSource, /root\.panelItem\.openEntry\(chipHit\.chip\.id\s*\|\|\s*""\)/);
 // Classic alarm chrome when colour-coding is off; RAG colours replace it when on.
 assert.match(barWidgetSource, /active:\s*!root\.colorCodeUsage\s*&&\s*root\.alarming/);
-assert.match(barWidgetSource, /text:\s*root\.alarming\s*\?\s*"󰅙"\s*:\s*"󰚩"/);
+assert.match(barWidgetSource, /text:\s*root\.urgentPriority\s*\?\s*"󰀦"\s*:\s*root\.alarming\s*\?\s*"󰅙"\s*:\s*"󰚩"/);
 assert.doesNotMatch(barWidgetSource, /\bIpcHandler\s*\{/);
 
 const panelSource = fs.readFileSync(new URL('./Panel.qml', import.meta.url), 'utf8');
@@ -281,7 +356,7 @@ assert.match(panelSource, /setting\("showProvider",\s*false\)/);
 assert.match(panelSource, /setting\("showAll",\s*false\)/);
 assert.match(panelSource, /setting\("colorCodeUsage",\s*false\)/);
 assert.match(panelSource, /Model\.normalizeBarWindow\(setting\("barWindow",\s*"auto"\)\)/);
-// The pin covers the bar value and its echoes (hero detail, tooltip):
+// The pin covers the bar value and its echoes (hero value, tooltip):
 // summary (bar label/chips) is pinned, while panel rows keep every pool.
 // Cursor's bar urgent state follows the pools still on the chip.
 assert.match(panelSource, /Model\.headline\(shapedEntry,\s*barWindow,\s*showAs\)/);
@@ -290,17 +365,17 @@ assert.match(panelSource, /Model\.isAlarming\(item\)/);
 // A failed or cached refresh alone cannot activate the bar, but a report that
 // never arrived has nothing else to show there.
 assert.match(panelSource, /readonly property bool reportMissing:\s*loadError\s*!==\s*""\s*&&\s*entries\.length\s*===\s*0/);
-assert.match(panelSource, /\(showAll\s*\?\s*shownAnyAlarming\(\)\s*:\s*entryAlarming\)[\s\S]{0,40}reportMissing/);
+assert.match(panelSource, /\(showAll\s*\?\s*shownAnyAlarming\(\)\s*:\s*entryIsAlarming\(barEntry\)\)[\s\S]{0,40}reportMissing/);
 assert.doesNotMatch(panelSource, /chipAlarm\s*=\s*rows\[i\]\.status\s*===\s*"error"/);
 assert.match(panelSource, /function shownAnyAlarming\(\)/);
 assert.doesNotMatch(panelSource, /Model\.anyAlarming\(visibleEntries\)/);
 assert.doesNotMatch(panelSource, /autoSummary/);
 assert.match(panelSource, /function\s+setBarWindow\s*\(/);
 assert.match(panelSource, /onBarWindowRequested/);
-assert.match(panelSource, /showProvider\s*\?\s*Model\.providerShort\(entry\)\s*:\s*""/);
+assert.match(panelSource, /showProvider\s*\?\s*Model\.providerShort\(barEntry\)\s*:\s*""/);
 assert.match(panelSource, /Model\.barStrip\([\s\S]*?barWindow/);
 assert.match(panelSource, /Model\.barChips\([\s\S]*?barWindow/);
-assert.match(panelSource, /Model\.providerIcon\(entry\)/);
+assert.match(panelSource, /Model\.providerIcon\(barEntry\)/);
 assert.match(panelSource, /BrandMark\s*\{/);
 assert.match(panelSource, /Model\.brandIconFile\(root\.entry\)/);
 
@@ -367,8 +442,12 @@ assert.match(panelSource, /return withCreditGrants\(pools, item\)/);
 assert.match(panelSource, /function panelHeadline\(item\) \{[\s\S]*?providerDualHeadline\(item\)/);
 
 const settingsViewSource = fs.readFileSync(new URL('./SettingsView.qml', import.meta.url), 'utf8');
-assert.match(settingsViewSource, /command:\s*\["ai-usagebar",\s*"settings",\s*"show"\]/);
-assert.match(settingsViewSource, /command:\s*\["ai-usagebar",\s*"settings",\s*"apply"\]/);
+// The executable is the reportBinary override (default ai-usagebar), still
+// structured argv with no shell.
+assert.match(settingsViewSource, /property string binaryPath: "ai-usagebar"/);
+assert.match(settingsViewSource, /command:\s*\[root\.binaryPath,\s*"settings",\s*"show"\]/);
+assert.match(settingsViewSource, /command:\s*\[root\.binaryPath,\s*"settings",\s*"apply"\]/);
+assert.match(panelSource, /binaryPath: root\.reportBinary/);
 assert.match(settingsViewSource, /stdinEnabled:\s*true/);
 assert.match(settingsViewSource, /write\(root\.pendingPayload\s*\+\s*"\\n"\)/);
 assert.match(settingsViewSource, /password:\s*true/);
@@ -411,7 +490,10 @@ assert.match(panelSource, /I18n\.displayLabel\(/);
 assert.match(panelSource, /I18n\.displayDetail\(/);
 assert.match(panelSource, /I18n\.tipPoolLine\(/);
 // Settings hero: long copy wraps under the hero, not inside the detail pill.
-assert.match(panelSource, /detail:\s*root\.settingsOpen\s*\?\s*""/);
+// The usage headline is no pill either: it sits beside the header actions,
+// and neither settings nor priorities show it.
+assert.doesNotMatch(panelSource, /PanelHero \{[^}]*?\n\s*detail:/);
+assert.match(panelSource, /readonly property string heroValue: !settingsOpen && !priorityOpen && entry && entry\.error === ""/);
 assert.match(panelSource, /root\.tr\("hero\.settings_detail"\)/);
 assert.match(panelSource, /I18n\.displayLabel\(root\.uiLocale,\s*detailRow\.row\.label\)/);
 assert.match(settingsViewSource, /I18n\.displaySecretLabel\(/);
@@ -445,7 +527,7 @@ assert.match(
 );
 assert.match(settingsViewSource, /root\.tr\("credentials\.paste"/);
 assert.match(panelSource, /function\s+openNousLogin\s*\(/);
-assert.match(panelSource, /ai-usagebar auth nous login/);
+assert.match(panelSource, /Util\.shellQuote\(root\.reportBinary\) \+ " auth nous login"/);
 assert.match(panelSource, /onNousLoginRequested/);
 assert.match(panelSource, /function\s+openCopilotLogin\s*\(/);
 assert.match(panelSource, /gh auth login --web/);
@@ -476,7 +558,10 @@ const raw = JSON.stringify({primary: 'openai', entries: [
   },
   {
     id: 'openai', name: 'openai', display_name: 'Codex', short_name: 'gpt', plan: 'Plus', error: null,
-    sections: [{type: 'metric', label: 'Codex weekly', percent: 95, value: '95%', detail: '', severity: 'critical'}]
+    sections: [
+      {type: 'text', label: 'Codex 5h', value: 'Not reported'},
+      {type: 'metric', label: 'Codex weekly', percent: 95, value: '95%', detail: '', severity: 'critical'}
+    ]
   }
 ]});
 
@@ -489,6 +574,10 @@ assert.equal(parsed.entries[0].brand, 'anthropic');
 assert.equal(parsed.entries[0].sections[1].reset_at, '2026-08-14T14:00:00Z');
 assert.equal(model.providerName(parsed.entries[0]), 'Claude · work');
 assert.equal(model.providerName(parsed.entries[1]), 'Codex');
+assert.deepEqual(JSON.parse(JSON.stringify(parsed.entries[1].sections[0])), {
+  type: 'text', label: 'Codex 5h', value: 'Not reported'
+});
+assert.equal(model.headline(parsed.entries[1]).text, '95%');
 assert.deepEqual(Array.from(model.filteredEntries(parsed.entries, '')).map(entry => entry.id), ['anthropic@work', 'openai']);
 assert.deepEqual(Array.from(model.filteredEntries(parsed.entries, 'anthropic')).map(entry => entry.id), ['anthropic@work']);
 assert.deepEqual(Array.from(model.filteredEntries(parsed.entries, 'openai')).map(entry => entry.id), ['openai']);
@@ -588,6 +677,8 @@ assert.equal(model.brandIconFile({id: 'grokbot'}), 'grokbot.svg');
 assert.equal(model.brandIconFile({id: 'copilot'}), 'copilot.svg');
 assert.equal(model.brandIconFile({id: 'devin'}), 'devin.svg');
 assert.equal(model.brandIconFile({id: 'devin@work'}), 'devin.svg');
+assert.equal(model.brandIconFile({id: 'synthetic'}), 'synthetic.svg');
+assert.equal(model.brandIconFile({id: 'synthetic', brand: 'synthetic'}), 'synthetic.svg');
 assert.equal(model.brandIconFile({id: 'custom:devin', brand: 'devin'}), 'devin.svg');
 const devinMark = fs.readFileSync(new URL('./icons/devin.svg', import.meta.url), 'utf8');
 assert.match(devinMark, /viewBox="0 0 24 24"/);
@@ -597,6 +688,13 @@ assert.match(devinMark, /<path\s/);
 assert.match(devinMark, /<svg\b[^>]*\bfill="#ffffff"/);
 assert.doesNotMatch(devinMark, /\bfill="(?:#000(?:000)?|black)"/i);
 assert.doesNotMatch(devinMark, /<(?:script|image|foreignObject|use)\b|\bhref\s*=|\bon\w+\s*=/i);
+assert.equal(model.brandIconFile({id: 'droid'}), 'droid.svg');
+const droidMark = fs.readFileSync(new URL('./icons/droid.svg', import.meta.url), 'utf8');
+assert.match(droidMark, /viewBox="0 0 24 24"/);
+assert.match(droidMark, /<path\s/);
+assert.match(droidMark, /<svg\b[^>]*\bfill="#ffffff"/);
+assert.doesNotMatch(droidMark, /\bfill="(?:#000(?:000)?|black)"/i);
+assert.doesNotMatch(droidMark, /<(?:script|image|foreignObject|use)\b|\bhref\s*=|\bon\w+\s*=/i);
 assert.equal(model.brandIconFile({id: 'zai'}), 'zhipu.svg');
 assert.equal(model.brandIconFile({id: 'kimi'}), 'kimi.svg');
 assert.equal(model.brandIconFile({id: 'opencode-go'}), 'opencode.svg');
@@ -611,6 +709,30 @@ assert.match(ollamaMark, /<path\s/);
 // White source artwork is needed for BrandMark's runtime colorization.
 assert.match(ollamaMark, /<svg\b[^>]*\bfill="#ffffff"/);
 assert.doesNotMatch(ollamaMark, /currentColor|<(?:script|image|foreignObject|use)\b|\bhref\s*=|\bon\w+\s*=/i);
+assert.equal(model.brandIconFile({id: 'orcarouter'}), 'orcarouter.svg');
+assert.equal(model.brandIconFile({id: 'orcarouter@work'}), 'orcarouter.svg');
+assert.equal(model.brandIconFile({id: 'custom:orca-second', brand: 'orcarouter'}), 'orcarouter.svg');
+const orcaMark = fs.readFileSync(new URL('./icons/orcarouter.svg', import.meta.url), 'utf8');
+assert.match(orcaMark, /viewBox="0 0 24 24"/);
+assert.match(orcaMark, /\bwidth="24"/);
+assert.match(orcaMark, /\bheight="24"/);
+assert.match(orcaMark, /<path\s/);
+assert.match(orcaMark, /fill-rule="evenodd"/);
+// White source artwork is needed for BrandMark's runtime colorization.
+assert.match(orcaMark, /<svg\b[^>]*\bfill="#ffffff"/);
+assert.doesNotMatch(orcaMark, /currentColor|<(?:script|image|foreignObject|use)\b|\bhref\s*=|\bon\w+\s*=/i);
+assert.equal(model.brandIconFile({id: 'muse-code'}), 'muse-code.svg');
+assert.equal(model.brandIconFile({id: 'muse-code@work'}), 'muse-code.svg');
+assert.equal(model.brandIconFile({id: 'custom:muse', brand: 'muse-code'}), 'muse-code.svg');
+// The legacy local-token recipe has no declared brand and keeps its fallback.
+assert.equal(model.brandIconFile({id: 'custom:muse'}), '');
+const museMark = fs.readFileSync(new URL('./icons/muse-code.svg', import.meta.url), 'utf8');
+assert.match(museMark, /viewBox="0 0 24 24"/);
+assert.match(museMark, /\bwidth="24"/);
+assert.match(museMark, /\bheight="24"/);
+assert.match(museMark, /<path\s/);
+assert.match(museMark, /<svg\b[^>]*\bfill="#ffffff"/);
+assert.doesNotMatch(museMark, /currentColor|<(?:script|image|foreignObject|use)\b|\bhref\s*=|\bon\w+\s*=/i);
 assert.equal(model.brandIconFile({id: 'lyceum'}), '');
 assert.equal(model.brandIconFile({id: 'commandcode'}), '');
 assert.equal(model.brandIconFile({id: 'anthropic_api'}), 'anthropic.svg');
@@ -632,7 +754,7 @@ assert.equal(model.brandIconFile({id: 'anthropic', brand: 'openai'}), 'openai.sv
 const slugs = [
   'anthropic', 'anthropic_api', 'openai', 'copilot', 'zai', 'openrouter',
   'deepseek', 'kimi', 'kilo', 'novita', 'moonshot', 'grok', 'supergrok', 'grokbot',
-  'antigravity', 'cursor', 'minimax', 'kiro', 'nous', 'opencode-go', 'lyceum', 'commandcode', 'devin', 'ollama'
+  'antigravity', 'cursor', 'minimax', 'kiro', 'nous', 'opencode-go', 'lyceum', 'commandcode', 'devin', 'ollama', 'orcarouter', 'muse-code', 'droid', 'mistral'
 ];
 const byMark = {};
 for (const slug of slugs) {
@@ -662,6 +784,19 @@ assert.equal(strip[0].brand, 'claude.svg');
 assert.equal(strip[1].brand, 'openai.svg');
 assert.equal(strip[0].label, '29%');
 assert.equal(strip[1].label, '95%');
+const museChip = {
+  id: 'muse-code', short_name: 'msc', icon: 'msc', brand: 'muse-code',
+  sections: [{type: 'metric', label: 'Session', percent: 41}]
+};
+const withMuse = model.barChips([claudeChip, openaiChip, museChip], openaiChip,
+  true, true, false, false, false, false, 'auto', 'left', true);
+assert.equal(withMuse.map(chip => chip.id).join(','), 'anthropic@work,openai,muse-code');
+assert.equal(withMuse[2].brand, 'muse-code.svg');
+assert.equal(withMuse[2].label, '59%');
+const museText = model.barChips([claudeChip, openaiChip, museChip], museChip,
+  true, true, false, false, false, false, 'auto', 'left', false);
+assert.equal(museText[2].brand, '');
+assert.equal(museText[2].label, 'msc 59%');
 const one = model.barChips([claudeChip, openaiChip], openaiChip, false, true, false, false, false, false);
 assert.equal(one.length, 1);
 assert.equal(one[0].brand, 'openai.svg');
@@ -925,7 +1060,17 @@ assert.equal(model.launchErrorMessage(0, ''), 'The usage command failed without 
 // The usage command must stay behind a helper that can emit exit 127 when the
 // binary is absent, without opening a shell-injection boundary.
 assert.match(panelSource,
-  /command:\s*\["\/usr\/bin\/env",\s*"ai-usagebar",\s*"usage",\s*"--json"\]/);
+  /command:\s*\["\/usr\/bin\/env",\s*root\.reportBinary,\s*"usage",\s*"--json"\]\.concat\(root\.showPriorities\s*\?\s*\["--priorities",\s*"--recent-hours",\s*String\(root\.recentHours\),\s*"--alert-unused-percent",\s*String\(root\.alertUnusedPercent\),\s*"--alert-hours",\s*String\(root\.alertHours\)\]\s*:\s*\[\]\)/);
+// reportBinary/tuiBinary default to the binaries on PATH and reach a shell
+// only through Util.shellQuote.
+assert.match(panelSource, /setting\("reportBinary", "ai-usagebar"\)/);
+assert.match(panelSource, /setting\("tuiBinary", "ai-usagebar-tui"\)/);
+assert.match(panelSource, /Util\.shellQuote\(root\.tuiBinary\)/);
+assert.match(fs.readFileSync(new URL('./BarWidget.qml', import.meta.url), 'utf8'),
+  /Util\.shellQuote\(root\.panelItem \? root\.panelItem\.tuiBinary : "ai-usagebar-tui"\)/);
+assert.equal(manifest.barWidget.defaults.reportBinary, 'ai-usagebar');
+assert.equal(manifest.barWidget.defaults.tuiBinary, 'ai-usagebar-tui');
+
 assert.doesNotMatch(panelSource, /command:\s*\["(?:\/usr\/bin\/)?(?:ba)?sh"/);
 assert.match(panelSource, /onExited:\s*function\(exitCode\)/);
 assert.match(panelSource, /Model\.launchErrorMessage\(/);
@@ -1752,6 +1897,21 @@ const zaiReport = (mcpPercent) => model.parseReport(JSON.stringify({entries: [{
 }
 
 {
+  const argon = model.parseReport(JSON.stringify({entries: [{id: 'antigravity', sections: [
+    {type: 'text', label: 'Weekly', value: ''},
+    {type: 'metric', label: 'Gemini', percent: 20, window_secs: 604800},
+    {type: 'metric', label: 'Gemini 4 Argon', percent: 90, window_secs: 604800},
+    {type: 'metric', label: 'Claude & GPT OSS', percent: 30, window_secs: 604800}
+  ]}]})).entries[0];
+  assert.deepEqual({...model.antigravityPoolPresence(argon)}, {gemini: true, third_party: true});
+  const geminiHidden = model.panelEntry(argon, {}, {}, {gemini: false, third_party: true});
+  assert.deepEqual(Array.from(geminiHidden.sections, row => row.label), ['Weekly', 'Claude & GPT OSS'],
+    'the Gemini switch hides both shared and per-model Gemini quota');
+  assert.equal(model.antigravityDualHeadline(argon, {gemini: true, third_party: true}, 'used', 'weekly').text, '90% · 30%',
+    'the Gemini headline includes the worst per-model quota');
+}
+
+{
   const partial = model.parseReport(JSON.stringify({entries: [{id: 'antigravity', sections: [
     {type: 'spacer'},
     {type: 'text', label: 'Session', value: ''},
@@ -2006,17 +2166,40 @@ assert.equal(model.cursorPoolOf(null), '');
   assert.doesNotMatch(panel, /metricEye|hideable|hasHideableMetrics|metric\.hidden_hint/, 'rows carry no switch; the choice lives in Settings');
   assert.match(panel, /onShowAsRequested:\s*function\(value\)\s*\{\s*root\.setShowAs\(value\)\s*\}/);
   assert.match(panel, /function shownAlarming\(\) \{\s*return entryIsAlarming\(shapedEntry\)/, 'the alert reads the entry without hidden metrics');
-  assert.match(panel, /entryIsAlarming\(shapedEntries\[i\]\)/);
+  assert.match(panel, /entryIsAlarming\(barEntries\[i\]\)/);
   assert.match(panel, /readonly property var valueView:\s*Model\.metricValueView\(row,\s*root\.showAs\)/);
   assert.match(settingsForm, /property string openSection:\s*"display"/);
   assert.match(settingsForm, /function toggleSection\(id\) \{\s*openSection = openSection === id \? "" : id\s*\}/);
-  assert.equal((settingsForm.match(/^    Disclosure \{/gm) || []).length, 8);
-  for (const id of ['display', 'language', 'barWindow', 'showAs', 'metrics', 'primary', 'providers', 'credentials']) {
+  assert.equal((settingsForm.match(/^    Disclosure \{/gm) || []).length, 9);
+  for (const id of ['display', 'priorities', 'language', 'barWindow', 'showAs', 'metrics', 'primary', 'providers', 'credentials']) {
     assert.match(settingsForm, new RegExp(`onToggled: root\\.toggleSection\\("${id}"\\)`), `${id} folds`);
     assert.match(settingsForm, new RegExp(`visible: root\\.openSection === "${id}"`), `${id} body`);
   }
   assert.doesNotMatch(settingsForm, /providersOpen|credentialsOpen/);
   assert.doesNotMatch(settingsForm, /^    PanelSectionHeader \{\s*\n\s*text: root\.tr\("section\.(display|language|bar_window|show_as|primary|providers|credentials)"\)/m);
+
+  // Keyboard reachability is a product contract, not a visual convention.
+  // Any new action button must opt into the Quattro tab/focus behavior, while
+  // the one custom pointer target (Disclosure) must keep equivalent keyboard
+  // activation and visibly claim focus on click.
+  const buttons = qmlBlocks(settingsForm, 'Button');
+  assert.equal(buttons.length, 6, 'all settings action buttons are covered');
+  for (const button of buttons)
+    assert.match(button, /\bfocusable:\s*true\b/, 'every settings Button is in the tab order');
+  const panelActionButtons = qmlBlocks(settingsForm, 'PanelActionButton');
+  assert.equal(panelActionButtons.length, 1, 'the credential clear action is covered');
+  assert.match(panelActionButtons[0], /\bfocusable:\s*true\b/);
+  assert.match(panelActionButtons[0], /\btooltipText:/, 'the icon-only action retains an accessible label');
+  const disclosures = qmlBlocks(settingsForm, 'component Disclosure: Item');
+  assert.equal(disclosures.length, 1);
+  assert.match(disclosures[0], /activeFocusOnTab:\s*true/);
+  for (const key of ['Return', 'Enter', 'Space'])
+    assert.match(disclosures[0], new RegExp(`Keys\\.on${key}Pressed:\\s*disclosure\\.toggled\\(\\)`));
+  assert.match(disclosures[0], /onClicked:\s*\{\s*disclosure\.forceActiveFocus\(\)\s*disclosure\.toggled\(\)/);
+  assert.equal(qmlBlocks(settingsForm, 'MouseArea').length, 1,
+    'new custom pointer targets need explicit keyboard-equivalence coverage');
+  assert.match(settingsForm, /focus:\s*visible/);
+  assert.match(settingsForm, /Keys\.onEscapePressed:\s*closeRequested\(\)/);
   assert.match(panel, /labelOnly:\s*chip\.labelOnly/);
   assert.match(panel, /if \(showProvider \|\| chip\.labelOnly === true\)/);
   assert.match(barWidgetSource, /visible:\s*chipHit\.chip\.labelOnly !== true/);
@@ -2029,15 +2212,19 @@ assert.equal(model.cursorPoolOf(null), '');
   assert.match(panel, /Model\.booleanSetting\(setting\("brandIcons",\s*true\),\s*true\)/);
   assert.match(panel, /barWindow,\s*showAs,\s*brandIcons\)/);
   assert.match(panel, /persistWidgetSettings\(\{\s*brandIcons:\s*next\s*\}\)/);
-  assert.match(panel, /brand: root\.settingsOpen \|\| !root\.brandIcons \? "" : Model\.brandIconFile\(root\.entry\)/);
+  assert.match(panel, /brand: root\.priorityOpen \|\| root\.settingsOpen \|\| !root\.brandIcons \? "" : Model\.brandIconFile\(root\.entry\)/);
   assert.match(settingsForm, /signal brandIconsRequested\(bool enabled\)/);
-  const displayKeys = ['showValue', 'brandIcons', 'showProvider', 'colorCodeUsage', 'showAll'];
-  assert.deepEqual(displayKeys.map(key => manifest.barWidget.defaults[key]), [true, true, false, false, false]);
+  const displayKeys = ['showValue', 'brandIcons', 'tabNames', 'showProvider', 'colorCodeUsage', 'showAll'];
+  assert.deepEqual(displayKeys.map(key => manifest.barWidget.defaults[key]), [true, true, false, false, false, false]);
   assert.deepEqual(manifest.barWidget.schema.filter(row => displayKeys.includes(row.key)).map(row => row.key), displayKeys);
-  assert.deepEqual(manifest.barWidget.schema.filter(row => displayKeys.includes(row.key)).map(row => row.defaultValue), [true, true, false, false, false]);
+  assert.deepEqual(manifest.barWidget.schema.filter(row => displayKeys.includes(row.key)).map(row => row.defaultValue), [true, true, false, false, false, false]);
   assert.deepEqual(
     Array.from(settingsForm.matchAll(/label: root\.tr\("toggle\.(\w+)"\)/g), match => match[1]),
-    ['show_value', 'brand_icons', 'show_provider', 'color_code', 'show_all']);
+    ['show_value', 'brand_icons', 'tab_names', 'show_provider', 'color_code', 'show_all']);
+  assert.match(settingsForm, /signal tabNamesRequested\(bool enabled\)/);
+  // Without logos the names always show, so the switch is locked on.
+  assert.match(settingsForm, /checked: root\.tabNames \|\| !root\.brandIcons\s*foreground[\s\S]*?enabled: root\.brandIcons && !root\.saving/);
+  assert.match(panel, /persistWidgetSettings\(\{\s*tabNames:\s*next\s*\}\)/);
   assert.equal(manifest.barWidget.defaults.brandIcons, true);
   assert.equal(manifest.barWidget.schema.find(row => row.key === 'brandIcons').type, 'boolean');
   assert.equal(manifest.barWidget.defaults.showAs, 'used');
@@ -2045,6 +2232,202 @@ assert.equal(model.cursorPoolOf(null), '');
   assert.equal(showAsSchema.type, 'enum');
   assert.deepEqual(showAsSchema.options, ['used', 'left']);
   assert.equal(showAsSchema.defaultValue, 'used');
+}
+
+// Display choices are per entry, including custom providers and named accounts.
+{
+  const entries = [{id:'custom:sample',name:'Sample',checked:true},
+    {id:'openai',name:'Codex',checked:true},{id:'openai@work',name:'Codex work',checked:true}];
+  const ids = rows => Array.from(rows, row => row.id);
+  assert.deepEqual(ids(model.barVisibleEntries(entries, null)), ids(entries));
+  const hidden = model.toggleBarEntry([], 'custom:sample');
+  assert.deepEqual(ids(model.barVisibleEntries(entries, hidden)), ['openai','openai@work']);
+  assert.deepEqual(ids(model.barVisibleEntries(entries, model.toggleBarEntry(hidden,'custom:sample'))), ids(entries));
+  assert.deepEqual(ids(model.barVisibleEntries(entries,['openai'])), ['custom:sample','openai@work']);
+  assert.equal(model.barVisibleEntries(entries,ids(entries)).length,0);
+  assert.equal(entries.length,3,'display filtering must not remove panel entries');
+  assert.deepEqual(Array.from(model.toggleBarEntry(['unavailable-entry'],'openai')),['unavailable-entry','openai']);
+  const saved=model.settingsWithOverrides({id:'test',unknownSetting:42},'test',{hiddenBarEntries:hidden});
+  assert.equal(saved.unknownSetting,42);
+  assert.deepEqual(ids(model.barVisibleEntries(entries,saved.hiddenBarEntries)),['openai','openai@work']);
+  assert.equal(model.providerDisplaySummary(entries),'3/3');
+  assert.equal(model.providerDisplaySummary([{...entries[0],checked:false},entries[1],entries[2]]),'2/3');
+  const bar = [{id:'a'},{id:'b'},{id:'c'}];
+  assert.equal(model.adjacentBarEntryId(bar, 'a', 1), 'b');
+  assert.equal(model.adjacentBarEntryId(bar, 'b', -1), 'a');
+  assert.equal(model.adjacentBarEntryId(bar, 'c', 1), 'a');
+  assert.equal(model.adjacentBarEntryId(bar, 'a', -1), 'c');
+  // The bar is showing `a` while the panel selection is a hidden entry.
+  assert.equal(model.adjacentBarEntryId(bar, 'hidden', 1), 'b');
+  assert.equal(model.adjacentBarEntryId(bar, 'hidden', -1), 'c');
+  assert.equal(model.adjacentBarEntryId([], 'a', 1), '');
+  assert.equal(model.adjacentBarEntryId(bar, 'a', 0), '');
+  assert.equal(model.adjacentBarEntryId(null, 'a', 1), '');
+
+}
+
+{
+  const panel=fs.readFileSync(new URL('./Panel.qml',import.meta.url),'utf8');
+  const form=fs.readFileSync(new URL('./SettingsView.qml',import.meta.url),'utf8');
+  assert.match(panel, /barProviderChoices: visibleEntries\.map/);
+  assert.match(form, /model: root\.snapshot\.vendors/, 'every built-in fetching switch remains available');
+  assert.match(form, /badge: Model\.providerDisplaySummary\(root\.barProviderChoices\)/);
+  assert.match(form, /badge: root\.vendorSummary\(\)/, 'fetching retains its independent enabled count');
+  assert.match(form, /property bool fetchingOpen: false/);
+  assert.match(form, /onClicked: root\.barProviderToggleRequested\(modelData.id\)/);
+  assert.match(panel, /function selectAdjacentBarEntry\(delta\)/);
+  assert.match(panel, /Model\.adjacentBarEntryId\(barEntries, selectedEntryId, delta\)/);
+  assert.match(panel, /selectEntry\(root\.entryIndex \+ dx\)/, 'panel keys still walk every tab');
+  assert.match(barWidgetSource, /function nextEntry\(\) \{\n\s*if \(panelItem\) panelItem\.selectAdjacentBarEntry\(1\)/);
+  assert.match(barWidgetSource, /selectAdjacentBarEntry\(delta < 0 \? 1 : -1\)/);
+  assert.doesNotMatch(barWidgetSource, /selectEntry\(/);
+  const chips=model.barChips([],null,true,true,true,false,false,false,'auto','used',true);
+  assert.equal(chips.length,1,'all hidden retains a generic clickable icon');
+  assert.equal(chips[0].label,'');
+}
+{
+  const reports=model.parseReport(JSON.stringify({entries:[
+    {id:'custom:sample',display_name:'Example custom',sections:[{type:'metric',label:'Weekly',percent:99}]},
+    {id:'openai@work',display_name:'Codex work',sections:[{type:'metric',label:'Weekly',percent:10}]}
+  ]})).entries;
+  const shown=model.barVisibleEntries(reports,['custom:sample']);
+  const chips=model.barChips(shown,reports[0],true,true,false,false,false,false,'auto','used',true);
+  assert.deepEqual(Array.from(chips,chip=>chip.id),['openai@work']);
+  assert.equal(chips[0].alarming,false,'a hidden critical entry must not alarm the visible chip');
+  const single=model.barChips(shown,reports[0],false,true,false,false,false,false,'auto','used',true);
+  assert.equal(single[0].id,'openai@work','single-entry mode falls back when the selected panel entry is hidden');
+  const prefs=JSON.parse(JSON.stringify({hiddenBarEntries:['custom:sample']}));
+  assert.deepEqual(Array.from(model.barVisibleEntries(reports,prefs.hiddenBarEntries),entry=>entry.id),['openai@work']);
+}
+
+// Qt 6.12 added a QtQuick type named Color, and it wins over the qs.Commons
+// singleton of the same name wherever a bare `Color` is written. Every bare
+// read then resolves to that type instead: `Color.foreground` is undefined, and
+// a `color` property assigned undefined paints as #000000. The theme file
+// lookup is worse, because `Color.currentThemePath` is undefined too and the
+// path becomes "file://undefined/colors.toml", so the theme never loads.
+//
+// Qualifying the singleton is the form Omarchy's own plugin documentation
+// asks for, and it reads the same on every Qt version.
+{
+  for (const file of ['Panel.qml', 'BarWidget.qml', 'BrandMark.qml', 'SettingsView.qml', 'PriorityCard.qml']) {
+    const source = fs.readFileSync(new URL(`./${file}`, import.meta.url), 'utf8');
+    assert.match(source, /^import qs\.Commons as Commons$/m, `${file} imports the palette with an alias`);
+    assert.doesNotMatch(source, /(^|[^.\w])Color\.[a-zA-Z]/, `${file} has no bare Color. reference`);
+  }
+  // The theme watcher binds to the palette's own signals, so its target has to
+  // be the qualified singleton too.
+  const panelSource = fs.readFileSync(new URL('./Panel.qml', import.meta.url), 'utf8');
+  assert.match(panelSource, /target:\s*Commons\.Color/);
+  assert.doesNotMatch(panelSource, /target:\s*Color\s*$/m);
+}
+
+// Errors render as a structured NoticeCard: the fix is only ever copied
+// (wl-copy through Util.shellQuote), and the card itself runs nothing.
+assert.match(panelSource, /NoticeCard \{\s*readonly property var current: root\.statusNotice\(\)/);
+assert.match(panelSource, /bar\.run\("printf %s " \+ Util\.shellQuote\(String\(text\)\) \+ " \| wl-copy"\)/);
+assert.doesNotMatch(fs.readFileSync(new URL('./NoticeCard.qml', import.meta.url), 'utf8'), /bar\.run|execDetached|Process/);
+// An error shows the translated badge, never the untranslated "Error" pill.
+assert.match(panelSource, /entry && entry\.error === ""\s*&& summary\.text !== "Ready"/);
+assert.match(panelSource, /root\.tr\("notice\.short\." \+ errorBadge\.notice\.category\)/);
+// Generic window names follow the interface language; English keeps them.
+assert.equal(i18n.displayLabel('pt-BR', 'Weekly (7d)'), i18n.t('pt-BR', 'metrics.window_weekly'));
+assert.equal(i18n.displayLabel('es', 'Session (5h)'), i18n.t('es', 'metrics.window_session'));
+assert.equal(i18n.displayLabel('en', 'Weekly (7d)'), 'Weekly (7d)');
+
+// Usage priorities stay opt-in and inside the same native popup.
+assert.equal(manifest.barWidget.defaults.showPriorities, false);
+assert.match(panelSource, /Model\.booleanSetting\(setting\("showPriorities", false\), false\)/);
+assert.match(panelSource, /visible: root\.priorityOpen && !root\.settingsOpen/);
+assert.match(panelSource, /Keys\.onEscapePressed: root\.priorityOpen = false/);
+assert.match(panelSource, /\(text === "p" \|\| text === "P"\)\) root\.openPriorities\(\)/);
+assert.match(settingsViewSource, /signal showPrioritiesRequested\(bool enabled\)/);
+for (const key of ['showPriorities', 'showPriorityShortcut', 'recentHours', 'priorityAlert', 'alertUnusedPercent', 'alertHours'])
+  assert.ok(manifest.barWidget.schema.some(row => row.key === key), `${key} is a documented setting`);
+assert.deepEqual(['priorityAlert', 'alertUnusedPercent', 'alertHours'].map(k => manifest.barWidget.defaults[k]), [true, 50, 24]);
+// A ranking computed with other settings is dropped, never shown as current.
+assert.match(panelSource, /alert\.unused_percent === alertUnusedPercent && alert\.hours === alertHours/);
+assert.match(panelSource, /ranking = current \? \(priorityReport\.ranking \|\| \[\]\) : \[\]/);
+// The report's recommendation is not read: the bar derives its own from the
+// ranking, minus the providers hidden from the bar (#487).
+assert.doesNotMatch(panelSource, /property var recommendation|priorityReport\.recommendation/);
+assert.match(panelSource, /Priority\.stateKey\(ranking\[i\]\) === "urgent" && !hiddenFromBar\(ranking\[i\]\.entry_id\)/);
+assert.match(panelSource, /ranking\[i\]\.status === "priority" && !hiddenFromBar\(ranking\[i\]\.entry_id\)/);
+assert.match(panelSource, /if \(!showPriorities \|\| !priorityAlert\) return null/);
+// The view switcher is a footer outside the scrolling content.
+assert.match(panelSource, /id: viewFooter[\s\S]*?visible: root\.showPriorities && !root\.settingsOpen[\s\S]*?anchors\.bottom: parent\.bottom/);
+assert.ok(panelSource.indexOf('id: viewSwitcher') < panelSource.indexOf('id: panelFlick'), 'footer is not inside the Flickable');
+assert.match(panelSource, /anchors\.bottom: viewFooter\.visible \? viewFooter\.top : parent\.bottom/);
+assert.match(panelSource, /fittedContentHeight\(column\.implicitHeight \+ viewFooter\.reserved/);
+// Cards: facts and notes from Priority.js, the accessible text built from both.
+{
+  const card = fs.readFileSync(new URL('./PriorityCard.qml', import.meta.url), 'utf8');
+  assert.match(panelSource, /facts: root\.priorityFacts\(modelData\)\s*notes: root\.priorityNotes\(modelData\)/);
+  assert.match(panelSource, /function priorityDetail\(row\) \{\s*var lines = priorityFacts\(row\)/);
+  assert.match(card, /model: root\.facts/);
+  assert.match(card, /model: root\.notes/);
+  assert.match(card, /text: root\.statusText/);
+}
+// Bar: usage chips first, then the priority chip. An urgent quota shows even
+// without the shortcut, and the chip presses like a provider chip.
+assert.ok(barWidgetSource.indexOf('id: chipRepeater') < barWidgetSource.indexOf('id: priorityHit'), 'usage chips precede the priority indicator');
+assert.match(barWidgetSource, /showPriorityShortcut \|\| urgentPriority/);
+assert.match(barWidgetSource, /color: root\.urgentPriority \? root\.priorityAlertColor : button\.foreground/);
+assert.match(barWidgetSource, /id: priorityHit[\s\S]*?buttonCode === Qt\.RightButton\) root\.launchDashboard\(\)[\s\S]*?root\.panelItem\.togglePriorities\(\)/);
+assert.match(panelSource, /function togglePriorities\(\) \{\s*if \(opened && priorityOpen\) close\(\)\s*else openPriorities\(\)/);
+// A vertical bar hides the chip row, so the priority chip carries the same
+// guard and is never registered as a click target there (#293).
+assert.match(barWidgetSource, /readonly property bool priorityChipShown: !\(root\.bar && root\.bar\.vertical\)\s*&& /);
+assert.match(barWidgetSource, /id: priorityHit\s*visible: root\.priorityChipShown/);
+assert.match(barWidgetSource, /if \(host && root\.priorityChipShown\) \{\s*host\.registerClickTarget\(priorityHit\)\s*priorityTargetHost = host/);
+assert.doesNotMatch(barWidgetSource, /(?<!un)registerClickTarget\(priorityHit\)[\s\S]*(?<!un)registerClickTarget\(priorityHit\)/);
+assert.match(barWidgetSource, /onPriorityChipShownChanged: Qt\.callLater\(root\.syncChipTargets\)/);
+// The slot hands the widget a placeholder api first and the plugin's own
+// later, and the api that registered a target keeps owning it. The chip is
+// static, so it leaves the api it joined before joining another, the way
+// WidgetButton tracks registeredBar; otherwise the bar ignores it and its
+// clicks land on the button.
+assert.match(barWidgetSource, /function syncPriorityTarget\(host\) \{\s*if \(priorityTargetHost\) priorityTargetHost\.unregisterClickTarget\(priorityHit\)\s*priorityTargetHost = null/);
+assert.match(barWidgetSource, /syncPriorityTarget\(null\)\s*return\s*\}/, 'losing the bar releases the chip');
+assert.match(barWidgetSource, /Component\.onDestruction: syncPriorityTarget\(null\)/);
+// A provider chip pressed while priorities show switches to its usage view
+// instead of closing the panel.
+assert.match(panelSource, /if \(opened && i === entryIndex && !priorityOpen\) \{\s*close\(\)/);
+
+// Panel look. Provider tabs share one width, show the brand mark beside the
+// name, and balance their rows (3 + 2 rather than 4 + 1). Logos only by
+// default, names one switch away, and never an empty tab without logos.
+assert.match(panelSource, /width: providerList\.tabWidth/);
+assert.match(panelSource, /var rows = Math\.ceil\(n \/ Math\.min\(n, fit\)\)/);
+assert.match(panelSource, /brand: Model\.brandIconFile\(providerTab\.modelData\)/);
+assert.match(panelSource, /Accessible\.name: Model\.providerName\(modelData\)/);
+assert.equal(manifest.barWidget.defaults.tabNames, false);
+assert.match(panelSource, /readonly property bool tabNames: tabNamesSetting \|\| !brandIcons/);
+assert.match(panelSource, /tooltipText: root\.tabNames \? "" : Model\.providerName\(modelData\)/);
+for (const locale of ['en', 'ru', 'pt-BR', 'ko', 'es'])
+  for (const key of ['toggle.tab_names', 'toggle.tab_names_desc'])
+    assert.notEqual(i18n.t(locale, key), key, `${locale} ${key}`);
+// The headline value sits beside the header actions, figure first and the %
+// lighter on the same baseline.
+assert.match(panelSource, /readonly property var parts: Model\.valueParts\(root\.heroValue\)/);
+assert.match(panelSource, /anchors\.baseline: heroFigure\.baseline/);
+// One glyph per view in the switcher; the alert replaces the list glyph.
+assert.match(panelSource, /value: "usage", label: root\.tr\("view\.usage"\), icon: "󰓅"/);
+assert.match(panelSource, /icon: root\.urgentPriority \? "󰀦" : "󰉻"/);
+// Metric values: figure emphasised, % and surrounding words secondary, all on
+// the label's baseline. Locale word order is preserved.
+{
+  const parts = value => JSON.parse(JSON.stringify(model.valueParts(value)));
+  assert.deepEqual(parts('47%'), {prefix: '', figure: '47', unit: '%', suffix: ''});
+  assert.deepEqual(parts('53% left'), {prefix: '', figure: '53', unit: '%', suffix: ' left'});
+  assert.deepEqual(parts('осталось 53%'), {prefix: 'осталось ', figure: '53', unit: '%', suffix: ''});
+  assert.deepEqual(parts('12.5%'), {prefix: '', figure: '12.5', unit: '%', suffix: ''});
+  assert.deepEqual(parts('$75.00'), {prefix: '', figure: '$75.00', unit: '', suffix: ''});
+  assert.deepEqual(parts(null), {prefix: '', figure: '', unit: '', suffix: ''});
+  assert.match(panelSource, /anchors\.baseline: metricValue\.baseline/);
+  assert.match(panelSource, /baselineOffset: valueFigure\.y \+ valueFigure\.baselineOffset/);
+  assert.match(panelSource, /readonly property var valueParts: Model\.valueParts\(valueText\)/);
+  assert.match(panelSource, /Accessible\.name: metricRow\.valueText/);
 }
 
 console.log('Omarchy model tests passed');

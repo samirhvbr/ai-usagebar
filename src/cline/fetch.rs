@@ -90,34 +90,69 @@ pub async fn fetch_snapshot(
     cache.ensure_dir()?;
     let _lock = acquire_lock_async(&cache.lock_path(), LOCK_TIMEOUT).await?;
 
-    let user_id = match credential.account_id.clone() {
-        Some(id) => id,
-        None if credential.expired => {
-            return Err(AppError::Credentials(super::creds::EXPIRED.to_string()));
-        }
-        None => fetch_user_id(client, endpoints, &credential.token).await?,
-    };
-    let target = target_key(endpoints, &user_id);
+    let credential_fingerprint = sha256_hex(&credential.token);
+    let cached_payload = cache.maybe_payload()?;
+    let mut target = credential
+        .account_id
+        .as_deref()
+        .map(|id| target_key(endpoints, id))
+        .or_else(|| {
+            cached_payload
+                .as_deref()
+                .and_then(|body| cached_target(body, endpoints, &credential_fingerprint))
+        });
 
     // A lapsed token would only earn a 401. The stored answer is still worth
     // showing, aged to the current instant: a window whose reset has passed
     // reads as empty, exactly as it does at Cline.
     if credential.expired {
+        let Some(target) = target.as_deref() else {
+            return Err(AppError::Credentials(super::creds::EXPIRED.to_string()));
+        };
         cache.mark_stale();
         let recorded = cache.write_last_error(401, super::creds::EXPIRED);
         return fallback_or_error(
             cache,
             Some(recorded),
-            &target,
+            target,
             AppError::Credentials(super::creds::EXPIRED.to_string()),
             now,
         );
     }
 
-    if cache.fresh_payload(ttl)?.is_some()
-        && let Some(state) = cache
-            .maybe_payload()?
-            .and_then(|bytes| parse_cache(&bytes, &target).ok())
+    let fresh_payload = cache.fresh_payload(ttl)?;
+    if let (Some(target), Some(bytes)) = (target.as_deref(), fresh_payload.as_deref())
+        && let Ok(state) = parse_cache(bytes, target)
+    {
+        return Ok(crate::outcome::Outcome::cached(
+            state.snapshot(now),
+            cache,
+            false,
+        ));
+    }
+
+    // `fresh_payload` is also the shared no-network gate. It may return a
+    // stale payload during backoff; if that payload belongs to another API
+    // key, refuse it and the network rather than using it to discover identity.
+    if target.is_none() && cache.backoff_remaining().is_some() {
+        return Err(AppError::Http {
+            status: 429,
+            body: status_message(429).to_string(),
+        });
+    }
+
+    if target.is_none() {
+        let user_id = match fetch_user_id(client, endpoints, &credential.token).await {
+            Ok(id) => id,
+            Err(error) => return handle_error(cache, None, error, now),
+        };
+        target = Some(target_key(endpoints, &user_id));
+    }
+    let target = target.expect("identity resolution set the cache target");
+    // Caches written before the credential fingerprint was added still work:
+    // resolve identity once, then apply the ordinary TTL to the old payload.
+    if let Some(bytes) = fresh_payload.as_deref()
+        && let Ok(state) = parse_cache(bytes, &target)
     {
         return Ok(crate::outcome::Outcome::cached(
             state.snapshot(now),
@@ -128,38 +163,14 @@ pub async fn fetch_snapshot(
 
     match fetch_live(client, endpoints, &credential.token).await {
         Ok(state) => {
-            cache.write_payload(&serde_json::to_vec(&state_repr(&target, &state))?)?;
+            cache.write_payload(&serde_json::to_vec(&state_repr(
+                &target,
+                &credential_fingerprint,
+                &state,
+            ))?)?;
             Ok(crate::outcome::Outcome::fresh(state.snapshot(now)))
         }
-        Err(error @ AppError::Transport(_)) => fallback_or_error(cache, None, &target, error, now),
-        Err(AppError::Http { status, .. }) => {
-            let message = status_message(status).to_string();
-            cache.mark_stale();
-            cache.write_last_error(status, &message);
-            fallback_or_error(
-                cache,
-                Some((status, message.clone())),
-                &target,
-                AppError::Http {
-                    status,
-                    body: message,
-                },
-                now,
-            )
-        }
-        Err(AppError::Schema(_)) => {
-            let message = SCHEMA_ERROR.to_string();
-            cache.mark_stale();
-            cache.write_last_error(0, &message);
-            fallback_or_error(
-                cache,
-                Some((0, message.clone())),
-                &target,
-                AppError::Schema(message),
-                now,
-            )
-        }
-        Err(error) => fallback_or_error(cache, None, &target, error, now),
+        Err(error) => handle_error(cache, Some(&target), error, now),
     }
 }
 
@@ -214,17 +225,21 @@ async fn get_json(client: &reqwest::Client, url: &str, token: &str) -> Result<Va
 /// rotates every few hours, so it cannot be what a cache is keyed on; the user
 /// id it resolves to is what the cached figures actually belong to.
 fn target_key(endpoints: &Endpoints, user_id: &str) -> String {
-    let digest = Sha256::digest(user_id.as_bytes());
+    // `v3` marks the usage-limits schema. A `v2` cache holds a charge ledger
+    // and no windows; it simply fails the target match and is refetched.
+    format!("{}|user:{}|v3", endpoints.base, sha256_hex(user_id))
+}
+
+fn sha256_hex(value: &str) -> String {
+    let digest = Sha256::digest(value.as_bytes());
     let mut fingerprint = String::with_capacity(digest.len() * 2);
     for byte in digest {
         let _ = write!(fingerprint, "{byte:02x}");
     }
-    // `v3` marks the usage-limits schema. A `v2` cache holds a charge ledger
-    // and no windows; it simply fails the target match and is refetched.
-    format!("{}|user:{fingerprint}|v3", endpoints.base)
+    fingerprint
 }
 
-fn state_repr(target: &str, state: &State) -> Value {
+fn state_repr(target: &str, credential_fingerprint: &str, state: &State) -> Value {
     let window = |window: &Option<Window>| {
         window.as_ref().map(|window| {
             serde_json::json!({
@@ -235,12 +250,30 @@ fn state_repr(target: &str, state: &State) -> Value {
     };
     serde_json::json!({
         "target": target,
+        "credential": credential_fingerprint,
         "plan": {
             "name": state.plan.name,
             "period_end": state.plan.period_end.map(|at| at.to_rfc3339()),
         },
         "windows": state.windows.iter().map(window).collect::<Vec<_>>(),
     })
+}
+
+/// Recover the account-scoped target only when this exact credential wrote it.
+/// The one-way fingerprint lets API-key users reach the ordinary TTL/backoff
+/// gate without persisting the key or showing another account's figures.
+fn cached_target(
+    body: &[u8],
+    endpoints: &Endpoints,
+    credential_fingerprint: &str,
+) -> Option<String> {
+    let value: Value = serde_json::from_slice(body).ok()?;
+    if value.get("credential").and_then(Value::as_str) != Some(credential_fingerprint) {
+        return None;
+    }
+    let target = value.get("target")?.as_str()?;
+    let prefix = format!("{}|user:", endpoints.base);
+    (target.starts_with(&prefix) && target.ends_with("|v3")).then(|| target.to_string())
 }
 
 fn parse_cache(body: &[u8], target: &str) -> Result<State> {
@@ -309,6 +342,40 @@ fn fallback_or_error(
     crate::outcome::fallback(cache, last_error, error, |body| {
         parse_cache(body, target).map(|state| state.snapshot(now))
     })
+}
+
+fn handle_error(
+    cache: &Cache,
+    target: Option<&str>,
+    error: AppError,
+    now: DateTime<Utc>,
+) -> Result<FetchOutcome> {
+    let (error, last_error) = match error {
+        AppError::Http { status, .. } => {
+            let message = status_message(status).to_string();
+            cache.mark_stale();
+            cache.write_last_error(status, &message);
+            (
+                AppError::Http {
+                    status,
+                    body: message.clone(),
+                },
+                Some((status, message)),
+            )
+        }
+        AppError::Schema(_) => {
+            let message = SCHEMA_ERROR.to_string();
+            cache.mark_stale();
+            cache.write_last_error(0, &message);
+            (AppError::Schema(message.clone()), Some((0, message)))
+        }
+        error => (error, None),
+    };
+
+    match target {
+        Some(target) => fallback_or_error(cache, last_error, target, error, now),
+        None => Err(error),
+    }
 }
 
 #[cfg(test)]
@@ -597,5 +664,199 @@ mod tests {
             endpoints.base
         );
         assert!(parse_cache(old.as_bytes(), &target_key(&endpoints, "usr-1")).is_err());
+    }
+
+    #[test]
+    fn cached_target_is_bound_to_both_credential_and_endpoint() {
+        let endpoints = Endpoints::default();
+        let state = State::default();
+        let body = serde_json::to_vec(&state_repr(
+            &target_key(&endpoints, "usr-1"),
+            "credential-a",
+            &state,
+        ))
+        .unwrap();
+
+        assert_eq!(
+            cached_target(&body, &endpoints, "credential-a"),
+            Some(target_key(&endpoints, "usr-1"))
+        );
+        assert_eq!(cached_target(&body, &endpoints, "credential-b"), None);
+        assert_eq!(
+            cached_target(
+                &body,
+                &Endpoints {
+                    base: "https://other.example".to_string(),
+                },
+                "credential-a",
+            ),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn api_key_identity_lookup_obeys_the_cache_ttl() {
+        let mut server = mockito::Server::new_async().await;
+        let me = server
+            .mock("GET", "/api/v1/users/me")
+            .with_body(r#"{"data":{"id":"usr-1"}}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let plan = server
+            .mock("GET", "/api/v1/users/me/plan")
+            .with_body(PLAN_BODY)
+            .expect(1)
+            .create_async()
+            .await;
+        let limits = server
+            .mock("GET", "/api/v1/users/me/plan/usage-limits")
+            .with_body(LIMITS_BODY)
+            .expect(1)
+            .create_async()
+            .await;
+        let (_dir, cache) = cache_fixture();
+        let endpoints = Endpoints { base: server.url() };
+        let api_key = Credential {
+            account_id: None,
+            ..credential()
+        };
+
+        refresh(
+            &cache,
+            &endpoints,
+            &api_key,
+            Duration::from_secs(600),
+            now(),
+        )
+        .await
+        .expect("first refresh");
+        let cached = refresh(
+            &cache,
+            &endpoints,
+            &api_key,
+            Duration::from_secs(600),
+            now(),
+        )
+        .await
+        .expect("second refresh should be cached");
+
+        assert!(!cached.off_the_wire());
+        me.assert_async().await;
+        plan.assert_async().await;
+        limits.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn api_key_reuses_a_fresh_cache_from_before_the_fingerprint_field() {
+        let mut server = mockito::Server::new_async().await;
+        let me = server
+            .mock("GET", "/api/v1/users/me")
+            .with_body(r#"{"data":{"id":"usr-1"}}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let plan = server
+            .mock("GET", "/api/v1/users/me/plan")
+            .expect(0)
+            .create_async()
+            .await;
+        let limits = server
+            .mock("GET", "/api/v1/users/me/plan/usage-limits")
+            .expect(0)
+            .create_async()
+            .await;
+        let (_dir, cache) = cache_fixture();
+        let endpoints = Endpoints { base: server.url() };
+        let mut old = state_repr(
+            &target_key(&endpoints, "usr-1"),
+            "not-present-before-this-fix",
+            &State::default(),
+        );
+        old.as_object_mut().unwrap().remove("credential");
+        cache
+            .write_payload(&serde_json::to_vec(&old).unwrap())
+            .unwrap();
+        let api_key = Credential {
+            account_id: None,
+            ..credential()
+        };
+
+        let cached = refresh(
+            &cache,
+            &endpoints,
+            &api_key,
+            Duration::from_secs(600),
+            now(),
+        )
+        .await
+        .expect("the previous cache schema remains readable");
+
+        assert!(!cached.off_the_wire());
+        me.assert_async().await;
+        plan.assert_async().await;
+        limits.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn api_key_identity_lookup_obeys_rate_limit_backoff() {
+        let mut server = mockito::Server::new_async().await;
+        let me = server
+            .mock("GET", "/api/v1/users/me")
+            .with_status(429)
+            .expect(1)
+            .create_async()
+            .await;
+        let (_dir, cache) = cache_fixture();
+        let endpoints = Endpoints { base: server.url() };
+        let api_key = Credential {
+            account_id: None,
+            ..credential()
+        };
+
+        for _ in 0..2 {
+            let error = refresh(&cache, &endpoints, &api_key, Duration::ZERO, now())
+                .await
+                .expect_err("rate-limited identity lookup");
+            assert!(matches!(error, AppError::Http { status: 429, .. }));
+        }
+
+        me.assert_async().await;
+        assert!(cache.backoff_remaining().is_some());
+    }
+
+    #[tokio::test]
+    async fn rate_limit_backoff_never_serves_or_probes_another_api_key() {
+        let mut server = mockito::Server::new_async().await;
+        let me = server
+            .mock("GET", "/api/v1/users/me")
+            .expect(0)
+            .create_async()
+            .await;
+        let (_dir, cache) = cache_fixture();
+        let endpoints = Endpoints { base: server.url() };
+        cache
+            .write_payload(
+                &serde_json::to_vec(&state_repr(
+                    &target_key(&endpoints, "usr-a"),
+                    &sha256_hex("api-key-a"),
+                    &State::default(),
+                ))
+                .unwrap(),
+            )
+            .unwrap();
+        cache.write_last_error(429, "rate limited");
+        let other_key = Credential {
+            token: "api-key-b".to_string(),
+            account_id: None,
+            ..credential()
+        };
+
+        let error = refresh(&cache, &endpoints, &other_key, Duration::ZERO, now())
+            .await
+            .expect_err("another key's cache must be refused during backoff");
+
+        assert!(matches!(error, AppError::Http { status: 429, .. }));
+        me.assert_async().await;
     }
 }

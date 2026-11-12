@@ -283,6 +283,44 @@ mod tests {
         std::fs::read_to_string(&path).ok()
     }
 
+    /// Every bullet in a version section must sit under a `### Category`
+    /// heading. A merge that appends a bullet where the conflict was
+    /// bullet-only can drop the heading, and the repeated-category check above
+    /// only looks for *duplicates* — an unheaded bullet used to pass every
+    /// gate while staying invisible to the release's version decision.
+    /// Every bullet in the pending section must sit under a `### Category`
+    /// heading. A merge that appends a bullet where the conflict was
+    /// bullet-only can drop the heading, and the repeated-category check above
+    /// only looks for *duplicates* — an unheaded bullet used to pass every
+    /// gate while staying invisible to the release's version decision.
+    ///
+    /// Only `[Unreleased]` is checked: released sections are frozen, already
+    /// covered byte-for-byte by `scripts/check-changelog-immutable.sh`, and
+    /// the oldest one predates the category rule.
+    #[test]
+    fn no_unreleased_changelog_bullet_sits_outside_a_category() {
+        let Some(changelog) = changelog() else { return };
+        let mut in_unreleased = false;
+        let mut in_category = false;
+        let mut offenders: Vec<String> = Vec::new();
+        for line in changelog.lines() {
+            if let Some(rest) = line.strip_prefix("## ") {
+                in_unreleased = rest.trim() == "[Unreleased]";
+                in_category = false;
+            } else if line.starts_with("### ") {
+                in_category = true;
+            } else if in_unreleased && line.starts_with("- ") && !in_category {
+                offenders.push(line.trim().to_string());
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "the pending section carries bullets before any ### category \
+             heading, so they are hidden from the release's version decision: \
+             {offenders:?}"
+        );
+    }
+
     /// How the macOS menu bar mirrors one vendor's figures.
     ///
     /// Two cases, because the mirror is a deliberate *subset*: Rust emits 289
@@ -324,12 +362,16 @@ mod tests {
             VendorId::Deepinfra => MacosMirror::Slot("dif_balance"),
             VendorId::Deepseek => MacosMirror::Slot("ds_balance"),
             VendorId::Devin => MacosMirror::Slot("devin_daily_pct"),
+            // Standard's 5-hour/weekly windows ride the generic slots.
+            VendorId::Droid => MacosMirror::Generic(CORE),
+            VendorId::MuseCode => MacosMirror::Generic(CORE),
             VendorId::Grok => MacosMirror::Slot("grok_balance"),
             VendorId::Kilo => MacosMirror::Slot("kilo_balance"),
             VendorId::Lyceum => MacosMirror::Slot("lyceum_balance"),
             VendorId::Minimax => MacosMirror::Slot("minimax_video_pct"),
             VendorId::Moonshot => MacosMirror::Slot("km_balance"),
             VendorId::Novita => MacosMirror::Slot("nv_balance"),
+            VendorId::Synthetic => MacosMirror::Slot("synthetic_pct"),
             VendorId::Ollama => MacosMirror::Slot("oll_monthly_pct"),
             VendorId::OpenCodeGo => MacosMirror::Slot("ocg_monthly_pct"),
             VendorId::Openrouter => MacosMirror::Slot("or_balance"),
@@ -342,7 +384,6 @@ mod tests {
             VendorId::Openai => MacosMirror::Generic(CORE),
             VendorId::Kimi => MacosMirror::Generic(CORE),
             VendorId::Kiro => MacosMirror::Generic(CORE),
-            VendorId::ModelStudio => MacosMirror::Generic(CORE),
             VendorId::NousResearch => MacosMirror::Generic(CORE),
             VendorId::OrcaRouter => MacosMirror::Generic(CORE),
             // Fork-only: today rides the session placeholder and week the
@@ -353,6 +394,16 @@ mod tests {
             // Three independent windows (5 h, weekly, monthly); the macOS bar
             // reads its fields by index, so each gets its own appended slot.
             VendorId::Cline => MacosMirror::Slot("cline_5h_pct"),
+            VendorId::ModelStudio => MacosMirror::Slot("mst_monthly_pct"),
+            // Monthly allowance + rolling weekly caps, rendered through the
+            // generic slots: `session_pct` carries the monthly window and
+            // `weekly_pct` the rolling cap. DeepRelay's own Swift dispatch case
+            // only relabels them ("Monthly" / "Weekly").
+            VendorId::DeepRelay => MacosMirror::Generic(CORE),
+            // Two monthly budgets ride the generic slots: `session_pct` carries
+            // the API budget and `weekly_pct` the Vibe Code budget. Mistral's
+            // own Swift dispatch case relabels them.
+            VendorId::Mistral => MacosMirror::Generic(CORE),
         }
     }
 

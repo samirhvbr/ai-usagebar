@@ -45,7 +45,7 @@ fn build_placeholders_with_tolerance(
     let weekly = window_pacing(snap.weekly.as_ref(), pace_tolerance, now);
     let mcp = window_pacing(snap.mcp.as_ref(), pace_tolerance, now);
     placeholders(vec![
-        ("icon", "󰚩".to_string()),
+        ("icon", VendorId::Zai.bar_icon().to_string()),
         ("vendor_short", VendorId::Zai.short_name().to_string()),
         // Cross-vendor aliases for scroll-cycle friendly formats.
         ("session_pct", session_pct.to_string()),
@@ -312,6 +312,10 @@ mod tests {
     #[test]
     fn default_format_renders_session_pct() {
         let snap = sample_snap();
+        assert_eq!(
+            build_placeholders(&snap, Utc::now())["icon"],
+            VendorId::Zai.bar_icon()
+        );
         let oc = outcome(snap.clone());
         let out = render(&oc, &snap, &Theme::default(), &opts(), Utc::now());
         assert!(out.text.contains("42%"));

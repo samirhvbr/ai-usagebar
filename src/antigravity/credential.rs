@@ -302,24 +302,59 @@ fn keyring_lookup_command() -> std::process::Command {
 
 #[cfg(not(any(windows, target_os = "macos")))]
 fn read_platform() -> Option<String> {
+    secret_tool_value(
+        || keyring_lookup_command().output().ok(),
+        || keyring_search_command().output().ok(),
+    )
+}
+
+/// The saved session as `secret-tool` reports it, given the two ways of
+/// asking. Split from the spawns so a test can feed it canned output.
+#[cfg(not(any(windows, target_os = "macos")))]
+fn secret_tool_value(
+    lookup: impl FnOnce() -> Option<std::process::Output>,
+    search: impl FnOnce() -> Option<std::process::Output>,
+) -> Option<String> {
     // `secret-tool` (libsecret) speaks to whichever Secret Service is running.
     // A missing binary or no running daemon both exit non-zero / fail to
     // spawn, and both mean "no session available here".
-    let out = keyring_lookup_command().output().ok()?;
+    let out = lookup()?;
+    if out.status.success() {
+        return decode_blob_bytes(&out.stdout);
+    }
+    // `lookup` prints only a value whose content type is exactly `text/plain`.
+    // go-keyring stores `text/plain; charset=utf8`, so on a Secret Service
+    // that keeps the type as written (KDE's ksecretd) `lookup` exits 1 with
+    // "secret does not contain a textual password" although the item is
+    // there. `search` prints the value whatever its content type.
+    let out = search()?;
     if !out.status.success() {
         return None;
     }
-    decode_blob_bytes(&out.stdout)
+    decode_blob_bytes(secret_from_search_output(&out.stdout)?)
 }
 
 /// `secret-tool lookup service <service> username <account>`, read-only; the
 /// secret arrives on stdout, never in argv.
 #[cfg(not(any(windows, target_os = "macos")))]
 fn keyring_lookup_command() -> std::process::Command {
+    secret_tool_command("lookup")
+}
+
+/// `secret-tool search service <service> username <account>`, read-only. It
+/// reports the first matching item as `key = value` lines, the secret among
+/// them, on stdout. Without `--unlock` a locked item prints no `secret` line.
+#[cfg(not(any(windows, target_os = "macos")))]
+fn keyring_search_command() -> std::process::Command {
+    secret_tool_command("search")
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn secret_tool_command(action: &str) -> std::process::Command {
     let mut command = std::process::Command::new("secret-tool");
     command
         .args([
-            "lookup",
+            action,
             "service",
             KEYRING_SERVICE,
             "username",
@@ -332,6 +367,17 @@ fn keyring_lookup_command() -> std::process::Command {
         command.env_remove(var);
     }
     command
+}
+
+/// The value of the `secret = ` line in `secret-tool search` output.
+/// secret-tool writes the value's raw bytes up to the end of that line, so a
+/// value holding a newline is cut there; the token blobs this module reads are
+/// single-line JSON or base64, and a cut blob fails to parse instead.
+#[cfg(not(any(windows, target_os = "macos")))]
+fn secret_from_search_output(stdout: &[u8]) -> Option<&[u8]> {
+    stdout
+        .split(|&byte| byte == b'\n')
+        .find_map(|line| line.strip_prefix(b"secret = "))
 }
 
 #[cfg(test)]
@@ -583,5 +629,101 @@ mod tests {
                 "expected {var} to be scrubbed from the keyring lookup"
             );
         }
+    }
+
+    #[cfg(not(any(windows, target_os = "macos")))]
+    #[test]
+    fn keyring_search_queries_the_same_item_and_scrubs_env() {
+        let command = keyring_search_command();
+        assert_eq!(command.get_program(), "secret-tool");
+        let args: Vec<_> = command.get_args().collect();
+        assert_eq!(
+            args,
+            [
+                "search",
+                "service",
+                KEYRING_SERVICE,
+                "username",
+                KEYRING_ACCOUNT
+            ]
+        );
+        let removed: Vec<String> = command
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(key, _)| key.to_string_lossy().into_owned())
+            .collect();
+        for var in crate::vendor::vendor_secret_env_vars_to_remove(&[]) {
+            assert!(removed.iter().any(|key| key == var));
+        }
+    }
+
+    #[cfg(not(any(windows, target_os = "macos")))]
+    fn secret_tool_output(code: i32, stdout: &str) -> std::process::Output {
+        use std::os::unix::process::ExitStatusExt as _;
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: Vec::new(),
+        }
+    }
+
+    /// The layout secret-tool 0.21 prints for the item go-keyring writes,
+    /// after `lookup` refused it over its `text/plain; charset=utf8` type.
+    #[cfg(not(any(windows, target_os = "macos")))]
+    #[test]
+    fn a_lookup_refused_over_content_type_reads_the_search_value() {
+        let search = concat!(
+            "[/4]\n",
+            "label = Password for 'antigravity' on 'gemini'\n",
+            "secret = {\"auth_method\":\"oauth\",\"token\":{\"access_token\":\"search-at\",",
+            "\"refresh_token\":\"search-rt\",\"expiry\":\"2030-01-02T03:04:05Z\"}}\n",
+            "created = 2026-10-14 14:11:14\n",
+            "attribute.service = gemini\n",
+            "attribute.username = antigravity\n",
+        );
+        let blob = secret_tool_value(
+            || Some(secret_tool_output(1, "")),
+            || Some(secret_tool_output(0, search)),
+        )
+        .unwrap();
+        let token = parse_keyring_blob(&blob).unwrap();
+        assert_eq!(token.access_token, "search-at");
+        assert_eq!(token.refresh_token.as_deref(), Some("search-rt"));
+    }
+
+    #[cfg(not(any(windows, target_os = "macos")))]
+    #[test]
+    fn a_successful_lookup_is_used_without_a_search() {
+        let blob = secret_tool_value(
+            || Some(secret_tool_output(0, "{\"access_token\":\"lookup-at\"}\n")),
+            || panic!("search must not run after a successful lookup"),
+        );
+        assert_eq!(blob.as_deref(), Some("{\"access_token\":\"lookup-at\"}"));
+    }
+
+    /// No item, a locked item, or no secret-tool at all: still "no session".
+    #[cfg(not(any(windows, target_os = "macos")))]
+    #[test]
+    fn no_session_when_neither_lookup_nor_search_yields_a_value() {
+        let no_item = secret_tool_value(
+            || Some(secret_tool_output(1, "")),
+            || Some(secret_tool_output(1, "")),
+        );
+        let locked = secret_tool_value(
+            || Some(secret_tool_output(1, "")),
+            || Some(secret_tool_output(0, "[/4]\nlabel = x\n")),
+        );
+        let no_binary = secret_tool_value(|| None, || panic!("search must not run"));
+        assert_eq!((no_item, locked, no_binary), (None, None, None));
+    }
+
+    /// A locked item, searched without `--unlock`, has no `secret` line; an
+    /// attribute whose value merely contains "secret = " is not one either.
+    #[cfg(not(any(windows, target_os = "macos")))]
+    #[test]
+    fn search_output_without_a_secret_line_is_none() {
+        let stdout = b"[/4]\nlabel = secret = not this\nattribute.service = gemini\n";
+        assert_eq!(secret_from_search_output(stdout), None);
+        assert_eq!(secret_from_search_output(b""), None);
     }
 }

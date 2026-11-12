@@ -131,9 +131,15 @@ When cutting a new version (patch, minor, or major):
     checkouts under `/tmp` (prune with `git worktree remove --force` +
     `git worktree prune`) and their `CARGO_TARGET_DIR` side directories
     (`/tmp/opencode/*-tgt`), which each hold a full dependency build.
+    Two more leftovers the batch workflow creates: the local `pr-*` branches
+    fetched per audited PR (`git branch | grep '^  pr-' | xargs git branch -D`
+    — fetched refs, not work) and any `node_modules/` a verification lane
+    installed inside the checkout (`git status --ignored --short | grep '^!!'`
+    — a stray one has broken `omarchy plugin validate` twice).
     The next `make test` pays a full rebuild for the reclaimed space —
     that trade is correct exactly once per release, and leaving the trash
-    in place has exhausted disk storage before.
+    in place has exhausted disk storage before. Shared caches
+    (`~/.cargo/registry`, `~/.npm`) are not part of this.
 
 **Anything skipping any of 1–10 is an incomplete release.** Tags are
 immutable; do **not** force-move a tag once it's pushed. Cut a new
@@ -230,6 +236,17 @@ patch version instead.
   USERPROFILE is the production input being verified, not ambient state
   the test is incidentally coupled to.
 
+  **Auth failures and the cache (#589).** A `401`/`403` from an API-key
+  vendor keeps the last good payload, marked stale, plus the fixed
+  `AUTH_FAILURE_MESSAGE` diagnostic — the cached reading is still what that
+  account last used, and every key vendor (DeepRelay, OpenRouter, DeepInfra,
+  Mistral, the rest) behaves this way; DeepRelay's PAYG wallet path is pinned
+  by `a_payg_wallet_401_keeps_the_balance_stale_and_redacted`. Antigravity is
+  the deliberate exception: a signed-out local app's cached quota is not a
+  reading at all, so its `401 | 403` returns `Err` without the fallback.
+  Do not flip one vendor to the other rule without deciding both and adding
+  the matching test.
+
 ## Secret-discipline rules (learned the hard way)
 
 Two separate leaks in early sessions where real keys appeared in the
@@ -281,14 +298,21 @@ vendor's response shape drifts:
   `~/.gemini/antigravity-cli/antigravity-oauth-token` (`credential.rs`:
   Credential Manager on Windows, `security` on macOS, `secret-tool` on
   Linux; read-only) and asks the Cloud Code API (`cloud.rs`) for the same
-  quota summary. A refreshed token goes to the vendor cache's
+  quota summary. Before Google it asks `agy` itself when `agy` is installed:
+  `agy -p "/quota" --output-format json` (`agy.rs`) is the reading `agy`'s own
+  Models & Quota page shows, which the Cloud Code request cannot reproduce for
+  an `agy` account (#450); it starts a process, so it runs at most every
+  `agy::QUOTA_INTERVAL`, and when it gives no reading its last one is kept,
+  stale, rather than replaced by the Cloud Code figure (`kept_agy_reading`).
+  A refreshed token goes to the vendor cache's
   `oauth.json`, keyed by a fingerprint of the refresh token, never back to
   the keyring. The OAuth client that refresh needs is config-only.
   Tests must never probe `/proc`, `lsof`, the keyring, the CLI token file, Google or the wall
-  clock — use `candidate_bases_with`, `probe_order`,
+  clock, nor run the real `agy` — use `candidate_bases_with`, `probe_order`,
   `matching_windows_ports`, `parse_lsof_pcn`, `parse_cache_at`, and
   `fetch_snapshot_at` with a `RemoteOverride` (`SavedCredential::Blob` /
-  `Absent`, mockito `Endpoints`, `local_bases: Some(vec![])`), not their
+  `Absent`, mockito `Endpoints`, `local_bases: Some(vec![])`, and `agy` left at
+  `AgyCommand::Off` or set to `AgyCommand::At` a script), not their
   production wrappers. The two tests that touch the real keyring
   (`reading_the_real_windows_credential_never_errors`, `antigravity_remote_live`)
   are `#[ignore]`d.

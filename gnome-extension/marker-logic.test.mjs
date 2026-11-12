@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import {barMarkup, colorForDelta, commonLabelPrefix, disambiguateTags, entryLabel, entryMetrics,
-    entryTag, field, FIELD, FORMAT, hasUsageWindows, integer, isGrouped, markerElapsed,
+    entryTag, field, FIELD, FORMAT, hasUsageWindows, integer, isGrouped, markerElapsed, paceGlyph,
     panelSegments, pickPool, plainTextFromPango, poolAvailable, poolTag, selectPools,
     SESSION_SECS, splitFormatOutput, WEEKLY_SECS, windowTag} from './marker-logic.js';
 
@@ -123,6 +123,11 @@ assert.equal(colorForDelta(0, colors), 'mid');
 assert.equal(colorForDelta(1, colors), 'high');
 assert.equal(colorForDelta(9, colors), 'high');
 assert.equal(colorForDelta(10, colors), 'critical');
+
+assert.equal(paceGlyph(-11), '↓');
+assert.equal(paceGlyph(-10), '→');
+assert.equal(paceGlyph(0), '→');
+assert.equal(paceGlyph(1), '↑');
 
 for (const [pct, elapsed, expected] of [[25, 50, 'low'], [50, 50, 'mid'], [75, 50, 'critical']]) {
     const markup = barMarkup(pct, 8, colors, elapsed);

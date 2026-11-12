@@ -569,9 +569,9 @@ mod tests {
         .unwrap();
         usage.assert_async().await;
         details.assert_async().await;
-        assert_eq!(out.snapshot.reset_credits.available, 2);
+        assert_eq!(out.snapshot.reset_credits.as_ref().unwrap().available, 2);
         assert_eq!(
-            out.snapshot.reset_credits.next_expiry(),
+            out.snapshot.reset_credits.as_ref().unwrap().next_expiry(),
             Some("2026-07-17T00:00:00Z".parse().unwrap())
         );
 
@@ -683,8 +683,15 @@ mod tests {
         details.assert_async().await;
         assert!(!out.stale);
         assert_eq!(out.snapshot.session.as_ref().unwrap().utilization_pct, 10);
-        assert_eq!(out.snapshot.reset_credits.available, 1);
-        assert!(out.snapshot.reset_credits.credits.is_empty());
+        assert_eq!(out.snapshot.reset_credits.as_ref().unwrap().available, 1);
+        assert!(
+            out.snapshot
+                .reset_credits
+                .as_ref()
+                .unwrap()
+                .credits
+                .is_empty()
+        );
     }
 
     /// With nothing banked there is nothing to detail. Asking anyway would
@@ -723,7 +730,10 @@ mod tests {
         .await
         .unwrap();
         details.assert_async().await;
-        assert!(out.snapshot.reset_credits.is_empty());
+        assert_eq!(
+            out.snapshot.reset_credits,
+            Some(crate::usage::ResetCredits::default())
+        );
     }
 
     #[tokio::test]

@@ -7,6 +7,7 @@ import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 
 import {ExtensionPreferences, gettext as _} from 'resource:///org/gnome/Shell/Extensions/js/extensions/prefs.js';
+import {terminalCandidates} from './terminal.js';
 
 import {configAnthropicAccounts} from './api-status-logic.js';
 
@@ -27,6 +28,9 @@ function readConfigText() {
 const VENDOR_AUTH = [
     {id: 'anthropic', name: 'Claude', kind: 'oauth', cli: 'claude', login: 'claude', pkg: '@anthropic-ai/claude-code'},
     {id: 'openai', name: 'Codex', kind: 'oauth', cli: 'codex', login: 'codex login', pkg: '@openai/codex'},
+    // OpenCode 2 keeps its credential in the CLI's own SQLite database. The
+    // binary reads that store directly; this row only opens the CLI login.
+    {id: 'opencode-go', name: 'OpenCode Go', kind: 'oauth', cli: 'opencode', login: 'opencode auth login', pkg: 'opencode-ai'},
     // Local-server vendor: there is no separate credential or npm-installable
     // login helper. If `agy` exists we can open it; the app and IDE are equally
     // valid sources and are managed outside this extension.
@@ -70,12 +74,50 @@ function configHasApiKey(section) {
     return false;
 }
 
+// OpenCode 2 stores its credential in the CLI's SQLite database, which GJS
+// cannot query. Ask the same binary the indicator uses; fall back to the
+// legacy JSON store and the explicit env/config key when it is unavailable.
+function openCodeGoConfigured() {
+    if ((GLib.getenv('OPENCODE_GO_API_KEY') || '').length > 0 || configHasApiKey('opencode-go'))
+        return true;
+    const bin = GLib.find_program_in_path('ai-usagebar') ||
+        `${GLib.get_home_dir()}/.local/bin/ai-usagebar`;
+    if (bin && GLib.file_test(bin, GLib.FileTest.IS_EXECUTABLE)) {
+        try {
+            const proc = Gio.Subprocess.new([bin, 'vendors', '--json'],
+                Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_SILENCE);
+            const [, stdout] = proc.communicate_utf8(null, null);
+            const row = JSON.parse(stdout).vendors?.find(v => v.id === 'opencode-go');
+            if (row)
+                return row.configured === true;
+        } catch (e) {}
+    }
+    const auth = `${GLib.get_user_data_dir()}/opencode/auth.json`;
+    if (!GLib.file_test(auth, GLib.FileTest.EXISTS))
+        return false;
+    try {
+        const [ok, bytes] = GLib.file_get_contents(auth);
+        if (!ok)
+            return false;
+        const value = JSON.parse(new TextDecoder().decode(bytes));
+        return ['opencode-go', 'opencode'].some(id => {
+            const entry = value?.[id];
+            return entry && ['api', 'key', 'zen'].includes(entry.type) &&
+                String(entry.key || '').trim().length > 0;
+        });
+    } catch (e) {
+        return false;
+    }
+}
+
 function vendorConfigured(v) {
     const home = GLib.get_home_dir();
     if (v.id === 'anthropic')
         return GLib.file_test(`${home}/.claude/.credentials.json`, GLib.FileTest.EXISTS);
     if (v.id === 'openai')
         return GLib.file_test(`${home}/.codex/auth.json`, GLib.FileTest.EXISTS);
+    if (v.id === 'opencode-go')
+        return openCodeGoConfigured();
     // Antigravity 2.0, the `agy` CLI and the IDE are separate products sharing
     // one quota, and any combination may be installed. Having any of their
     // state directories is enough — the binary reads usage from whichever
@@ -89,11 +131,7 @@ function vendorConfigured(v) {
 
 // Open the user's terminal running `command` (login shell, so claude/codex are on PATH).
 function spawnInTerminal(command) {
-    for (const argv of [
-        ['kgx', '--', 'bash', '-lc', command],
-        ['gnome-terminal', '--', 'bash', '-lc', command],
-        ['xterm', '-e', 'bash', '-lc', command],
-    ]) {
+    for (const argv of terminalCandidates(command)) {
         if (!GLib.find_program_in_path(argv[0]))
             continue;
         try {
@@ -105,11 +143,11 @@ function spawnInTerminal(command) {
 }
 
 function spawnArgvInTerminal(commandArgv) {
-    for (const argv of [
-        ['kgx', '--', ...commandArgv],
-        ['gnome-terminal', '--', ...commandArgv],
-        ['xterm', '-e', ...commandArgv],
-    ]) {
+    // The prefs/GNOME process PATH is minimal, so run through a login shell
+    // and put ~/.local/bin (agy, ai-usagebar-tui) first, like spawnInTerminal.
+    const quoted = commandArgv.map(a => GLib.shell_quote(a)).join(' ');
+    const line = `export PATH="$HOME/.local/bin:$PATH" && ${quoted}`;
+    for (const argv of terminalCandidates(line)) {
         if (!GLib.find_program_in_path(argv[0]))
             continue;
         try {
@@ -207,7 +245,10 @@ function colorRow(settings, key, title) {
 export default class AiUsageBarPrefs extends ExtensionPreferences {
     fillPreferencesWindow(window) {
         const settings = this.getSettings();
-        const page = new Adw.PreferencesPage();
+        const page = new Adw.PreferencesPage({
+            title: _('General'),
+            icon_name: 'preferences-system-symbolic',
+        });
         window.add(page);
 
         // ── Display ──────────────────────────────────────────────────────
@@ -224,7 +265,7 @@ export default class AiUsageBarPrefs extends ExtensionPreferences {
 
         const showExtra = new Adw.SwitchRow({
             title: _('Show extra usage bar (3rd)'),
-            subtitle: _('o custo extra ($) como terceira barra'),
+            subtitle: _('the extra spend ($) as a third bar'),
         });
         settings.bind('show-extra', showExtra, 'active', Gio.SettingsBindFlags.DEFAULT);
         display.add(showExtra);
@@ -234,8 +275,8 @@ export default class AiUsageBarPrefs extends ExtensionPreferences {
         const poolLabels = [_('Both'), _('First only'), _('Second only'), _('Automatic')];
         const poolValues = ['both', 'primary', 'secondary', 'auto'];
         const pools = new Adw.ComboRow({
-            title: _('Pools no painel'),
-            subtitle: GLib.markup_escape_text(_('for providers with two independent pools (e.g. Antigravity: Gemini and Claude & GPT OSS)'), -1),
+            title: _('Panel pools'),
+            subtitle: _('for providers with two independent pools (e.g. Antigravity: Gemini and Claude & GPT OSS)'),
             model: Gtk.StringList.new(poolLabels),
         });
         bindCombo(settings, 'panel-pools', pools, poolValues);
@@ -264,6 +305,15 @@ export default class AiUsageBarPrefs extends ExtensionPreferences {
         });
         settings.bind('show-bars', showBars, 'active', Gio.SettingsBindFlags.DEFAULT);
         display.add(showBars);
+
+        const showPace = new Adw.SwitchRow({
+            title: _('Pace arrows'),
+            subtitle: _('With bars off: color each value by pace and add ↓ under, → on, ↑ ahead'),
+        });
+        settings.bind('show-pace', showPace, 'active', Gio.SettingsBindFlags.DEFAULT);
+        settings.bind('show-bars', showPace, 'sensitive', Gio.SettingsBindFlags.GET |
+            Gio.SettingsBindFlags.INVERT_BOOLEAN);
+        display.add(showPace);
 
         const barWidth = new Adw.SpinRow({
             title: _('Width of each bar (cells)'),
@@ -327,23 +377,32 @@ export default class AiUsageBarPrefs extends ExtensionPreferences {
         // CLAUDE_CONFIG_DIR setup may never sign into.
         const accounts = configAnthropicAccounts(readConfigText(), GLib.get_home_dir())
             .map(({label}) => `anthropic@${label}`);
-        const vendorList = ['anthropic', ...accounts, 'openai', 'zai', 'openrouter',
-            'deepseek', 'antigravity', 'minimax'];
-        const vendor = new Adw.ComboRow({
-            title: _('Vendor da barra superior'),
-            subtitle: _('O que a barra mostra quando nada está marcado em "No painel, lado a lado". '
-                + 'O menu lista todos os provedores ativos.'),
-            model: Gtk.StringList.new(vendorList),
+        // One switch per provider; each one switched on gets its own top bar
+        // indicator, in this order. Stored as the comma-separated `vendor` list.
+        const vendorList = ['anthropic', ...accounts, 'openai', 'opencode-go', 'zai', 'openrouter', 'deepseek', 'antigravity', 'supergrok', 'minimax', 'shvia'];
+        const vendors = new Adw.ExpanderRow({
+            title: _('Top bar vendors'),
+            subtitle: _('One indicator per provider, unless the combined panel below has selected entries.'),
         });
-        bindCombo(settings, 'vendor', vendor, vendorList);
-        data.add(vendor);
+        const enabledVendors = () => settings.get_string('vendor').split(',').map(v => v.trim());
+        const vendorRows = vendorList.map(v => {
+            const row = new Adw.SwitchRow({title: v, active: enabledVendors().includes(v)});
+            row.connect('notify::active', () => {
+                const chosen = vendorList.filter((x, i) => vendorRows[i].active);
+                if (chosen.join(',') !== settings.get_string('vendor'))
+                    settings.set_string('vendor', chosen.join(','));
+            });
+            vendors.add_row(row);
+            return row;
+        });
+        data.add(vendors);
 
         // Multi-entry panel: one switch per id, so two Claude accounts and a
-        // Codex can share the top bar. Nothing selected keeps the classic
-        // panel, which follows the Vendor row above.
+        // Codex can share the top bar. Nothing selected keeps the separate
+        // provider indicators chosen above.
         const entries = new Adw.ExpanderRow({
             title: _('No painel, lado a lado'),
-            subtitle: _('Nada marcado = só o vendor acima. O que aparece em cada '
+            subtitle: _('Nada marcado = indicadores dos vendors acima. O que aparece em cada '
                 + 'entrada segue os interruptores de 5h / semanal abaixo'),
         });
         const entrySwitches = new Map();
@@ -351,7 +410,7 @@ export default class AiUsageBarPrefs extends ExtensionPreferences {
             const on = settings.get_strv('panel-entries').filter(id => id);
             entries.subtitle = on.length
                 ? on.join(', ')
-                : _('Nada marcado = só o vendor acima. O que aparece em cada '
+                : _('Nada marcado = indicadores dos vendors acima. O que aparece em cada '
                     + 'entrada segue os interruptores de 5h / semanal abaixo');
         };
         for (const id of vendorList) {
@@ -438,7 +497,7 @@ export default class AiUsageBarPrefs extends ExtensionPreferences {
                     row.subtitle = _('checking…');
                     checkCliInstalled(v.cli, (installed) => {
                         if (productDetected) {
-                            row.subtitle = _('✓ Antigravity detectado — mantenha o app, IDE ou agy aberto');
+                            row.subtitle = _('✓ Antigravity detected — keep the app, IDE or agy open');
                         } else if (installed) {
                             row.subtitle = _('agy installed — open a session to make the quota available');
                         } else {

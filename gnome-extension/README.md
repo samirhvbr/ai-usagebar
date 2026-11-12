@@ -1,7 +1,7 @@
 # AI Usage Bar — GNOME Shell extension
 
 A native GNOME top-panel indicator for [`ai-usagebar`](../README.md). It puts
-one provider's **5-hour session** and **weekly** usage bars next to the
+each chosen provider's **5-hour session** and **weekly** usage next to the
 clock/network. Its native click menu lists every provider enabled in
 `config.toml`, in native submenus with the windows and details the binary reports.
 
@@ -13,8 +13,8 @@ GNOME screenshot is currently bundled.
 
 ## Vendor scope
 
-The **top bar** selector supports **Claude, Codex, Z.AI, OpenRouter, DeepSeek, and
-Google Antigravity**. The **click menu** does not use that list. It draws every
+The **top bar** selector supports **Claude, Codex, OpenCode Go, Z.AI, OpenRouter,
+DeepSeek, and Google Antigravity**. The **click menu** does not use that list. It draws every
 entry `ai-usagebar usage --json` returns, which is every provider enabled in
 `config.toml` — including Cursor and the others the bar selector does not offer.
 
@@ -33,7 +33,7 @@ shows the last cached figures, then an error once those age out.
 
 ## Requirements
 
-- GNOME Shell **45–50** (ESM extensions).
+- GNOME Shell **45–51** (ESM extensions).
 - The `ai-usagebar` binary on `PATH` (or `~/.cargo/bin`, or set an explicit
   path in preferences). Install it with `cargo install ai-usagebar` or from
   the AUR — see the [main README](../README.md).
@@ -67,17 +67,18 @@ mkdir -p "$DEST" && cp -r * "$DEST"/      # or: ln -s "$PWD" "$DEST"
 |---|---|---|
 | Show 5h / weekly bar | on / on | toggle either window; with nothing left to draw, the top bar shows the vendor's icon |
 | Show percentage | on | numeric `%` next to each bar |
+| Pace arrows | off | with bars off, colors each value by pace (usage minus elapsed) and adds `↓` under, `→` on, `↑` ahead; off keeps plain numbers |
 | Bar width | 8 | cells per bar (4–20) |
 | Refresh interval | 30 s | 5–3600 |
-| Top bar vendor | `anthropic` | Top bar only. Selectors: Claude, Codex, Z.AI, OpenRouter, DeepSeek, Antigravity. The click menu lists every enabled provider from `usage --json`. |
+| Top bar vendors | `anthropic` | Top bar only. One switch per provider (Claude, Codex, OpenCode Go, Z.AI, OpenRouter, DeepSeek, Antigravity, SuperGrok); each one on gets its own indicator, marked by its brand icon. Stored as a comma-separated list in `vendor`. The click menu lists every enabled provider from `usage --json`. |
 | Panel pools | `both` | two-pool vendors only: `both`, first pool, second pool, or `auto` |
 | Auto threshold | 95 % | `auto` switches pools once the shown one reaches this usage |
 | Binary path | auto | empty = `PATH` then `~/.cargo/bin` |
 | Panel area | `right` | `right` = next to network/clock; also `center`/`left` |
 | Panel index | 0 | order within the area (0 = leftmost) |
-| Provider summary | bars and values | Menu only. Choose values only to hide the mini bars; the overview stays visible. |
-| Show provider icons | on | Menu only. Symbolic marks follow the Shell text colour; providers without an asset use a generic system icon. |
-| Compact spacing | off | Menu only. Reduces spacing without hiding metrics. |
+| Provider summary | bars and values | Menu only. Choose values only to hide the metric bars. |
+| Show provider icons | on | Menu only. Controls the selected provider's symbolic mark; providers without an asset omit it. |
+| Compact spacing | off | Menu only. Reduces panel and metric spacing without hiding data. |
 
 ## How it renders
 
@@ -94,32 +95,22 @@ binary's default One Dark theme and `severity_for()` thresholds (≥90 red · �
 orange · ≥50 yellow · else green), so it matches the Waybar widget.
 
 The **click menu** runs `ai-usagebar usage --json` when opened and at the
-configured interval while it is open. It lists each report entry in report
-order, including named accounts and custom providers. Each collapsed row
-previews up to two metrics in report order, retaining their labels and group
-headings. `+N more` indicates additional metrics available when expanded.
-The summary never merges quotas or guesses window names. A balance uses the
-report's formatted value; entries with no metrics preview up to two text
-values instead. Expand a provider with
-a click, Enter or Right; Left collapses it. The provider list scrolls within
-60% of the monitor height, and report text wraps within a bounded width.
+configured interval while it is open. It shows one provider at a time in a
+tabbed panel, preserving the selected tab while the Shell process remains
+running. Tabs follow report order and include named accounts and custom
+providers without frontend registration. A horizontally scrolling tab strip
+keeps large provider lists usable.
 
-Each submenu shows the report's plan, metric labels and values, bars, reset
-countdowns, text and blocks. The report supplies the severity used for bar
-colors. Absent metrics stay absent; a balance retains its formatted value,
-including a negative sign. Errors appear as messages rather than zero usage,
-and stale entries are marked `cached`. Metrics are not combined or relabelled
-as session or weekly windows.
+The selected tab shows the provider's plan, metric labels and values, bars,
+reset countdowns, text and blocks. The report supplies bar severity. Absent
+metrics stay absent; a balance keeps its formatted value, including a negative
+sign. Errors remain messages rather than becoming zero usage. The header has
+**Refresh now** and **Settings** buttons, and **Open TUI** remains below the
+panel. The footer records when the current report was received.
 
-The menu uses GNOME's submenu navigation and theme, with the existing
-**Refresh now**, **Open TUI**, and **Settings** actions below the provider list.
-Refresh updates the panel and report and closes the menu like a normal menu
-action. Periodic updates preserve expanded providers and keyboard focus.
-The top bar's command failures appear above the provider list.
-
-**Menu appearance** in preferences controls mini bars, icons and spacing
-independently of the top bar. Changes apply immediately and preserve focus
-and the expanded provider. Bar fills reuse the existing severity colours;
+**Menu appearance** controls bars, the selected provider icon, and spacing
+independently of the top bar. Changes apply immediately and preserve the
+selected tab. Bar fills reuse the existing severity colours;
 backgrounds, text and selection follow the Shell theme. Provider artwork is
 reused from the Omarchy integration; see [sources and licences](icons/README.md).
 Assets are optional: a new provider works without adding an icon or editing a
@@ -129,7 +120,10 @@ Pace markers need a real reset and the elapsed share of the window. The top
 bar uses the `{*_reset}` / `{*_elapsed}` fields and its existing point-delta
 colors. The menu computes marker positions from `reset_at` and `window_secs`,
 which Rust supplies for windows of an exact length. Without both, it draws no
-marker. Menu fills use the report's severity; countdowns use the absolute
+marker. With bars off and **Pace arrows** on, the top bar moves the pace into
+the value instead: the percentage is colored by usage minus elapsed, with the same point-delta bands,
+and followed by `↓` (more than 10 points under), `→` (within 10 under), or
+`↑` (ahead). Menu fills use the report's severity; countdowns use the absolute
 reset time. The panel's final `__aiub_end__` literal receives any stale suffix
 so that the preceding elapsed field remains numeric.
 

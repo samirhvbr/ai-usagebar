@@ -6,9 +6,16 @@ import {
   formatDuration,
   nextUpdateLabel,
   parseHostPayload,
+  providerState,
   projectCards,
   resetLabel,
   friendlyError,
+  keyCheckError,
+  keyDialogPhase,
+  KEY_CHECK_NO_ANSWER_MS,
+  signInPhase,
+  SIGN_IN_NO_ANSWER_MS,
+  countdownText,
   explainError,
   displayPlan,
   leftLabel,
@@ -30,7 +37,16 @@ import {
   quotaAlternate,
   headlineLabel,
   headlineAlternate,
-  lacksCredentials,
+  providerListRows,
+  providerOf,
+  reorderProviderRows,
+  providerGroups,
+  expandGroupOrder,
+  activeAccountTab,
+  accountLabel,
+  metricsCountText,
+  multiAccountSubtitle,
+  addAccountDecision,
   seedLayout,
   hintPending,
   absorbPayload,
@@ -88,6 +104,17 @@ import {
   menuAction,
 } from './src/model.js';
 import { measurePanelHeight } from './src/panel-size.js';
+import {
+  buildCardSvg,
+  CARD_IMAGE_SCALE,
+  createCopyRegistry,
+  findCardElement,
+  IMAGE_COPIED_TIMEOUT_MS,
+  namespacedCardHtml,
+  PNG_DATA_URL_PREFIX,
+  serializeCardHtml,
+  stripPngDataUrlPrefix,
+} from './src/lib/cardImage.ts';
 
 const englishMessages = JSON.parse(readFileSync(new URL('./messages/en.json', import.meta.url), 'utf8'));
 
@@ -125,8 +152,8 @@ const portugueseMessages = JSON.parse(readFileSync(new URL('./messages/pt-BR.jso
 assert.deepEqual(Object.keys(portugueseMessages).sort(), Object.keys(englishMessages).sort());
 assert.ok(Object.values(englishMessages).every((value) => typeof value === 'string' && value.trim()));
 assert.ok(Object.values(portugueseMessages).every((value) => typeof value === 'string' && value.trim()));
-assert.equal(englishMessages.menu_bar_shows_hint, "Chart and Logos show every provider's starred metrics. Quattro shows the selected provider's highest usage.");
-assert.equal(portugueseMessages.menu_bar_shows_hint, "Gráfico e Logotipos mostram as métricas marcadas de todos os provedores. Quattro mostra o maior uso do provedor selecionado.");
+assert.equal(englishMessages.menu_bar_shows_hint, "App Icon shows the app's gauge. Chart and Logos show every provider's starred metrics. Quattro shows the selected provider's highest usage.");
+assert.equal(portugueseMessages.menu_bar_shows_hint, "Ícone do app mostra o medidor do aplicativo. Gráfico e Logotipos mostram as métricas marcadas de todos os provedores. Quattro mostra o maior uso do provedor selecionado.");
 for (const key of ['focused_provider', 'highest_consumption', 'usage_window']) {
   assert.equal(Object.hasOwn(englishMessages, key), false);
   assert.equal(Object.hasOwn(portugueseMessages, key), false);
@@ -196,6 +223,8 @@ assert.equal(parseHostPayload({ menu_bar_look: 'sparkles' }).menuBarLook, 'chart
 assert.equal(parseHostPayload({}).menuBarLook, 'chart');
 assert.equal(emptyPayload('').menuBarLook, 'chart');
 assert.equal(parseHostPayload({ menu_bar_look: 'logos' }).menuBarLook, 'logos');
+// Mutation captured: treating icon as unknown resets the host-selected mode to Chart.
+assert.equal(parseHostPayload({ menu_bar_look: 'icon' }).menuBarLook, 'icon');
 assert.equal(parseHostPayload({ menu_bar_look: 'quattro' }).menuBarLook, 'quattro');
 // The host only reports `quattro`; the 1.32.0 spelling is read on the Rust side, so `name` is unknown here.
 assert.equal(parseHostPayload({ menu_bar_look: 'name' }).menuBarLook, 'chart');
@@ -255,7 +284,7 @@ assert.equal(updateMessage({ state: 'available', installable: true }, 'pt-BR'), 
 assert.equal(updateMessage({ state: 'downloading' }, 'pt-BR'), 'Baixando a nova versão…');
 assert.equal(updateMessage({ state: 'downloading' }), 'Downloading the new version…');
 // A diagnosis that is only a path cleans to nothing: the fallback hint is translated too.
-assert.equal(explainError('/Users/someone/.config/x', 'zai', 'pt-BR').hint, 'Abra o TUI para ver detalhes.');
+assert.equal(explainError('/Users/someone/.config/x', 'zai', 'pt-BR').hint, 'Nenhum detalhe foi informado.');
 
 const bad = parseHostPayload('{');
 assert.equal(bad.hostError.includes('valid JSON'), true);
@@ -325,7 +354,7 @@ assert.equal(nextUpdateLabel({ nextRefreshAt: 0 }, 1), 'Updating…');
 
 assert.equal(
   friendlyError('Zai: no API key. Either set an API key in a valid environment variable or set `api_key` under [zai] in C:\\Users\\dj4lm\\AppData\\Roaming\\ai-usagebar\\config\\config.toml.'),
-  'No API key. Open TUI → Settings to add one.',
+  'No API key. Add one to start tracking usage.',
 );
 assert.equal(
   friendlyError('HTTP 429: Rate limited. Please try again later.'),
@@ -498,22 +527,26 @@ const three = [
   { id: 'openai', title: 'Codex' },
   { id: 'cursor', title: 'Cursor' },
 ];
+assert.deepEqual(orderedCards(three, { cardOrder: ['cursor'] }).map((c) => c.id), ['cursor', 'anthropic', 'openai']);
+
+// A layout saved with the removed `hidden` key still loads: the key is ignored
+// and a once-hidden card shows again.
 assert.deepEqual(
   applyCardLayout(three, { cardOrder: ['cursor', 'anthropic'], hidden: { openai: true }, collapsed: {}, hideExtras: false }).map((c) => c.id),
-  ['cursor', 'anthropic'],
+  ['cursor', 'anthropic', 'openai'],
 );
 assert.deepEqual(moveCardBefore(['a', 'b', 'c'], 'c', 'a'), ['c', 'a', 'b']);
 assert.deepEqual(moveCardBefore(['a', 'b', 'c'], 'a', null), ['b', 'c', 'a']);
 assert.deepEqual(nudgeCard(['a', 'b', 'c'], 'b', -1), ['b', 'a', 'c']);
-assert.deepEqual(orderedCards(three, { cardOrder: ['cursor'] }).map((c) => c.id), ['cursor', 'anthropic', 'openai']);
 
 const store = memoryStorage();
 saveLayout(store, { cardOrder: ['cursor', 'openai'], hidden: { openai: true }, collapsed: { cursor: true }, hideExtras: true });
 const loaded = loadLayout(store);
 assert.equal(loaded.hideExtras, true);
-assert.equal(loaded.hidden.openai, true);
+assert.equal(loaded.hidden, undefined, 'hidden is no longer a layout field');
 assert.equal(loaded.collapsed.cursor, true);
 assert.deepEqual(loaded.cardOrder, ['cursor', 'openai']);
+assert.ok(!store.getItem(LAYOUT_KEY).includes('"hidden"'), 'the old key drops on the next save');
 const synced = syncLayout(loaded, ['anthropic', 'openai', 'cursor']);
 assert.deepEqual(synced.cardOrder, ['cursor', 'openai', 'anthropic']);
 assert.ok(store.getItem(LAYOUT_KEY).includes('cursor'));
@@ -699,6 +732,41 @@ assert.equal(resetAlternate(sameDayRow, 'exact', resetNow, utc), 'Resets in 6h 3
 assert.equal(resetAlternate(noStampRow, 'countdown', resetNow, utc), '');
 assert.equal(resetAlternate(badStampRow, 'exact', resetNow, utc), '');
 
+// A refilling window (Synthetic's weekly credits) gets `regen` back at its
+// instant instead of resetting: the countdown, the exact time and the hover say so.
+{
+  const refillRow = { ...sameDayRow, regen: '2%' };
+  assert.equal(resetText(refillRow, 'countdown', resetNow, utc), 'Regenerates 2% in 6h 38m');
+  assert.equal(resetText(refillRow, 'exact', resetNow, utc), 'Regenerates 2% today at 6:38 PM');
+  assert.equal(resetAlternate(refillRow, 'countdown', resetNow, utc), 'Regenerates 2% today at 6:38 PM');
+  assert.equal(resetAlternate(refillRow, 'exact', resetNow, utc), 'Regenerates 2% in 6h 38m');
+  assert.equal(resetText(refillRow, 'countdown', resetNow, { ...utc, locale: 'pt-BR' }), 'Regenera 2% em 6h 38m');
+  assert.equal(resetText(refillRow, 'countdown', resetNow, { ...utc, locale: 'ko' }), '6h 38m 후 2% 재생성');
+  assert.equal(resetText(refillRow, 'countdown', resetNow, { ...utc, locale: 'es' }), 'Regenera 2% en 6h 38m');
+
+  // The report's `regen` survives the projection onto the row.
+  const synthetic = parseHostPayload({
+    entries: [{
+      id: 'synthetic',
+      display_name: 'Synthetic',
+      sections: [{
+        type: 'metric',
+        label: 'Weekly credits',
+        percent: 30,
+        value: '30%',
+        detail: 'Regenerates 2% in 6h 38m',
+        severity: 'low',
+        reset_at: '2026-09-04T18:38:00Z',
+        regen: '2%',
+      }],
+    }],
+  });
+  const [row] = projectCards(synthetic, resetNow)[0].rows;
+  assert.equal(row.regen, '2%');
+  assert.equal(row.reset, 'Regenerates 2% in 6h 38m');
+  assert.equal(resetText(row, 'countdown', resetNow, utc), 'Regenerates 2% in 6h 38m');
+}
+
 // --- timeFormat: 12h / 24h override rides through resetText and resetAlternate --
 
 {
@@ -848,6 +916,7 @@ assert.equal(resetAlternate(badStampRow, 'exact', resetNow, utc), '');
   assert.equal(parseHostPayload({ refresh_minutes: 10 }).refreshMinutes, 10);
   assert.equal(parseHostPayload({ refresh_minutes: 1 }).refreshMinutes, 1);
   assert.equal(parseHostPayload({ refresh_minutes: 7 }).refreshMinutes, 5);
+  assert.equal(parseHostPayload({ refresh_minutes: 60 }).refreshMinutes, 60);
   assert.equal(parseHostPayload({ refresh_minutes: '10' }).refreshMinutes, 10);
   assert.equal(parseHostPayload({ refresh_minutes: 'often' }).refreshMinutes, 5);
   assert.equal(parseHostPayload({}).refreshMinutes, 5);
@@ -1198,42 +1267,33 @@ assert.equal(quotaAlternate({ kind: 'metric', leftPercent: 0, usedPercent: 100 }
 assert.equal(quotaAlternate({ kind: 'text', label: 'Balance', value: '$1' }, 'left'), '');
 assert.equal(quotaAlternate(null, 'left'), '');
 
-// --- first launch: lacksCredentials / seedLayout / hintPending ---------------
+// --- first launch: seedLayout / hintPending ---------------------------------
 
 {
-  // ARRANGE: two providers with keys, two without, one with an expired login
-  const keyed = { id: 'anthropic', error: '' };
-  const expired = { id: 'openai', error: 'HTTP 401: authentication rejected' };
-  const zai = { id: 'zai', error: 'no API key configured for zai' };
-  const openrouter = { id: 'openrouter', error: 'No API key' };
-  const entries = [keyed, expired, zai, openrouter];
+  // ARRANGE: providers with and without credentials on this machine
+  const entries = [
+    { id: 'anthropic', error: '' },
+    { id: 'openai', error: 'HTTP 401: authentication rejected' },
+    { id: 'zai', error: 'no API key configured for zai' },
+    { id: 'openrouter', error: 'No API key' },
+  ];
 
   // ACT
   const seeded = seedLayout(emptyLayout(), entries);
 
-  // ASSERT: only the "No API key" providers start hidden, once
-  assert.equal(lacksCredentials(zai), true);
-  assert.equal(lacksCredentials(expired), false);
-  assert.equal(lacksCredentials(keyed), false);
-  assert.equal(lacksCredentials(null), false);
-  assert.deepEqual(seeded.hidden, { zai: true, openrouter: true });
+  // ASSERT: first launch only marks the layout seeded — nothing is hidden any
+  // more, since the list's switch is the provider's `enabled` in config.toml
   assert.equal(seeded.seeded, true);
+  assert.equal(seeded.hidden, undefined);
   assert.equal(hintPending(seeded), true);
 
-  // ACT: the user re-enables Z.AI later; a second payload must not hide it again
-  const reenabled = { ...seeded, hidden: { openrouter: true } };
-  assert.deepEqual(seedLayout(reenabled, entries).hidden, { openrouter: true });
-  assert.strictEqual(seedLayout(reenabled, entries), reenabled);
+  // ACT: a second payload is not a first launch
+  assert.strictEqual(seedLayout(seeded, entries), seeded);
 
   // ASSERT: no entries (host error) is not a first launch
   assert.equal(seedLayout(emptyLayout(), []).seeded, false);
   assert.equal(seedLayout(emptyLayout(), null).seeded, false);
   assert.equal(hintPending(emptyLayout()), false);
-
-  // ASSERT: when every provider lacks a credential the starter set stays visible
-  const allMissing = seedLayout(emptyLayout(), [zai, openrouter]);
-  assert.deepEqual(allMissing.hidden, {});
-  assert.equal(allMissing.seeded, true);
 
   // ASSERT: the flags survive storage and syncLayout; the hint can be dismissed
   const store = memoryStorage();
@@ -1245,7 +1305,6 @@ assert.equal(quotaAlternate(null, 'left'), '');
   const synced = syncLayout(loaded, ['anthropic', 'openai', 'zai', 'openrouter']);
   assert.equal(synced.seeded, true);
   assert.equal(synced.hintDismissed, true);
-  assert.deepEqual(synced.hidden, { zai: true, openrouter: true });
   assert.equal(emptyLayout().seeded, false);
   assert.equal(emptyLayout().hintDismissed, false);
   assert.equal(normalizeLayout({ seeded: 'yes', hintDismissed: 1 }).seeded, false);
@@ -1254,11 +1313,10 @@ assert.equal(quotaAlternate(null, 'left'), '');
 // --- absorbPayload ------------------------------------------------------------
 
 {
-  // ARRANGE: a remembered layout with hidden providers and a custom order
+  // ARRANGE: a remembered layout with a custom order
   const remembered = {
     ...emptyLayout(),
     cardOrder: ['openai', 'anthropic'],
-    hidden: { zai: true },
     seeded: true,
     hintDismissed: true,
   };
@@ -1267,18 +1325,165 @@ assert.equal(quotaAlternate(null, 'left'), '');
   assert.strictEqual(absorbPayload(remembered, []), remembered);
   assert.strictEqual(absorbPayload(remembered, null), remembered);
 
-  // ACT + ASSERT: a real payload syncs (keeps hidden for known ids, appends new ids)
+  // ACT + ASSERT: a real payload syncs (appends new ids after the remembered order)
   const entries = [{ id: 'anthropic', error: '' }, { id: 'openai', error: '' }, { id: 'zai', error: 'no API key' }, { id: 'cursor', error: '' }];
   const synced = absorbPayload(remembered, entries);
   assert.deepEqual(synced.cardOrder, ['openai', 'anthropic', 'zai', 'cursor']);
-  assert.deepEqual(synced.hidden, { zai: true });
   assert.equal(synced.seeded, true);
 
-  // ACT + ASSERT: a fresh layout gets seeded by its first real payload
+  // ACT + ASSERT: a fresh layout gets seeded by its first real payload, hiding nothing
   const fresh = absorbPayload(emptyLayout(), entries);
-  assert.deepEqual(fresh.hidden, { zai: true });
   assert.equal(fresh.seeded, true);
+  assert.equal(fresh.hidden, undefined);
   assert.equal(hintPending(fresh), true);
+}
+
+// --- the single provider list: providerListRows / reorderProviderRows --------
+
+{
+  // ARRANGE: a catalog with three on (one without a card on screen) and two
+  // off (one with a card still on screen), plus a custom provider only the
+  // report knows
+  const providers = [
+    { id: 'anthropic', name: 'Claude', enabled: true, configured: true, env: '', signIn: '', action: '', addAccounts: ['code', 'desktop'] },
+    { id: 'openai', name: 'Codex', enabled: true, configured: false, env: '', signIn: 'Run `codex login`', action: 'terminal', addAccounts: ['codex'] },
+    { id: 'supergrok', name: 'SuperGrok', enabled: true, configured: false, env: '', signIn: '', action: 'terminal', addAccounts: [] },
+    { id: 'zai', name: 'Z.AI', enabled: false, configured: false, env: '', signIn: '', action: 'settings', addAccounts: [] },
+    { id: 'moonshot', name: 'Moonshot', enabled: false, configured: true, env: '', signIn: '', action: 'settings', addAccounts: [] },
+  ];
+  const cards = [
+    { id: 'zai', title: 'Z.AI', icon: 'zai', rows: [{ kind: 'metric' }] },
+    { id: 'anthropic', title: 'Claude', icon: 'anthropic', rows: [{ kind: 'metric' }, { kind: 'text' }] },
+    { id: 'openai@work', title: 'Work', icon: 'openai', rows: [{ kind: 'metric' }, { kind: 'metric' }] },
+    { id: 'openai@home', title: 'Home', icon: 'openai', rows: [{ kind: 'metric' }] },
+    { id: 'my-llm', title: 'My LLM', icon: 'ollama', rows: [{ kind: 'metric' }] },
+  ];
+  const layout = { ...emptyLayout(), cardOrder: ['zai', 'anthropic', 'openai@work', 'openai@home', 'my-llm'] };
+
+  // ACT
+  const { enabled, disabled } = providerListRows(providers, cards, layout);
+
+  // ASSERT: the enabled block follows the dashboard's first-card order — the
+  // switched-off provider's card takes no row — and an enabled provider with no
+  // card on screen trails the block, in the catalog's order
+  assert.deepEqual(enabled.map((row) => row.id), ['anthropic', 'openai', 'my-llm', 'supergrok']);
+  assert.deepEqual(disabled.map((row) => row.id), ['zai', 'moonshot']);
+
+  // ASSERT: accounts group under their provider, keeping the dashboard's order
+  const codex = enabled.find((row) => row.id === 'openai');
+  assert.deepEqual(codex.cards.map((card) => card.id), ['openai@work', 'openai@home']);
+  assert.deepEqual(codex.cards.map((card) => card.metrics), [2, 1]);
+  assert.equal(codex.state, 'needs');
+  assert.equal(codex.signIn, 'Run `codex login`');
+  assert.deepEqual(codex.addAccounts, ['codex']);
+
+  // ASSERT: a catalog-less card is a custom row: on, no switch, its own place
+  const custom = enabled.find((row) => row.id === 'my-llm');
+  assert.equal(custom.switchable, false);
+  assert.equal(custom.enabled, true);
+  assert.equal(custom.state, '');
+  assert.equal(custom.name, 'My LLM');
+  assert.equal(custom.icon, 'ollama');
+  assert.deepEqual(custom.cards, [{ id: 'my-llm', title: 'My LLM', metrics: 1 }]);
+
+  // ASSERT: the disabled block reads the catalog's status and keeps its card
+  const offZai = disabled.find((row) => row.id === 'zai');
+  assert.equal(offZai.state, 'off');
+  assert.equal(offZai.switchable, true);
+  assert.deepEqual(offZai.cards.map((card) => card.id), ['zai']);
+  const offMoonshot = disabled.find((row) => row.id === 'moonshot');
+  assert.equal(offMoonshot.state, 'off-ready');
+  assert.deepEqual(offMoonshot.cards, []);
+
+  // ACT: drag My LLM to the top; its provider's cards move together
+  const moved = reorderProviderRows(layout.cardOrder, enabled, ['my-llm', 'anthropic', 'openai', 'supergrok']);
+
+  // ASSERT: Codex's two accounts stay in their own order, and the switched-off
+  // card waits after them
+  assert.deepEqual(moved, ['my-llm', 'anthropic', 'openai@work', 'openai@home', 'zai']);
+
+  // ASSERT: providerOf links an account card to its provider
+  assert.equal(providerOf('anthropic@work'), 'anthropic');
+  assert.equal(providerOf('anthropic'), 'anthropic');
+}
+
+// --- provider accounts: grouping, tabs, labels, and the "+" decision -------
+
+{
+  // ARRANGE: dashboard order with one provider's two accounts, a plain card, and a
+  // custom provider's card the catalog doesn't know
+  const cards = [
+    { id: 'zai', title: 'Z.AI', icon: 'zai', rows: [{ kind: 'metric' }] },
+    { id: 'anthropic', title: 'Claude', icon: 'anthropic', rows: [{ kind: 'metric' }, { kind: 'metric' }] },
+    { id: 'anthropic@work', title: 'Claude · work', icon: 'anthropic', rows: [{ kind: 'metric' }, { kind: 'metric' }, { kind: 'metric' }] },
+    { id: 'my-llm', title: 'My LLM', icon: 'ollama', rows: [{ kind: 'metric' }] },
+  ];
+  const layout = emptyLayout();
+
+  // ACT: group the dashboard's cards by provider
+  const groups = providerGroups(cards);
+
+  // ASSERT: groups follow the first-card order; several accounts land in one
+  // group; a catalog-less card is a group of one
+  assert.deepEqual(groups.map((group) => group.id), ['zai', 'anthropic', 'my-llm']);
+  assert.deepEqual(groups[1].cards.map((card) => card.id), ['anthropic', 'anthropic@work']);
+  assert.deepEqual(groups[2].cards.map((card) => card.id), ['my-llm']);
+
+  // ACT: the remembered account tab, then the fallbacks
+  // ASSERT: a remembered tab that is one of the provider's cards wins, over primary
+  assert.equal(activeAccountTab(groups[1].cards, { ...layout, accountTab: { anthropic: 'anthropic@work' } }, 'anthropic', 'anthropic'), 'anthropic@work');
+  // ASSERT: with no value, the payload's primary is worth when it is one of the group's cards
+  assert.equal(activeAccountTab(groups[1].cards, layout, 'anthropic', 'anthropic@work'), 'anthropic@work');
+  // ASSERT: a remembered tab no card holds yields to a valid primary
+  assert.equal(activeAccountTab(groups[1].cards, { ...layout, accountTab: { anthropic: 'anthropic@gone' } }, 'anthropic', 'anthropic@work'), 'anthropic@work');
+  // ASSERT: a primary of another provider (or none) doesn't count; the first card is worth
+  assert.equal(activeAccountTab(groups[1].cards, layout, 'anthropic', 'zai'), 'anthropic');
+  assert.equal(activeAccountTab(groups[1].cards, layout, 'anthropic'), 'anthropic');
+  assert.equal(activeAccountTab(groups[1].cards, { ...layout, accountTab: { anthropic: 'anthropic@gone' } }, 'anthropic', 'zai'), 'anthropic');
+  // ASSERT: a group of one always lands on its card, primary or not
+  assert.equal(activeAccountTab(groups[0].cards, layout, 'zai', 'anthropic'), 'zai');
+
+  // ACT: the tab labels — "Claude · work" loses its prefix, "anthropic@home" uses its
+  // suffix, and the plain account reads the catalog's word
+  // ASSERT
+  assert.equal(accountLabel({ id: 'anthropic@work', title: 'Claude · work' }, 'Claude'), 'work');
+  assert.equal(accountLabel({ id: 'anthropic@home', title: 'Claude' }, 'Claude'), 'home');
+  assert.equal(accountLabel({ id: 'anthropic', title: 'Claude' }, 'Claude'), 'Default');
+  assert.equal(accountLabel({ id: 'anthropic', title: 'Claude' }, 'Claude', 'pt-BR'), 'Padrão');
+
+  // ACT: the multi-account subtitle joins the labels and the provider's total count
+  // ASSERT
+  const rowCards = [
+    { id: 'anthropic', title: 'Claude', metrics: 2 },
+    { id: 'anthropic@work', title: 'Claude · work', metrics: 3 },
+  ];
+  assert.equal(multiAccountSubtitle(rowCards, 5, 'Claude', 'en'), 'Default, work · 5 metrics');
+  assert.equal(metricsCountText(1, 'en'), '1 metric');
+  assert.equal(metricsCountText(5, 'en'), '5 metrics');
+  assert.equal(metricsCountText(5, 'pt-BR'), '5 métricas');
+
+  // ACT: the "+" decision — nothing when off or kindless, the kind's action when there
+  // is one, a menu when there are several
+  // ASSERT
+  assert.equal(addAccountDecision({ enabled: false, addAccounts: ['code'] }), null);
+  assert.equal(addAccountDecision({ enabled: true, addAccounts: [] }), null);
+  assert.deepEqual(addAccountDecision({ enabled: true, addAccounts: ['codex'] }), { kind: 'direct', value: 'codex' });
+  assert.deepEqual(addAccountDecision({ enabled: true, addAccounts: ['code', 'desktop'] }), { kind: 'menu', value: ['code', 'desktop'] });
+
+  // ACT: dragging the Claude group to the top expands it to its accounts in their own
+  // order; groups the drag order left out still keep their cards
+  // ASSERT
+  assert.deepEqual(expandGroupOrder(groups, ['anthropic', 'zai', 'my-llm']), ['anthropic', 'anthropic@work', 'zai', 'my-llm']);
+  assert.deepEqual(expandGroupOrder(groups, ['zai']), ['zai', 'anthropic', 'anthropic@work', 'my-llm']);
+
+  // ACT: the layout round-trip remembers the tab per provider
+  const storage = memoryStorage();
+  saveLayout(storage, { ...layout, accountTab: { anthropic: 'anthropic@work' } });
+  const loaded = loadLayout(storage);
+  assert.deepEqual(loaded.accountTab, { anthropic: 'anthropic@work' });
+  // ASSERT: syncLayout keeps it, and a fresh layout starts without tabs
+  assert.deepEqual(syncLayout(loaded, cards.map((card) => card.id)).accountTab, { anthropic: 'anthropic@work' });
+  assert.deepEqual(normalizeLayout({}).accountTab, {});
 }
 
 // --- grouped metrics (Antigravity Session / Weekly) and duplicate labels -----
@@ -1315,6 +1520,24 @@ assert.equal(quotaAlternate(null, 'left'), '');
   assert.equal(new Set(card.rows.map(rowKey)).size, card.rows.length);
   assert.equal(visibleRowsFor(card, { collapsed: false }).length, 4);
   assert.equal(metricCount(card), 4);
+  assert.ok(card.rows.every((r) => r.modelPool === false), 'no row claims to be a model pool');
+
+  // ASSERT: the report's `model_pool` reaches the row it marks, and only that one (#453)
+  const pooled = parseHostPayload({
+    entries: [{
+      id: 'antigravity',
+      display_name: 'Antigravity',
+      sections: [
+        { type: 'text', label: 'Weekly', value: '' },
+        { type: 'metric', label: 'Gemini', percent: 39, severity: 'low' },
+        { type: 'metric', label: 'Gemini 4 Argon', percent: 100, severity: 'critical', model_pool: true },
+      ],
+    }],
+  });
+  assert.deepEqual(
+    projectCards(pooled, 0)[0].rows.map((r) => [r.label, r.modelPool]),
+    [['Gemini (Weekly)', false], ['Gemini 4 Argon (Weekly)', true]],
+  );
 
   // ASSERT: a vendor repeating a label outright still yields distinct rows
   const repeated = parseHostPayload({
@@ -1412,8 +1635,19 @@ assert.equal(quotaAlternate(null, 'left'), '');
   assert.equal(cards[0].warning, null);
 
   // ASSERT: actions by error class
-  assert.deepEqual(explainError('no API key', 'zai').action, { cmd: 'open-tui', label: 'Open TUI' });
-  assert.deepEqual(explainError('no vendors enabled').action, { cmd: 'open-tui', label: 'Open TUI' });
+  // A missing key opens the key dialog for that provider, and no provider on
+  // opens Customize: both are fixed inside the popover, never in the TUI.
+  assert.deepEqual(explainError('no API key', 'zai').action, { cmd: 'add-key', id: 'zai', label: 'Add key' });
+  assert.deepEqual(explainError('no API key', 'zai@work').action, { cmd: 'add-key', id: 'zai', label: 'Add key' });
+  assert.deepEqual(explainError('no API key', { id: 'openrouter' }).action, { cmd: 'add-key', id: 'openrouter', label: 'Add key' });
+  assert.deepEqual(explainError('no API key').action, { cmd: 'customize', label: 'Customize' });
+  assert.deepEqual(explainError('no vendors enabled').action, { cmd: 'customize', label: 'Customize' });
+  assert.equal(explainError('no vendors enabled').hint, 'Turn one on in Customize.');
+  // A local read failure shows its own diagnosis and offers Refresh.
+  const ioFailure = explainError('io error: permission denied reading ~/.codex/sessions', 'openai');
+  assert.deepEqual(ioFailure.action, { cmd: 'refresh', label: 'Refresh' });
+  assert.match(ioFailure.hint, /permission denied/);
+  assert.doesNotMatch(JSON.stringify([explainError('no API key', 'zai'), explainError('no vendors enabled'), ioFailure]), /TUI/);
   assert.deepEqual(explainError('HTTP 503: down', 'zai').action, { cmd: 'refresh', label: 'Refresh' });
   assert.deepEqual(explainError('network transport error: connection refused', 'openai').action, { cmd: 'refresh', label: 'Refresh' });
   assert.equal(explainError('HTTP 401: authentication rejected', 'openai').action, undefined);
@@ -1596,6 +1830,41 @@ assert.equal(resolvedTheme('system'), 'light');
 }
 
 {
+  // 1.41.0 put Anthropic API's changing coverage date in persisted row keys.
+  // Loading that layout migrates every variant to the stable spend row,
+  // deduplicates it, and frees the second star slot.
+  const restored = normalizeLayout({
+    stars: {
+      anthropic_api: [
+        'metric:Month to date (through Oct 17)',
+        'metric:Month to date (through Oct 18)',
+      ],
+      'anthropic_api@work': ['text:Completed daily buckets this month'],
+    },
+    rows: {
+      anthropic_api: {
+        always: ['metric:Month to date (through Oct 17)', 'metric:Spend (mo)'],
+        demand: ['text:Completed daily buckets this month', 'text:Other'],
+        off: {
+          'metric:Month to date (through Oct 18)': true,
+          'text:Completed daily buckets this month': true,
+        },
+      },
+    },
+  });
+  assert.deepEqual(restored.stars.anthropic_api, ['metric:Spend (mo)']);
+  assert.deepEqual(restored.stars['anthropic_api@work'], ['text:Spend (mo)']);
+  assert.deepEqual(restored.rows.anthropic_api, {
+    always: ['metric:Spend (mo)'],
+    demand: ['text:Spend (mo)', 'text:Other'],
+    off: { 'metric:Spend (mo)': true, 'text:Spend (mo)': true },
+  });
+  const added = toggleStar(restored.stars, 'anthropic_api', 'metric:Requests');
+  assert.equal(added.error, '');
+  assert.deepEqual(added.stars.anthropic_api, ['metric:Spend (mo)', 'metric:Requests']);
+}
+
+{
   const payload = parseHostPayload({
     entries: [{
       id: 'anthropic',
@@ -1631,6 +1900,170 @@ assert.equal(resolvedTheme('system'), 'light');
   // The menu bar follows the Used/Left reading, so the strip message carries it.
   assert.equal(stripCommand({ ...seeded, showAs: 'used' }, cards).show_as, 'used');
   assert.equal(stripCommand({ ...seeded, showAs: 'sideways' }, cards).show_as, 'left');
+}
+
+// --- stars for providers that arrive late, and stars taken off on purpose (#437) --
+
+{
+  // ARRANGE: Claude was starred on first launch; Antigravity was enabled later
+  const payload = parseHostPayload({
+    entries: [
+      { id: 'anthropic', display_name: 'Claude', sections: [
+        { type: 'metric', label: 'Session', percent: 41 },
+        { type: 'metric', label: 'Weekly', percent: 19 },
+      ] },
+      { id: 'antigravity', display_name: 'Antigravity', sections: [
+        { type: 'text', label: 'Session', value: '' },
+        { type: 'metric', label: 'Gemini', percent: 0 },
+        { type: 'text', label: 'Weekly', value: '' },
+        { type: 'metric', label: 'Gemini', percent: 95 },
+      ] },
+    ],
+  });
+  const cards = projectCards(payload, 0);
+  const remembered = { ...emptyLayout(), stars: { anthropic: ['metric:Weekly'] } };
+
+  // ACT
+  const seeded = seedStars(remembered, cards);
+
+  // ASSERT: the newcomer gets its defaults and reaches the strip; the remembered
+  // choice is untouched, and with nothing left to seed the same layout comes back
+  assert.deepEqual(seeded.stars.anthropic, ['metric:Weekly']);
+  assert.deepEqual(seeded.stars.antigravity, ['metric:Gemini (Session)', 'metric:Gemini (Weekly)']);
+  assert.deepEqual(stripCommand(seeded, cards).stars.antigravity, ['metric:Gemini (Session)', 'metric:Gemini (Weekly)']);
+  assert.equal(seedStars(seeded, cards), seeded);
+}
+
+{
+  // ARRANGE: two starred providers
+  const payload = parseHostPayload({
+    entries: [
+      { id: 'anthropic', display_name: 'Claude', sections: [{ type: 'metric', label: 'Weekly', percent: 19 }] },
+      { id: 'openai', display_name: 'Codex', sections: [{ type: 'metric', label: 'Codex weekly', percent: 2 }] },
+    ],
+  });
+  const cards = projectCards(payload, 0);
+  const start = seedStars(emptyLayout(), cards);
+  assert.deepEqual(start.stars.openai, ['metric:Codex weekly']);
+
+  // ACT: the user unstars Codex's only metric
+  const off = { ...start, stars: toggleStar(start.stars, 'openai', 'metric:Codex weekly').stars };
+
+  // ASSERT: an explicit empty list that seeding, storage, sync and the strip respect
+  assert.deepEqual(off.stars.openai, []);
+  assert.equal(seedStars(off, cards), off);
+  const restored = normalizeLayout(JSON.parse(JSON.stringify(off)));
+  assert.deepEqual(restored.stars.openai, []);
+  assert.equal(seedStars(restored, cards), restored);
+  assert.deepEqual(syncLayout(restored, ['anthropic', 'openai']).stars.openai, []);
+  assert.deepEqual(stripCommand(off, cards).stars, { anthropic: ['metric:Weekly'] });
+}
+
+{
+  // ARRANGE: Antigravity's entry id switches as agy statusline sessions come and go
+  const entriesFor = (id) => [
+    { id: 'anthropic', display_name: 'Claude', sections: [{ type: 'metric', label: 'Weekly', percent: 19 }] },
+    { id, display_name: 'Antigravity', sections: [{ type: 'metric', label: 'Gemini', percent: 95 }] },
+  ];
+  const step = (layout, id) => {
+    const payload = parseHostPayload({ entries: entriesFor(id) });
+    return seedStars(absorbPayload(layout, payload.entries), projectCards(payload, 0));
+  };
+
+  // ACT: the plain id, then a per-account one, then the plain id again
+  const first = step(emptyLayout(), 'antigravity');
+  const perAccount = step(first, 'antigravity@abc123');
+  const back = step(perAccount, 'antigravity');
+
+  // ASSERT: whichever id the report uses is starred, so the strip never drops it
+  assert.deepEqual(first.stars.antigravity, ['metric:Gemini']);
+  assert.deepEqual(perAccount.stars['antigravity@abc123'], ['metric:Gemini']);
+  assert.deepEqual(back.stars.antigravity, ['metric:Gemini']);
+}
+
+{
+  // ARRANGE: the user's own place, stars, rows and flags for Antigravity's
+  // per-account entry, among other providers (#452)
+  const mine = {
+    ...emptyLayout(),
+    seeded: true,
+    cardOrder: ['anthropic', 'supergrok', 'antigravity@abc123', 'zai'],
+    collapsed: { 'antigravity@abc123': true },
+    rows: { 'antigravity@abc123': { always: ['metric:Gemini (Weekly)'], demand: [], off: {} } },
+    stars: {
+      anthropic: ['metric:Session (5h)'],
+      'antigravity@abc123': ['metric:Gemini (Session)', 'metric:Gemini (Weekly)'],
+    },
+  };
+
+  // ACT: a reboot leaves no agy session, so the plain id comes back; then one starts
+  const plain = syncLayout(mine, ['anthropic', 'supergrok', 'antigravity', 'zai']);
+  const again = syncLayout(plain, ['anthropic', 'supergrok', 'antigravity@abc123', 'zai']);
+
+  // ASSERT: the plain id takes the card's place and settings over, and hands them back
+  assert.deepEqual(plain.cardOrder, ['anthropic', 'supergrok', 'antigravity', 'zai']);
+  assert.deepEqual(plain.stars.antigravity, ['metric:Gemini (Session)', 'metric:Gemini (Weekly)']);
+  assert.equal(plain.collapsed.antigravity, true);
+  assert.deepEqual(plain.rows.antigravity, mine.rows['antigravity@abc123']);
+  assert.equal(plain.stars['antigravity@abc123'], undefined, 'moved, not copied');
+  assert.deepEqual(again.cardOrder, mine.cardOrder);
+  assert.deepEqual(again.stars, mine.stars);
+  assert.deepEqual(again.collapsed, mine.collapsed);
+  assert.deepEqual(again.rows, mine.rows);
+}
+
+{
+  // ARRANGE: a provider missing from one payload — switched off, or failing to list
+  const mine = {
+    ...emptyLayout(),
+    cardOrder: ['openai', 'anthropic', 'zai'],
+    stars: { openai: ['metric:Codex weekly'], zai: [] },
+  };
+
+  // ACT
+  const without = syncLayout(mine, ['anthropic', 'openai']);
+  const back = syncLayout(without, ['anthropic', 'openai', 'zai']);
+
+  // ASSERT: its place, stars (even "off the menu bar") and flags wait for it
+  assert.deepEqual(without.cardOrder, ['openai', 'anthropic', 'zai']);
+  assert.deepEqual(back.cardOrder, ['openai', 'anthropic', 'zai']);
+  assert.deepEqual(back.stars.zai, []);
+}
+
+{
+  // ARRANGE: two accounts on screen at once, each with its own settings
+  const mine = {
+    ...emptyLayout(),
+    cardOrder: ['antigravity@a', 'anthropic', 'antigravity@b'],
+    stars: { 'antigravity@a': ['metric:Gemini (Session)'], 'antigravity@b': ['metric:Gemini (Weekly)'] },
+  };
+
+  // ACT: both present, then a third account appears beside them
+  const both = syncLayout(mine, ['antigravity@a', 'anthropic', 'antigravity@b', 'antigravity@c']);
+
+  // ASSERT: a present sibling is never taken over; the newcomer starts at the end
+  assert.deepEqual(both.cardOrder, ['antigravity@a', 'anthropic', 'antigravity@b', 'antigravity@c']);
+  assert.deepEqual(both.stars['antigravity@a'], ['metric:Gemini (Session)']);
+  assert.deepEqual(both.stars['antigravity@b'], ['metric:Gemini (Weekly)']);
+  assert.equal(both.stars['antigravity@c'], undefined);
+}
+
+{
+  // ARRANGE: two saved accounts are both absent when the provider's plain id appears
+  const mine = {
+    ...emptyLayout(),
+    cardOrder: ['antigravity@a', 'anthropic', 'antigravity@b'],
+    stars: { 'antigravity@a': ['metric:Gemini (Session)'], 'antigravity@b': ['metric:Gemini (Weekly)'] },
+  };
+
+  // ACT
+  const plain = syncLayout(mine, ['anthropic', 'antigravity']);
+
+  // ASSERT: there is no safe account to inherit from, so neither account's
+  // preferences are moved onto the provider-wide card.
+  assert.deepEqual(plain.cardOrder, ['antigravity@a', 'anthropic', 'antigravity@b', 'antigravity']);
+  assert.deepEqual(plain.stars, mine.stars);
+  assert.equal(plain.stars.antigravity, undefined);
 }
 
 {
@@ -1710,6 +2143,44 @@ assert.equal(resolvedTheme('system'), 'light');
   const prefs = defaultRowPrefs(card.rows);
   assert.ok(prefs.demand.indexOf('resetCredits:Rate Limit Resets') >= 0);
   assert.ok(prefs.always.indexOf('resetCredits:Rate Limit Resets') < 0);
+}
+
+{
+  // A stated zero (Codex) is a row reading "0 available", not a missing one,
+  // and its "Reset credits" text block becomes that row rather than a block.
+  const payload = parseHostPayload({
+    entries: [{
+      id: 'openai',
+      display_name: 'Codex',
+      reset_credits: { available: 0, credits: [] },
+      sections: [
+        { type: 'metric', label: 'Weekly', percent: 10, reset_at: '2026-10-01T00:00:00Z' },
+        { type: 'block', label: 'Reset credits', body: ['None available'] },
+      ],
+    }],
+  });
+  const [card] = projectCards(payload, 0);
+  assert.equal(card.resetCredits.available, 0);
+  const resets = card.rows.filter((row) => row.kind === 'resetCredits');
+  assert.equal(resets.length, 1);
+  assert.equal(resets[0].available, 0);
+  assert.equal(resets[0].credits.length, 0);
+  assert.ok(!card.rows.some((row) => row.kind !== 'resetCredits' && /reset credits/i.test(row.label || '')));
+}
+
+{
+  // Only an explicit finite number means the provider stated a reset-credit
+  // balance. Malformed or partial objects must not invent a zero balance.
+  for (const resetCredits of [{}, { available: '0' }, { available: null }, { available: Infinity }]) {
+    const payload = parseHostPayload({
+      entries: [{ id: 'openai', display_name: 'Codex', reset_credits: resetCredits, sections: [] }],
+    });
+    assert.equal(payload.entries[0].resetCredits, null);
+  }
+  const payload = parseHostPayload({
+    entries: [{ id: 'openai', display_name: 'Codex', reset_credits: { available: -2 }, sections: [] }],
+  });
+  assert.equal(payload.entries[0].resetCredits.available, 0);
 }
 
 {
@@ -1973,4 +2444,411 @@ console.log('ok');
   assert.equal(accountSwitchFor('anthropic@two', payload.accounts).preparing, true);
   assert.equal(accountSwitchFor('anthropic@one', payload.accounts).busy, true);
   assert.equal(accountSwitchFor('anthropic@one', payload.accounts).active, true);
+}
+
+// --- provider catalog (Settings → Providers) ---------------------------------
+{
+  const payload = parseHostPayload(JSON.stringify({
+    entries: [{ id: 'custom:mine', brand: 'opencode-go', display_name: 'Mine', sections: [] }],
+    providers_error: 'Could not write',
+    providers: [
+      { id: 'cursor', name: 'Cursor', enabled: false, configured: true, env: '', sign_in: 'Sign in to the Cursor app, then Refresh.', action: 'app', add_accounts: ['codex', 'bogus'] },
+      { id: 'zai', name: 'Z.AI', enabled: true, configured: false, env: 'ZAI_API_KEY', sign_in: 'Add an API key', action: 'settings' },
+      { id: 'kiro', name: 'Kiro', enabled: true, configured: true, action: 'rm -rf' },
+      { id: '', name: 'nameless' },
+      'junk',
+    ],
+  }));
+  assert.deepEqual(payload.providers.map((p) => p.id), ['cursor', 'zai', 'kiro']);
+  assert.equal(payload.providers[2].action, '', 'unknown actions are dropped');
+  assert.deepEqual(payload.providers[0].addAccounts, ['codex']);
+  assert.deepEqual(payload.providers[1].addAccounts, []);
+  assert.equal(payload.providersError, 'Could not write');
+  assert.deepEqual(payload.providers.map(providerState), ['off-ready', 'needs', 'ready']);
+  assert.equal(providerState({ enabled: false, configured: false }), 'off');
+  assert.deepEqual(parseHostPayload('{}').providers, []);
+  // A custom provider that declares a brand draws that brand's mark.
+  assert.equal(projectCards(payload, 0, 'en')[0].icon, 'opencode-go');
+}
+
+// --- capped text rows become meters --------------------------------------------
+{
+  const payload = parseHostPayload(JSON.stringify({ entries: [{ id: 'cursor', sections: [
+    { type: 'text', label: 'On-Demand', value: '$12.00 / $10.00', used_cents: 1200, limit_cents: 1000, percent: 120, severity: 'critical' },
+    { type: 'text', label: 'Plan', value: 'Pro' },
+  ] }] }));
+  const [meter, plain] = payload.entries[0].sections;
+  assert.equal(meter.type, 'metric');
+  assert.equal(meter.percent, 100);
+  assert.equal(meter.headline, 'value');
+  assert.equal(meter.value, '$12.00 / $10.00');
+  assert.equal(meter.severity, 'critical');
+  assert.equal(plain.type, 'text');
+}
+
+// --- stale cards know how old their payload is -------------------------------------
+{
+  const payload = parseHostPayload(JSON.stringify({ entries: [{ id: 'zai', stale: true, fetched_at: '2026-10-16T12:00:00Z', sections: [] }, { id: 'kiro', fetched_at: null, sections: [] }] }));
+  const [stale, fresh] = projectCards(payload, 0, 'en');
+  assert.equal(stale.fetchedAt, Date.parse('2026-10-16T12:00:00Z'));
+  assert.equal(fresh.fetchedAt, 0);
+}
+
+// --- card image export (copy one provider's card as a PNG) --------------------------
+{
+  // A 320 px card becomes a 960 px PNG: the fixed scale is part of the contract.
+  assert.equal(CARD_IMAGE_SCALE, 3);
+
+  // The SVG document: the SVG namespace on the root with the CSS-px dimensions, an
+  // opaque rounded background (the export's surface color, the card's radius), and the
+  // card HTML inside a foreignObject wrapped in the XHTML namespace — without it the
+  // data-URL SVG's XML re-parse drops the HTML semantics and the card renders blank.
+  // The card sits inset by the padding, so its edges never touch the image's.
+  const svg = buildCardSvg({ html: '<section data-card-id="anthropic"></section>', height: 180, padding: 12, radius: 10, surface: '#ffffff', width: 320 });
+  assert.match(svg, /^<svg xmlns="http:\/\/www\.w3\.org\/2000\/svg" width="344" height="204">/);
+  assert.match(svg, /<rect x="0" y="0" width="344" height="204" rx="10" fill="#ffffff"\/>/);
+  assert.ok(svg.includes('<foreignObject x="12" y="12" width="320" height="180">'));
+  assert.ok(svg.includes('xmlns="http://www.w3.org/1999/xhtml"'));
+  assert.ok(svg.includes('<section data-card-id="anthropic"></section>'));
+}
+
+{
+  // Nested <svg> icons are re-namespaced for the XML re-parse (they would inherit the
+  // XHTML namespace and vanish); an icon that already declares the SVG namespace keeps
+  // its single declaration.
+  const html = '<div><svg viewBox="0 0 24 24"></svg><svg xmlns="http://www.w3.org/2000/svg" width="10"></svg><svg width="12" aria-hidden="true"></svg></div>';
+  const out = namespacedCardHtml(html);
+  assert.match(out, /<svg xmlns="http:\/\/www\.w3\.org\/2000\/svg" viewBox="0 0 24 24">/);
+  assert.match(out, /<svg xmlns="http:\/\/www\.w3\.org\/2000\/svg" width="12" aria-hidden="true">/);
+  assert.ok(!out.includes('xmlns="http://www.w3.org/2000/svg" xmlns='));
+  assert.equal((out.match(/<svg/g) || []).length, 3);
+}
+
+{
+  // Only the PNG data-URL prefix comes off, and only off a PNG data URL.
+  assert.equal(stripPngDataUrlPrefix(`${PNG_DATA_URL_PREFIX}iVBORw0KGgo`), 'iVBORw0KGgo');
+  assert.throws(() => stripPngDataUrlPrefix('data:image/jpeg;base64,zzz'));
+  assert.throws(() => stripPngDataUrlPrefix('iVBORw0KGgo'));
+}
+
+{
+  // F1: the clone is XML-serialized into the SVG, never outerHTML'd. The HTML serializer
+  // writes U+00A0 as &nbsp; — an entity that does not exist in an XML document — and the
+  // SVG data URL then fails to load (a card whose name carries a non-breaking space could
+  // not be copied). The serializer is the injectable seam, so the pure pipeline
+  // (serializeCardHtml -> namespacedCardHtml -> buildCardSvg) runs here with
+  // XMLSerializer's documented output for a text with an nbsp, & and <.
+  const content = 'Alice\u00a0Example & Co <tag>';
+  const xmlSerialized = `<section xmlns="http://www.w3.org/1999/xhtml"><div class="card-surface">${content.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replace(/\u00a0/g, '&#160;')}</div></section>`;
+  const html = serializeCardHtml({ fake: 'clone' }, { serialize: () => xmlSerialized });
+  const svg = buildCardSvg({ html: namespacedCardHtml(html), height: 120, padding: 12, radius: 10, surface: '#ffffff', width: 320 });
+  assert.equal(svg.includes('&nbsp;'), false, 'no HTML-only &nbsp; entity may reach the SVG');
+  assert.ok(svg.includes('&#160;') || svg.includes('\u00a0'), 'the nbsp survives as a numeric reference or the literal character');
+  assert.ok(svg.includes('&amp;') && svg.includes('&lt;'), 'the & and < stay XML-escaped');
+}
+
+{
+  // F2: the card id is never interpolated into a selector. A macOS account label may
+  // carry a double quote, and anthropic@work"demo would make [data-card-id="..."] an
+  // invalid selector that throws before the copy starts; the attribute value is compared
+  // directly instead.
+  const id = 'anthropic@work"demo';
+  const make = (value) => ({ getAttribute: (name) => (name === 'data-card-id' ? value : null) });
+  const first = make('anthropic');
+  const quoted = make(id);
+  const root = { querySelectorAll: () => [first, quoted, make('openai')] };
+  assert.equal(findCardElement(root, id), quoted, 'the quoted id is found by attribute comparison');
+  assert.equal(findCardElement(root, 'anthropic'), first);
+  assert.equal(findCardElement(root, 'not-there'), null);
+  assert.equal(findCardElement(null, 'anthropic'), null, 'no shell yet: nothing to find, no throw');
+}
+
+{
+  // Contract v2: the pending copies are keyed by the id sent with each command — no
+  // queue, no order dependency. Each id settles exactly once (its own answer, the
+  // timeout, or a pre-send failure) and leaves the pending set, so an answer for an
+  // unknown, expired or null id is ignored.
+  const makeRegistry = () => {
+    const timers = new Map();
+    let seq = 0;
+    const registry = createCopyRegistry({
+      setTimer: (task, ms) => {
+        const id = ++seq;
+        timers.set(id, { task, ms });
+        return id;
+      },
+      clearTimer: (id) => timers.delete(id),
+    });
+    const expire = () => {
+      for (const [id, t] of [...timers])
+        if (t.ms === 5000) {
+          timers.delete(id);
+          t.task();
+        }
+    };
+    return { registry, expire };
+  };
+
+  assert.equal(IMAGE_COPIED_TIMEOUT_MS, 5000, 'the timeout the registry defaults to is 5 s');
+
+  // Ids: the per-instance counter only grows, and copy-<n> matches the contract's shape
+  // ^[A-Za-z0-9_-]{1,64}$.
+  {
+    const { registry } = makeRegistry();
+    const first = registry.begin(() => {});
+    const second = registry.begin(() => {});
+    assert.equal(first.id, 'copy-1');
+    assert.equal(second.id, 'copy-2');
+    assert.match(first.id, /^[A-Za-z0-9_-]{1,64}$/);
+    assert.equal(registry.isBusy(), true);
+    registry.answer(first.id, true);
+    assert.equal(registry.isBusy(), true, 'the second copy still holds the lock');
+    second.settle(false);
+    assert.equal(registry.isBusy(), false);
+  }
+
+  // R1: A's raster is slow, A expires, B is sent before A is. B's own answer settles B;
+  // A's answer is ignored because A's id is no longer pending.
+  {
+    const { registry, expire } = makeRegistry();
+    const notices = [];
+    const a = registry.begin((ok) => notices.push(['a', ok]));
+    expire(); // A times out before its dispatch
+    assert.deepEqual(notices, [['a', false]]);
+    const b = registry.begin((ok) => notices.push(['b', ok]));
+    assert.equal(registry.isBusy(), true);
+    registry.answer(b.id, false); // B's own answer (its IPC arrived before A's) settles B
+    assert.deepEqual(notices, [['a', false], ['b', false]]);
+    registry.answer(a.id, true); // A's late answer: the id expired, so it is ignored
+    assert.equal(notices.length, 2, "A's answer after its timeout settled nothing");
+    assert.equal(registry.isBusy(), false);
+  }
+
+  // R2: A's answer never arrives and A expires; B and C each receive their own true
+  // answer and announce success — nothing is stuck a response behind.
+  {
+    const { registry, expire } = makeRegistry();
+    const notices = [];
+    registry.begin((ok) => notices.push(['a', ok]));
+    expire(); // A never answered: the timeout settles A and removes the id
+    for (const who of ['b', 'c']) {
+      const handle = registry.begin((ok) => notices.push([who, ok]));
+      registry.answer(handle.id, true);
+    }
+    assert.deepEqual(notices, [['a', false], ['b', true], ['c', true]]);
+    assert.equal(registry.isBusy(), false);
+  }
+
+  // Pre-send failure after the timeout: settling removes the id (nothing stays
+  // pending), and a later answer for it cannot settle it twice.
+  {
+    const { registry, expire } = makeRegistry();
+    const notices = [];
+    const a = registry.begin((ok) => notices.push(['a', ok]));
+    expire();
+    a.settle(false); // the raster fails after the timeout: idempotent no-op, nothing pending
+    assert.equal(registry.isBusy(), false);
+    registry.answer(a.id, true);
+    assert.deepEqual(notices, [['a', false]], 'the expired id settled exactly once');
+  }
+
+  // Double click: one send while a copy is pending.
+  {
+    const { registry, expire } = makeRegistry();
+    const started = [];
+    const click = () => {
+      if (registry.isBusy()) return;
+      started.push(1);
+      registry.begin(() => {});
+    };
+    click();
+    click();
+    assert.equal(started.length, 1, 'a second click while a copy is pending starts nothing');
+    assert.equal(registry.isBusy(), true, 'the pending copy holds the lock');
+    expire();
+    assert.equal(registry.isBusy(), false);
+  }
+
+  // null, unknown and already-settled ids are ignored, without throwing.
+  {
+    const { registry, expire } = makeRegistry();
+    const notices = [];
+    registry.answer(null, true); // the host's null-id answer
+    registry.answer('copy-9', true); // no such id was reserved in this instance
+    const live = registry.begin((ok) => notices.push(ok));
+    registry.answer(live.id, true);
+    assert.deepEqual(notices, [true], 'only the live id settled');
+    live.settle(true); // a second settle for the same id is a no-op
+    assert.deepEqual(notices, [true]);
+    expire();
+  }
+}
+
+// --- the key dialog: key_check from the host -------------------------------------
+{
+  const ok = parseHostPayload(JSON.stringify({ key_check: { id: 'zai', seq: 7, state: 'ok', error: '' } }));
+  assert.deepEqual(ok.keyCheck, { id: 'zai', seq: 7, state: 'ok', error: '' });
+  // Absent, non-object, missing id, or an unknown state all mean "no fact",
+  // never a guessed one.
+  assert.equal(parseHostPayload('{}').keyCheck, null);
+  assert.equal(parseHostPayload(JSON.stringify({ key_check: null })).keyCheck, null);
+  assert.equal(parseHostPayload(JSON.stringify({ key_check: 'ok' })).keyCheck, null);
+  assert.equal(parseHostPayload(JSON.stringify({ key_check: { id: 'zai', seq: 7, state: 'exploded' } })).keyCheck, null);
+  assert.equal(parseHostPayload(JSON.stringify({ key_check: { seq: 7, state: 'ok' } })).keyCheck, null);
+  assert.equal(parseHostPayload(JSON.stringify({ key_check: { id: 'zai', seq: 7.5, state: 'ok' } })).keyCheck, null);
+  assert.equal(parseHostPayload(JSON.stringify({ key_check: { id: 'zai', seq: -1, state: 'ok' } })).keyCheck, null);
+  // The error is untrusted text: it is cleaned with the same limit as providers_error.
+  const dirty = parseHostPayload(JSON.stringify({ key_check: { id: 'zai', seq: 7, state: 'failed', error: 'bad\u001b[31m key' } }));
+  assert.equal(dirty.keyCheck.state, 'failed');
+  assert.equal(dirty.keyCheck.id, 'zai');
+  assert.ok(!dirty.keyCheck.error.includes('\u001b'));
+  assert.match(dirty.keyCheck.error, /bad/);
+}
+
+// --- the key dialog: keyDialogPhase -----------------------------------------------
+{
+  const now = 10_000_000;
+  const sent = (ago) => now - ago;
+  assert.equal(keyDialogPhase(null, null, 0, now), 'idle');
+  // Nothing pending means idle, even when a verdict for another send is on screen.
+  assert.equal(keyDialogPhase({ id: 'zai', seq: 1, state: 'ok', error: '' }, null, sent(1_000), now), 'idle');
+  const inFlight = { id: 'zai', seq: 5, state: 'checking', error: '' };
+  assert.equal(keyDialogPhase(inFlight, 5, sent(1_000), now), 'checking');
+  assert.equal(keyDialogPhase({ id: 'zai', seq: 5, state: 'ok', error: '' }, 5, sent(1_000), now), 'ok');
+  assert.equal(keyDialogPhase({ id: 'zai', seq: 5, state: 'failed', error: '' }, 5, sent(1_000), now), 'failed');
+  // A verdict for another send is not this dialog's: earlier or later, it
+  // counts as no answer and the spinner keeps running.
+  assert.equal(keyDialogPhase({ id: 'zai', seq: 4, state: 'ok', error: '' }, 5, sent(1_000), now), 'checking');
+  assert.equal(keyDialogPhase({ id: 'zai', seq: 6, state: 'failed', error: '' }, 5, sent(1_000), now), 'checking');
+  // No answer at the limit, inclusive; still checking one millisecond before it.
+  assert.equal(keyDialogPhase(inFlight, 5, sent(KEY_CHECK_NO_ANSWER_MS - 1), now), 'checking');
+  assert.equal(keyDialogPhase(inFlight, 5, sent(KEY_CHECK_NO_ANSWER_MS), now), 'no-answer');
+  assert.equal(keyDialogPhase(null, 5, sent(KEY_CHECK_NO_ANSWER_MS), now), 'no-answer');
+  assert.equal(KEY_CHECK_NO_ANSWER_MS, 60_000);
+}
+
+// --- the catalog rows carry the credential's label and note -----------------------
+{
+  const payload = parseHostPayload(JSON.stringify({ providers: [
+    { id: 'zai', name: 'Z.AI', enabled: true, configured: true, key_label: 'API key', key_note: 'From the Z.AI console.' },
+    { id: 'anthropic', name: 'Anthropic', enabled: true, configured: true },
+  ] }));
+  assert.equal(payload.providers[0].keyLabel, 'API key');
+  assert.equal(payload.providers[0].keyNote, 'From the Z.AI console.');
+  // A row without the pair carries the pair as empty text, not undefined.
+  assert.equal(payload.providers[1].keyLabel, '');
+  assert.equal(payload.providers[1].keyNote, '');
+}
+
+// --- the key dialog: the line for a refused key ----------------------------------
+{
+  // A rejection names the key, never the error card's "sign-in expired".
+  assert.equal(keyCheckError('HTTP 401: {"type":"error"}', 'Z.AI', 'en'), 'Z.AI rejected this key.');
+  assert.equal(keyCheckError('HTTP 403 forbidden', 'Z.AI', 'pt-BR'), 'Z.AI recusou esta chave.');
+  assert.equal(keyCheckError('authentication rejected', 'OpenRouter', 'en'), 'OpenRouter rejected this key.');
+  // Anything else reads as the card does.
+  const unreachable = keyCheckError('network transport error: connection refused', 'Z.AI', 'en');
+  assert.equal(unreachable, friendlyError('network transport error: connection refused', null, 'en'));
+  assert.doesNotMatch(unreachable, /rejected this key/);
+  assert.equal(keyCheckError('', 'Z.AI', 'en'), '');
+}
+
+// --- the provider list rows carry the credential's label and note ----------------
+{
+  const providers = parseHostPayload(JSON.stringify({
+    entries: [],
+    providers: [
+      { id: 'zai', name: 'Z.AI', kind: 'api_key', enabled: true, configured: false, env: 'ZAI_API_KEY', sign_in: 'Add an API key in Settings, then Refresh.', action: 'settings', add_accounts: [], key_label: 'API key', key_note: 'From the Z.AI console.' },
+      { id: 'openai', name: 'Codex', kind: 'oauth', enabled: true, configured: true, env: '', sign_in: 'Run `codex login` in a terminal, then Refresh.', action: 'terminal', add_accounts: [] },
+    ],
+  })).providers;
+  const { enabled } = providerListRows(providers, [], emptyLayout());
+  const zai = enabled.find((row) => row.id === 'zai');
+  assert.equal(zai.keyLabel, 'API key');
+  assert.equal(zai.keyNote, 'From the Z.AI console.');
+  const codex = enabled.find((row) => row.id === 'openai');
+  assert.equal(codex.keyLabel, '');
+  assert.equal(codex.keyNote, '');
+}
+
+// --- the sign-in sheet: sign_in from the host -------------------------------------
+{
+  const fact = { id: 'openai', seq: 7, state: 'waiting', code: 'ABCD-12345', expires_at: 1_700_000_000_000, reason: '', error: '' };
+  assert.deepEqual(parseHostPayload(JSON.stringify({ sign_in: fact })).signIn, {
+    id: 'openai', seq: 7, state: 'waiting', code: 'ABCD-12345', expiresAt: 1_700_000_000_000, reason: '', error: '',
+  });
+  // Absent, malformed, or an unknown state: no fact, never a guess.
+  assert.equal(parseHostPayload('{}').signIn, null);
+  assert.equal(parseHostPayload(JSON.stringify({ sign_in: 'waiting' })).signIn, null);
+  assert.equal(parseHostPayload(JSON.stringify({ sign_in: { ...fact, state: 'exploded' } })).signIn, null);
+  assert.equal(parseHostPayload(JSON.stringify({ sign_in: { ...fact, seq: 7.5 } })).signIn, null);
+  assert.equal(parseHostPayload(JSON.stringify({ sign_in: { ...fact, id: '' } })).signIn, null);
+  // The code is shown and typed elsewhere: anything but its shape is dropped,
+  // and so is an unknown reason; the error is cleaned like every host text.
+  const odd = parseHostPayload(JSON.stringify({ sign_in: { ...fact, code: '<img src=x>', reason: 'hacked', error: 'bad\u001b[31m', expires_at: -4 } })).signIn;
+  assert.equal(odd.code, '');
+  assert.equal(odd.reason, '');
+  assert.equal(odd.expiresAt, 0);
+  assert.ok(!odd.error.includes('\u001b'));
+  assert.equal(parseHostPayload(JSON.stringify({ sign_in: { ...fact, state: 'unavailable', reason: 'device-off' } })).signIn.reason, 'device-off');
+}
+
+// --- the sign-in sheet: signInPhase and the countdown -----------------------------
+{
+  const now = 10_000_000;
+  const sent = (ago) => now - ago;
+  const fact = (state, extra = {}) => ({ id: 'openai', seq: 5, state, code: 'ABCD-1234', expiresAt: 0, reason: '', error: '', ...extra });
+  assert.equal(signInPhase(null, null, 0, now), 'idle');
+  // Until the host answers this start, the sheet is asking for a code.
+  assert.equal(signInPhase(null, 5, sent(1_000), now), 'starting');
+  assert.equal(signInPhase(fact('ok', { seq: 4 }), 5, sent(1_000), now), 'starting');
+  assert.equal(signInPhase(null, 5, sent(SIGN_IN_NO_ANSWER_MS - 1), now), 'starting');
+  assert.equal(signInPhase(null, 5, sent(SIGN_IN_NO_ANSWER_MS), now), 'no-answer');
+  // The host's own fact answers, whatever its age.
+  for (const state of ['starting', 'waiting', 'ok', 'expired', 'unavailable', 'failed']) {
+    assert.equal(signInPhase(fact(state), 5, sent(SIGN_IN_NO_ANSWER_MS * 10), now), state);
+  }
+  // A code past its expiry on this clock reads as expired before the host gives up on it.
+  assert.equal(signInPhase(fact('waiting', { expiresAt: now + 1 }), 5, sent(1_000), now), 'waiting');
+  assert.equal(signInPhase(fact('waiting', { expiresAt: now }), 5, sent(1_000), now), 'expired');
+  assert.equal(countdownText(now + (14 * 60 + 32) * 1000 + 999, now), '14:32');
+  assert.equal(countdownText(now + 5_000, now), '0:05');
+  assert.equal(countdownText(now - 5_000, now), '0:00');
+}
+
+// --- a device-code provider's card offers the sign-in sheet -----------------------
+{
+  const device = (configured) => ({ id: 'openai', account: 'ChatGPT', configured });
+  // No login at all: "Not signed in", whatever the read failure said.
+  const missing = explainError('io error: No such file or directory at ~/.codex/auth.json', 'openai', 'en', device(false));
+  assert.equal(missing.title, 'Not signed in');
+  assert.equal(missing.hint, 'Sign in with your ChatGPT account to track usage.');
+  assert.deepEqual(missing.action, { cmd: 'sign-in', id: 'openai', label: 'Sign in' });
+  // A login the provider refused: the same fix, under "Sign-in expired".
+  const refused = explainError('HTTP 401: authentication rejected', 'openai', 'en', device(true));
+  assert.equal(refused.title, 'Sign-in expired');
+  assert.deepEqual(refused.action, { cmd: 'sign-in', id: 'openai', label: 'Sign in' });
+  assert.equal(explainError('Kimi Code CLI token refresh failed (x). Run `kimi` and log in again.', 'kimi', 'en', { id: 'kimi', account: 'Kimi', configured: true }).action.cmd, 'sign-in');
+  // Any other failure of a signed-in provider reads as before.
+  assert.deepEqual(explainError('HTTP 503: down', 'openai', 'en', device(true)).action, { cmd: 'refresh', label: 'Refresh' });
+  // Without a device flow, a refused login keeps the terminal hint and no button.
+  assert.equal(explainError('HTTP 401: authentication rejected', 'openai', 'en', null).action, undefined);
+  assert.equal(explainError('HTTP 401: authentication rejected', 'openai', 'pt-BR', device(false)).title, 'Não conectado');
+}
+
+// --- the catalog rows carry a device-code provider's sheet words ------------------
+{
+  const payload = parseHostPayload(JSON.stringify({ providers: [
+    { id: 'openai', name: 'Codex', enabled: true, configured: false, action: 'device', sign_in_account: 'ChatGPT', sign_in_issuer: 'OpenAI' },
+    { id: 'anthropic', name: 'Claude', enabled: true, configured: false, action: 'terminal' },
+  ] }));
+  assert.equal(payload.providers[0].action, 'device');
+  assert.equal(payload.providers[0].signInAccount, 'ChatGPT');
+  assert.equal(payload.providers[0].signInIssuer, 'OpenAI');
+  assert.equal(payload.providers[1].signInAccount, '');
+  const { enabled } = providerListRows(payload.providers, [], emptyLayout());
+  const codex = enabled.find((row) => row.id === 'openai');
+  assert.equal(codex.action, 'device');
+  assert.equal(codex.signInAccount, 'ChatGPT');
+  assert.equal(codex.signInIssuer, 'OpenAI');
 }

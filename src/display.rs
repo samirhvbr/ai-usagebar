@@ -52,6 +52,36 @@ pub fn sanitize_untrusted_path(path: &std::path::Path) -> String {
     sanitize_untrusted_line(&path.to_string_lossy())
 }
 
+/// Remove `secret` from text that is about to be persisted or displayed.
+///
+/// A provider's answer can quote the credential it was sent with — Z.AI
+/// returns the reason for an in-band failure in `msg`, inside an HTTP 200 —
+/// and the first point of writing is the vendor cache, so the key must be
+/// gone before the failure is recorded, not scrubbed after the fact. Exact
+/// occurrences become `[key]`; when the secret is at least eight characters
+/// long and any consecutive eight-character window of it — counted in
+/// `char`, not bytes — still survives in the text, the provider quoted the
+/// key in part, and a partial echo is the key with a missing tail, so the
+/// whole text is replaced with a fixed note. An empty secret leaves the text
+/// alone.
+pub(crate) fn redact_secret(text: &str, secret: &str) -> String {
+    const PARTIAL_ECHO: &str = "The provider's answer quoted the key, so it is not shown.";
+    if secret.is_empty() {
+        return text.to_string();
+    }
+    let redacted = text.replace(secret, "[key]");
+    let chars: Vec<char> = secret.chars().collect();
+    let quoted_partial = chars.len() >= 8
+        && (0..=chars.len() - 8).any(|start| {
+            redacted.contains(chars[start..start + 8].iter().collect::<String>().as_str())
+        });
+    if quoted_partial {
+        PARTIAL_ECHO.to_string()
+    } else {
+        redacted
+    }
+}
+
 fn is_bidi_control(ch: char) -> bool {
     matches!(
         ch,
@@ -97,6 +127,32 @@ mod tests {
         assert_eq!(output.chars().count(), MAX_UNTRUSTED_FIELD_CHARS);
         assert!(output.chars().all(|ch| ch == 'é'));
     }
+
+    /// A provider that quotes the key a fetch was sent with must not persist
+    /// it: exact echoes become the marker, and for a key of eight characters
+    /// or more a surviving eight-character window is a partial echo — the key
+    /// with a missing tail — so the whole text is replaced instead.
+    #[test]
+    fn redact_secret_replaces_echoed_keys_and_partial_echoes() {
+        let key = "abcdefghijklmnop";
+        // A verbatim echo, on its own and alongside the provider's wording.
+        assert_eq!(redact_secret(key, key), "[key]");
+        assert_eq!(
+            redact_secret("bad key abcdefghijklmnop", key),
+            "bad key [key]"
+        );
+        // An eight-char window is the key in all but the missing tail.
+        assert_eq!(
+            redact_secret("bad key abcdefgh…", key),
+            "The provider's answer quoted the key, so it is not shown."
+        );
+        // Text without the key passes through unchanged.
+        assert_eq!(redact_secret("HTTP 500", key), "HTTP 500");
+        // A short key has no eight-char window: exact replacement only.
+        assert_eq!(redact_secret("short", "short"), "[key]");
+        // An empty secret leaves the text alone.
+        assert_eq!(redact_secret("nothing to hide", ""), "nothing to hide");
+    }
 }
 
 /// Width of plain (non-markup) text in terminal columns.
@@ -139,9 +195,22 @@ pub fn pad_end(s: &str, width: usize) -> String {
     out
 }
 
+/// Right-align `s` in a field `width` columns wide — the [`pad_end`]
+/// counterpart, measured in display width for the same reason.
+pub fn pad_start(s: &str, width: usize) -> String {
+    let w = text_width(s);
+    if w >= width {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len() + (width - w));
+    out.extend(std::iter::repeat_n(' ', width - w));
+    out.push_str(s);
+    out
+}
+
 #[cfg(test)]
 mod width_tests {
-    use super::{pad_end, text_width};
+    use super::{pad_end, pad_start, text_width};
 
     #[test]
     fn text_width_measures_columns_not_characters() {
@@ -149,6 +218,17 @@ mod width_tests {
         assert_eq!(text_width("日本語"), 6); // 3 chars, 6 columns
         assert_eq!(text_width("사용량"), 6);
         assert_eq!(text_width("e\u{301}"), 1); // combining mark adds nothing
+    }
+
+    #[test]
+    fn pad_start_pads_by_columns_not_characters() {
+        // The right-align half of the report's columns: a wide or combining
+        // value must end at the same column as an ASCII one.
+        assert_eq!(pad_start("7", 6), "     7");
+        assert_eq!(pad_start("日本語", 8), "  日本語");
+        assert_eq!(pad_start("e\u{301}", 3), "  e\u{301}");
+        // Already wide enough: untouched, never truncated.
+        assert_eq!(pad_start("日本語", 4), "日本語");
     }
 
     #[test]

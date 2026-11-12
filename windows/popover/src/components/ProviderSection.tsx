@@ -1,8 +1,9 @@
 import type { DraggableAttributes, DraggableSyntheticListeners } from "@dnd-kit/core";
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import MdiAlert from "~icons/mdi/alert";
 import MdiChevronDown from "~icons/mdi/chevron-down";
 import MdiChevronUp from "~icons/mdi/chevron-up";
+import MdiContentCopy from "~icons/mdi/content-copy";
 import MdiFire from "~icons/mdi/fire";
 import MdiLoading from "~icons/mdi/loading";
 import MdiStar from "~icons/mdi/star";
@@ -13,7 +14,9 @@ import MdiArrowTopRight from "~icons/mdi/arrow-top-right";
 import MdiClockStart from "~icons/mdi/clock-start";
 import MdiCheck from "~icons/mdi/check";
 import { Chip } from "@/components/Chip";
+import { IconButton } from "@/components/IconButton";
 import { Hint } from "@/components/Hint";
+import { AccountTabs } from "@/components/AccountTabs";
 import { ProviderIcon } from "@/components/ProviderIcon";
 import { ResetPopover } from "@/components/ResetPopover";
 import { RowMenu, type RowAction } from "@/components/RowMenu";
@@ -33,6 +36,7 @@ import type {
 import { m } from "@/paraglide/messages.js";
 import { translateUsage, useI18n } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
+import { handFocusOnRemoval, usePopoverActions } from "@/lib/popoverActions";
 import {
   cardHasExtras,
   condensedTextRowIndexes,
@@ -52,7 +56,6 @@ import {
   paceWarmupHint,
   paceWarmupText,
   prefsForCard,
-  providerIconId,
   resetAlternate,
   resetCreditDetails,
   resetText,
@@ -61,6 +64,7 @@ import {
   usageGoal,
   usageGoalPercent,
   visibleRowsFor,
+  formatAgo,
 } from "../model.js";
 
 interface SectionHandle {
@@ -73,10 +77,19 @@ interface ProviderSectionProps {
   account?: CardAccount | null;
   card: Card;
   handle?: SectionHandle;
+  /** The provider's catalog name and accounts. Two or more accounts get tabs
+   * between the header and the card. */
+  group?: {
+    name: string;
+    cards: Array<{ id: string; title: string }>;
+    activeId: string;
+    onSelect: (id: string) => void;
+  };
   layout: Layout;
   lifted?: boolean;
   nowMs: number;
   onCustomize?: () => void;
+  onCopyImage?: () => void;
   onRowAction?: (key: string, action: RowAction) => void;
   onRowMenuOpenChange?: (open: boolean) => void;
   onSwitchAccount?: () => void;
@@ -96,10 +109,12 @@ export function ProviderSection({
   account,
   card,
   handle,
+  group,
   layout,
   lifted,
   nowMs,
   onCustomize,
+  onCopyImage,
   onRowAction,
   onRowMenuOpenChange,
   onSwitchAccount,
@@ -107,6 +122,9 @@ export function ProviderSection({
   onToggleShowAs,
 }: ProviderSectionProps) {
   const { language } = useI18n();
+  const actions = usePopoverActions();
+  // Account labels belong to the tabs; the header always names the provider.
+  const grouped = group && group.cards.length > 1;
   const prefs = prefsForCard(card, layout);
   const expanded = layout.collapsed?.[card.id] !== true;
   const opts = { hideExtras: layout.hideExtras, prefs };
@@ -166,8 +184,15 @@ export function ProviderSection({
         handle={handle}
         nowMs={nowMs}
         onCustomize={onCustomize}
+        onCopyImage={onCopyImage}
         onSwitchAccount={onSwitchAccount}
+        title={group?.name}
       />
+      {grouped ? (
+        <div className="px-[var(--card-pad)]">
+          <AccountTabs cards={group.cards} providerName={group.name} selected={group.activeId} onSelect={group.onSelect} />
+        </div>
+      ) : null}
       <div
         className={cn(
           "pt-[var(--card-gutter)]",
@@ -175,7 +200,7 @@ export function ProviderSection({
           lifted ? "lifted-surface" : "card-surface",
         )}
       >
-        {card.errorTitle ? <ErrorRow explained={explainError(card.errorDetail, card.id, language)} /> : null}
+        {card.errorTitle ? <ErrorRow explained={explainError(card.errorDetail, card.id, language, actions.deviceProvider(card.id))} /> : null}
         {alwaysRows.map((row, index) => renderRow(row, index, condensedAlways, false))}
         {showExpander ? (
           <button
@@ -222,7 +247,10 @@ function ResetCreditsRow({ condensedTop, demand, layout, nowMs, row }: ResetCred
       <span className="min-w-[var(--gap-controls)] flex-1" />
       <ResetPopover hidden={details.hidden} items={details.items}>
         <Chip aria-label={`${row.available} ${noun}; ${m.show_expiry_dates()}`} variant="compact">
-          <span aria-hidden="true" className="size-[var(--dot-sm)] rounded-full bg-meter-yellow" />
+          <span
+            aria-hidden="true"
+            className={cn("size-[var(--dot-sm)] rounded-full", row.available > 0 ? "bg-meter-yellow" : "bg-muted-foreground")}
+          />
           <span className="tabular-nums">{row.available} {row.available === 1 ? m.available_singular() : m.available()}</span>
         </Chip>
       </ResetPopover>
@@ -235,14 +263,18 @@ interface ProviderSectionHeaderProps {
   card: Card;
   handle?: SectionHandle;
   nowMs?: number;
+  /** The header's name; the card's own title when absent (a multi-account provider names itself). */
+  title?: string;
   onCustomize?: () => void;
+  onCopyImage?: () => void;
   onSwitchAccount?: () => void;
 }
 
 /**
  * ProviderSectionHeader: gray provider mark, name, plan badge, stale hint, warning triangle,
- * and on the trailing edge the per-provider shortcut OpenUsage keeps in the context menu:
- * Customize (this provider's rows). An account card also gets the
+ * and on the trailing edge the per-provider shortcuts OpenUsage keeps in the context menu:
+ * copy the card as an image (only on the header's hover or focus, like the tray's own reveal)
+ * and Customize (this provider's rows). An account card also gets the
  * switch control first: a filled star on the login in use, an outline star button on the others. The
  * header is also the drag handle, so the buttons stop the pointer-down from starting a drag.
  */
@@ -251,21 +283,26 @@ export function ProviderSectionHeader({
   card,
   handle,
   nowMs = 0,
+  title,
   onCustomize,
+  onCopyImage,
   onSwitchAccount,
 }: ProviderSectionHeaderProps) {
   const plan = displayPlan(card.title, card.plan);
+  const name = title || card.title;
+  const { language } = useI18n();
+  const age = card.stale && card.fetchedAt && nowMs > card.fetchedAt ? ` · ${formatAgo(nowMs - card.fetchedAt, language)}` : "";
   return (
     <header
       className="group/header flex items-center gap-[var(--gap-inline)] px-[var(--card-pad)] py-[var(--space-2xs)]"
       {...handle?.attributes}
       {...handle?.listeners}
     >
-      <ProviderIcon className="text-label-2" size="var(--sz-icon)" slug={providerIconId(card.id)} title={card.title} />
+      <ProviderIcon className="text-label-2" size="var(--sz-icon)" slug={card.icon} title={name} />
       <div className="flex min-w-0 items-baseline gap-[var(--gap-inline)]">
-        <TruncatedText className="min-w-0 text-[length:var(--sz-header)] font-semibold">{card.title}</TruncatedText>
+        <TruncatedText className="min-w-0 text-[length:var(--sz-header)] font-semibold">{name}</TruncatedText>
         {plan ? <span className="shrink-0 text-[length:var(--sz-badge)] text-label-2">{plan}</span> : null}
-        {card.stale ? <span className="text-[length:var(--sz-badge)] text-label-3">{m.stale()}</span> : null}
+        {card.stale ? <span className="text-[length:var(--sz-badge)] text-label-3">{m.stale()}{age}</span> : null}
       </div>
       {card.errorTitle ? (
         <MdiAlert className="size-[var(--icon-mark)] shrink-0 text-meter-red" aria-label={card.errorTitle}>
@@ -278,9 +315,17 @@ export function ProviderSectionHeader({
       ) : null}
       <span className="min-w-[var(--gap-controls)] flex-1" />
       {account ? <DesktopPrepareControl account={account} card={card} nowMs={nowMs} /> : null}
-      {account ? <AccountControl account={account} title={card.title} onSwitch={onSwitchAccount} /> : null}
+      {account ? <AccountControl account={account} title={name} onSwitch={onSwitchAccount} /> : null}
+      {onCopyImage ? (
+        <HeaderAction
+          // Always shown, beside the customize action; the exported PNG drops it (data-exporting).
+          icon={<MdiContentCopy />}
+          label={m.copy_as_image()}
+          onClick={onCopyImage}
+        />
+      ) : null}
       {onCustomize ? (
-        <HeaderAction icon={<MdiTune />} label={`${m.customize()} ${card.title}`} onClick={onCustomize} />
+        <HeaderAction icon={<MdiTune />} label={`${m.customize()} ${name}`} onClick={onCustomize} />
       ) : null}
     </header>
   );
@@ -328,7 +373,7 @@ function AccountControl({ account, title, onSwitch }: AccountControlProps) {
   if (account.active) {
     const label = `${title} is the active account`;
     return (
-      <span aria-label={label} className="header-action is-active [&_svg]:size-[14px]" role="img" title={label}>
+      <span aria-label={label} className="icon-btn header-action is-active" role="img" title={label}>
         <MdiStar />
       </span>
     );
@@ -336,7 +381,7 @@ function AccountControl({ account, title, onSwitch }: AccountControlProps) {
   if (account.switching) {
     const label = `Switching to ${title}…`;
     return (
-      <span aria-label={label} className="header-action [&_svg]:size-[14px]" role="status" title={label}>
+      <span aria-label={label} className="icon-btn header-action" role="status" title={label}>
         <MdiLoading className="animate-spin" />
       </span>
     );
@@ -375,18 +420,15 @@ interface HeaderActionProps {
 
 function HeaderAction({ className, icon, label, onClick }: HeaderActionProps) {
   return (
-    <Hint content={label}>
-      <button
-        type="button"
-        aria-label={label}
-        className={cn("header-action [&_svg]:size-[var(--icon-row)]", className)}
-        onClick={onClick}
-        onKeyDown={(event) => event.stopPropagation()}
-        onPointerDown={(event) => event.stopPropagation()}
-      >
-        {icon}
-      </button>
-    </Hint>
+    <IconButton
+      label={label}
+      className={cn("header-action", className)}
+      onClick={onClick}
+      onKeyDown={(event) => event.stopPropagation()}
+      onPointerDown={(event) => event.stopPropagation()}
+    >
+      {icon}
+    </IconButton>
   );
 }
 
@@ -543,10 +585,22 @@ interface ErrorRowProps {
 }
 
 /**
- * A provider with nothing to show: the verdict, the one-line hint, and — when the fix is a host
- * command — a small action button. Terminal-side fixes (sign-in) and waits (429) get no button.
+ * A provider with nothing to show: the verdict, the one-line hint, and — when there is a fix to
+ * offer — a small action button. A missing key opens the key dialog, a device-code provider that
+ * is not signed in opens the sign-in sheet, and no provider switched on opens Customize, all
+ * inside the popover; the rest are host commands. Terminal-side fixes (the other sign-ins) and
+ * waits (429) get no button.
  */
 export function ErrorRow({ explained }: ErrorRowProps) {
+  const actions = usePopoverActions();
+  function run(trigger: HTMLElement) {
+    const action = explained.action;
+    if (!action) return;
+    if (action.cmd === "add-key" && action.id) actions.addKey(action.id, trigger);
+    else if (action.cmd === "sign-in" && action.id) actions.signIn(action.id, trigger);
+    else if (action.cmd === "customize") actions.openCustomize();
+    else sendCommand(action.cmd);
+  }
   return (
     <div className="flex flex-col gap-[var(--gap-stack)] px-[var(--card-pad)] py-[var(--pad-text-row)]">
       <span className="text-[length:var(--sz-support)] font-semibold">{explained.title || m.couldn_t_update()}</span>
@@ -554,15 +608,48 @@ export function ErrorRow({ explained }: ErrorRowProps) {
         <span className="text-[length:var(--sz-badge)] leading-[var(--leading-note)] text-label-2">{explained.hint}</span>
       ) : null}
       {explained.action ? (
-        <button
-          type="button"
-          className="action-btn mt-[var(--gap-stack)] w-fit"
-          onClick={() => sendCommand(explained.action?.cmd)}
-        >
-          {explained.action.label}
-        </button>
+        <ErrorActionButton
+          label={explained.action.label}
+          providerId={explained.action.cmd === "add-key" || explained.action.cmd === "sign-in" ? explained.action.id : undefined}
+          onClick={run}
+        />
       ) : null}
     </div>
+  );
+}
+
+interface ErrorActionButtonProps {
+  label: string;
+  /** Set for "Add key": the provider whose card this row stands in for. */
+  providerId?: string;
+  onClick: (trigger: HTMLElement) => void;
+}
+
+/**
+ * The error row's one action. "Add key" goes away once the key is accepted,
+ * often after the key dialog has handed focus back to it and the next report
+ * arrives with the card's metrics: removed while focused, it passes focus to
+ * the card's header action instead of leaving it on the body.
+ */
+function ErrorActionButton({ label, providerId, onClick }: ErrorActionButtonProps) {
+  const button = useRef<HTMLButtonElement | null>(null);
+  useLayoutEffect(() => {
+    const node = button.current;
+    // A layout cleanup on removal runs while the node is still in the document.
+    return () => {
+      if (providerId) handFocusOnRemoval(node, providerId);
+    };
+  }, [providerId]);
+  return (
+    <button
+      ref={button}
+      type="button"
+      className="action-btn mt-[var(--gap-stack)] w-fit"
+      data-key-row={providerId}
+      onClick={(event) => onClick(event.currentTarget)}
+    >
+      {label}
+    </button>
   );
 }
 

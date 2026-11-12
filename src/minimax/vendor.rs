@@ -67,7 +67,7 @@ fn build_placeholders_with_tolerance(
         optional_window_pacing(snap.video_weekly.as_ref(), pace_tolerance, now);
 
     placeholders(vec![
-        ("icon", "󰚩".to_string()),
+        ("icon", VendorId::Minimax.bar_icon().to_string()),
         ("vendor_short", VendorId::Minimax.short_name().to_string()),
         // Cross-vendor aliases — what the desktop surfaces read.
         ("plan", snap.plan.clone()),
@@ -354,6 +354,10 @@ mod tests {
     #[test]
     fn default_format_shows_session_percent_and_reset() {
         let s = snap();
+        assert_eq!(
+            build_placeholders(&s, now())["icon"],
+            VendorId::Minimax.bar_icon()
+        );
         let out = render(&outcome(&s), &s, &Theme::default(), &opts(), now());
         assert!(out.text.contains("31%"), "bar text was {:?}", out.text);
     }

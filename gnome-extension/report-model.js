@@ -82,6 +82,7 @@ export function metricDetail(detail, resetAt) {
     if (timestampMs(resetAt) === null)
         return text;
     text = text.replace(/^Resets in [^·]+\s*(?:·\s*)?/i, '');
+    text = text.replace(/^Regenerates [^·]+? in [^·]+\s*(?:·\s*)?/i, '');
     text = text.replace(/\s*·\s*reset\s+[^·]+$/i, '');
     return text.trim();
 }
@@ -104,6 +105,7 @@ function metricRow(raw, nowMs) {
         elapsed: elapsedPercent(raw.reset_at, raw.window_secs, nowMs),
         detail: metricDetail(raw.detail, raw.reset_at),
         group: clean(raw.group, 80),
+        regen: clean(raw.regen, 40),
     };
 }
 

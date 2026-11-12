@@ -37,6 +37,20 @@ pub struct HostFacts {
     /// Vendors whose active login the popover can switch. Only the macOS host
     /// fills this; an empty list hides the control everywhere else.
     pub accounts: Vec<AccountSwitchFact>,
+    /// Every built-in provider, enabled or not, for Settings → Providers.
+    pub providers: Vec<crate::catalog::VendorStatus>,
+    /// Why the last enable/disable from the popover failed, or empty.
+    pub providers_error: String,
+    /// Bumped each time the popover switches a provider. A catalog read that
+    /// began under an older generation is dropped rather than published, so
+    /// it cannot put back the state the switch replaced.
+    pub providers_generation: u64,
+    /// The in-flight or finished `set-api-key` check; `None` before the
+    /// first send.
+    pub key_check: Option<KeyCheckFact>,
+    /// The popover's device-code sign-in, from `start-sign-in` until it
+    /// ends or is cancelled; `None` when no sign-in sheet is open.
+    pub sign_in: Option<SignInFact>,
 }
 
 /// One vendor's switchable logins, as the popover renders them beside each
@@ -64,6 +78,114 @@ pub struct AccountSwitchFact {
     pub prepare_error: String,
     /// Server-confirmed reset, never a local five-hour estimate.
     pub prepared_reset: String,
+}
+
+/// State of the popover's API-key check, one fact per `set-api-key` send.
+/// The key itself never reaches a fact: only the verdict and its error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyCheckState {
+    /// The check's thread is writing the key and fetching the provider.
+    Checking,
+    /// The provider accepted the key; the config keeps it.
+    Ok,
+    /// The provider refused it (or the fetch failed); the previous value is
+    /// back in the config.
+    Failed,
+}
+
+/// The popover's API-key check, published by the host when a `set-api-key`
+/// request lands. `seq` is the popover's send number: a check that finishes
+/// after a newer send has replaced the fact must not write its verdict over
+/// it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyCheckFact {
+    /// The vendor slug the check ran for; from `KEY_VENDORS`, so trusted.
+    pub id: String,
+    pub seq: u64,
+    pub state: KeyCheckState,
+    /// Why the check failed (sanitized on the way out), or empty.
+    pub error: String,
+}
+
+/// The payload keys a facts-only push refreshes: every fact the popover
+/// watches change between two reports. Both hosts copy exactly these from a
+/// fresh [`wrap_report`] into the payload they hold, so a new fact is listed
+/// once, here, and reaches both.
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+pub const STAMPED_FACTS: &[&str] = &[
+    "shortcut",
+    "shortcut_error",
+    "refresh_minutes",
+    "updates",
+    "update",
+    "update_checked_at",
+    "repository",
+    "version",
+    "accounts",
+    "providers",
+    "providers_error",
+    "key_check",
+    "sign_in",
+];
+
+/// Where one device-code sign-in stands; see [`super::device_login`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignInState {
+    /// Asking the provider (or its CLI) for a one-time code.
+    Starting,
+    /// The code is on screen; the flow waits for the browser's approval.
+    Waiting,
+    /// Approved and saved: the provider's next reading uses the new login.
+    Ok,
+    /// The code expired before anyone approved it.
+    Expired,
+    /// Device sign-in cannot run here; `reason` says why, and the terminal
+    /// is the way left.
+    Unavailable,
+    /// Anything else that ended the flow; `error` is the diagnostic.
+    Failed,
+}
+
+impl SignInState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SignInState::Starting => "starting",
+            SignInState::Waiting => "waiting",
+            SignInState::Ok => "ok",
+            SignInState::Expired => "expired",
+            SignInState::Unavailable => "unavailable",
+            SignInState::Failed => "failed",
+        }
+    }
+}
+
+/// The popover's device-code sign-in. `seq` is the popover's send number:
+/// a flow that a newer `start-sign-in` or a `cancel-sign-in` replaced finds
+/// another `seq` (or none) here, stops its child, and publishes nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignInFact {
+    /// The vendor slug; from the device-login table, so trusted.
+    pub id: String,
+    pub seq: u64,
+    pub state: SignInState,
+    /// The one-time code the user types on the provider's page, or empty
+    /// until the flow prints one.
+    pub code: String,
+    /// Wall-clock ms when the code stops working; 0 while unknown.
+    pub expires_at: i64,
+    /// Why device sign-in cannot run (`Unavailable`) or was refused:
+    /// `device-off`, `cli-missing`, `custom-path`, `denied`, or empty.
+    pub reason: &'static str,
+    /// The flow's own diagnostic for `Failed`, or empty.
+    pub error: String,
+    /// The page that takes the code. Never serialized: the popover asks
+    /// the host to open it by `seq`, so a page address never comes from the
+    /// webview, and only an address the flow's allowlist accepted is kept.
+    pub url: String,
+    /// The approval arrived and the login is being saved. Never serialized:
+    /// from here a cancel is too late, so it leaves the fact alone, and the
+    /// verdict that follows is the login's.
+    pub committing: bool,
 }
 
 /// State of a newer release as the popover renders it.
@@ -122,6 +244,11 @@ impl Default for HostFacts {
             updates: String::new(),
             version: String::new(),
             accounts: Vec::new(),
+            providers: Vec::new(),
+            providers_error: String::new(),
+            providers_generation: 0,
+            key_check: None,
+            sign_in: None,
         }
     }
 }
@@ -214,6 +341,32 @@ pub fn wrap_report(
         "update_checked_at": facts.update_checked_at,
         "repository": repository_page(),
         "accounts": accounts,
+        "providers": super::providers::rows_json(&facts.providers, host_os() == "macos"),
+        "providers_error": sanitize_untrusted_field(&facts.providers_error),
+        "key_check": facts.key_check.as_ref().map(|fact| {
+            let state = match fact.state {
+                KeyCheckState::Checking => "checking",
+                KeyCheckState::Ok => "ok",
+                KeyCheckState::Failed => "failed",
+            };
+            json!({
+                "id": fact.id,
+                "seq": fact.seq,
+                "state": state,
+                "error": sanitize_untrusted_field(&fact.error),
+            })
+        }),
+        "sign_in": facts.sign_in.as_ref().map(|fact| {
+            json!({
+                "id": fact.id,
+                "seq": fact.seq,
+                "state": fact.state.as_str(),
+                "code": sanitize_untrusted_field(&fact.code),
+                "expires_at": fact.expires_at,
+                "reason": fact.reason,
+                "error": sanitize_untrusted_field(&fact.error),
+            })
+        }),
         "accent": accent,
         "host_error": host_error.map(sanitize_untrusted_field),
         "primary": Value::Null,
@@ -759,5 +912,65 @@ mod tests {
     fn no_switchable_accounts_is_an_empty_object() {
         let payload = wrap_report(&sample_report(), &facts("1.10.0", false), 0, None);
         assert_eq!(payload["accounts"], json!({}));
+    }
+
+    #[test]
+    fn key_check_fact_serializes_its_state_and_sanitizes_the_error() {
+        let mut host = facts("1.44.0", false);
+        host.key_check = Some(KeyCheckFact {
+            id: "zai".into(),
+            seq: 7,
+            state: KeyCheckState::Checking,
+            error: String::new(),
+        });
+        let payload = wrap_report(&sample_report(), &host, 0, None);
+        assert_eq!(payload["key_check"]["id"], "zai");
+        assert_eq!(payload["key_check"]["seq"], 7);
+        assert_eq!(payload["key_check"]["state"], "checking");
+        assert_eq!(payload["key_check"]["error"], "");
+
+        host.key_check = Some(KeyCheckFact {
+            id: "zai".into(),
+            seq: 8,
+            state: KeyCheckState::Ok,
+            error: String::new(),
+        });
+        let payload = wrap_report(&sample_report(), &host, 0, None);
+        assert_eq!(payload["key_check"]["state"], "ok");
+        assert_eq!(payload["key_check"]["seq"], 8);
+
+        host.key_check = Some(KeyCheckFact {
+            id: "openrouter".into(),
+            seq: 9,
+            state: KeyCheckState::Failed,
+            error: "HTTP 401\u{1b}[31m invalid key".into(),
+        });
+        let payload = wrap_report(&sample_report(), &host, 0, None);
+        assert_eq!(payload["key_check"]["state"], "failed");
+        // The error is untrusted text: it leaves through the same sanitizer
+        // as `providers_error`.
+        let error = payload["key_check"]["error"].as_str().unwrap();
+        assert!(!error.contains('\u{1b}'), "{error:?}");
+        assert!(error.contains("HTTP 401"), "{error:?}");
+    }
+
+    #[test]
+    fn a_facts_only_push_carries_both_popover_dialogs() {
+        // The key dialog and the sign-in sheet wait on facts that change
+        // between reports; a push that left either out showed the popover
+        // `null` until the next full report.
+        for key in ["key_check", "sign_in", "providers"] {
+            assert!(STAMPED_FACTS.contains(&key), "{key}");
+        }
+        let payload = wrap_report("{}", &HostFacts::default(), 0, None);
+        for key in STAMPED_FACTS {
+            assert!(payload.get(*key).is_some(), "{key} is not in the payload");
+        }
+    }
+
+    #[test]
+    fn key_check_is_null_before_the_first_send() {
+        let payload = wrap_report(&sample_report(), &facts("1.44.0", false), 0, None);
+        assert!(payload["key_check"].is_null());
     }
 }

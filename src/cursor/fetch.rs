@@ -94,8 +94,9 @@ async fn fetch_snapshot_at(
     // Resolve the local identity before accepting a cache hit. Cursor can switch
     // accounts in-place in this database; returning the cache first would show
     // the previous account's private usage until the TTL elapsed.
-    let token = db::resolve_access_token(db_path, agent_auth_path)?;
-    let auth = db::session_auth(&token)?;
+    let tokens = db::resolve_access_tokens(db_path, agent_auth_path)?;
+    let token = tokens.primary;
+    let auth = db::session_auth_for(db_path, &token)?;
 
     // A payload written before credit grants existed has no `credits` key.
     // Serving it fresh would hide a balance the spending page is showing
@@ -106,20 +107,50 @@ async fn fetch_snapshot_at(
     {
         return Ok(outcome);
     }
+    // #515: during a backoff `fresh_payload` returns bytes this refresh can
+    // refuse, such as a payload past its billing-cycle reset or one written
+    // before credit grants existed. The shared backoff still applies, as it
+    // does for the Anthropic API since #496: surface the countdown instead of
+    // contacting the server, or a refresh interval shorter than the backoff
+    // would re-request and re-arm it forever.
+    if let Some(remaining) = cache.backoff_remaining() {
+        return Err(AppError::Http {
+            status: 429,
+            body: format!(
+                "rate limited; next attempt in {}",
+                crate::cache::human_backoff(remaining)
+            ),
+        });
+    }
 
-    match fetch_live(client, endpoints, &auth, &token).await {
+    let mut live = fetch_live(client, endpoints, &auth, &token).await;
+    let mut accepted_auth = auth.clone();
+    // Cursor 3.27.12's opaque IDE token supplies an identity locally but the
+    // dashboard rejects its legacy cookie with 401. If cursor-agent has its
+    // own JWT login, retry once with that independently valid session. Never
+    // switch accounts pre-emptively, on a WAF 403, or for a decodable IDE JWT.
+    if matches!(live, Err(AppError::Http { status: 401, .. }))
+        && crate::jwt::claims(&token).is_none()
+        && let Some(agent_token) = tokens.agent_fallback
+        && let Ok(agent_auth) = db::session_auth(&agent_token)
+    {
+        live = fetch_live(client, endpoints, &agent_auth, &agent_token).await;
+        accepted_auth = agent_auth;
+    }
+
+    match live {
         Ok(snap) => {
-            let bytes = serde_json::to_vec(&snap_to_json(&snap, &auth.account_key))?;
+            let bytes = serde_json::to_vec(&snap_to_json(&snap, &accepted_auth.account_key))?;
             cache.write_payload(&bytes)?;
             Ok(crate::outcome::Outcome::fresh(snap))
         }
-        Err(e) if e.is_transient() => fallback_silent(cache, &auth.account_key, now, e),
+        Err(e) if e.is_transient() => fallback_silent(cache, &accepted_auth.account_key, now, e),
         Err(e) => {
             cache.mark_stale();
             if let Some((code, msg)) = error_to_pair(&e) {
                 cache.write_last_error(code, &msg);
             }
-            fallback_with_error(cache, &auth.account_key, now, e)
+            fallback_with_error(cache, &accepted_auth.account_key, now, e)
         }
     }
 }
@@ -433,6 +464,15 @@ mod tests {
         path
     }
 
+    fn seed_profile(path: &Path, user_id: &str) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute(
+            "INSERT INTO ItemTable (key, value) VALUES ('cursorAuth/cachedScopedProfile', ?1)",
+            [serde_json::json!({"authId": format!("grok|{user_id}")}).to_string()],
+        )
+        .unwrap();
+    }
+
     fn account_key(token: &str) -> String {
         db::session_auth(token).unwrap().account_key
     }
@@ -587,6 +627,62 @@ mod tests {
         m.assert_async().await;
         assert_eq!(out.snapshot.plan, "Ultra");
         assert!(!out.stale);
+    }
+
+    #[tokio::test]
+    async fn rejected_opaque_ide_token_falls_back_to_cursor_agent() {
+        let mut server = mockito::Server::new_async().await;
+        let opaque = "curs_opaque_ide_token";
+        let agent = fake_token("agent_user");
+        let rejected = server
+            .mock("GET", "/api/usage-summary")
+            .match_header(
+                "cookie",
+                format!("WorkosCursorSessionToken=ide_user%3A%3A{opaque}").as_str(),
+            )
+            .with_status(401)
+            .expect(1)
+            .create_async()
+            .await;
+        let accepted = server
+            .mock("GET", "/api/usage-summary")
+            .match_header(
+                "cookie",
+                format!("WorkosCursorSessionToken=agent_user%3A%3A{agent}").as_str(),
+            )
+            .with_status(200)
+            .with_body(sample_json())
+            .expect(1)
+            .create_async()
+            .await;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = seed_state_db(&dir, opaque);
+        seed_profile(&db_path, "ide_user");
+        let agent_path = dir.path().join("auth.json");
+        std::fs::write(
+            &agent_path,
+            serde_json::json!({"accessToken": agent}).to_string(),
+        )
+        .unwrap();
+        let (_cache_dir, cache) = cache_fixture();
+
+        let out = fetch_snapshot(
+            &reqwest::Client::new(),
+            &db_path,
+            &agent_path,
+            &cache,
+            &endpoints_for(&server),
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+        rejected.assert_async().await;
+        accepted.assert_async().await;
+        assert_eq!(out.snapshot.plan, "Ultra");
+        let cached: serde_json::Value =
+            serde_json::from_slice(&cache.maybe_payload().unwrap().unwrap()).unwrap();
+        assert_eq!(cached["account"], account_key(&agent));
     }
 
     #[tokio::test]
@@ -807,6 +903,66 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(err, AppError::Http { status: 503, .. }));
+    }
+
+    /// #515: the cached payload is past its billing-cycle reset, so
+    /// `reuse_cache` refuses it, but a 429 backoff armed moments ago still
+    /// applies. The refresh must surface the shared countdown without
+    /// contacting the server.
+    #[tokio::test]
+    async fn an_active_backoff_is_not_bypassed_after_the_billing_reset() {
+        let token = fake_token("user_123");
+        let db_dir = TempDir::new().unwrap();
+        let db_path = seed_state_db(&db_dir, &token);
+        let (_cache_dir, cache) = cache_fixture();
+        cache
+            .write_payload(
+                serde_json::json!({
+                    "account": account_key(&token),
+                    "plan": "Pro", "auto_pct": 7, "api_pct": 3, "total_pct": 5,
+                    "unlimited": false, "on_demand_enabled": false,
+                    "reset_at": "2026-08-04T00:00:00Z",
+                    "credits": [],
+                })
+                .to_string()
+                .as_bytes(),
+            )
+            .unwrap();
+        // Armed against the real clock, like a genuine 429 would be; the
+        // payload above is seconds fresh, so `fresh_payload` returns it and
+        // the reset check refuses it.
+        cache.note_rate_limit_at(std::time::SystemTime::now());
+
+        let mut server = mockito::Server::new_async().await;
+        let summary = server
+            .mock("GET", "/api/usage-summary")
+            .with_status(500)
+            .with_body("must not be contacted during backoff")
+            .expect(0)
+            .create_async()
+            .await;
+        let now = DateTime::parse_from_rfc3339("2026-08-05T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let err = fetch_snapshot_at(
+            &reqwest::Client::new(),
+            &db_path,
+            &no_agent_auth(),
+            &cache,
+            &endpoints_for(&server),
+            Duration::from_secs(600),
+            now,
+        )
+        .await
+        .unwrap_err();
+        summary.assert_async().await;
+        match &err {
+            AppError::Http { status, body } => {
+                assert_eq!(status, &429, "body: {body}");
+                assert!(body.contains("rate limited"), "body: {body}");
+            }
+            other => panic!("expected the shared backoff 429, got {other:?}"),
+        }
     }
 
     #[test]

@@ -121,12 +121,12 @@ pub struct Cli {
     #[arg(long, value_name = "FILE")]
     pub creds_path: Option<std::path::PathBuf>,
 
-    /// Select a named Claude, Codex (OpenAI), or API-key vendor (Z.AI,
-    /// OpenRouter, DeepSeek, Kilo, Novita, Moonshot, Grok, MiniMax, OrcaRouter,
-    /// Lyceum) account from the matching `[[...accounts]]` config array. Without it,
-    /// the vendor's default account
-    /// and original cache path are unchanged. For Claude it conflicts with the
-    /// lower-level `--creds-path` because both select a credential source.
+    /// Select a named Claude, Codex (OpenAI), GitHub Copilot, Devin, or API-key
+    /// vendor (Z.AI, OpenRouter, DeepSeek, Kilo, Novita, Moonshot, Grok, MiniMax,
+    /// OrcaRouter, Lyceum) account from the matching `[[...accounts]]` config array.
+    /// Without it, the vendor's default account and original cache path are
+    /// unchanged. For Claude it conflicts with the lower-level `--creds-path`
+    /// because both select a credential source.
     #[arg(long, value_name = "LABEL", conflicts_with = "creds_path")]
     pub account: Option<String>,
 
@@ -166,7 +166,31 @@ pub enum Command {
         /// Machine-readable output.
         #[arg(long)]
         json: bool,
+        /// Add a usage-priority ranking to the JSON document: which provider's
+        /// weekly quota is projected to reset unused. Records a small local
+        /// history of quota percentages to estimate the recent pace. Off by
+        /// default, so the plain report (and every reader of it) is unchanged.
+        #[arg(long, requires = "json")]
+        priorities: bool,
+        /// Look back this many hours for the recent quota-consumption rate.
+        #[arg(long, requires = "priorities",
+            default_value_t = crate::recommendation::DEFAULT_RECENT_HOURS,
+            value_parser = clap::value_parser!(u8).range(1..=24))]
+        recent_hours: u8,
+        /// Flag a quota as urgent when at least this percent is projected unused.
+        #[arg(long, requires = "priorities",
+            default_value_t = crate::recommendation::DEFAULT_ALERT_UNUSED_PERCENT,
+            value_parser = clap::value_parser!(u8).range(1..=100))]
+        alert_unused_percent: u8,
+        /// ...and its weekly window resets within this many hours.
+        #[arg(long, requires = "priorities",
+            default_value_t = crate::recommendation::DEFAULT_ALERT_HOURS,
+            value_parser = clap::value_parser!(u8).range(1..=168))]
+        alert_hours: u8,
     },
+
+    /// Serve read-only usage and provider tools over local MCP stdio.
+    Mcp,
 
     /// Turn on vendors whose credentials already exist on this machine
     /// (local files, keychains, saved keys, env vars; never the network).
@@ -403,6 +427,7 @@ pub enum Vendor {
     Kimi,
     Kilo,
     Novita,
+    Synthetic,
     Moonshot,
     Grok,
     Supergrok,
@@ -427,7 +452,13 @@ pub enum Vendor {
     ModelStudio,
     Lyceum,
     Devin,
+    MuseCode,
     Cline,
+    Droid,
+    // The slug is one word; clap's derived spelling would be `deep-relay`.
+    #[value(name = "deeprelay")]
+    DeepRelay,
+    Mistral,
 }
 
 impl Vendor {
@@ -444,6 +475,7 @@ impl Vendor {
             Vendor::Kimi => crate::vendor::VendorId::Kimi,
             Vendor::Kilo => crate::vendor::VendorId::Kilo,
             Vendor::Novita => crate::vendor::VendorId::Novita,
+            Vendor::Synthetic => crate::vendor::VendorId::Synthetic,
             Vendor::Moonshot => crate::vendor::VendorId::Moonshot,
             Vendor::Grok => crate::vendor::VendorId::Grok,
             Vendor::Supergrok => crate::vendor::VendorId::Supergrok,
@@ -461,7 +493,11 @@ impl Vendor {
             Vendor::ModelStudio => crate::vendor::VendorId::ModelStudio,
             Vendor::Lyceum => crate::vendor::VendorId::Lyceum,
             Vendor::Devin => crate::vendor::VendorId::Devin,
+            Vendor::MuseCode => crate::vendor::VendorId::MuseCode,
             Vendor::Cline => crate::vendor::VendorId::Cline,
+            Vendor::Droid => crate::vendor::VendorId::Droid,
+            Vendor::DeepRelay => crate::vendor::VendorId::DeepRelay,
+            Vendor::Mistral => crate::vendor::VendorId::Mistral,
         }
     }
 }
@@ -545,6 +581,7 @@ fn id_to_vendor(id: crate::vendor::VendorId) -> Vendor {
         crate::vendor::VendorId::Kimi => Vendor::Kimi,
         crate::vendor::VendorId::Kilo => Vendor::Kilo,
         crate::vendor::VendorId::Novita => Vendor::Novita,
+        crate::vendor::VendorId::Synthetic => Vendor::Synthetic,
         crate::vendor::VendorId::Moonshot => Vendor::Moonshot,
         crate::vendor::VendorId::Grok => Vendor::Grok,
         crate::vendor::VendorId::Supergrok => Vendor::Supergrok,
@@ -562,7 +599,11 @@ fn id_to_vendor(id: crate::vendor::VendorId) -> Vendor {
         crate::vendor::VendorId::ModelStudio => Vendor::ModelStudio,
         crate::vendor::VendorId::Lyceum => Vendor::Lyceum,
         crate::vendor::VendorId::Devin => Vendor::Devin,
+        crate::vendor::VendorId::MuseCode => Vendor::MuseCode,
         crate::vendor::VendorId::Cline => Vendor::Cline,
+        crate::vendor::VendorId::Droid => Vendor::Droid,
+        crate::vendor::VendorId::DeepRelay => Vendor::DeepRelay,
+        crate::vendor::VendorId::Mistral => Vendor::Mistral,
     }
 }
 
@@ -639,9 +680,114 @@ mod tests {
     }
 
     #[test]
+    fn usage_recent_hours_are_bounded_and_explicit() {
+        for hours in ["1", "6", "24"] {
+            let cli = Cli::try_parse_from([
+                "ai-usagebar",
+                "usage",
+                "--json",
+                "--priorities",
+                "--recent-hours",
+                hours,
+            ])
+            .unwrap();
+            assert!(
+                matches!(cli.command, Some(Command::Usage { recent_hours, .. }) if recent_hours == hours.parse::<u8>().unwrap())
+            );
+        }
+        let cli = Cli::try_parse_from([
+            "ai-usagebar",
+            "usage",
+            "--json",
+            "--priorities",
+            "--alert-unused-percent",
+            "30",
+            "--alert-hours",
+            "48",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Usage {
+                alert_unused_percent: 30,
+                alert_hours: 48,
+                ..
+            })
+        ));
+        for (flag, value) in [
+            ("--alert-unused-percent", "0"),
+            ("--alert-unused-percent", "101"),
+            ("--alert-hours", "0"),
+            ("--alert-hours", "169"),
+        ] {
+            assert!(
+                Cli::try_parse_from([
+                    "ai-usagebar",
+                    "usage",
+                    "--json",
+                    "--priorities",
+                    flag,
+                    value
+                ])
+                .is_err()
+            );
+        }
+        for hours in ["0", "25", "-1", "1.5", "invalid"] {
+            assert!(
+                Cli::try_parse_from([
+                    "ai-usagebar",
+                    "usage",
+                    "--json",
+                    "--priorities",
+                    "--recent-hours",
+                    hours
+                ])
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn priorities_are_opt_in_and_only_with_json() {
+        // The plain report stays exactly what every other reader consumes.
+        let cli = Cli::parse_from(["ai-usagebar", "usage", "--json"]);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Usage {
+                priorities: false,
+                ..
+            })
+        ));
+        // Ranking is a JSON field, and its tuning flags mean nothing without it.
+        assert!(Cli::try_parse_from(["ai-usagebar", "usage", "--priorities"]).is_err());
+        for flag in ["--recent-hours", "--alert-unused-percent", "--alert-hours"] {
+            assert!(
+                Cli::try_parse_from(["ai-usagebar", "usage", "--json", flag, "6"]).is_err(),
+                "{flag} requires --priorities"
+            );
+        }
+    }
+
+    #[test]
     fn usage_subcommand_parses_machine_readable_mode() {
         let cli = Cli::parse_from(["ai-usagebar", "usage", "--json"]);
-        assert!(matches!(cli.command, Some(Command::Usage { json: true })));
+        assert!(matches!(
+            cli.command,
+            Some(Command::Usage {
+                json: true,
+                priorities: false,
+                recent_hours: 3,
+                alert_unused_percent: 50,
+                alert_hours: 24,
+            })
+        ));
+    }
+
+    #[test]
+    fn mcp_subcommand_parses_without_widget_flags() {
+        let cli = Cli::parse_from(["ai-usagebar", "mcp"]);
+        assert!(matches!(cli.command, Some(Command::Mcp)));
+        assert!(Cli::try_parse_from(["ai-usagebar", "--pretty", "mcp"]).is_err());
     }
 
     #[test]

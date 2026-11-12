@@ -100,6 +100,20 @@ async fn fetch_snapshot_at(
     {
         return Ok(outcome);
     }
+    // #515: during a backoff `fresh_payload` returns bytes this refresh can
+    // refuse, such as a payload past its credit-cycle reset. The shared
+    // backoff still applies, as it does for the Anthropic API since #496:
+    // surface the countdown instead of contacting the server, or a refresh
+    // interval shorter than the backoff would re-request and re-arm it forever.
+    if let Some(remaining) = cache.backoff_remaining() {
+        return Err(AppError::Http {
+            status: 429,
+            body: format!(
+                "rate limited; next attempt in {}",
+                crate::cache::human_backoff(remaining)
+            ),
+        });
+    }
 
     apply_persisted_oauth(cache, &mut creds)?;
 
@@ -874,5 +888,68 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(err, AppError::Http { status: 503, .. }));
+    }
+
+    /// #515: the cached payload is past its credit-cycle reset, so
+    /// `reuse_cache` refuses it, but a 429 backoff armed moments ago still
+    /// applies. The refresh must surface the shared countdown without
+    /// contacting the server. Mirrors `cursor::fetch`'s
+    /// `an_active_backoff_is_not_bypassed_after_the_billing_reset`.
+    #[tokio::test]
+    async fn an_active_backoff_is_not_bypassed_after_the_credit_reset() {
+        let db_dir = TempDir::new().unwrap();
+        let db_path = seed_db(&db_dir, "2099-01-01T00:00:00Z");
+        let (_cache_dir, cache) = cache_fixture();
+        let account = account_key(&db_dir);
+        cache
+            .write_payload(
+                serde_json::to_vec(&serde_json::json!({
+                    "account": account,
+                    "plan": "KIRO POWER",
+                    "used": 10.0,
+                    "limit": 100.0,
+                    "reset_at": "2026-08-04T00:00:00Z",
+                }))
+                .unwrap()
+                .as_slice(),
+            )
+            .unwrap();
+        // Armed against the real clock, like a genuine 429 would be; the
+        // payload above is seconds fresh, so `fresh_payload` returns it and
+        // the reset check refuses it.
+        cache.note_rate_limit_at(std::time::SystemTime::now());
+
+        let mut server = mockito::Server::new_async().await;
+        let usage = server
+            .mock("POST", "/")
+            .with_status(500)
+            .with_body("must not be contacted during backoff")
+            .expect(0)
+            .create_async()
+            .await;
+        let now = DateTime::parse_from_rfc3339("2026-08-05T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let err = fetch_snapshot_at(
+            &reqwest::Client::new(),
+            &db_path,
+            &cache,
+            Duration::from_secs(600),
+            Some(&Endpoints {
+                usage_limits: server.url(),
+                token: format!("{}/token", server.url()),
+            }),
+            now,
+        )
+        .await
+        .unwrap_err();
+        usage.assert_async().await;
+        match &err {
+            AppError::Http { status, body } => {
+                assert_eq!(status, &429, "body: {body}");
+                assert!(body.contains("rate limited"), "body: {body}");
+            }
+            other => panic!("expected the shared backoff 429, got {other:?}"),
+        }
     }
 }

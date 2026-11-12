@@ -484,6 +484,31 @@ func testParserBalances() {
     assertEqual(ocgFloat?.weekly?.pct, 12, "opencode-go parses floating weekly")
     assertEqual(ocgFloat?.sonnet?.pct, 34, "opencode-go parses floating monthly")
 
+    let mistral = snapshot(FORMAT, vendor: "mistral",
+                           fields: fields(through: 16, set: [
+                              0: "EDU", 1: "16", 2: "25d", 3: "0", 4: "25d",
+                              13: "0", 14: "0", 16: "mis"
+                           ]))
+    assertEqual(mistral?.session?.pct, 16, "mistral API pct")
+    assertEqual(mistral?.sessionLabel, "API budget", "mistral API label")
+    assertEqual(mistral?.sessionTag, "api", "mistral API tag")
+    assertEqual(mistral?.session?.elapsed, nil, "mistral API elapsed is nil")
+    assertEqual(mistral?.weekly?.pct, 0, "mistral Vibe pct")
+    assertEqual(mistral?.weeklyLabel, "Vibe budget", "mistral Vibe label")
+    assertEqual(mistral?.weeklyTag, "vibe", "mistral Vibe tag")
+    assertEqual(mistral?.weekly?.elapsed, nil, "mistral Vibe elapsed is nil")
+
+    let mistralNoApi = snapshot(FORMAT, vendor: "mistral",
+                                fields: fields(through: 16, set: [
+                                   0: "EDU", 1: "", 2: "", 3: "40", 4: "25d",
+                                   13: "", 14: "0", 16: "mis"
+                                ]))
+    assertEqual(mistralNoApi?.session, nil, "mistral without API budget has no session window")
+    assertEqual(mistralNoApi?.weekly?.pct, 40, "mistral without API budget keeps Vibe pct")
+    assertEqual(mistralNoApi?.weeklyLabel, "Vibe budget", "mistral without API budget keeps Vibe label")
+    assertEqual(mistralNoApi?.weeklyTag, "vibe", "mistral without API budget keeps Vibe tag")
+    assertEqual(mistralNoApi?.weekly?.elapsed, nil, "mistral Vibe elapsed is nil without API budget")
+
     let cmd = snapshot(FORMAT, vendor: "commandcode",
                        fields: fields(through: 37, set: [
                           0: "Command Code", 1: "15", 2: "4h 30m", 3: "40", 4: "5d", 16: "cmd",
@@ -595,6 +620,146 @@ func testParserBalances() {
     assertEqual(dvnOldBinary?.hasUsageWindows, true, "devin old binary shows windows")
     assertNil(dvnOldBinary?.session, "devin old binary has no daily window")
     assertEqual(dvnOldBinary?.weekly?.pct, 31, "devin old binary still parses weekly window")
+
+    // Cline: 5h quota at 57-58, 7d at 59-60, 30d at 61-62.
+    let cln = snapshot(FORMAT, vendor: "cline",
+                       fields: fields(through: 62, set: [
+                          0: "ClinePass Tier 2", 1: "10", 2: "3h", 3: "40", 4: "4d", 16: "cln",
+                          57: "10", 58: "3h", 59: "40", 60: "4d", 61: "70", 62: "25d"
+                       ]))
+    assertEqual(cln?.hasUsageWindows, true, "cline shows windows")
+    assertNil(cln?.creditBalance, "cline has no balance-only creditBalance")
+    assertEqual(cln?.session?.pct, 10, "cline 5h pct")
+    assertEqual(cln?.session?.reset, "3h", "cline 5h reset")
+    assertEqual(cln?.sessionLabel, "5 hours", "cline session label is 5 hours")
+    assertEqual(cln?.sessionTag, "5h", "cline session tag is 5h")
+    assertEqual(cln?.weekly?.pct, 40, "cline 7d pct")
+    assertEqual(cln?.weekly?.reset, "4d", "cline 7d reset")
+    assertEqual(cln?.weeklyLabel, "Weekly", "cline weekly label is Weekly")
+    assertEqual(cln?.weeklyTag, "7d", "cline weekly tag is 7d")
+    assertEqual(cln?.sonnet?.pct, 70, "cline 30d pct mapped to third window")
+    assertEqual(cln?.sonnet?.reset, "25d", "cline 30d reset")
+    assertEqual(cln?.sonnetLabel, "Monthly", "cline sonnet label is Monthly")
+
+    let clnOldBinary = snapshot(FORMAT, vendor: "cline",
+                                fields: fields(through: 16, set: [
+                                   0: "ClinePass", 1: "15", 2: "2h", 3: "35", 4: "5d", 16: "cln"
+                                ]))
+    assertEqual(clnOldBinary?.hasUsageWindows, true, "cline old binary shows windows")
+    assertEqual(clnOldBinary?.session?.pct, 15, "cline old binary falls back to session slot")
+    assertEqual(clnOldBinary?.sessionLabel, "5 hours", "cline old binary keeps 5 hours label")
+    assertEqual(clnOldBinary?.weekly?.pct, 35, "cline old binary falls back to weekly slot")
+    assertEqual(clnOldBinary?.weeklyLabel, "Weekly", "cline old binary keeps Weekly label")
+    assertNil(clnOldBinary?.sonnet, "cline old binary has no monthly window")
+
+    let clnNoQuota = snapshot(FORMAT, vendor: "cline",
+                              fields: fields(through: 62, set: [
+                                 0: "Free", 16: "cln",
+                                 57: "—", 58: "—", 59: "—", 60: "—", 61: "—", 62: "—"
+                              ]))
+    assertNil(clnNoQuota?.session, "cline unquoted session is nil")
+    assertNil(clnNoQuota?.weekly, "cline unquoted weekly is nil")
+    assertNil(clnNoQuota?.sonnet, "cline unquoted monthly is nil")
+
+    // Model Studio: monthly quota at 63-64.
+    // Three-window account: session at 1-2, weekly at 3-4, monthly at 63-64.
+    let mst = snapshot(FORMAT, vendor: "modelstudio",
+                       fields: fields(through: 64, set: [
+                          0: "Token Plan", 1: "15", 2: "3h 12m", 3: "45", 4: "4d 2h", 16: "mst",
+                          63: "75", 64: "18d 0h"
+                       ]))
+    assertEqual(mst?.hasUsageWindows, true, "modelstudio shows windows")
+    assertNil(mst?.creditBalance, "modelstudio has no balance-only creditBalance")
+    assertEqual(mst?.session?.pct, 15, "modelstudio 5h pct")
+    assertEqual(mst?.session?.reset, "3h 12m", "modelstudio 5h reset")
+    assertEqual(mst?.sessionLabel, "Session", "modelstudio session label is Session")
+    assertEqual(mst?.sessionTag, "5h", "modelstudio session tag is 5h")
+    assertEqual(mst?.weekly?.pct, 45, "modelstudio 7d pct")
+    assertEqual(mst?.weekly?.reset, "4d 2h", "modelstudio 7d reset")
+    assertEqual(mst?.weeklyLabel, "Weekly", "modelstudio weekly label is Weekly")
+    assertEqual(mst?.weeklyTag, "7d", "modelstudio weekly tag is 7d")
+    assertEqual(mst?.sonnet?.pct, 75, "modelstudio 30d pct mapped to third window")
+    assertEqual(mst?.sonnet?.reset, "18d 0h", "modelstudio 30d reset")
+    assertEqual(mst?.sonnetLabel, "Monthly", "modelstudio sonnet label is Monthly")
+
+    // Monthly-only account (Token Plan individual): session and weekly absent.
+    let mstMonthlyOnly = snapshot(FORMAT, vendor: "modelstudio",
+                                  fields: fields(through: 64, set: [
+                                     0: "Token Plan", 16: "mst",
+                                     63: "60", 64: "22d 8h"
+                                  ]))
+    assertEqual(mstMonthlyOnly?.hasUsageWindows, true, "modelstudio monthly-only shows windows")
+    assertEqual(mstMonthlyOnly?.session?.pct, 60, "modelstudio monthly routes to primary sessionWindow")
+    assertEqual(mstMonthlyOnly?.session?.reset, "22d 8h", "modelstudio monthly reset on sessionWindow")
+    assertEqual(mstMonthlyOnly?.sessionLabel, "Monthly", "modelstudio monthly-only session label is Monthly")
+    assertEqual(mstMonthlyOnly?.sessionTag, "mo", "modelstudio monthly-only session tag is mo")
+    assertNil(mstMonthlyOnly?.weekly, "modelstudio monthly-only has no weekly window")
+    assertNil(mstMonthlyOnly?.sonnet, "modelstudio monthly-only does not duplicate monthly into sonnet")
+
+    // A percentage is usable even when the API omits the reset timestamp.
+    let mstMonthlyUnknownReset = snapshot(FORMAT, vendor: "modelstudio",
+                                          fields: fields(through: 64, set: [
+                                             0: "Token Plan", 16: "mst",
+                                             63: "35", 64: "—"
+                                          ]))
+    assertEqual(mstMonthlyUnknownReset?.session?.pct, 35, "modelstudio monthly parses without a reset")
+    assertEqual(mstMonthlyUnknownReset?.session?.reset, "—", "modelstudio preserves an unknown reset")
+    assertEqual(mstMonthlyUnknownReset?.sessionLabel, "Monthly", "modelstudio unknown-reset row stays monthly")
+
+    // Old binary fallback: slots 63-64 absent or empty.
+    let mstOldBinary = snapshot(FORMAT, vendor: "modelstudio",
+                                fields: fields(through: 16, set: [
+                                   0: "Token Plan", 1: "20", 2: "4h", 3: "50", 4: "6d", 16: "mst"
+                                ]))
+    assertEqual(mstOldBinary?.hasUsageWindows, true, "modelstudio old binary shows windows")
+    assertEqual(mstOldBinary?.session?.pct, 20, "modelstudio old binary parses session window")
+    assertEqual(mstOldBinary?.weekly?.pct, 50, "modelstudio old binary parses weekly window")
+    assertNil(mstOldBinary?.sonnet, "modelstudio old binary has no monthly window")
+
+    // No-quota / unquoted state: all windows empty or "—".
+    let mstNoQuota = snapshot(FORMAT, vendor: "modelstudio",
+                              fields: fields(through: 64, set: [
+                                 0: "Token Plan", 16: "mst",
+                                 1: "—", 2: "—", 3: "—", 4: "—", 63: "—", 64: "—"
+                              ]))
+    assertNil(mstNoQuota?.session, "modelstudio unquoted session is nil")
+    assertNil(mstNoQuota?.weekly, "modelstudio unquoted weekly is nil")
+    assertNil(mstNoQuota?.sonnet, "modelstudio unquoted monthly is nil")
+
+    // Synthetic: subscription request quota at 65-66.
+    let syn = snapshot(FORMAT, vendor: "synthetic",
+                       fields: fields(through: 66, set: [
+                          0: "Synthetic", 1: "42", 2: "15d", 16: "syn",
+                          65: "42", 66: "15d"
+                       ]))
+    assertEqual(syn?.hasUsageWindows, true, "synthetic shows windows")
+    assertNil(syn?.creditBalance, "synthetic has no balance-only creditBalance")
+    assertEqual(syn?.session?.pct, 42, "synthetic subscription pct")
+    assertEqual(syn?.session?.reset, "15d", "synthetic subscription reset")
+    assertEqual(syn?.sessionLabel, "Subscription", "synthetic session label is Subscription")
+    assertEqual(syn?.sessionTag, "sub", "synthetic session tag is sub")
+    assertNil(syn?.weekly, "synthetic has no weekly window")
+    assertNil(syn?.sonnet, "synthetic has no third window")
+
+    // Old binary fallback: slots 65-66 absent, reads session slots 1-2.
+    let synOldBinary = snapshot(FORMAT, vendor: "synthetic",
+                                fields: fields(through: 16, set: [
+                                   0: "Synthetic", 1: "25", 2: "10d", 16: "syn"
+                                ]))
+    assertEqual(synOldBinary?.hasUsageWindows, true, "synthetic old binary shows windows")
+    assertEqual(synOldBinary?.session?.pct, 25, "synthetic old binary falls back to session slot")
+    assertEqual(synOldBinary?.sessionLabel, "Subscription", "synthetic old binary keeps Subscription label")
+    assertEqual(synOldBinary?.sessionTag, "sub", "synthetic old binary keeps sub tag")
+    assertNil(synOldBinary?.weekly, "synthetic old binary has no weekly window")
+
+    // No-quota / unquoted plan:
+    let synNoQuota = snapshot(FORMAT, vendor: "synthetic",
+                              fields: fields(through: 66, set: [
+                                 0: "Synthetic", 16: "syn",
+                                 1: "—", 2: "—", 65: "—", 66: "—"
+                              ]))
+    assertNil(synNoQuota?.session, "synthetic unquoted session is nil")
+    assertNil(synNoQuota?.weekly, "synthetic unquoted weekly is nil")
 }
 
 // ─── Run ─────────────────────────────────────────────────────────────────
@@ -1184,6 +1349,51 @@ func testCopilotAccounts() {
                 "Preferences includes every named Copilot account")
 }
 
+func testDevinAccounts() {
+    let config = """
+    [[devin.accounts]]
+    label = "work"
+    credentials_path = "~/.devin-work/credentials.toml"
+
+    [[devin.accounts]]
+    label = "personal"
+    credentials_path = "~/.devin-personal/credentials.toml"
+    """
+    let labels = accountLabels(inTOML: config, vendor: "devin")
+    assertEqual(labels, ["work", "personal"], "extracts the Devin account labels in file order")
+
+    func catalog(enabled: Bool, configured: Bool) -> [VendorCatalogEntry] {
+        [VendorCatalogEntry(id: "devin", name: "Devin", shortName: "dvn", kind: "local",
+            enabled: enabled, configured: configured, needsCredential: true, env: "",
+            login: "devin auth login")]
+    }
+    let ready = catalog(enabled: true, configured: true)
+
+    let entries = vendorEntries(active: "overview", catalog: ready,
+                                devinLabels: { labels })
+    assertEqual(entries.map { $0.id }, ["devin", "devin@work", "devin@personal"],
+                "selector lists the default and every named Devin account")
+    assertEqual(entries.map { $0.name }, ["Devin", "Devin · work", "Devin · personal"],
+                "account names come from the catalog name")
+
+    assertEqual(vendorEntries(active: "overview", catalog: ready, devinLabels: { [] })
+                    .map { $0.id },
+                ["devin"], "with no accounts the entry list is unchanged")
+
+    assertEqual(vendorEntries(active: "devin@work", catalog: catalog(enabled: false,
+                                                                    configured: true),
+                              devinLabels: { labels }).count,
+                0, "disabled Devin exposes no accounts")
+
+    assertEqual(vendorArgs(for: "devin@work"), ["--vendor", "devin", "--account", "work"],
+                "fetch selects the named credentials via Rust")
+
+    assertEqual(preferenceVendorIds(catalog: ready, claude: [], apiKeyAccounts: [:],
+                                    codex: [], copilot: [], devin: labels),
+                ["devin", "devin@work", "devin@personal"],
+                "Preferences includes every named Devin account")
+}
+
 func testCodexAccounts() {
     let config = """
     [[openai.accounts]]
@@ -1300,6 +1510,7 @@ func testDisabledVendorPreferences() {
 struct TestRunner {
     static func main() {
         testCopilotAccounts()
+        testDevinAccounts()
         testCodexAccounts()
         testApiKeyAccounts()
         testEnableVendorCommand()

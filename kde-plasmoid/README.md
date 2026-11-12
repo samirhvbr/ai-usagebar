@@ -38,9 +38,12 @@ One caveat worth knowing before you put a vendor in the scroll ring:
 - GNU coreutils `timeout` (standard on Plasma Linux distributions)
 
 > **plasmashell does not inherit your shell's `PATH`.** A `cargo install` into
-> `~/.cargo/bin` is typically invisible to the widget. Either install to a
-> session-visible prefix (`make install PREFIX=~/.local`) or set the full path
-> under *Configure → Binary path*.
+> `~/.cargo/bin` (or a release tarball dropped into `~/.local/bin`) is typically
+> invisible to the widget. Either install to a session-visible prefix
+> (`make install PREFIX=~/.local`, or symlink into `/usr/local/bin`) or set the
+> full path under *Configure → Binary path*. That same setting also locates
+> `ai-usagebar-tui` next to the binary, so the panel / middle-click TUI launch
+> does not fall back to an empty terminal when PATH cannot see the install.
 
 ## Install (dev)
 
@@ -50,13 +53,16 @@ cd kde-plasmoid
 # then: right-click the panel → "Add or Manage Widgets…" → search "AI Usage"
 ```
 
-It symlinks `package/` into `~/.local/share/plasma/plasmoids/` and restarts
-plasmashell, so editing the QML only needs
-`systemctl --user restart plasma-plasmashell` afterwards.
+It runs `sync-provider-icons.sh` (KDE/Linux install helper only — not used on
+Windows/macOS or at widget runtime; symlinks the tray SVG catalog under
+`windows/popover/src/icons/providers/`), symlinks `package/` into
+`~/.local/share/plasma/plasmoids/`, and restarts plasmashell. Editing the QML
+only needs `systemctl --user restart plasma-plasmashell` afterwards.
 
 The copy-based alternative, if you prefer it:
 
 ```sh
+./sync-provider-icons.sh
 kpackagetool6 --type Plasma/Applet --install ./package
 kpackagetool6 --type Plasma/Applet --upgrade ./package   # on re-runs
 ```
@@ -74,17 +80,21 @@ never appears in the chooser.
 
 ## Configuration
 
-Right-click the widget → *Configure*. One page: which vendors are in the scroll
-ring (each listed with its plan or its error, straight from the report), the
-current vendor, the popup layout, refresh interval, command timeout, left-click
-action, compact percentage and bar toggles, bar width, and the five severity
-colours.
+Right-click the widget → *Configure*. One page: which vendors appear as tabs
+and in the scroll ring (each listed with its plan or its error, straight from
+the report — every vendor is shown until you untick one; arrows reorder the
+chips), the current vendor,
+per-provider metric switches, the popup layout, refresh interval, command
+timeout, left-click action, compact percentage and bar toggles, bar width, and
+the five severity colours. Hidden metrics leave both popup layouts, the compact
+panel, the tooltip, and headline/severity selection. The final visible metric is
+locked to keep the applet usable.
 
 The GNOME prefs window has a second "Vendors" page listing per-vendor login
 status. There is no equivalent page here because the report already carries
-`status` and `error` for every configured vendor: the popup's tab strip marks a
-failing one where you are already looking, and the ring checkboxes show the same
-thing while you choose.
+`status` and `error` for every configured vendor: a failing vendor you left
+ticked still shows ⚠ on its tab, and the ring checkboxes show the same status
+while you choose.
 
 **Each panel instance keeps its own vendor.** One report covers every vendor, so
 switching is a client-side re-pick rather than a refetch, and the widget never
@@ -104,6 +114,14 @@ provider tab strip, a tinted surface when something is wrong, the usage rows
 under one heading, and a footer saying how old the data is. Only the structure
 is ported — every size comes from `Kirigami.Units` and every colour from
 `Kirigami.Theme`, so the widget follows whatever Plasma colour scheme you run.
+Provider tabs and cards use the same brand SVG marks as the Win/mac tray
+(`windows/popover/src/icons/providers/`, also embedded by `src/tray/marks.rs`).
+Dev install symlinks that catalog into the package; `make install-plasmoid`
+copies the SVGs into the install prefix so the plasmoid tree does not duplicate
+them in git. The slug list in `plasmoid-logic.mjs` is a hand-kept
+mirror of that directory, because QML cannot list one; `plasmoid-logic.test.mjs`
+diffs the two in both directions, so a new mark cannot ship without its slug and
+a slug cannot outlive its file.
 
 Each row puts its label and value on one line, the bar under them, then the pace
 text and a live countdown. The countdown is recomputed locally from the
@@ -158,12 +176,14 @@ quoting and argv construction. The QML holds only what needs Qt.
 
 It is an ECMAScript module imported by QML (`import "../code/x.mjs" as X`).
 That is officially supported by Qt and used by other Plasma 6 widgets, but it is
-a minority pattern in the KDE ecosystem, so two engine differences are guarded
+a minority pattern in the KDE ecosystem, so three engine differences are guarded
 by tests rather than left to review:
 
 - QML's V4 engine **rejects** the ES2019 optional catch binding (`catch {`);
 - V4 **silently evaluates Unicode property escapes (`\p{L}`) to false** instead
-  of throwing, which once made every pool tag render empty.
+  of throwing, which once made every pool tag render empty;
+- V4 **rejects** object spread (`{...obj}`) with `Unexpected token '...'`. Copy
+  properties explicitly instead.
 
 `make mjs-probe` loads `probe/` in a real applet host and asserts both, along
 with the one thing Node cannot check: that the fully single-quoted
@@ -198,6 +218,8 @@ page — is still exercised by hand against the checklist below.
 4. Running `ai-usagebar --cycle-next` in a terminal does **not** move the
    widget — the proof it is independent of the shared state file.
 5. Hover shows every quota row, and the countdowns tick between fetches.
+   Hide one metric in Configure and confirm it leaves the popup, compact panel
+   and tooltip, then survives a plasmashell restart.
 6. Click opens the popup; the refresh and TUI buttons are visible and work
    (they were once clipped by a zero-height root).
 7. Breeze Light ↔ Dark ↔ a third-party scheme recolours without a restart, and
