@@ -56,7 +56,11 @@ export function emptyPayload(hostError) {
     updateCheckedAt: 0,
     repository: "",
     accounts: {},
+    providers: [],
+    providersError: "",
     accent: null,
+    keyCheck: null,
+    signIn: null,
   };
 }
 
@@ -105,7 +109,11 @@ function normalizePayload(parsed) {
     updateCheckedAt: finiteNumber(parsed.update_checked_at),
     repository: githubPage(parsed.repository),
     accounts: normalizeAccounts(parsed.accounts),
+    providers: normalizeProviders(parsed.providers),
+    providersError: clean(parsed.providers_error, 300),
     accent: normalizeAccent(parsed.accent),
+    keyCheck: normalizeKeyCheck(parsed.key_check),
+    signIn: normalizeSignIn(parsed.sign_in),
   };
 }
 
@@ -115,6 +123,129 @@ function normalizeAccent(value) {
   const color = /^#[0-9a-f]{6}$/i;
   if (!color.test(value.light) || !color.test(value.dark)) return null;
   return { light: value.light.toLowerCase(), dark: value.dark.toLowerCase() };
+}
+
+// The host's key-check verdict (`key_check` in the payload). Only the three
+// states the host publishes reach the dialog; any other shape means "no
+// fact" rather than a guessed one, exactly like a missing account switch.
+const KEY_CHECK_STATES = ["checking", "ok", "failed"];
+
+/** @returns {import("./lib/types").KeyCheck | null} */
+function normalizeKeyCheck(value) {
+  if (!isPlainObject(value)) return null;
+  const state = KEY_CHECK_STATES.includes(value.state) ? value.state : null;
+  if (!state) return null;
+  const id = clean(value.id, 64).trim();
+  const seq = Number(value.seq);
+  if (!id || !Number.isInteger(seq) || seq < 0) return null;
+  return { id, seq, state, error: clean(value.error, 300) };
+}
+
+/** A check that has not answered by then is reported, not left spinning. */
+export const KEY_CHECK_NO_ANSWER_MS = 60_000;
+
+/**
+ * The key dialog's phase for one send. Only the verdict for `pendingSeq`
+ * belongs to the dialog: a verdict for another send — or none — is no
+ * answer, and the wait is measured on this clock, from the send, exactly
+ * like the update check. The host's clock never enters the comparison.
+ *
+ * @returns {"idle" | "checking" | "ok" | "failed" | "no-answer"}
+ */
+export function keyDialogPhase(keyCheck, pendingSeq, sentAtMs, nowMs) {
+  if (pendingSeq === null || pendingSeq === undefined) return "idle";
+  const mine = keyCheck && keyCheck.seq === pendingSeq ? keyCheck : null;
+  if (mine && (mine.state === "ok" || mine.state === "failed")) return mine.state;
+  return Number(nowMs) - Number(sentAtMs) >= KEY_CHECK_NO_ANSWER_MS ? "no-answer" : "checking";
+}
+
+// The host's device-code sign-in (`sign_in` in the payload). As with the key
+// check, an unknown state or a malformed fact means "no fact", never a guess.
+const SIGN_IN_STATES = ["starting", "waiting", "ok", "expired", "unavailable", "failed"];
+const SIGN_IN_REASONS = ["device-off", "cli-missing", "custom-path", "denied"];
+
+/** @returns {import("./lib/types").SignInFact | null} */
+function normalizeSignIn(value) {
+  if (!isPlainObject(value)) return null;
+  const state = SIGN_IN_STATES.includes(value.state) ? value.state : null;
+  if (!state) return null;
+  const id = clean(value.id, 64).trim();
+  const seq = Number(value.seq);
+  if (!id || !Number.isInteger(seq) || seq < 0) return null;
+  // The code is typed on the provider's page; anything but its shape is dropped.
+  const code = /^[A-Za-z0-9-]{4,24}$/.test(String(value.code || "")) ? String(value.code) : "";
+  const expiresAt = Number(value.expires_at);
+  return {
+    id,
+    seq,
+    state,
+    code,
+    expiresAt: Number.isFinite(expiresAt) && expiresAt > 0 ? expiresAt : 0,
+    reason: SIGN_IN_REASONS.includes(value.reason) ? value.reason : "",
+    error: clean(value.error, 300),
+  };
+}
+
+/** A start the host has not acknowledged by then is reported, not left spinning. */
+export const SIGN_IN_NO_ANSWER_MS = 15_000;
+
+/**
+ * The sign-in sheet's phase for one start. Only the fact for `pendingSeq`
+ * belongs to the sheet. A code past its expiry on this clock reads as
+ * expired at once, though the host only gives up on it a little later.
+ *
+ * @returns {"idle" | "starting" | "waiting" | "ok" | "expired" | "unavailable" | "failed" | "no-answer"}
+ */
+export function signInPhase(fact, pendingSeq, sentAtMs, nowMs) {
+  if (pendingSeq === null || pendingSeq === undefined) return "idle";
+  const mine = fact && fact.seq === pendingSeq ? fact : null;
+  if (!mine) return Number(nowMs) - Number(sentAtMs) >= SIGN_IN_NO_ANSWER_MS ? "no-answer" : "starting";
+  if (mine.state === "waiting" && mine.expiresAt > 0 && Number(nowMs) >= mine.expiresAt) return "expired";
+  return mine.state;
+}
+
+/** "14:32": what is left of a code, floored at zero. */
+export function countdownText(expiresAt, nowMs) {
+  const left = Math.max(0, Math.floor((Number(expiresAt) - Number(nowMs)) / 1000));
+  const minutes = Math.floor(left / 60);
+  const seconds = left % 60;
+  return `${minutes}:${String(seconds).padStart(2, "0")}`;
+}
+
+const SIGN_IN_ACTIONS = ["device", "terminal", "app", "settings"];
+const ADD_ACCOUNT_KINDS = ["code", "desktop", "codex"];
+
+// Every built-in provider from the host's catalog (Settings → Providers).
+// The host owns names, hints and actions; this only bounds and types them.
+function normalizeProviders(value) {
+  if (!Array.isArray(value)) return [];
+  const out = [];
+  for (const raw of value.slice(0, MAX_ENTRIES)) {
+    if (!isPlainObject(raw)) continue;
+    const id = clean(raw.id, 64).trim();
+    if (!id) continue;
+    out.push({
+      id,
+      name: clean(raw.name, 120) || id,
+      enabled: raw.enabled === true,
+      configured: raw.configured === true,
+      env: clean(raw.env, 120),
+      signIn: clean(raw.sign_in, 200),
+      keyLabel: clean(raw.key_label, 120),
+      keyNote: clean(raw.key_note, 300),
+      signInAccount: clean(raw.sign_in_account, 60),
+      signInIssuer: clean(raw.sign_in_issuer, 60),
+      action: SIGN_IN_ACTIONS.includes(raw.action) ? raw.action : "",
+      addAccounts: Array.isArray(raw.add_accounts) ? ADD_ACCOUNT_KINDS.filter((kind) => raw.add_accounts.includes(kind)) : [],
+    });
+  }
+  return out;
+}
+
+/** "off" | "off-ready" (credential found) | "ready" | "needs" (enabled, not signed in). */
+export function providerState(provider) {
+  if (!provider.enabled) return provider.configured ? "off-ready" : "off";
+  return provider.configured ? "ready" : "needs";
 }
 
 const SWITCHABLE_VENDORS = ["anthropic", "openai", "claude-desktop"];
@@ -225,7 +356,7 @@ function windowSeconds(value) {
   return secs > 0 ? secs : 0;
 }
 
-const REFRESH_MINUTES = [1, 5, 10];
+const REFRESH_MINUTES = [1, 5, 10, 15, 30, 60];
 
 function normalizeOs(value) {
   const os = String(value || "").toLowerCase();
@@ -235,7 +366,7 @@ function normalizeOs(value) {
 
 // The menu-bar look the host reports; anything else reads as the default chart.
 function normalizeMenuBarLook(value) {
-  return value === "logos" || value === "quattro" ? value : "chart";
+  return value === "icon" || value === "logos" || value === "quattro" ? value : "chart";
 }
 
 // The host's refresh interval; anything outside the offered set reads as the
@@ -292,14 +423,20 @@ function normalizeEntry(raw) {
     // How to sign this provider in, from VendorId::sign_in_hint on the host.
     // Deliberately not a table in this file; see signInHint.
     signIn: clean(raw.sign_in, 200),
+    // A `[[custom]]` provider can name the built-in it mirrors; its mark follows.
+    brand: clean(raw.brand, 64),
+    // Wall-clock ms of the payload on screen; 0 when the report has none.
+    fetchedAt: Date.parse(clean(raw.fetched_at, 64)) || 0,
     sections,
   };
 }
 
 function normalizeResetCredits(raw) {
   if (!isPlainObject(raw)) return null;
-  const available = Math.max(0, Math.min(10_000, Math.floor(finiteNumber(raw.available))));
-  if (available === 0) return null;
+  if (typeof raw.available !== "number" || !Number.isFinite(raw.available)) return null;
+  // The host only sends a zero when the provider states it (Codex), so it
+  // stays a row reading "0 available" instead of disappearing.
+  const available = Math.max(0, Math.min(10_000, Math.floor(raw.available)));
   const source = Array.isArray(raw.credits) ? raw.credits : [];
   const credits = [];
   for (let i = 0; i < source.length && i < 64; i++) {
@@ -344,7 +481,18 @@ function normalizeSection(raw) {
       // The sub-group the report assigned this metric ("Breakdown" slices,
       // Claude CLI "Sessions"); "" when it stands on its own.
       group: clean(raw.group, 80),
+      // One model's own limit (Antigravity's "Gemini 4 Argon"), not a window
+      // the whole provider shares.
+      modelPool: raw.model_pool === true,
+      // What a refilling window (Synthetic's weekly credits) gets back at
+      // `reset_at`, such as "2%"; "" for a window that resets.
+      regen: clean(raw.regen, 40),
     };
+  }
+  // A text row that meters a cap (Cursor's On-Demand spend) carries `percent`
+  // and `severity`: draw it as a bar headed by its amount.
+  if (type === "text" && typeof raw.percent === "number" && Number.isFinite(raw.percent) && raw.severity) {
+    return normalizeSection({ ...raw, type: "metric", headline: "value", detail: "" });
   }
   if (type === "text") {
     return { type: "text", label: clean(raw.label, 160), value: clean(raw.value, 1000) };
@@ -374,7 +522,11 @@ export function resetLabel(section, nowMs, locale) {
   if (!section || section.type !== "metric") return "";
   if (section.resetAt) {
     const at = Date.parse(section.resetAt);
-    if (!Number.isNaN(at)) return m.resets_in({ duration: formatDuration(at - nowMs, locale) }, { locale: lang(locale) });
+    if (!Number.isNaN(at)) {
+      const duration = formatDuration(at - nowMs, locale);
+      if (section.regen) return m.regenerates_in({ amount: section.regen, duration }, { locale: lang(locale) });
+      return m.resets_in({ duration }, { locale: lang(locale) });
+    }
   }
   const detail = section.detail || "";
   if (/reset/i.test(detail)) return detail;
@@ -615,8 +767,16 @@ export function resetText(row, mode, nowMs, opts) {
     const resetFallback = /^Resets in (.*)$/.exec(fallback);
     return resetFallback ? m.resets_in({ duration: resetFallback[1] }, { locale: lang(opts && opts.locale) }) : fallback;
   }
-  if (mode === "exact") return m.resets_at({ exact: formatResetExact(at, Number(nowMs) || 0, opts) }, { locale: lang(opts && opts.locale) });
-  return m.resets_in({ duration: formatDuration(at - (Number(nowMs) || 0), opts && opts.locale) }, { locale: lang(opts && opts.locale) });
+  // A refilling window gets `regen` back at that instant instead of resetting.
+  const amount = row.regen;
+  if (mode === "exact") {
+    const exact = formatResetExact(at, Number(nowMs) || 0, opts);
+    if (amount) return m.regenerates_at({ amount, exact }, { locale: lang(opts && opts.locale) });
+    return m.resets_at({ exact }, { locale: lang(opts && opts.locale) });
+  }
+  const duration = formatDuration(at - (Number(nowMs) || 0), opts && opts.locale);
+  if (amount) return m.regenerates_in({ amount, duration }, { locale: lang(opts && opts.locale) });
+  return m.resets_in({ duration }, { locale: lang(opts && opts.locale) });
 }
 
 // Same row in the other mode, for hover tooltips; "" without a timestamp.
@@ -832,8 +992,10 @@ export function projectCards(payload, nowMs, locale) {
           severity: section.severity,
           reset: resetLabel(section, now, locale),
           resetAt: section.resetAt || "",
+          regen: section.regen || "",
           window: section.window || 0,
           grouped: Boolean(metricGroup),
+          modelPool: Boolean(section.modelPool),
         };
         row.key = metricRowKey(entry.id, section.label, metricGroup);
         rows.push(row);
@@ -861,6 +1023,8 @@ export function projectCards(payload, nowMs, locale) {
     const explained = explainError(entry.error, entry, locale);
     cards.push({
       id: entry.id,
+      icon: providerIconId(entry.brand || entry.id),
+      fetchedAt: entry.fetchedAt,
       title: entry.displayName || entry.shortName || entry.id,
       plan: entry.plan,
       stale: entry.stale,
@@ -945,10 +1109,10 @@ export function prettyMetricLabel(entryId, raw, group) {
 /** @returns {Layout} */
 export function emptyLayout() {
   return {
+    accountTab: {},
     alwaysShowPace: false,
     usageGoal: false,
     cardOrder: [],
-    hidden: {},
     collapsed: {},
     hideExtras: false,
     hintDismissed: false,
@@ -982,15 +1146,43 @@ function normalizeTheme(value) {
   return value === "light" || value === "dark" ? value : "system";
 }
 
+/** The remembered account tab per provider (provider id → card id). */
+function normalizeAccountTab(raw) {
+  const tabs = {};
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return tabs;
+  for (const id of Object.keys(raw)) {
+    const key = clean(id, 180).trim();
+    const value = clean(raw[id], 180).trim();
+    if (key && value) tabs[key] = value;
+  }
+  return tabs;
+}
+
 /** @returns {Record<string, string[]>} */
+function isLegacyAnthropicSpendKey(key) {
+  return /^(metric|text):(?:Month to date \(through [^)]+\)|Completed daily buckets this month)$/.test(key);
+}
+
+function canonicalStoredRowKey(providerId, key) {
+  if (vendorSlug(providerId) !== "anthropic_api" || !isLegacyAnthropicSpendKey(key)) return key;
+  return key.slice(0, key.indexOf(":")) + ":Spend (mo)";
+}
+
+function normalizeStoredRowKeys(providerId, raw) {
+  const keys = cleanIdList(raw).map((key) => canonicalStoredRowKey(providerId, key));
+  return keys.filter((key, index) => keys.indexOf(key) === index);
+}
+
 function normalizeStars(raw) {
   const stars = {};
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return stars;
   for (const id of Object.keys(raw)) {
     const key = clean(id, 180).trim();
     if (!key) continue;
-    const keys = cleanIdList(raw[id]).slice(0, MAX_STARS_PER_PROVIDER);
-    if (keys.length) stars[key] = keys;
+    // An empty list is a provider the user took off the menu bar (see
+    // `toggleStar`); it must survive storage, or `seedStars` would star it again.
+    if (!Array.isArray(raw[id])) continue;
+    stars[key] = normalizeStoredRowKeys(key, raw[id]).slice(0, MAX_STARS_PER_PROVIDER);
   }
   return stars;
 }
@@ -1025,8 +1217,10 @@ export function toggleStar(stars, providerId, key) {
   const idx = list.indexOf(metric);
   if (idx >= 0) {
     list.splice(idx, 1);
-    if (list.length === 0) delete current[id];
-    else current[id] = list;
+    // Unstarring the last metric keeps an empty list rather than dropping the
+    // provider: "off the menu bar on purpose", which `seedStars` leaves alone,
+    // unlike a provider that never had an entry.
+    current[id] = list;
     return { stars: current, error: "" };
   }
   if (list.length >= MAX_STARS_PER_PROVIDER) {
@@ -1105,7 +1299,6 @@ export function normalizeLayout(raw) {
   layout.alwaysShowPace = raw.alwaysShowPace === true;
   layout.usageGoal = raw.usageGoal === true;
   layout.cardOrder = cleanIdList(raw.cardOrder);
-  copyFlagMap(raw.hidden, layout.hidden);
   copyFlagMap(raw.collapsed, layout.collapsed);
   layout.timeFormat = normalizeTimeFormat(raw.timeFormat);
   layout.hideExtras = raw.hideExtras === true;
@@ -1118,6 +1311,7 @@ export function normalizeLayout(raw) {
   layout.stars = normalizeStars(raw.stars);
   layout.stripStyle = "bars";
   layout.theme = normalizeTheme(raw.theme);
+  layout.accountTab = normalizeAccountTab(raw.accountTab);
   if (raw.rows && typeof raw.rows === "object" && !Array.isArray(raw.rows)) {
     for (const id of Object.keys(raw.rows)) {
       const prefs = raw.rows[id];
@@ -1125,10 +1319,16 @@ export function normalizeLayout(raw) {
       const key = clean(id, 180).trim();
       if (!key) continue;
       const off = {};
-      copyFlagMap(prefs.off, off);
+      if (prefs.off && typeof prefs.off === "object" && !Array.isArray(prefs.off)) {
+        for (const rowKey of Object.keys(prefs.off)) {
+          if (prefs.off[rowKey] !== true) continue;
+          const cleanKey = clean(rowKey, 180).trim();
+          if (cleanKey) off[canonicalStoredRowKey(key, cleanKey)] = true;
+        }
+      }
       layout.rows[key] = {
-        always: cleanIdList(prefs.always),
-        demand: cleanIdList(prefs.demand),
+        always: normalizeStoredRowKeys(key, prefs.always),
+        demand: normalizeStoredRowKeys(key, prefs.demand),
         off,
       };
     }
@@ -1170,31 +1370,204 @@ export function saveLayout(storage, layout) {
   storage.setItem(LAYOUT_KEY, JSON.stringify(normalizeLayout(layout)));
 }
 
-/** @returns {Layout} */
+/** The provider a card id belongs to: `antigravity@3f2a` is an account of `antigravity`. */
+export function providerOf(id) {
+  const at = id.indexOf("@");
+  return at < 0 ? id : id.slice(0, at);
+}
+
+/**
+ * The dashboard's cards grouped by provider, in the order each provider's
+ * first card appears: a provider with several accounts becomes one group the
+ * dashboards render as one card with a tab per account, and a card whose
+ * provider is not in the catalog (a custom provider) is a group of one.
+ * @param {import("./lib/types").Card[]} cards the ordered visible list
+ * @returns {{ id: string, cards: import("./lib/types").Card[] }[]} one group per provider
+ */
+export function providerGroups(cards) {
+  const groups = [];
+  const byProvider = new Map();
+  for (const card of Array.isArray(cards) ? cards : []) {
+    if (!card || !card.id) continue;
+    const id = providerOf(card.id);
+    if (!byProvider.has(id)) {
+      const group = { id, cards: [] };
+      byProvider.set(id, group);
+      groups.push(group);
+    }
+    byProvider.get(id).cards.push(card);
+  }
+  return groups;
+}
+
+/**
+ * The card order to save after dragging a grouped dashboard: each group id
+ * in the new order expands to its own cards in their relative order, so the
+ * accounts of a provider stay together wherever it lands.
+ * @param {{ id: string, cards: import("./lib/types").Card[] }[]} groups
+ * @param {string[]} groupIds the groups' ids in the new order
+ * @returns {string[]} the card ids
+ */
+export function expandGroupOrder(groups, groupIds) {
+  const list = Array.isArray(groups) ? groups : [];
+  const byId = new Map(list.map((group) => [String(group && group.id), group]));
+  const ids = [];
+  const seen = new Set();
+  for (const id of Array.isArray(groupIds) ? groupIds : []) {
+    const group = byId.get(String(id));
+    if (!group) continue;
+    for (const card of group.cards) {
+      if (card && card.id && !seen.has(card.id)) {
+        seen.add(card.id);
+        ids.push(card.id);
+      }
+    }
+  }
+  // Groups the drag order left out keep their cards at the end, so a drop
+  // never loses an account from `cardOrder`.
+  for (const group of list) {
+    for (const card of group.cards) {
+      if (card && card.id && !seen.has(card.id)) {
+        seen.add(card.id);
+        ids.push(card.id);
+      }
+    }
+  }
+  return ids;
+}
+
+/**
+ * The account a provider's card shows: the remembered choice in
+ * `layout.accountTab`, when it still names one of the provider's cards;
+ * else the payload's primary, when it is one of them (the host's main entry
+ * is the account the selection pointed at before tabs existed); else the
+ * first card (a tab with no value, or one whose account is gone, never
+ * blanks the card).
+ * @param {import("./lib/types").Card[]} cards the provider's cards, in dashboard order
+ * @param {import("./lib/types").Layout} layout
+ * @param {string} providerId
+ * @param {string} [primary] the payload's primary card id
+ * @returns {string} the card id
+ */
+export function activeAccountTab(cards, layout, providerId, primary) {
+  const ids = (Array.isArray(cards) ? cards : []).map((card) => String(card && card.id)).filter(Boolean);
+  if (ids.length === 0) return "";
+  const remembered = layout && layout.accountTab ? layout.accountTab[String(providerId)] : "";
+  if (ids.indexOf(remembered) >= 0) return remembered;
+  const fallback = String(primary || "");
+  if (fallback !== "" && ids.indexOf(fallback) >= 0) return fallback;
+  return ids[0];
+}
+
+/**
+ * The account's tab label. A title of `"<providerName> · <label>"` loses its
+ * prefix ("Claude · work" → "work"); an id with an account suffix uses it
+ * ("openai@work" → "work"); the default account has no suffix, so it reads
+ * the catalog's word for that.
+ * @param {{ id: string, title: string }} card
+ * @param {string} providerName the provider's display name
+ * @param {string} [locale]
+ * @returns {string}
+ */
+export function accountLabel(card, providerName, locale) {
+  const name = String(providerName || "");
+  const title = String((card && card.title) || "");
+  const prefix = `${name} · `;
+  if (name && title.startsWith(prefix)) {
+    const rest = title.slice(prefix.length).trim();
+    if (rest) return rest;
+  }
+  const id = String((card && card.id) || "");
+  const at = id.indexOf("@");
+  const suffix = at >= 0 ? id.slice(at + 1).trim() : "";
+  return suffix || m.default_account({}, { locale: lang(locale) });
+}
+
+/** "1 metric" / "6 metrics", in the layout's language. */
+export function metricsCountText(count, locale) {
+  const total = Number(count) || 0;
+  return `${total} ${total === 1 ? m.metric_singular({}, { locale: lang(locale) }) : m.metric_plural({}, { locale: lang(locale) })}`;
+}
+
+/**
+ * The list row's subtitle for a provider with several accounts: the account
+ * labels joined by ", ", then the provider's total metric count
+ * ("Default, work · 6 metrics").
+ * @param {{ id: string, title: string }[]} cards the provider's accounts
+ * @param {number} total the provider's total metric count
+ * @param {string} providerName
+ * @param {string} [locale]
+ * @returns {string}
+ */
+export function multiAccountSubtitle(cards, total, providerName, locale) {
+  const list = Array.isArray(cards) ? cards : [];
+  const labels = list.map((card) => accountLabel(card, providerName, locale));
+  return `${labels.join(", ")} · ${metricsCountText(total, locale)}`;
+}
+
+/**
+ * What the list row's "+" does: nothing (the provider is off, or the
+ * catalog offers no account kinds), the one kind's `add-account` directly,
+ * or a menu with one item per kind.
+ * @param {{ enabled: boolean, addAccounts: string[] }} row
+ * @returns {null | { kind: "direct", value: string } | { kind: "menu", value: string[] }}
+ */
+export function addAccountDecision(row) {
+  const kinds = row && Array.isArray(row.addAccounts) ? row.addAccounts.map(String) : [];
+  if (!row || row.enabled !== true || kinds.length === 0) return null;
+  if (kinds.length === 1) return { kind: "direct", value: kinds[0] };
+  return { kind: "menu", value: kinds.slice() };
+}
+
+/**
+ * Reconcile the stored layout with the ids a payload carries.
+ *
+ * Settings outlive a payload that lacks their id: a provider switched off, or
+ * an account whose entry is gone for a while, keeps its place, stars, rows and
+ * flags for when it returns. An id seen for the first time takes over the place
+ * and settings of its sole absent sibling — another id of the same provider —
+ * instead of starting over at the end. More than one absent sibling is
+ * ambiguous, so those settings stay separate. Antigravity is why: its entry is `antigravity`
+ * without a live `agy` status-line session and `antigravity@<account>` with
+ * one, so every reboot switches it, and pruning the absent id reset the card's
+ * place and stars on each switch (#452). The settings move rather than copy,
+ * so the two forms never diverge.
+ * @returns {Layout}
+ */
 export function syncLayout(layout, cardIds) {
   const ids = Array.isArray(cardIds) ? cardIds.filter(Boolean) : [];
-  const known = new Set(ids);
-  const order = (layout.cardOrder || []).filter((id) => known.has(id));
-  for (const id of ids) {
-    if (order.indexOf(id) < 0) order.push(id);
-  }
-  const hidden = {};
+  const present = new Set(ids);
+  const order = (layout.cardOrder || []).filter(Boolean);
   const collapsed = {};
-  const rows = {};
-  for (const id of Object.keys(layout.hidden || {})) {
-    if (known.has(id) && layout.hidden[id]) hidden[id] = true;
-  }
+  const rows = Object.assign({}, layout.rows || {});
+  const stars = {};
   for (const id of Object.keys(layout.collapsed || {})) {
-    if (known.has(id) && layout.collapsed[id]) collapsed[id] = true;
+    if (layout.collapsed[id]) collapsed[id] = true;
   }
-  for (const id of Object.keys(layout.rows || {})) {
-    if (known.has(id)) rows[id] = layout.rows[id];
+  const starSource = layout.stars && typeof layout.stars === "object" ? layout.stars : {};
+  for (const id of Object.keys(starSource)) {
+    if (Array.isArray(starSource[id])) stars[id] = starSource[id].slice(0, MAX_STARS_PER_PROVIDER);
+  }
+  for (const id of ids) {
+    if (order.indexOf(id) >= 0) continue;
+    const siblings = order.filter((other) => other !== id && !present.has(other) && providerOf(other) === providerOf(id));
+    if (siblings.length !== 1) {
+      order.push(id);
+      continue;
+    }
+    const [sibling] = siblings;
+    order[order.indexOf(sibling)] = id;
+    for (const settings of [collapsed, rows, stars]) {
+      if (Object.prototype.hasOwnProperty.call(settings, sibling)) {
+        settings[id] = settings[sibling];
+        delete settings[sibling];
+      }
+    }
   }
   return {
     alwaysShowPace: layout.alwaysShowPace === true,
     usageGoal: layout.usageGoal === true,
     cardOrder: order,
-    hidden,
     collapsed,
     hideExtras: layout.hideExtras === true,
     hintDismissed: layout.hintDismissed === true,
@@ -1204,22 +1577,12 @@ export function syncLayout(layout, cardIds) {
     seeded: layout.seeded === true,
     rows,
     showAs: normalizeShowAs(layout.showAs),
-    stars: pruneStars(layout.stars, known),
+    stars,
     stripStyle: "bars",
     theme: normalizeTheme(layout.theme),
     timeFormat: normalizeTimeFormat(layout.timeFormat),
+    accountTab: Object.assign({}, layout.accountTab || {}),
   };
-}
-
-function pruneStars(source, known) {
-  const stars = {};
-  if (!source || typeof source !== "object") return stars;
-  for (const id of Object.keys(source)) {
-    if (!known.has(id)) continue;
-    const keys = Array.isArray(source[id]) ? source[id].slice(0, MAX_STARS_PER_PROVIDER) : [];
-    if (keys.length) stars[id] = keys;
-  }
-  return stars;
 }
 
 export function metricCount(card) {
@@ -1267,7 +1630,7 @@ export function orderedCards(cards, layout) {
 
 /** @returns {Card[]} */
 export function applyCardLayout(cards, layout) {
-  return orderedCards(cards, layout).filter((card) => !layout.hidden || !layout.hidden[card.id]);
+  return orderedCards(cards, layout);
 }
 
 export function moveCardBefore(order, draggedId, beforeId) {
@@ -1309,42 +1672,119 @@ export function mergeVisibleOrder(fullOrder, visibleOrder) {
   return next;
 }
 
-// First launch, as OpenUsage does it: providers with no credential on this
-// machine start hidden, and the dashboard's welcome card points at Customize.
-// Only "No API key" counts — an expired sign-in means a credential exists.
-export function lacksCredentials(entry) {
-  if (!entry || typeof entry !== "object") return false;
-  return explainError(entry.error, entry).title === "No API key";
-}
-
 // Runs once, on the first payload that carries entries. A host error (no
-// entries) is not a first launch. When every provider lacks a credential the
-// starter set stays visible, so a fresh install never opens on an empty
-// dashboard.
+// entries) is not a first launch. It only marks the layout seeded, so the
+// dashboard's welcome hint can show; which providers are visible is the
+// provider's `enabled` in config.toml, and the list's switch is the only one.
 /** @returns {Layout} */
 export function seedLayout(layout, entries) {
   const list = Array.isArray(entries) ? entries.filter((e) => e && typeof e === "object" && e.id) : [];
   if (!layout || layout.seeded === true || list.length === 0) return layout;
-  const missing = list.filter(lacksCredentials);
-  const hidden = Object.assign({}, layout.hidden || {});
-  if (missing.length < list.length) {
-    for (const entry of missing) hidden[String(entry.id)] = true;
-  }
-  return Object.assign({}, layout, { hidden, seeded: true });
+  return Object.assign({}, layout, { seeded: true });
 }
 
-/** Fill default stars once, from projected cards (metric keys). */
+/**
+ * One row of the single provider list (Customize and Settings → Providers
+ * share it): a catalog provider with its cards in the dashboard's order, or
+ * a card whose provider is not in the catalog — a custom provider — which
+ * stands alone, keeps the card's place and has no switch (it toggles in
+ * config.toml).
+ * @param {import("./lib/types").ProviderInfo[]} providers
+ * @param {import("./lib/types").Card[]} cards
+ * @param {import("./lib/types").Layout} layout
+ * @returns {{ enabled: import("./lib/types").ProviderListRow[], disabled: import("./lib/types").ProviderListRow[] }}
+ */
+export function providerListRows(providers, cards, layout) {
+  const catalog = new Map();
+  for (const provider of Array.isArray(providers) ? providers : []) catalog.set(String(provider.id), provider);
+  // First-card order: grouped in the order `orderedCards` sees the cards.
+  const grouped = new Map();
+  for (const card of orderedCards(cards, layout)) {
+    const id = providerOf(card.id);
+    const list = grouped.get(id) || [];
+    list.push(card);
+    grouped.set(id, list);
+  }
+  const toRow = (provider, id, list) => ({
+    id,
+    name: provider ? provider.name : list[0].title,
+    icon: provider ? providerIconId(provider.id) : list[0].icon,
+    enabled: provider ? provider.enabled === true : true,
+    switchable: provider ? true : false,
+    state: provider ? providerState(provider) : "",
+    signIn: provider ? provider.signIn : "",
+    action: provider ? provider.action : "",
+    signInAccount: provider ? provider.signInAccount || "" : "",
+    signInIssuer: provider ? provider.signInIssuer || "" : "",
+    keyLabel: provider ? provider.keyLabel || "" : "",
+    keyNote: provider ? provider.keyNote || "" : "",
+    addAccounts: provider ? provider.addAccounts : [],
+    cards: list.map((card) => ({ id: card.id, title: card.title, metrics: metricCount(card) })),
+    metrics: list.reduce((total, card) => total + metricCount(card), 0),
+  });
+  const enabled = [];
+  for (const [id, list] of grouped) {
+    const provider = catalog.get(id);
+    if (provider && !provider.enabled) continue; // its row lives in the disabled block
+    enabled.push(toRow(provider, id, list));
+  }
+  // Enabled without a card on screen (just turned on, or a missing report
+  // entry) trails the block, in the catalog's order.
+  for (const provider of Array.isArray(providers) ? providers : []) {
+    if (provider.enabled && !grouped.has(provider.id)) enabled.push(toRow(provider, provider.id, []));
+  }
+  const disabled = [];
+  for (const provider of Array.isArray(providers) ? providers : []) {
+    if (!provider.enabled) disabled.push(toRow(provider, provider.id, grouped.get(provider.id) || []));
+  }
+  return { enabled, disabled };
+}
+
+/**
+ * The card order to save after dragging one row of the enabled block: every
+ * card of the dragged row moves together, in its own relative order, to the
+ * row it landed on, and every card outside the block (a switched-off
+ * provider's) keeps its relative place after them, as `mergeVisibleOrder`.
+ * @param {string[]} cardOrder the stored order
+ * @param {import("./lib/types").ProviderListRow[]} rows the enabled rows, before the move
+ * @param {string[]} rowIds the enabled row ids, after the move
+ * @returns {string[]}
+ */
+export function reorderProviderRows(cardOrder, rows, rowIds) {
+  const byId = new Map();
+  for (const row of Array.isArray(rows) ? rows : []) {
+    byId.set(String(row && row.id), (row && Array.isArray(row.cards) ? row.cards : []).map((card) => String(card && card.id)).filter(Boolean));
+  }
+  const visible = [];
+  for (const id of Array.isArray(rowIds) ? rowIds : []) {
+    for (const cardId of byId.get(String(id)) || []) if (visible.indexOf(cardId) < 0) visible.push(cardId);
+  }
+  return mergeVisibleOrder(Array.isArray(cardOrder) ? cardOrder : [], visible);
+}
+
+/**
+ * Give every provider without a stars entry its default stars, from projected
+ * cards (metric keys). Filling the map only while it was empty — on first
+ * launch — left a provider switched on later, or one whose entry `syncLayout`
+ * pruned while its id was missing from a payload (Antigravity switches between
+ * `antigravity` and `antigravity@<account>`), off the menu bar for good
+ * (#437). An empty list is the user's own "off" and is left alone.
+ */
 export function seedStars(layout, cards) {
-  if (!layout || (layout.stars && Object.keys(layout.stars).length)) return layout;
-  const stars = defaultStars(cards);
-  if (!Object.keys(stars).length) return layout;
+  if (!layout) return layout;
+  const current = layout.stars && typeof layout.stars === "object" ? layout.stars : {};
+  const defaults = defaultStars(cards);
+  const missing = Object.keys(defaults).filter((id) => !Array.isArray(current[id]));
+  if (!missing.length) return layout;
+  const stars = Object.assign({}, current);
+  for (const id of missing) stars[id] = defaults[id];
   return Object.assign({}, layout, { stars });
 }
 
 // What a fresh host payload does to the stored layout. A payload without
 // entries (the host's placeholder before the first report, or a host error)
 // must leave the layout alone: syncing against an empty id list would wipe
-// every remembered order, hidden flag and row preference.
+// every remembered order and row preference.
 /** @returns {Layout} */
 export function absorbPayload(layout, entries) {
   const list = Array.isArray(entries) ? entries : [];
@@ -1611,7 +2051,7 @@ function shortenDiagnostic(raw, locale) {
   text = text.replace(/^[A-Za-z0-9. _-]+:\s+/, "");
   // A bare path says where, never what went wrong: it is no diagnosis.
   if (/^~[\\/]\S*$/.test(text)) text = "";
-  if (text === "") return m.open_tui_for_details({}, { locale: lang(locale) });
+  if (text === "") return m.no_details_given({}, { locale: lang(locale) });
   // The card wraps long hints, so keep the whole diagnosis; only a runaway
   // body (an HTML error page pasted into the message) is cut.
   if (text.length <= 400) return text;
@@ -1622,17 +2062,32 @@ function shortenDiagnostic(raw, locale) {
 // can offer (a host command) when there is one. Errors whose fix is a terminal
 // command (sign-in) or waiting (429 backoff) carry no action.
 /** @returns {ExplainedError} */
-export function explainError(text, entry, locale) {
+export function explainError(text, entry, locale, device) {
   const raw = clean(text, 1200);
   const options = { locale: lang(locale) };
-  const openTui = { cmd: "open-tui", label: m.open_tui({}, options) };
   const refresh = { cmd: "refresh", label: m.refresh({}, options) };
   if (raw === "") return { title: "", hint: "" };
+  // A device-code provider signs in from here: the card that has no login, or
+  // whose login the provider refused, offers the sheet instead of a terminal.
+  if (device && device.id && (!device.configured || SIGN_IN_TROUBLE.test(raw))) {
+    return {
+      title: device.configured ? m.sign_in_expired({}, options) : m.not_signed_in({}, options),
+      hint: m.sign_in_to_track_usage({ account: device.account }, options),
+      action: { cmd: "sign-in", id: device.id, label: m.provider_sign_in({}, options) },
+    };
+  }
   if (/no vendors enabled/i.test(raw)) {
-    return { title: m.no_providers_enabled({}, options), hint: m.open_tui_settings_to_turn_one_on({}, options), action: openTui };
+    return { title: m.no_providers_enabled({}, options), hint: m.turn_one_on_in_customize({}, options), action: { cmd: "customize", label: m.customize({}, options) } };
   }
   if (/no API key/i.test(raw)) {
-    return { title: m.no_api_key({}, options), hint: m.open_tui_settings_to_add_one({}, options), action: openTui };
+    // The popover takes the key itself (the key dialog); a host-wide error
+    // names no provider, so it points at Customize, where the rows are.
+    const id = typeof entry === "string" ? providerOf(entry) : entry && entry.id ? providerOf(entry.id) : "";
+    return {
+      title: m.no_api_key({}, options),
+      hint: m.add_one_to_track_usage({}, options),
+      action: id ? { cmd: "add-key", id, label: m.provider_add_key({}, options) } : { cmd: "customize", label: m.customize({}, options) },
+    };
   }
   if (/no local server found|Antigravity must be running|no local language server/i.test(raw)) {
     return {
@@ -1664,7 +2119,7 @@ export function explainError(text, entry, locale) {
     return { title: m.can_t_reach_the_server({}, options), hint: m.connection_retry_hint({}, options), action: refresh };
   }
   if (/io error/i.test(raw)) {
-    return { title: m.couldn_t_read_local_files({}, options), hint: m.open_tui_for_details({}, options), action: openTui };
+    return { title: m.couldn_t_read_local_files({}, options), hint: shortenDiagnostic(raw, locale), action: refresh };
   }
   if (/did not contain valid JSON/i.test(raw)) {
     return { title: m.couldn_t_read_usage_data({}, options), hint: m.error_recovery_hint({}, options), action: refresh };
@@ -1694,8 +2149,23 @@ function isWarningSection(section) {
   return section.type === "text" && (section.label === "Warning" || /schema drift/i.test(section.label));
 }
 
+// A login the provider refused, or one that is gone: what a sign-in fixes.
+const SIGN_IN_TROUBLE = /HTTP 401|HTTP 403|authentication rejected|not signed in|no credentials|token refresh failed|re-auth|log in again|login is required|run `claude`|run `codex|run `kimi|auth nous login/i;
+
 export function friendlyError(text, entry, locale) {
   return joinError(explainError(text, entry, locale));
+}
+
+// The key dialog's line for a key the provider refused. A rejection names the
+// key: the error card's "sign-in expired" would send the user to a sign-in
+// that a key-only provider does not have. Anything else reads as the card does.
+export function keyCheckError(text, provider, locale) {
+  const raw = clean(text, 300);
+  if (raw === "") return "";
+  if (/HTTP 401|HTTP 403|authentication rejected|unauthori[sz]ed|invalid[^.]*key/i.test(raw)) {
+    return m.api_key_rejected({ provider }, { locale: lang(locale) });
+  }
+  return friendlyError(raw, null, locale);
 }
 
 export function nextUpdateLabel(payload, nowMs, locale) {

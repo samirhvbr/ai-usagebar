@@ -81,7 +81,7 @@ impl BrowserOpener for SystemBrowserOpener {
         }
         #[cfg(target_os = "macos")]
         {
-            let _child = Command::new("open").arg(url).spawn()?;
+            let _child = Command::new("/usr/bin/open").arg(url).spawn()?;
             Ok(())
         }
         #[cfg(target_os = "windows")]
@@ -265,7 +265,10 @@ pub async fn refresh_if_needed(
     endpoint: &str,
     now: DateTime<Utc>,
 ) -> Result<NousCredential, OAuthError> {
-    let lock = store.acquire_lock().map_err(|_| OAuthError::Credentials)?;
+    let lock = store
+        .acquire_lock_async()
+        .await
+        .map_err(|_| OAuthError::Credentials)?;
     let document = store
         .read_unlocked()
         .map_err(|_| OAuthError::Credentials)?
@@ -332,7 +335,7 @@ fn token_expiration(now: DateTime<Utc>, expires_in: u64) -> Result<DateTime<Utc>
         .ok_or(OAuthError::Schema)
 }
 
-fn is_safe_portal_url(url: &str) -> bool {
+pub(crate) fn is_safe_portal_url(url: &str) -> bool {
     let Ok(parsed) = reqwest::Url::parse(url) else {
         return false;
     };
@@ -444,6 +447,74 @@ mod tests {
         assert!(needs_refresh(now, now + ChronoDuration::seconds(120)));
         assert!(needs_refresh(now, now + ChronoDuration::seconds(119)));
         assert!(needs_refresh(now, now - ChronoDuration::seconds(1)));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_contended_refresh_lock_keeps_the_runtime_responsive() {
+        use std::future::{Future, poll_fn};
+        use std::task::Poll;
+
+        let root = tempfile::tempdir().unwrap();
+        let store = CredentialStore::at(root.path().join("config/credentials.json"));
+        let now = Utc.with_ymd_and_hms(2026, 10, 28, 12, 0, 0).unwrap();
+        let credential = NousCredential {
+            client_id: CLIENT_ID.into(),
+            access_token: "test-access".into(),
+            refresh_token: "test-refresh".into(),
+            expires_at: now + ChronoDuration::hours(1),
+        };
+        store
+            .write(&CredentialDocument::new(Some(credential.clone())))
+            .unwrap();
+        let client = reqwest::Client::new();
+        let held = store.acquire_lock().unwrap();
+        let (release, released) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            // A watchdog releases the lock even on the broken implementation,
+            // so a regression fails instead of hanging the entire test suite.
+            let runtime_progressed = released.recv_timeout(Duration::from_secs(10)).is_ok();
+            drop(held);
+            runtime_progressed
+        });
+        let mut refresh = Box::pin(refresh_if_needed(
+            &client,
+            &store,
+            "http://127.0.0.1:1/unused",
+            now,
+        ));
+        // A contended async lock must yield on its first poll. Release the
+        // holder only after observing that yield, not after a timing estimate.
+        let first_poll = poll_fn(|cx| Poll::Ready(refresh.as_mut().poll(cx))).await;
+        let _ = release.send(());
+        assert!(
+            holder.join().unwrap(),
+            "credential lock blocked the runtime until the watchdog released it"
+        );
+        assert!(
+            first_poll.is_pending(),
+            "refresh must wait for the existing holder"
+        );
+        assert_eq!(refresh.await.unwrap(), credential);
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_lock_wait_does_not_leave_a_waiter_or_release_the_holder() {
+        let root = tempfile::tempdir().unwrap();
+        let store = CredentialStore::at(root.path().join("config/credentials.json"));
+        let held = store.acquire_lock().unwrap();
+        for _ in 0..2 {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), store.acquire_lock_async())
+                    .await
+                    .is_err()
+            );
+        }
+        drop(held);
+        let guard = tokio::time::timeout(Duration::from_secs(2), store.acquire_lock_async())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(guard);
     }
 
     #[tokio::test]

@@ -16,6 +16,7 @@ use crate::config::Config;
 use crate::copilot;
 use crate::cursor;
 use crate::deepinfra;
+use crate::deeprelay;
 use crate::deepseek;
 use crate::error::{AppError, Result};
 use crate::grok;
@@ -25,6 +26,7 @@ use crate::kimi;
 use crate::kiro;
 use crate::lyceum;
 use crate::minimax;
+use crate::mistral;
 use crate::modelstudio;
 use crate::moonshot;
 use crate::novita;
@@ -32,15 +34,17 @@ use crate::ollama;
 use crate::openai;
 use crate::openrouter;
 use crate::orcarouter;
+use crate::outcome::fetch_api_keyed;
 use crate::pango::escape;
 use crate::shvia;
 use crate::supergrok;
+use crate::synthetic;
 use crate::theme::Theme;
 use crate::vendor::{HTTP_CLIENT_TIMEOUT, RenderOpts, VendorId, VendorOutcome};
 use crate::waybar::WaybarOutput;
 use crate::widget::cli::{Cli, Vendor};
 use crate::widget::pretty::print_pretty;
-use crate::widget::render::{DEFAULT_FORMAT, RenderInput, render_anthropic};
+use crate::widget::render::{RenderInput, default_format, render_anthropic};
 use crate::zai;
 
 /// Entry point — runs to completion and ALWAYS returns Ok with exit code 0
@@ -161,6 +165,7 @@ async fn build_output(cli: &Cli) -> Result<WaybarOutput> {
         Vendor::Kimi => kimi_output(cli, &config).await,
         Vendor::Kilo => kilo_output(cli, &config).await,
         Vendor::Novita => novita_output(cli, &config).await,
+        Vendor::Synthetic => synthetic_output(cli, &config).await,
         Vendor::Moonshot => moonshot_output(cli, &config).await,
         Vendor::Grok => grok_output(cli, &config).await,
         Vendor::Supergrok => supergrok_output(cli, &config).await,
@@ -178,21 +183,31 @@ async fn build_output(cli: &Cli) -> Result<WaybarOutput> {
         Vendor::Lyceum => lyceum_output(cli, &config).await,
         Vendor::ModelStudio => modelstudio_output(cli, &config).await,
         Vendor::Devin => devin_output(cli, &config).await,
+        Vendor::Droid => droid_output(cli, &config).await,
+        Vendor::MuseCode => muse_output(cli, &config).await,
         Vendor::Cline => cline_output(cli, &config).await,
+        Vendor::DeepRelay => deeprelay_output(cli, &config).await,
+        Vendor::Mistral => mistral_output(cli, &config).await,
     }
 }
 
 fn validate_vendor_options(cli: &Cli, vendor: Vendor) -> Result<()> {
     if cli.account.is_some()
-        && !matches!(vendor, Vendor::Anthropic | Vendor::Openai | Vendor::Copilot)
+        && !matches!(
+            vendor,
+            Vendor::Anthropic | Vendor::Openai | Vendor::Copilot | Vendor::Devin
+        )
         && !Config::API_KEY_ACCOUNT_VENDORS.contains(&vendor.to_id())
     {
-        return Err(AppError::Other(
-            "--account is supported only for Claude, Codex (OpenAI), GitHub Copilot, and \
-             the API-key vendors with a [[<vendor>.accounts]] array: Z.AI, OpenRouter, \
-             DeepSeek, DeepInfra, Kilo, Novita, Moonshot, Grok, MiniMax, and OrcaRouter"
-                .into(),
-        ));
+        let api_key_vendors = Config::API_KEY_ACCOUNT_VENDORS
+            .iter()
+            .map(|vendor| vendor.display_name())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(AppError::Other(format!(
+            "--account is supported only for Claude, Codex (OpenAI), GitHub Copilot, Devin, \
+                 and the API-key vendors with a [[<vendor>.accounts]] array: {api_key_vendors}"
+        )));
     }
     if cli.desktop && vendor != Vendor::Anthropic {
         return Err(AppError::Other(
@@ -211,12 +226,23 @@ fn dispatch_is_eligible(cli: &Cli, config: &Config, vendor: Vendor) -> bool {
 
 /// Nous Research authenticates with the independent OAuth credential store.
 async fn nous_output(cli: &Cli) -> Result<WaybarOutput> {
-    let client = http_client()?;
     let store = crate::nous::credentials::CredentialStore::default();
     let endpoints = crate::nous::fetch::Endpoints::default();
-    let account =
-        crate::nous::fetch::fetch_account_with_refresh(&client, &store, &endpoints, Utc::now())
-            .await?;
+    nous_output_with(cli, &store, &endpoints).await
+}
+
+async fn nous_output_with(
+    cli: &Cli,
+    store: &crate::nous::credentials::CredentialStore,
+    endpoints: &crate::nous::fetch::Endpoints,
+) -> Result<WaybarOutput> {
+    let account = match fetch_nous_account(store, endpoints).await {
+        Ok(account) => account,
+        Err(error) if error.is_transient() => {
+            return Ok(WaybarOutput::loading(cli.icon.as_deref()));
+        }
+        Err(error) => return Err(error),
+    };
     let snapshot = account.clone();
     // Nous keeps no cache of its own, so every read is a live one.
     let outcome =
@@ -231,6 +257,17 @@ async fn nous_output(cli: &Cli) -> Result<WaybarOutput> {
     ))
 }
 
+async fn fetch_nous_account(
+    store: &crate::nous::credentials::CredentialStore,
+    endpoints: &crate::nous::fetch::Endpoints,
+) -> Result<crate::nous::AccountSnapshot> {
+    let client = http_client()?;
+    let account =
+        crate::nous::fetch::fetch_account_with_refresh(&client, store, endpoints, Utc::now())
+            .await?;
+    Ok(account)
+}
+
 async fn opencode_go_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
     let api_key = crate::opencode_go::creds::resolve_key(
         &config.opencode_go.api_key_env,
@@ -238,14 +275,20 @@ async fn opencode_go_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> 
         config.opencode_go.auth_paths.as_deref(),
     )?;
     let client = http_client()?;
-    let cache = vendor_cache(cli, "opencode-go")?;
+    let cache = vendor_cache(cli, "opencode-go")?.redacting(&api_key);
     let endpoints = crate::opencode_go::fetch::Endpoints::default();
-    let outcome = match crate::opencode_go::fetch::fetch_snapshot(
-        &client,
+    let outcome = match fetch_api_keyed(
+        async {
+            crate::opencode_go::fetch::fetch_snapshot(
+                &client,
+                &api_key,
+                &cache,
+                &endpoints,
+                DEFAULT_TTL,
+            )
+            .await
+        },
         &api_key,
-        &cache,
-        &endpoints,
-        DEFAULT_TTL,
     )
     .await
     {
@@ -349,15 +392,21 @@ async fn ollama_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
         config.ollama.api_key.as_deref(),
     )?;
     let client = http_client()?;
-    let cache = vendor_cache(cli, "ollama")?;
+    let cache = vendor_cache(cli, "ollama")?.redacting(&api_key);
     let endpoints = ollama::fetch::Endpoints::default();
-    let outcome = match ollama::fetch_snapshot(
-        &client,
+    let outcome = match fetch_api_keyed(
+        async {
+            ollama::fetch_snapshot(
+                &client,
+                &api_key,
+                &config.ollama.plan,
+                &cache,
+                &endpoints,
+                DEFAULT_TTL,
+            )
+            .await
+        },
         &api_key,
-        &config.ollama.plan,
-        &cache,
-        &endpoints,
-        DEFAULT_TTL,
     )
     .await
     {
@@ -384,12 +433,11 @@ async fn orcarouter_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
     let (api_key, cache) = api_key_target(cli, config, VendorId::OrcaRouter)?;
     let client = http_client()?;
     let endpoints = orcarouter::fetch::Endpoints::default();
-    let outcome = match orcarouter::fetch_snapshot(
-        &client,
+    let outcome = match fetch_api_keyed(
+        async {
+            orcarouter::fetch_snapshot(&client, &api_key, &cache, &endpoints, DEFAULT_TTL).await
+        },
         &api_key,
-        &cache,
-        &endpoints,
-        DEFAULT_TTL,
     )
     .await
     {
@@ -426,6 +474,7 @@ async fn antigravity_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> 
         &cache,
         DEFAULT_TTL,
         oauth.as_ref(),
+        config.antigravity.agy_binary.as_deref(),
         config.antigravity.ide_language_server,
     )
     .await
@@ -525,13 +574,19 @@ async fn grok_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
     let (key, cache) = api_key_target(cli, config, VendorId::Grok)?;
     let client = http_client()?;
     let endpoints = grok::fetch::Endpoints::default();
-    let outcome = match grok::fetch_snapshot(
-        &client,
+    let outcome = match fetch_api_keyed(
+        async {
+            grok::fetch_snapshot(
+                &client,
+                &key,
+                &cache,
+                &endpoints,
+                DEFAULT_TTL,
+                config.grok.team_id.as_deref(),
+            )
+            .await
+        },
         &key,
-        &cache,
-        &endpoints,
-        DEFAULT_TTL,
-        config.grok.team_id.as_deref(),
     )
     .await
     {
@@ -553,7 +608,7 @@ async fn grok_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
     ))
 }
 
-/// SuperGrok reads billing over the CLI's documented HTTPS endpoint (or, as a
+/// SuperGrok reads billing over the Grok CLI's `/usage` HTTPS endpoint (or, as a
 /// fallback, its ACP process). The login's `key` is used only inside one
 /// outgoing Authorization header — never cached, refreshed, or written back.
 async fn supergrok_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
@@ -592,13 +647,12 @@ async fn moonshot_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
     let (api_key, cache) = api_key_target(cli, config, VendorId::Moonshot)?;
     let client = http_client()?;
     let (endpoints, currency) = moonshot::fetch::Endpoints::for_region(&config.moonshot.region);
-    let outcome = match moonshot::fetch_snapshot(
-        &client,
+    let outcome = match fetch_api_keyed(
+        async {
+            moonshot::fetch_snapshot(&client, &api_key, &cache, &endpoints, DEFAULT_TTL, currency)
+                .await
+        },
         &api_key,
-        &cache,
-        &endpoints,
-        DEFAULT_TTL,
-        currency,
     )
     .await
     {
@@ -624,12 +678,16 @@ async fn minimax_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
     let (api_key, cache) = api_key_target(cli, config, VendorId::Minimax)?;
     let client = http_client()?;
     let endpoints = minimax::fetch::Endpoints::for_region(&config.minimax.region);
-    let outcome =
-        match minimax::fetch_snapshot(&client, &api_key, &cache, &endpoints, DEFAULT_TTL).await {
-            Ok(o) => o,
-            Err(e) if e.is_transient() => return Ok(WaybarOutput::loading(cli.icon.as_deref())),
-            Err(e) => return Err(e),
-        };
+    let outcome = match fetch_api_keyed(
+        async { minimax::fetch_snapshot(&client, &api_key, &cache, &endpoints, DEFAULT_TTL).await },
+        &api_key,
+    )
+    .await
+    {
+        Ok(o) => o,
+        Err(e) if e.is_transient() => return Ok(WaybarOutput::loading(cli.icon.as_deref())),
+        Err(e) => return Err(e),
+    };
 
     let theme = theme_from_cli(cli);
     let snap = outcome.snapshot.clone();
@@ -648,12 +706,16 @@ async fn novita_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
     let (api_key, cache) = api_key_target(cli, config, VendorId::Novita)?;
     let client = http_client()?;
     let endpoints = novita::fetch::Endpoints::default();
-    let outcome =
-        match novita::fetch_snapshot(&client, &api_key, &cache, &endpoints, DEFAULT_TTL).await {
-            Ok(o) => o,
-            Err(e) if e.is_transient() => return Ok(WaybarOutput::loading(cli.icon.as_deref())),
-            Err(e) => return Err(e),
-        };
+    let outcome = match fetch_api_keyed(
+        async { novita::fetch_snapshot(&client, &api_key, &cache, &endpoints, DEFAULT_TTL).await },
+        &api_key,
+    )
+    .await
+    {
+        Ok(o) => o,
+        Err(e) if e.is_transient() => return Ok(WaybarOutput::loading(cli.icon.as_deref())),
+        Err(e) => return Err(e),
+    };
 
     let theme = theme_from_cli(cli);
     let snap = outcome.snapshot.clone();
@@ -668,10 +730,107 @@ async fn novita_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
     ))
 }
 
+async fn synthetic_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
+    let (api_key, cache) = api_key_target(cli, config, VendorId::Synthetic)?;
+    let client = http_client()?;
+    let endpoints = synthetic::fetch::Endpoints::default();
+    let outcome = match fetch_api_keyed(
+        async {
+            synthetic::fetch_snapshot(
+                &client,
+                &api_key,
+                &cache,
+                &endpoints,
+                DEFAULT_TTL,
+                config.synthetic.plan_tier.as_deref(),
+            )
+            .await
+        },
+        &api_key,
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) if error.is_transient() => {
+            return Ok(WaybarOutput::loading(cli.icon.as_deref()));
+        }
+        Err(error) => return Err(error),
+    };
+    let snapshot = outcome.snapshot.clone();
+    let vendor_outcome: VendorOutcome = outcome.into();
+    Ok(synthetic::vendor::render(
+        &vendor_outcome,
+        &snapshot,
+        &theme_from_cli(cli),
+        &RenderOpts::from_cli(cli),
+        Utc::now(),
+    ))
+}
+
+async fn deeprelay_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
+    let (api_key, cache) = api_key_target(cli, config, VendorId::DeepRelay)?;
+    let client = http_client()?;
+    let endpoints = deeprelay::fetch::Endpoints::default();
+    let outcome = match fetch_api_keyed(
+        async {
+            deeprelay::fetch_snapshot(&client, &api_key, &cache, &endpoints, DEFAULT_TTL).await
+        },
+        &api_key,
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) if error.is_transient() => {
+            return Ok(WaybarOutput::loading(cli.icon.as_deref()));
+        }
+        Err(error) => return Err(error),
+    };
+    let snapshot = outcome.snapshot.clone();
+    let vendor_outcome: VendorOutcome = outcome.into();
+    Ok(deeprelay::vendor::render(
+        &vendor_outcome,
+        &snapshot,
+        &theme_from_cli(cli),
+        &RenderOpts::from_cli(cli),
+        Utc::now(),
+    ))
+}
+
+async fn mistral_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
+    let (api_key, cache) = api_key_target(cli, config, VendorId::Mistral)?;
+    let client = http_client()?;
+    let endpoints = mistral::fetch::Endpoints::default();
+    let outcome = match fetch_api_keyed(
+        async { mistral::fetch_snapshot(&client, &api_key, &cache, &endpoints, DEFAULT_TTL).await },
+        &api_key,
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) if error.is_transient() => {
+            return Ok(WaybarOutput::loading(cli.icon.as_deref()));
+        }
+        Err(error) => return Err(error),
+    };
+    let snapshot = outcome.snapshot.clone();
+    let vendor_outcome: VendorOutcome = outcome.into();
+    Ok(mistral::vendor::render(
+        &vendor_outcome,
+        &snapshot,
+        &theme_from_cli(cli),
+        &RenderOpts::from_cli(cli),
+        Utc::now(),
+    ))
+}
+
 async fn lyceum_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
     let (api_key, cache) = api_key_target(cli, config, VendorId::Lyceum)?;
     let client = http_client()?;
-    let outcome = match lyceum::fetch::fetch_snapshot(&client, &api_key, &cache, DEFAULT_TTL).await
+    let outcome = match fetch_api_keyed(
+        async { lyceum::fetch::fetch_snapshot(&client, &api_key, &cache, DEFAULT_TTL).await },
+        &api_key,
+    )
+    .await
     {
         Ok(outcome) => outcome,
         Err(error) if error.is_transient() => {
@@ -694,13 +853,19 @@ async fn kilo_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
     let (api_key, cache) = api_key_target(cli, config, VendorId::Kilo)?;
     let client = http_client()?;
     let endpoints = kilo::fetch::Endpoints::default();
-    let outcome = match kilo::fetch_snapshot(
-        &client,
+    let outcome = match fetch_api_keyed(
+        async {
+            kilo::fetch_snapshot(
+                &client,
+                &api_key,
+                &cache,
+                &endpoints,
+                DEFAULT_TTL,
+                config.kilo.organization_id.as_deref(),
+            )
+            .await
+        },
         &api_key,
-        &cache,
-        &endpoints,
-        DEFAULT_TTL,
-        config.kilo.organization_id.as_deref(),
     )
     .await
     {
@@ -723,21 +888,22 @@ async fn kilo_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
 }
 
 async fn anthropic_api_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
-    let key = crate::config::resolve_api_key(
-        "Anthropic_API",
-        &config.anthropic_api.api_key_env,
-        config.anthropic_api.api_key.as_deref(),
-    )?;
+    let (key, cache) = api_key_target(cli, config, VendorId::AnthropicApi)?;
     let client = http_client()?;
-    let cache = vendor_cache(cli, "anthropic_api")?;
     let endpoints = anthropic_api::fetch::Endpoints::default();
-    let outcome = match anthropic_api::fetch_snapshot(
-        &client,
+    let outcome = match fetch_api_keyed(
+        async {
+            anthropic_api::fetch_snapshot(
+                &client,
+                &key,
+                &cache,
+                &endpoints,
+                DEFAULT_TTL,
+                config.anthropic_api_monthly_limit(cli.account.as_deref()),
+            )
+            .await
+        },
         &key,
-        &cache,
-        &endpoints,
-        DEFAULT_TTL,
-        config.anthropic_api.monthly_limit,
     )
     .await
     {
@@ -823,7 +989,7 @@ async fn openai_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
 
 async fn copilot_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
     let label = cli.account.as_deref();
-    let token = config.copilot.resolve_token(label)?;
+    let token = config.copilot.resolve_token_async(label).await?;
     let client = http_client()?;
     let cache = copilot_cache(cli)?;
     let endpoints = copilot::fetch::Endpoints::default();
@@ -847,16 +1013,31 @@ async fn copilot_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
 }
 
 async fn zai_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
+    zai_output_with(cli, config, &zai::fetch::Endpoints::default()).await
+}
+
+/// [`zai_output`] with the endpoints redirected — the seam a hermetic test
+/// points at a mock server, the way `nous_output_with` does.
+async fn zai_output_with(
+    cli: &Cli,
+    config: &Config,
+    endpoints: &zai::fetch::Endpoints,
+) -> Result<WaybarOutput> {
     let (api_key, cache) = api_key_target(cli, config, VendorId::Zai)?;
     let client = http_client()?;
-    let endpoints = zai::fetch::Endpoints::default();
-    let outcome = match zai::fetch_snapshot(
-        &client,
+    let outcome = match fetch_api_keyed(
+        async {
+            zai::fetch_snapshot(
+                &client,
+                &api_key,
+                &cache,
+                endpoints,
+                DEFAULT_TTL,
+                config.zai.plan_tier.as_deref(),
+            )
+            .await
+        },
         &api_key,
-        &cache,
-        &endpoints,
-        DEFAULT_TTL,
-        config.zai.plan_tier.as_deref(),
     )
     .await
     {
@@ -923,13 +1104,19 @@ async fn openrouter_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
     let management_key = config.openrouter_management_key(cli.account.as_deref());
     let client = http_client()?;
     let endpoints = openrouter::fetch::Endpoints::default();
-    let outcome = match openrouter::fetch_snapshot(
-        &client,
+    let outcome = match fetch_api_keyed(
+        async {
+            openrouter::fetch_snapshot(
+                &client,
+                &api_key,
+                management_key.as_deref(),
+                &cache,
+                &endpoints,
+                DEFAULT_TTL,
+            )
+            .await
+        },
         &api_key,
-        management_key.as_deref(),
-        &cache,
-        &endpoints,
-        DEFAULT_TTL,
     )
     .await
     {
@@ -967,7 +1154,11 @@ fn api_key_target(cli: &Cli, config: &Config, vendor: VendorId) -> Result<(Strin
         (Some(root), None) => Cache::at(root.join(slug)),
         (None, Some(label)) => Cache::for_vendor_account(slug, label)?,
         (None, None) => Cache::for_vendor(slug)?,
-    };
+    }
+    // The fetch goes out with this key and a provider's answer can quote it
+    // back: the cache redacts it at the first point of writing, so the key
+    // never reaches `.last_error` or the payload a successful answer writes.
+    .redacting(&api_key);
     Ok((api_key, cache))
 }
 
@@ -975,12 +1166,18 @@ async fn deepseek_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
     let (api_key, cache) = api_key_target(cli, config, VendorId::Deepseek)?;
     let client = http_client()?;
     let endpoints = deepseek::fetch::Endpoints::default();
-    let outcome =
-        match deepseek::fetch_snapshot(&client, &api_key, &cache, &endpoints, DEFAULT_TTL).await {
-            Ok(o) => o,
-            Err(e) if e.is_transient() => return Ok(WaybarOutput::loading(cli.icon.as_deref())),
-            Err(e) => return Err(e),
-        };
+    let outcome = match fetch_api_keyed(
+        async {
+            deepseek::fetch_snapshot(&client, &api_key, &cache, &endpoints, DEFAULT_TTL).await
+        },
+        &api_key,
+    )
+    .await
+    {
+        Ok(o) => o,
+        Err(e) if e.is_transient() => return Ok(WaybarOutput::loading(cli.icon.as_deref())),
+        Err(e) => return Err(e),
+    };
 
     let theme = theme_from_cli(cli);
     let snap = outcome.snapshot.clone();
@@ -999,16 +1196,21 @@ async fn deepinfra_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
     let (api_key, cache) = api_key_target(cli, config, VendorId::Deepinfra)?;
     let client = http_client()?;
     let endpoints = deepinfra::fetch::Endpoints::default();
-    let outcome =
-        match deepinfra::fetch::fetch_snapshot(&client, &api_key, &cache, &endpoints, DEFAULT_TTL)
-            .await
-        {
-            Ok(outcome) => outcome,
-            Err(error) if error.is_transient() => {
-                return Ok(WaybarOutput::loading(cli.icon.as_deref()));
-            }
-            Err(error) => return Err(error),
-        };
+    let outcome = match fetch_api_keyed(
+        async {
+            deepinfra::fetch::fetch_snapshot(&client, &api_key, &cache, &endpoints, DEFAULT_TTL)
+                .await
+        },
+        &api_key,
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) if error.is_transient() => {
+            return Ok(WaybarOutput::loading(cli.icon.as_deref()));
+        }
+        Err(error) => return Err(error),
+    };
 
     let theme = theme_from_cli(cli);
     let snapshot = outcome.snapshot.clone();
@@ -1025,14 +1227,22 @@ async fn deepinfra_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
 
 async fn kimi_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
     let (auth, endpoints) = kimi::resolve_auth(&config.kimi)?;
+    // The API key is the value the user entered and the only one a provider
+    // answer could echo back. The Kimi Code CLI's OAuth token is not exposed
+    // by `Auth` — `bearer_token` resolves it at fetch time and refreshes
+    // rotate it — so that variant carries an empty (no-op) secret.
+    let secret = match &auth {
+        kimi::fetch::Auth::ApiKey(key) => key.clone(),
+        kimi::fetch::Auth::KimiCode(_) => String::new(),
+    };
     let client = http_client()?;
-    let cache = vendor_cache(cli, "kimi")?;
-    let outcome = match kimi::fetch::fetch_snapshot_with_auth(
-        &client,
-        &auth,
-        &cache,
-        &endpoints,
-        DEFAULT_TTL,
+    let cache = vendor_cache(cli, "kimi")?.redacting(&secret);
+    let outcome = match fetch_api_keyed(
+        async {
+            kimi::fetch::fetch_snapshot_with_auth(&client, &auth, &cache, &endpoints, DEFAULT_TTL)
+                .await
+        },
+        &secret,
     )
     .await
     {
@@ -1112,10 +1322,66 @@ async fn modelstudio_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> 
     ))
 }
 
+async fn muse_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
+    let cache = vendor_cache(cli, "muse-code")?;
+    let outcome = match crate::muse::fetch::fetch_snapshot(&config.muse, &cache).await {
+        Ok(outcome) => outcome,
+        Err(error) if error.is_transient() => {
+            return Ok(WaybarOutput::loading(cli.icon.as_deref()));
+        }
+        Err(error) => return Err(error),
+    };
+    let snap = outcome.snapshot.clone();
+    let outcome: VendorOutcome = outcome.into();
+    Ok(crate::muse::vendor::render(
+        &outcome,
+        &snap,
+        &theme_from_cli(cli),
+        &RenderOpts::from_cli(cli),
+        Utc::now(),
+    ))
+}
+
+fn devin_cache(cli: &Cli) -> Result<Cache> {
+    Ok(match (cli.cache_dir.as_deref(), cli.account.as_deref()) {
+        (Some(root), Some(label)) => Cache::at(root.join("devin").join(label)),
+        (Some(root), None) => Cache::at(root.join("devin")),
+        (None, Some(label)) => Cache::for_vendor_account("devin", label)?,
+        (None, None) => Cache::for_vendor("devin")?,
+    })
+}
+
 async fn devin_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
-    let cache = vendor_cache(cli, "devin")?;
+    let creds_path = config
+        .devin
+        .resolve_credentials_path(cli.account.as_deref())?;
+    let mut devin_cfg = config.devin.clone();
+    devin_cfg.credentials_path = Some(creds_path);
+    let cache = devin_cache(cli)?;
+    let outcome = match crate::devin::fetch::fetch_snapshot(&devin_cfg, &cache, DEFAULT_TTL).await {
+        Ok(outcome) => outcome,
+        Err(error) if error.is_transient() => {
+            return Ok(WaybarOutput::loading(cli.icon.as_deref()));
+        }
+        Err(error) => return Err(error),
+    };
+    let theme = theme_from_cli(cli);
+    let snapshot = outcome.snapshot.clone();
+    let vendor_outcome: VendorOutcome = outcome.into();
+    let opts = RenderOpts::from_cli(cli);
+    Ok(crate::devin::vendor::render(
+        &vendor_outcome,
+        &snapshot,
+        &theme,
+        &opts,
+        chrono::Utc::now(),
+    ))
+}
+
+async fn droid_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
+    let cache = vendor_cache(cli, "droid")?;
     let outcome =
-        match crate::devin::fetch::fetch_snapshot(&config.devin, &cache, DEFAULT_TTL).await {
+        match crate::droid::fetch::fetch_snapshot(&config.droid, &cache, DEFAULT_TTL).await {
             Ok(outcome) => outcome,
             Err(error) if error.is_transient() => {
                 return Ok(WaybarOutput::loading(cli.icon.as_deref()));
@@ -1126,7 +1392,7 @@ async fn devin_output(cli: &Cli, config: &Config) -> Result<WaybarOutput> {
     let snapshot = outcome.snapshot.clone();
     let vendor_outcome: VendorOutcome = outcome.into();
     let opts = RenderOpts::from_cli(cli);
-    Ok(crate::devin::vendor::render(
+    Ok(crate::droid::vendor::render(
         &vendor_outcome,
         &snapshot,
         &theme,
@@ -1178,7 +1444,7 @@ fn render_with_theme(
     let format_owned = cli
         .format
         .clone()
-        .unwrap_or_else(|| DEFAULT_FORMAT.to_string());
+        .unwrap_or_else(|| default_format(&outcome.snapshot).to_string());
     let input = RenderInput {
         outcome,
         theme,
@@ -1281,6 +1547,7 @@ fn theme_from_cli(cli: &Cli) -> Theme {
 fn fallback(err: &AppError, _cli: &Cli) -> WaybarOutput {
     let tooltip = match err {
         AppError::Credentials(m) => format!("Credentials error.\n{m}"),
+        AppError::Permission(m) => m.clone(),
         AppError::Http { status, .. } if matches!(status, 401 | 403) => {
             format!("HTTP {status}\n{}", crate::error::AUTH_FAILURE_MESSAGE)
         }
@@ -1319,11 +1586,11 @@ mod tests {
         FetchOutcome {
             snapshot: AnthropicSnapshot {
                 plan: "Test".into(),
-                session: UsageWindow {
+                session: Some(UsageWindow {
                     utilization_pct: 25,
                     resets_at: None,
                     window_duration: chrono::Duration::hours(5),
-                },
+                }),
                 weekly: UsageWindow {
                     utilization_pct: 10,
                     resets_at: None,
@@ -1333,6 +1600,8 @@ mod tests {
                 scoped: vec![],
                 extra: None,
                 reset_credits: Default::default(),
+                cloud_credits: None,
+                usage_credits: None,
             },
             stale: false,
             last_error: None,
@@ -1602,6 +1871,7 @@ mod tests {
                 api_key_env: None,
                 api_key: Some("work-key".into()),
                 management_api_key_env: None,
+                monthly_limit: None,
             });
         config
             .openrouter
@@ -1611,6 +1881,7 @@ mod tests {
                 api_key_env: None,
                 api_key: Some("personal-key".into()),
                 management_api_key_env: None,
+                monthly_limit: None,
             });
         let root = tempfile::tempdir().unwrap();
         let root_str = root.path().to_str().unwrap();
@@ -1651,6 +1922,8 @@ mod tests {
         assert!(validate_vendor_options(&cli, Vendor::Openai).is_ok());
         // Copilot joined the named-account vendors in #378.
         assert!(validate_vendor_options(&cli, Vendor::Copilot).is_ok());
+        // Devin named accounts select a credentials file via [[devin.accounts]].
+        assert!(validate_vendor_options(&cli, Vendor::Devin).is_ok());
     }
 
     #[test]
@@ -1663,11 +1936,26 @@ mod tests {
             .filter(|id| {
                 !matches!(
                     id,
-                    VendorId::Anthropic | VendorId::Openai | VendorId::Copilot
+                    VendorId::Anthropic | VendorId::Openai | VendorId::Copilot | VendorId::Devin
                 )
             })
             .collect();
         assert_eq!(accepted, Config::API_KEY_ACCOUNT_VENDORS);
+    }
+
+    #[test]
+    fn account_flag_error_lists_every_api_key_account_vendor() {
+        let cli = cli_with(Some("work"), None, Some("/tmp/cache"));
+        let err = validate_vendor_options(&cli, Vendor::Ollama)
+            .unwrap_err()
+            .to_string();
+        for vendor in Config::API_KEY_ACCOUNT_VENDORS {
+            assert!(
+                err.contains(vendor.display_name()),
+                "expected {err} to list {}",
+                vendor.display_name()
+            );
+        }
     }
 
     #[test]
@@ -1680,6 +1968,7 @@ mod tests {
             api_key_env: None,
             api_key: Some("work-key".into()),
             management_api_key_env: None,
+            monthly_limit: None,
         });
         let root = tempfile::tempdir().unwrap();
         let root_str = root.path().to_str().unwrap();
@@ -1713,5 +2002,100 @@ mod tests {
         cli.desktop = true;
         assert!(validate_vendor_options(&cli, Vendor::Openrouter).is_err());
         assert!(validate_vendor_options(&cli, Vendor::Anthropic).is_ok());
+    }
+
+    #[tokio::test]
+    async fn nous_output_returns_loading_on_transient_failure_and_propagates_auth_error() {
+        use crate::nous::credentials::{CredentialDocument, CredentialStore, NousCredential};
+        use crate::nous::fetch::Endpoints;
+
+        let mut server = mockito::Server::new_async().await;
+        let transient_mock = server
+            .mock("GET", "/account")
+            .with_status(503)
+            .create_async()
+            .await;
+        let root = tempfile::TempDir::new().unwrap();
+        let store = CredentialStore::at(root.path().join("config").join("credentials.json"));
+        store
+            .write(&CredentialDocument::new(Some(NousCredential {
+                client_id: "hermes-cli".into(),
+                access_token: "test-access-token".into(),
+                refresh_token: "test-refresh-token".into(),
+                expires_at: Utc::now() + chrono::Duration::hours(1),
+            })))
+            .unwrap();
+        let endpoints = Endpoints {
+            account: format!("{}/account", server.url()),
+            token: format!("{}/token", server.url()),
+        };
+        let mut cli = cli_default();
+        cli.icon = Some("N".into());
+
+        let res = nous_output_with(&cli, &store, &endpoints).await;
+        let out = res.unwrap();
+        let expected = WaybarOutput::loading(Some("N"));
+        assert_eq!(out.text, expected.text);
+        assert_eq!(out.tooltip, expected.tooltip);
+        assert_eq!(out.class, expected.class);
+        transient_mock.assert_async().await;
+
+        let auth_mock = server
+            .mock("GET", "/account")
+            .with_status(401)
+            .create_async()
+            .await;
+        let res = nous_output_with(&cli, &store, &endpoints).await;
+        let err = res.unwrap_err();
+        assert!(!err.is_transient(), "{err:?}");
+        assert_eq!(fallback(&err, &cli).text, "⚠");
+        auth_mock.assert_async().await;
+    }
+
+    /// The widget-side twin of the report's regression (review F1-A): the
+    /// widget builds its own cache and runs its own fetch, so a Z.AI in-band
+    /// failure — a 200 whose `msg` quotes the key — must leave the key in
+    /// neither the cache's `.last_error` nor the text the widget prints. The
+    /// seams: `--cache-dir` relocates the cache, and `zai_output_with`
+    /// points the fetch at the mock server.
+    #[tokio::test]
+    async fn zai_in_band_failure_quoting_the_key_leaves_no_key_in_the_widget() {
+        let key = "test-key-value";
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("GET", "/api/monitor/usage/quota/limit")
+            .with_status(200)
+            .with_body(format!(
+                r#"{{"code":401,"msg":"bad key {key}","data":null,"success":false}}"#
+            ))
+            .create_async()
+            .await;
+
+        let root = tempfile::TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.zai.api_key_env.clear();
+        config.zai.api_key = Some(key.into());
+        let cli = cli_with(None, None, Some(root.path().to_str().unwrap()));
+
+        let endpoints = zai::fetch::Endpoints {
+            quota: format!("{}/api/monitor/usage/quota/limit", server.url()),
+        };
+        let err = zai_output_with(&cli, &config, &endpoints)
+            .await
+            .unwrap_err();
+
+        // The cache's first point of writing never held the key.
+        let persisted =
+            std::fs::read_to_string(root.path().join("zai").join(".last_error")).unwrap();
+        assert!(
+            !persisted.contains(key),
+            "the key reached .last_error: {persisted}"
+        );
+        assert!(persisted.contains("[key]"), "{persisted}");
+        // Neither does the text the widget prints for that error.
+        let out = fallback(&err, &cli);
+        assert!(!out.text.contains(key), "{}", out.text);
+        assert!(!out.tooltip.contains(key), "{}", out.tooltip);
+        assert!(out.tooltip.contains("[key]"), "{}", out.tooltip);
     }
 }

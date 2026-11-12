@@ -3,6 +3,7 @@
 
 use std::io;
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use crate::error::{AppError, Result};
 use crate::vendor::vendor_secret_env_vars_to_remove;
@@ -131,6 +132,8 @@ pub trait GhAuthTokenRunner {
 
 pub struct SystemGhAuthTokenRunner;
 
+const GH_AUTH_TOKEN_TIMEOUT: Duration = Duration::from_secs(5);
+
 impl GhAuthTokenRunner for SystemGhAuthTokenRunner {
     fn run(&self, command: &GhAuthTokenCommand) -> io::Result<GhAuthTokenOutput> {
         let mut process = Command::new(&command.program);
@@ -157,6 +160,80 @@ impl GhAuthTokenRunner for SystemGhAuthTokenRunner {
     }
 }
 
+impl SystemGhAuthTokenRunner {
+    /// Run the credential helper without parking a current-thread runtime.
+    /// The owned task deliberately outlives a cancelled caller: it still
+    /// enforces the deadline, kills the child, and reaps it instead of leaving
+    /// an orphaned `gh` process behind.
+    async fn run_async(
+        &self,
+        command: GhAuthTokenCommand,
+        timeout: Duration,
+    ) -> io::Result<GhAuthTokenOutput> {
+        tokio::spawn(async move { run_system_async(command, timeout).await })
+            .await
+            .map_err(|error| io::Error::other(format!("gh credential task failed: {error}")))?
+    }
+}
+
+async fn run_system_async(
+    command: GhAuthTokenCommand,
+    timeout: Duration,
+) -> io::Result<GhAuthTokenOutput> {
+    use tokio::io::AsyncReadExt;
+
+    let mut process = tokio::process::Command::new(&command.program);
+    process
+        .args(&command.args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    for variable in &command.env_remove {
+        process.env_remove(variable);
+    }
+    #[cfg(windows)]
+    {
+        process.creation_flags(crate::process::CREATE_NO_WINDOW);
+    }
+    let mut child = process.spawn()?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("gh stdout pipe was unavailable"))?;
+    let mut bytes = Vec::new();
+    let completion = async {
+        let ((), status) = tokio::try_join!(
+            async {
+                stdout.read_to_end(&mut bytes).await?;
+                Ok::<(), io::Error>(())
+            },
+            child.wait()
+        )?;
+        Ok::<_, io::Error>((status, bytes))
+    };
+    match tokio::time::timeout(timeout, completion).await {
+        Ok(result) => {
+            let (status, stdout) = result?;
+            Ok(GhAuthTokenOutput {
+                success: status.success(),
+                stdout,
+            })
+        }
+        Err(_) => {
+            // `kill` waits on Windows; the explicit `wait` is still required
+            // on Unix to reap the child. Ignore AlreadyExited races and keep
+            // the timeout diagnosis stable.
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "gh auth token exceeded its deadline",
+            ))
+        }
+    }
+}
+
 /// `login` selects one of several `gh` accounts; `None` keeps the historical
 /// behavior of using whichever account `gh` has active.
 pub fn resolve_with(
@@ -177,6 +254,42 @@ pub fn resolve_with(
         }
         Err(_) => return Err(login_error("GitHub CLI could not be started. Run")),
     };
+    token_from_output(output, login)
+}
+
+/// Async production counterpart to [`resolve_with`]. The command and output
+/// interpretation stay identical; only the child wait gains reactor safety
+/// and a bounded lifetime.
+pub async fn resolve_async(
+    gh_binary: Option<&std::path::Path>,
+    login: Option<&str>,
+) -> Result<String> {
+    let command = match login {
+        Some(login) => GhAuthTokenCommand::for_user(gh_binary, login)?,
+        None => GhAuthTokenCommand::standard(gh_binary),
+    };
+    let output = match SystemGhAuthTokenRunner
+        .run_async(command, GH_AUTH_TOKEN_TIMEOUT)
+        .await
+    {
+        Ok(output) => output,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(login_error(
+                "GitHub CLI (`gh`) is not installed. Install it, then run",
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::TimedOut => {
+            return Err(AppError::Other(
+                "GitHub Copilot: timed out while asking `gh` for the saved login token; try again."
+                    .into(),
+            ));
+        }
+        Err(_) => return Err(login_error("GitHub CLI could not be started. Run")),
+    };
+    token_from_output(output, login)
+}
+
+fn token_from_output(output: GhAuthTokenOutput, login: Option<&str>) -> Result<String> {
     if !output.success {
         return match login {
             Some(login) => Err(AppError::Credentials(format!(
@@ -186,12 +299,11 @@ pub fn resolve_with(
             None => Err(login_error("GitHub CLI is not logged in. Run")),
         };
     }
-    let token = String::from_utf8(output.stdout)
+    String::from_utf8(output.stdout)
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| login_error("GitHub CLI returned no OAuth token. Run"))?;
-    Ok(token)
+        .ok_or_else(|| login_error("GitHub CLI returned no OAuth token. Run"))
 }
 
 fn login_error(prefix: &str) -> AppError {
@@ -204,6 +316,69 @@ fn login_error(prefix: &str) -> AppError {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+
+    #[cfg(unix)]
+    fn executable_script(body: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fake-gh");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        (dir, path)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_slow_helper_does_not_stall_the_reactor_and_is_timed_out() {
+        // Use shell builtins only: hermetic builders such as Nix do not
+        // expose `/bin/sleep`, which would make this fixture exit immediately
+        // and test the non-zero-status path instead of the deadline.
+        let (_dir, helper) = executable_script("while :; do :; done");
+        let command = GhAuthTokenCommand::standard(Some(&helper));
+        let start = std::time::Instant::now();
+        let (timer_elapsed, result) = tokio::join!(
+            async {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                start.elapsed()
+            },
+            SystemGhAuthTokenRunner.run_async(command, Duration::from_millis(80))
+        );
+        assert!(
+            timer_elapsed < Duration::from_millis(60),
+            "timer took {timer_elapsed:?}"
+        );
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn async_resolution_keeps_normal_and_named_account_argv() {
+        let dir = tempfile::tempdir().unwrap();
+        let helper = dir.path().join("fake-gh");
+        let args = dir.path().join("args");
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(
+            &helper,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf 'async-token\\n'\n",
+                args.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert_eq!(
+            resolve_async(Some(&helper), Some("octocat-work"))
+                .await
+                .unwrap(),
+            "async-token"
+        );
+        assert_eq!(
+            std::fs::read_to_string(args).unwrap(),
+            "auth\ntoken\n--user\noctocat-work\n"
+        );
+    }
 
     struct FakeRunner {
         result: io::Result<GhAuthTokenOutput>,

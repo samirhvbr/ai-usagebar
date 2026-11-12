@@ -8,8 +8,9 @@
 //!
 //! Each exposes a CSRF-guarded JSON-RPC surface on a **dynamically assigned**
 //! loopback port (`--https_server_port 0`), so the port cannot be hardcoded.
-//! Quota lives behind `RetrieveUserQuotaSummary`, which reports two model groups
-//! — Gemini, and Claude/GPT — each holding a 5-hour and a weekly bucket.
+//! Quota lives behind `RetrieveUserQuotaSummary`, which reports two shared model
+//! groups — Gemini, and Claude/GPT — each holding a 5-hour and a weekly bucket,
+//! plus plan-dependent per-model pools such as Gemini 4 Argon.
 //! `GetUserStatus` carries only the plan name; its per-model `quotaInfo` mirrors
 //! whichever bucket is scarcest and must not be read as a window in its own
 //! right.
@@ -21,6 +22,19 @@
 //! its undiscoverable CSRF token is required. Every other local rejection — a
 //! server that is signed out or answering on the wrong protocol — keeps its
 //! own diagnosis.
+//!
+//! The fallback asks `agy` before Google when `agy` is installed: its
+//! `-p "/quota"` reading is what its own Models & Quota page shows, which the
+//! Cloud Code request cannot reproduce for an `agy` account (#450). Only when
+//! `agy` cannot answer does the saved session go to the Cloud Code API.
+//!
+//! `agy` not answering *now* is not the same as having nothing of its own to
+//! show. A cold `agy` start runs past the reading's timeout, and the failure
+//! holds the next attempt off for ten minutes; the Cloud Code figure that
+//! filled that gap is the other tracker — an untouched week, 0% used — shown
+//! as current. So while `agy` is installed, a reading it gave earlier is kept,
+//! stale, for as long as the cache would serve it anyway, and the Cloud Code
+//! API answers only when there is no reading of `agy`'s own to keep.
 //!
 //! That ranking has one sharp edge (#405): a signed-out product's 401/403 is
 //! actionable, so it outranks the `agy` answer that would unlock the fallback
@@ -38,7 +52,7 @@ use super::cloud;
 use super::credential::{self, StoredToken};
 use crate::cache::{Cache, acquire_lock_async};
 use crate::error::{AppError, Result};
-use crate::usage::{AntigravitySnapshot, AntigravitySource, UsageWindow};
+use crate::usage::{AntigravitySnapshot, AntigravitySource, ModelPoolWindow, UsageWindow};
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(5);
 const LOCK_TIMEOUT: Duration = Duration::from_secs(15);
@@ -164,6 +178,7 @@ pub async fn fetch_snapshot(
     cache: &Cache,
     cache_ttl: Duration,
     oauth: Option<&cloud::OauthClient>,
+    agy_binary: Option<&std::path::Path>,
     ide_language_server: bool,
 ) -> Result<FetchOutcome> {
     fetch_snapshot_at(
@@ -172,7 +187,9 @@ pub async fn fetch_snapshot(
         cache_ttl,
         oauth,
         RemoteOverride {
-            agy: super::agy::AgyCommand::Discover,
+            agy: agy_binary.map_or(super::agy::AgyCommand::Discover, |path| {
+                super::agy::AgyCommand::At(path.to_path_buf())
+            }),
             ide_language_server,
             ..Default::default()
         },
@@ -219,7 +236,17 @@ pub async fn fetch_snapshot_at(
     };
     let account = origin.account();
 
-    if let Some(bytes) = cache.fresh_payload(cache_ttl)?
+    // The remote path starts `agy` when there is one; see
+    // [`super::agy::QUOTA_INTERVAL`] for why it is not run on every TTL.
+    let cache_ttl = match origin {
+        Origin::Remote(Ok(_)) if remote.agy.is_available() => {
+            cache_ttl.max(super::agy::QUOTA_INTERVAL)
+        }
+        _ => cache_ttl,
+    };
+    let auth_rejected = matches!(&origin, Origin::Local(Err(e)) if is_auth_rejection(e));
+    if !auth_rejected
+        && let Some(bytes) = cache.fresh_payload(cache_ttl)?
         && let Ok(outcome) = reuse_cache(bytes, cache, false, account.as_deref(), now)
     {
         return Ok(outcome);
@@ -234,7 +261,20 @@ pub async fn fetch_snapshot_at(
                 agy: &remote.agy,
                 credential: remote.credential,
             };
-            fetch_remote(client, cache, oauth, endpoints, token, renewal, now).await
+            match fetch_remote(client, cache, oauth, endpoints, token, renewal, now).await {
+                Ok(RemoteReading::Live(snap)) => Ok(snap),
+                Ok(RemoteReading::Kept(outcome)) => return Ok(outcome),
+                Ok(RemoteReading::Backoff(remaining)) => {
+                    return Err(AppError::Http {
+                        status: 429,
+                        body: format!(
+                            "rate limited; next attempt in {}",
+                            crate::cache::human_backoff(remaining)
+                        ),
+                    });
+                }
+                Err(e) => Err(e),
+            }
         }
     };
 
@@ -245,6 +285,11 @@ pub async fn fetch_snapshot_at(
             Ok(crate::outcome::Outcome::fresh(snap))
         }
         Err(e) if e.is_transient() => fallback_silent(cache, now, e),
+        Err(AppError::Http { status, body }) if matches!(status, 401 | 403) => {
+            cache.mark_stale();
+            let _ = cache.write_last_error(status, &body);
+            Err(AppError::Http { status, body })
+        }
         Err(AppError::Http { status, body }) => {
             cache.mark_stale();
             let last_error = Some(cache.write_last_error(status, &body));
@@ -558,10 +603,27 @@ struct AccessToken {
     just_refreshed: bool,
 }
 
-/// Pick the freshest usable access token without going to the network: the
-/// one this program persisted after its last refresh, if it outlives the
+/// The freshest usable access token there is without going to the network:
+/// the one this program persisted after its last refresh, if it outlives the
 /// keyring's and is not about to expire; else the keyring's own while it
-/// lasts. Only when both are spent does this refresh.
+/// lasts.
+fn current_access_token(
+    oauth_path: &std::path::Path,
+    token: &StoredToken,
+    now: DateTime<Utc>,
+) -> Option<String> {
+    if let Some(persisted) = cloud::read_persisted(oauth_path, &token.fingerprint)
+        && token
+            .expires_at
+            .is_none_or(|keyring| persisted.expires_at > keyring)
+        && !cloud::needs_refresh(Some(persisted.expires_at), now)
+    {
+        return Some(persisted.access_token);
+    }
+    (!cloud::needs_refresh(token.expires_at, now)).then(|| token.access_token.clone())
+}
+
+/// [`current_access_token`], and only when both are spent, a refresh.
 async fn resolve_access_token(
     client: &reqwest::Client,
     oauth: Option<&cloud::OauthClient>,
@@ -570,20 +632,9 @@ async fn resolve_access_token(
     token: &StoredToken,
     now: DateTime<Utc>,
 ) -> Result<AccessToken> {
-    if let Some(persisted) = cloud::read_persisted(oauth_path, &token.fingerprint)
-        && token
-            .expires_at
-            .is_none_or(|keyring| persisted.expires_at > keyring)
-        && !cloud::needs_refresh(Some(persisted.expires_at), now)
-    {
+    if let Some(value) = current_access_token(oauth_path, token, now) {
         return Ok(AccessToken {
-            value: persisted.access_token,
-            just_refreshed: false,
-        });
-    }
-    if !cloud::needs_refresh(token.expires_at, now) {
-        return Ok(AccessToken {
-            value: token.access_token.clone(),
+            value,
             just_refreshed: false,
         });
     }
@@ -646,14 +697,42 @@ impl Renewal<'_> {
     }
 }
 
-/// Quota through the Cloud Code API, as the signed-in Google account.
+/// What the remote path produced: a reading taken on this poll, to be cached
+/// as fresh, or `agy`'s earlier one served in place of a Cloud Code figure,
+/// already an outcome because it is stale by construction.
+enum RemoteReading {
+    Live(AntigravitySnapshot),
+    Kept(FetchOutcome),
+    /// A pre-network refusal, not a failed request: do not record it as a new
+    /// HTTP error or extend the backoff that is already counting down.
+    Backoff(Duration),
+}
+
+/// Quota as the signed-in Google account: `agy`'s own reading when it can
+/// give one, its last one when it cannot, else the Cloud Code API.
 ///
-/// A rejected token gets one refresh and one retry, unless it was refreshed a
-/// moment ago — then the rejection is Google's verdict on the session, and
-/// the user has to sign in again. A plan-verdict 403 (`SUBSCRIPTION_REQUIRED`,
-/// #405) is not a rejection: it is passed through untouched, without spending
-/// a refresh or an `agy` run on a session that is fine. The plan name is
-/// best-effort: the summary is the figure, and a missing name must not cost it.
+/// `agy` answers first (#450). It reads as the saved session's account — the
+/// session is `agy`'s own login — so its snapshot is attributed the same way.
+/// Its output names no plan; a plan is looked up only with a token that is
+/// still good, never at the price of a refresh.
+///
+/// When `agy` is installed but gives no reading on this poll — it ran past
+/// its timeout, exited nonzero, or a failure a moment ago is still holding
+/// the next attempt off — the reading it gave last is served stale rather
+/// than replaced: the Cloud Code figure is another tracker for an `agy`
+/// account, and a 65 s `agy` start had turned into ten minutes of "0% used".
+/// Only a reading of `agy`'s own is kept, from the same account, and only
+/// while [`parse_cache_at`] still accepts it: one whose session window has
+/// rolled over is refused there, so a persistently silent `agy` yields to
+/// the Cloud Code API within five hours.
+///
+/// On the Cloud Code path, a rejected token gets one refresh and one retry,
+/// unless it was refreshed a moment ago — then the rejection is Google's
+/// verdict on the session, and the user has to sign in again. A plan-verdict
+/// 403 (`SUBSCRIPTION_REQUIRED`, #405) is not a rejection: it is passed through
+/// untouched, without spending a refresh or an `agy` run on a session that is
+/// fine. The plan name is best-effort: the summary is the figure, and a
+/// missing name must not cost it.
 async fn fetch_remote(
     client: &reqwest::Client,
     cache: &Cache,
@@ -662,9 +741,35 @@ async fn fetch_remote(
     token: Result<StoredToken>,
     renewal: Renewal<'_>,
     now: DateTime<Utc>,
-) -> Result<AntigravitySnapshot> {
+) -> Result<RemoteReading> {
     let mut token = token?;
     let oauth_path = cloud::oauth_cache_path(cache);
+    match super::agy::quota_snapshot(renewal.agy, cache, now).await {
+        Some(mut snap) => {
+            let access = current_access_token(&oauth_path, &token, now)
+                .filter(|_| cache.backoff_remaining().is_none());
+            snap.plan = match access {
+                Some(access) => cloud::fetch_plan(client, endpoints, &access).await,
+                None => None,
+            }
+            .unwrap_or_else(|| DEFAULT_PLAN.to_string());
+            snap.account = remote_account(&token.fingerprint);
+            snap.source = AntigravitySource::Agy;
+            return Ok(RemoteReading::Live(snap));
+        }
+        None if renewal.agy.is_available() => {
+            if let Some(kept) = kept_agy_reading(cache, &remote_account(&token.fingerprint), now) {
+                return Ok(RemoteReading::Kept(kept));
+            }
+        }
+        None => {}
+    }
+    // Local RPC and `agy` can still answer after a cached window expires.
+    // Once neither has a figure, honor the shared backoff before any OAuth
+    // refresh or Cloud Code request; rejected cache bytes cannot bypass it.
+    if let Some(remaining) = cache.backoff_remaining() {
+        return Ok(RemoteReading::Backoff(remaining));
+    }
     let mut access =
         match resolve_access_token(client, oauth, endpoints, &oauth_path, &token, now).await {
             Ok(access) => access,
@@ -716,7 +821,26 @@ async fn fetch_remote(
     let mut snap = parse_quota_summary(&quota, plan)?;
     snap.account = remote_account(&token.fingerprint);
     snap.source = AntigravitySource::Remote;
-    Ok(snap)
+    Ok(RemoteReading::Live(snap))
+}
+
+/// `agy`'s last reading for `account`, served stale, or `None` when the cache
+/// holds nothing of the kind: no payload, one past [`MAX_STALE`], another
+/// account's, one whose window has rolled over, or a Cloud Code figure — the
+/// very thing this exists not to repeat. The caller then goes on to the Cloud
+/// Code API as before, so the error this hands the shared policy is never
+/// shown; it only names the branch.
+///
+/// [`MAX_STALE`]: crate::cache::MAX_STALE
+fn kept_agy_reading(cache: &Cache, account: &str, now: DateTime<Utc>) -> Option<FetchOutcome> {
+    let not_agys = || AppError::Other("Antigravity: no reading of `agy`'s own to keep".into());
+    crate::outcome::fallback(cache, None, not_agys(), |bytes| {
+        let snap = parse_cache_at(bytes, Some(account), now)?;
+        (snap.source == AntigravitySource::Agy)
+            .then_some(snap)
+            .ok_or_else(not_agys)
+    })
+    .ok()
 }
 
 /// Identity of the signed-in account, fingerprinted rather than stored in
@@ -806,7 +930,8 @@ pub fn plan_from_status(v: &serde_json::Value) -> String {
 ///
 /// Buckets are keyed by `bucketId` (`gemini-5h`, `gemini-weekly`, `3p-5h`,
 /// `3p-weekly`), falling back to the group display name plus the `window`
-/// discriminator so a renamed bucket id still lands in the right slot.
+/// discriminator so a renamed bucket id still lands in the right slot. The
+/// fallback only runs when no canonical id arrived at all.
 /// One bucket, named the way the response named it.
 fn describe_bucket(group_name: &str, id: &str, window: Option<&str>) -> String {
     let id = if id.is_empty() { "<unnamed>" } else { id };
@@ -847,10 +972,35 @@ pub fn parse_quota_summary(v: &serde_json::Value, plan: String) -> Result<Antigr
         .or_else(|| v["groups"].as_array())
         .ok_or_else(|| AppError::Other("antigravity: quota summary has no groups".into()))?;
 
-    let mut gemini_5h = None;
-    let mut gemini_weekly = None;
-    let mut tp_5h = None;
-    let mut tp_weekly = None;
+    // Slot order: Gemini 5h, Gemini weekly, Claude/GPT 5h, Claude/GPT weekly.
+    const SLOT_NAMES: [&str; 4] = [
+        "Gemini 5h",
+        "Gemini weekly",
+        "Claude/GPT 5h",
+        "Claude/GPT weekly",
+    ];
+    const CANONICAL_IDS: [&str; 4] = ["gemini-5h", "gemini-weekly", "3p-5h", "3p-weekly"];
+    let is_canonical = |bucket: &serde_json::Value| {
+        CANONICAL_IDS.contains(&bucket["bucketId"].as_str().unwrap_or_default())
+    };
+    let shares_a_slot = |group: &serde_json::Value| {
+        group["buckets"]
+            .as_array()
+            .is_some_and(|buckets| buckets.iter().any(is_canonical))
+    };
+    // Besides the two shared groups, the summary carries pools of their own,
+    // such as "Gemini 4 Argon" (`gemini-argon-wtu-weekly`), whose ids look like
+    // a shared bucket to the prefix/suffix heuristic. While any canonical id is
+    // present, a group holding none of them is such a pool and is shown under
+    // its own name. Only when no canonical id arrived at all — the ids were
+    // renamed — are slots inferred from id prefixes and group names.
+    let renamed = !groups.iter().any(shares_a_slot);
+
+    // Per slot, the buckets whose id is the canonical one and the buckets that
+    // only look like it. A canonical id always wins.
+    let mut exact: [Vec<&serde_json::Value>; 4] = Default::default();
+    let mut inferred: [Vec<&serde_json::Value>; 4] = Default::default();
+    let mut pools: Vec<(&str, &serde_json::Value, bool)> = Vec::new();
     // What the response actually offered, so a summary we cannot use says so
     // instead of only naming what it wanted. Bucket ids and group names are
     // quota vocabulary, not account data.
@@ -861,9 +1011,14 @@ pub fn parse_quota_summary(v: &serde_json::Value, plan: String) -> Result<Antigr
         let Some(buckets) = group["buckets"].as_array() else {
             continue;
         };
+        let own_pool = !renamed && !shares_a_slot(group);
         for bucket in buckets {
             let id = bucket["bucketId"].as_str().unwrap_or_default();
             seen.push(describe_bucket(group_name, id, bucket["window"].as_str()));
+            if let Some(slot) = CANONICAL_IDS.iter().position(|c| *c == id) {
+                exact[slot].push(bucket);
+                continue;
+            }
             let window = bucket["window"].as_str().unwrap_or_default();
             let is_weekly = if id.ends_with("weekly") || window == "weekly" {
                 true
@@ -874,6 +1029,15 @@ pub fn parse_quota_summary(v: &serde_json::Value, plan: String) -> Result<Antigr
                 // so it cannot overwrite a known slot.
                 continue;
             };
+            if own_pool {
+                pools.push((group_name, bucket, is_weekly));
+                continue;
+            }
+            // A noncanonical bucket inside a shared group cannot supply a
+            // missing shared window, even when its prefix and cadence match.
+            if !renamed {
+                continue;
+            }
             let is_gemini = if id.starts_with("gemini") {
                 true
             } else if id.starts_with("3p") {
@@ -883,30 +1047,63 @@ pub fn parse_quota_summary(v: &serde_json::Value, plan: String) -> Result<Antigr
             } else if group_name.contains("Claude") || group_name.contains("GPT") {
                 false
             } else {
-                // Likewise, an unrelated future group is not implicitly the
-                // third-party pool.
+                // An unrelated group is not implicitly the third-party pool;
+                // it is one of its own.
+                pools.push((group_name, bucket, is_weekly));
                 continue;
             };
 
-            let (slot, slot_name) = match (is_gemini, is_weekly) {
-                (true, false) => (&mut gemini_5h, "Gemini 5h"),
-                (true, true) => (&mut gemini_weekly, "Gemini weekly"),
-                (false, false) => (&mut tp_5h, "Claude/GPT 5h"),
-                (false, true) => (&mut tp_weekly, "Claude/GPT weekly"),
-            };
-            let parsed = usage_window(bucket, is_weekly)?;
-            if slot.replace(parsed).is_some() {
+            let slot = usize::from(!is_gemini) * 2 + usize::from(is_weekly);
+            inferred[slot].push(bucket);
+        }
+    }
+
+    // Infer slots only when the whole response has no canonical ids. Two
+    // candidates at the same rank cannot be told apart, so that is an error
+    // rather than a guess.
+    let mut slots: [Option<UsageWindow>; 4] = Default::default();
+    for slot in 0..4 {
+        let candidates = if renamed {
+            &inferred[slot]
+        } else {
+            &exact[slot]
+        };
+        match candidates.as_slice() {
+            [] => {}
+            [bucket] => slots[slot] = Some(usage_window(bucket, slot % 2 == 1)?),
+            _ => {
                 return Err(AppError::Schema(format!(
-                    "antigravity: duplicate {slot_name} bucket"
+                    "antigravity: duplicate {} bucket",
+                    SLOT_NAMES[slot]
                 )));
             }
         }
     }
+    let [gemini_5h, gemini_weekly, tp_5h, tp_weekly] = slots;
+
+    // A pool that will not parse is left out rather than failing the parse:
+    // it must not take the shared windows down with it, and showing nothing
+    // for it is not showing a figure that did not arrive.
+    let model_pools: Vec<ModelPoolWindow> = pools
+        .into_iter()
+        .filter_map(|(group_name, bucket, is_weekly)| {
+            let window = usage_window(bucket, is_weekly).ok()?;
+            Some(ModelPoolWindow {
+                name: pool_name(group_name, bucket),
+                window,
+            })
+        })
+        .collect();
 
     // Not every product offers every window: Antigravity CLI 1.1.22 returns
     // weekly buckets only. One recognised window is enough to render — what
     // must never happen is showing a figure for a window that did not arrive.
-    if gemini_5h.is_none() && gemini_weekly.is_none() && tp_5h.is_none() && tp_weekly.is_none() {
+    if gemini_5h.is_none()
+        && gemini_weekly.is_none()
+        && tp_5h.is_none()
+        && tp_weekly.is_none()
+        && model_pools.is_empty()
+    {
         return Err(no_usable_bucket(&seen));
     }
 
@@ -920,7 +1117,23 @@ pub fn parse_quota_summary(v: &serde_json::Value, plan: String) -> Result<Antigr
         weekly: gemini_weekly,
         third_party_session: tp_5h,
         third_party_weekly: tp_weekly,
+        model_pools,
     })
+}
+
+/// A pool's label: the group's display name, as Antigravity's own Model Quota
+/// screen shows it, else the bucket's, else its id. It is API text bound for
+/// every frontend, so control and bidi characters are stripped here.
+fn pool_name(group_name: &str, bucket: &serde_json::Value) -> String {
+    [
+        group_name,
+        bucket["displayName"].as_str().unwrap_or_default(),
+        bucket["bucketId"].as_str().unwrap_or_default(),
+    ]
+    .into_iter()
+    .map(crate::display::sanitize_untrusted_field)
+    .find(|name| !name.trim().is_empty())
+    .unwrap_or_else(|| "Model pool".to_string())
 }
 
 /// `remainingFraction` is required and must be finite: defaulting a missing or
@@ -1064,7 +1277,9 @@ fn ide_ls_pids(pids: std::collections::HashSet<u32>) -> std::collections::HashSe
         .map(u32::to_string)
         .collect::<Vec<_>>()
         .join(",");
-    let Ok(output) = std::process::Command::new("ps")
+    // By path, like every other `ps` here: the menu bar app puts user
+    // directories ahead of the system ones on `PATH` (#472).
+    let Ok(output) = std::process::Command::new("/bin/ps")
         .args(["-o", "pid=,comm=", "-p", &list])
         .output()
     else {
@@ -1298,7 +1513,8 @@ pub(crate) fn discover_ls_ports() -> Vec<(u32, u16)> {
 /// listening TCP sockets by `-iTCP -sTCP:LISTEN`.
 #[cfg(target_os = "macos")]
 pub(crate) fn discover_ls_ports() -> Vec<(u32, u16)> {
-    let Ok(output) = std::process::Command::new("lsof")
+    // By path, for the reason `ide_ls_pids` gives for `ps` (#472).
+    let Ok(output) = std::process::Command::new("/usr/sbin/lsof")
         .args(["-nP", "-iTCP", "-sTCP:LISTEN", "-F", "pcn"])
         .output()
     else {
@@ -1629,16 +1845,29 @@ pub fn parse_cache(bytes: &[u8], account: Option<&str>) -> Result<AntigravitySna
 /// This matters more here than for other vendors: "nothing running" is the
 /// normal state for Antigravity, and `MAX_STALE` is seven days — far past the
 /// five hours after which the session window is guaranteed wrong.
-fn expired_window(snap: &AntigravitySnapshot, now: DateTime<Utc>) -> Option<&'static str> {
-    [
+fn expired_window(snap: &AntigravitySnapshot, now: DateTime<Utc>) -> Option<String> {
+    let shared = [
         ("Gemini 5h", snap.session.as_ref()),
         ("Gemini weekly", snap.weekly.as_ref()),
         ("Claude & GPT OSS 5h", snap.third_party_session.as_ref()),
         ("Claude & GPT OSS weekly", snap.third_party_weekly.as_ref()),
     ]
     .into_iter()
-    .find(|(_, w)| w.and_then(|w| w.resets_at).is_some_and(|r| r <= now))
-    .map(|(name, _)| name)
+    .filter_map(|(name, w)| Some((name.to_string(), w?)));
+    let pools = snap.model_pools.iter().map(|pool| {
+        let name = format!("{} {}", pool.name, pool_cadence(pool.is_weekly()));
+        (name, &pool.window)
+    });
+    shared
+        .chain(pools)
+        .find(|(_, w)| w.resets_at.is_some_and(|r| r <= now))
+        .map(|(name, _)| name)
+}
+
+/// The cadence a cached pool window was written with. Pools reuse the shared
+/// windows' two lengths, so anything else is a document we did not write.
+fn pool_cadence(weekly: bool) -> &'static str {
+    if weekly { "weekly" } else { "5h" }
 }
 
 pub fn parse_cache_at(
@@ -1711,6 +1940,7 @@ pub fn parse_cache_at(
         weekly: optional("weekly_pct", "weekly_reset", true)?,
         third_party_session: optional("tp_session_pct", "tp_session_reset", false)?,
         third_party_weekly: optional("tp_weekly_pct", "tp_weekly_reset", true)?,
+        model_pools: cached_pools(&v)?,
     };
 
     // A cache with no window left is not a snapshot; refetch rather than draw
@@ -1719,6 +1949,7 @@ pub fn parse_cache_at(
         && snap.weekly.is_none()
         && snap.third_party_session.is_none()
         && snap.third_party_weekly.is_none()
+        && snap.model_pools.is_empty()
     {
         return Err(AppError::Schema(
             "antigravity cache holds no usable window; refetching".into(),
@@ -1733,7 +1964,61 @@ pub fn parse_cache_at(
     Ok(snap)
 }
 
+/// The per-model pools of a cached payload. Payloads written before pools
+/// existed have no `model_pools` key and carry none; an entry that is present
+/// but malformed means the document is not one we wrote whole, so it refetches.
+fn cached_pools(v: &serde_json::Value) -> Result<Vec<ModelPoolWindow>> {
+    let Some(entries) = v.get("model_pools") else {
+        return Ok(Vec::new());
+    };
+    let malformed = || AppError::Schema("antigravity: cached model_pools is malformed".into());
+    entries
+        .as_array()
+        .ok_or_else(malformed)?
+        .iter()
+        .map(|entry| {
+            let name = entry["name"].as_str().ok_or_else(malformed)?;
+            let weekly = match entry["window"].as_str() {
+                Some(cadence) if cadence == pool_cadence(true) => true,
+                Some(cadence) if cadence == pool_cadence(false) => false,
+                _ => return Err(malformed()),
+            };
+            let pct = entry["pct"]
+                .as_i64()
+                .filter(|pct| (0..=100).contains(pct))
+                .ok_or_else(malformed)?;
+            Ok(ModelPoolWindow {
+                // Cache files are local, but keeping the same display-field
+                // invariant as live responses prevents terminal/control text
+                // from re-entering renderers through a damaged file.
+                name: crate::display::sanitize_untrusted_field(name),
+                window: UsageWindow {
+                    utilization_pct: pct as i32,
+                    resets_at: parse_reset(&entry["reset"], "model_pools reset")?,
+                    window_duration: if weekly {
+                        chrono::Duration::days(7)
+                    } else {
+                        chrono::Duration::hours(5)
+                    },
+                },
+            })
+        })
+        .collect()
+}
+
 pub fn snap_to_json(snap: &AntigravitySnapshot) -> serde_json::Value {
+    let model_pools: Vec<serde_json::Value> = snap
+        .model_pools
+        .iter()
+        .map(|pool| {
+            serde_json::json!({
+                "name": pool.name,
+                "window": pool_cadence(pool.is_weekly()),
+                "pct": pool.window.utilization_pct,
+                "reset": pool.window.resets_at.map(|dt| dt.to_rfc3339()),
+            })
+        })
+        .collect();
     serde_json::json!({
         "plan": snap.plan,
         "account": snap.account,
@@ -1746,6 +2031,7 @@ pub fn snap_to_json(snap: &AntigravitySnapshot) -> serde_json::Value {
         "tp_session_reset": snap.third_party_session.as_ref().and_then(|w| w.resets_at.map(|dt| dt.to_rfc3339())),
         "tp_weekly_pct": snap.third_party_weekly.as_ref().map(|w| w.utilization_pct),
         "tp_weekly_reset": snap.third_party_weekly.as_ref().and_then(|w| w.resets_at.map(|dt| dt.to_rfc3339())),
+        "model_pools": model_pools,
     })
 }
 
@@ -1869,21 +2155,134 @@ mod tests {
         assert!(snap.third_party_weekly.is_none());
     }
 
+    /// The summary as Antigravity CLI served it in October 2026: a per-model
+    /// "Gemini 4 Argon" pool beside the two shared ones. Its id looks like a
+    /// Gemini weekly bucket to the heuristic, and used to fail the whole parse
+    /// as a duplicate of `gemini-weekly`. It is a separate limit on Pro plans,
+    /// so it is reported as a pool of its own.
+    #[test]
+    fn a_per_model_pool_is_reported_beside_the_canonical_buckets() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"response":{"groups":[
+              {"displayName":"Gemini Models","buckets":[
+                {"bucketId":"gemini-weekly","displayName":"Weekly Limit Remaining","window":"weekly",
+                 "remainingFraction":0.7839184,"resetTime":"2026-10-23T12:22:17Z"},
+                {"bucketId":"gemini-5h","displayName":"Five Hour Limit Remaining","window":"5h",
+                 "remainingFraction":0.253501,"resetTime":"2026-10-16T17:22:17Z"}]},
+              {"displayName":"Claude and GPT models","buckets":[
+                {"bucketId":"3p-weekly","displayName":"Weekly Limit Remaining","window":"weekly",
+                 "remainingFraction":1,"resetTime":"2026-10-23T17:05:12Z"},
+                {"bucketId":"3p-5h","displayName":"Five Hour Limit Remaining","window":"5h",
+                 "remainingFraction":1,"resetTime":"2026-10-16T22:05:12Z"}]},
+              {"displayName":"Gemini 4 Argon","buckets":[
+                {"bucketId":"gemini-argon-wtu-weekly","displayName":"Gemini 4 Argon Weekly Limit",
+                 "window":"weekly","remainingFraction":0.4,"resetTime":"2026-10-23T17:05:12Z"}]}
+            ]}}"#,
+        )
+        .unwrap();
+        let snap = parse_quota_summary(&v, "Google AI Pro".into()).unwrap();
+        assert_eq!(snap.session.as_ref().unwrap().utilization_pct, 75);
+        assert_eq!(snap.weekly.as_ref().unwrap().utilization_pct, 22);
+        assert_eq!(
+            snap.third_party_session.as_ref().unwrap().utilization_pct,
+            0
+        );
+        assert_eq!(snap.third_party_weekly.as_ref().unwrap().utilization_pct, 0);
+        let [argon] = snap.model_pools.as_slice() else {
+            panic!("{:?}", snap.model_pools);
+        };
+        assert_eq!(argon.name, "Gemini 4 Argon");
+        assert_eq!(argon.window.utilization_pct, 60);
+        assert!(argon.is_weekly());
+    }
+
+    /// A pool that will not parse is left out; it must not take the shared
+    /// windows down with it.
+    #[test]
+    fn a_malformed_model_pool_is_left_out() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"response":{"groups":[
+              {"displayName":"Gemini Models","buckets":[
+                {"bucketId":"gemini-weekly","window":"weekly","remainingFraction":0.5}]},
+              {"displayName":"Gemini 4 Argon","buckets":[
+                {"bucketId":"gemini-argon-wtu-weekly","window":"weekly","remainingFraction":"x"}]}
+            ]}}"#,
+        )
+        .unwrap();
+        let snap = parse_quota_summary(&v, "Pro".into()).unwrap();
+        assert_eq!(snap.weekly.unwrap().utilization_pct, 50);
+        assert!(snap.model_pools.is_empty());
+    }
+
+    /// A pool's label is API text bound for every frontend.
+    #[test]
+    fn a_model_pool_name_is_sanitized_and_falls_back_to_the_bucket() {
+        let v: serde_json::Value = serde_json::from_str(
+            "{\"response\":{\"groups\":[
+              {\"displayName\":\"Gemini Models\",\"buckets\":[
+                {\"bucketId\":\"gemini-weekly\",\"window\":\"weekly\",\"remainingFraction\":0.5}]},
+              {\"displayName\":\"Argon\\u001b[31m\",\"buckets\":[
+                {\"bucketId\":\"argon-weekly\",\"window\":\"weekly\",\"remainingFraction\":0.5}]},
+              {\"buckets\":[
+                {\"bucketId\":\"nova-5h\",\"displayName\":\"Nova Five Hour\",\"window\":\"5h\",\"remainingFraction\":0.5}]}
+            ]}}",
+        )
+        .unwrap();
+        let snap = parse_quota_summary(&v, "Pro".into()).unwrap();
+        let names: Vec<&str> = snap.model_pools.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["Argon[31m", "Nova Five Hour"]);
+    }
+
+    #[test]
+    fn canonical_presence_disables_inference_in_a_shared_group() {
+        for remaining in [serde_json::json!(0.1), serde_json::json!("unknown")] {
+            let summary = serde_json::json!({"groups": [{
+                "displayName": "Gemini Models",
+                "buckets": [
+                    {"bucketId": "gemini-5h", "remainingFraction": 0.5},
+                    {"bucketId": "gemini-argon-wtu-weekly", "remainingFraction": remaining}
+                ]
+            }]});
+            let snap = parse_quota_summary(&summary, "Pro".into()).unwrap();
+            assert_eq!(snap.session.unwrap().utilization_pct, 50);
+            assert!(snap.weekly.is_none());
+            assert!(snap.model_pools.is_empty());
+        }
+    }
+
     #[test]
     fn duplicate_or_unclassified_buckets_cannot_overwrite_a_slot() {
-        let duplicate: serde_json::Value = serde_json::from_str(
+        // A bucket that only resembles a canonical one never displaces it, and
+        // is not even parsed: its missing fraction would otherwise be an error.
+        let lookalike: serde_json::Value = serde_json::from_str(
             r#"{"response":{"groups":[{"displayName":"Gemini Models","buckets":[
+              {"bucketId":"gemini-5h-copy","window":"5h"},
               {"bucketId":"gemini-5h","window":"5h","remainingFraction":0.9},
-              {"bucketId":"gemini-5h-copy","window":"5h","remainingFraction":0.1},
               {"bucketId":"gemini-weekly","window":"weekly","remainingFraction":0.8}
             ]}]}}"#,
         )
         .unwrap();
-        let err = parse_quota_summary(&duplicate, "Pro".into()).unwrap_err();
-        assert!(err.to_string().contains("duplicate Gemini 5h"), "{err}");
+        let snap = parse_quota_summary(&lookalike, "Pro".into()).unwrap();
+        assert_eq!(snap.session.as_ref().unwrap().utilization_pct, 10);
 
-        // A future pool or cadence is ignored, not silently treated as the
-        // Claude/GPT 5h slot.
+        // Two buckets at the same rank cannot be told apart: canonical ids
+        // repeated, or two lookalikes competing for a slot nobody named.
+        for buckets in [
+            r#"{"bucketId":"gemini-5h","window":"5h","remainingFraction":0.9},
+               {"bucketId":"gemini-5h","window":"5h","remainingFraction":0.1}"#,
+            r#"{"bucketId":"x1","window":"5h","remainingFraction":0.9},
+               {"bucketId":"x2","window":"5h","remainingFraction":0.1}"#,
+        ] {
+            let duplicate: serde_json::Value = serde_json::from_str(&format!(
+                r#"{{"response":{{"groups":[{{"displayName":"Gemini Models","buckets":[{buckets}]}}]}}}}"#
+            ))
+            .unwrap();
+            let err = parse_quota_summary(&duplicate, "Pro".into()).unwrap_err();
+            assert!(err.to_string().contains("duplicate Gemini 5h"), "{err}");
+        }
+
+        // A future cadence is ignored, and a future group is a pool of its
+        // own, not silently treated as the Claude/GPT 5h slot.
         let unrelated: serde_json::Value = serde_json::from_str(
             r#"{"response":{"groups":[
               {"displayName":"Gemini Models","buckets":[
@@ -1900,6 +2299,11 @@ mod tests {
         let snap = parse_quota_summary(&unrelated, "Pro".into()).unwrap();
         assert!(snap.third_party_session.is_none());
         assert!(snap.third_party_weekly.is_none());
+        let [future] = snap.model_pools.as_slice() else {
+            panic!("{:?}", snap.model_pools);
+        };
+        assert_eq!(future.name, "Future Models");
+        assert!(!future.is_weekly());
     }
 
     /// A drifted bucket must fail the parse rather than report a reassuring
@@ -2877,6 +3281,42 @@ mod tests {
         assert!(parse_lsof_pcn("").is_empty());
     }
 
+    /// The menu bar puts user-writable directories before the macOS system
+    /// directories. Every fixed system tool in the refresh and desktop-action
+    /// boundary is therefore spawned by its canonical path (#472).
+    #[test]
+    fn macos_system_tools_are_pinned_to_trusted_paths() {
+        let sources = [
+            crate::guard::production_code(include_str!("fetch.rs")),
+            crate::guard::production_code(include_str!("../tray/tui_launch_macos.rs")),
+            crate::guard::production_code(include_str!("../tray/browse.rs")),
+            crate::guard::production_code(include_str!("../nous/oauth.rs")),
+            crate::guard::production_code(include_str!("../../macos/ai-usagebar-menubar.swift")),
+        ];
+        let code = sources.join("\n");
+        for bare in [
+            r#"Command::new("lsof")"#,
+            r#"Command::new("ps")"#,
+            r#"Command::new("open")"#,
+            r#"Command::new("osascript")"#,
+            r#"do script \"bash "#,
+        ] {
+            assert!(!code.contains(bare), "{bare} looks the tool up on PATH");
+        }
+        for pinned in [
+            r#"Command::new("/usr/sbin/lsof")"#,
+            r#"Command::new("/bin/ps")"#,
+            r#"Command::new("/usr/bin/open")"#,
+            r#"Command::new("/usr/bin/osascript")"#,
+            r#"do script \"/bin/bash "#,
+        ] {
+            assert!(
+                code.contains(pinned),
+                "missing trusted system path: {pinned}"
+            );
+        }
+    }
+
     /// First run with Antigravity closed: no cache to serve, so the user must
     /// be told what to start — not "no usable cache", which says nothing.
     #[test]
@@ -3143,6 +3583,148 @@ mod tests {
         .unwrap();
         assert_eq!(cached.source, AntigravitySource::Remote);
         assert_eq!(cached.account, snap.account);
+    }
+
+    fn cached_remote(cache: &Cache, blob: &str, expired: bool) -> AntigravitySnapshot {
+        let mut snap = parsed();
+        snap.source = AntigravitySource::Remote;
+        snap.account = remote_account(&credential::parse_keyring_blob(blob).unwrap().fingerprint);
+        if expired {
+            snap.session.as_mut().unwrap().resets_at = Some(now());
+        }
+        cache
+            .write_payload(&serde_json::to_vec(&snap_to_json(&snap)).unwrap())
+            .unwrap();
+        snap
+    }
+
+    #[tokio::test]
+    async fn an_active_backoff_blocks_cloud_requests_after_a_window_reset() {
+        for expiry in [VALID, EXPIRED] {
+            let mut server = mockito::Server::new_async().await;
+            let eps = endpoints(&server);
+            let network = server
+                .mock("POST", mockito::Matcher::Any)
+                .with_status(429)
+                .expect(0)
+                .create_async()
+                .await;
+            let blob = keyring_blob(expiry, true);
+            let (_td, cache) = fixture();
+            cached_remote(&cache, &blob, true);
+            cache.write_last_error(429, "quota limited");
+            let marker = std::fs::read(cache.retry_after_path()).unwrap();
+
+            let error = run(&cache, remote(&blob, &eps), Duration::ZERO)
+                .await
+                .unwrap_err();
+
+            network.assert_async().await;
+            assert!(matches!(error, AppError::Http { status: 429, .. }));
+            assert!(error.to_string().contains("next attempt in"));
+            assert_eq!(std::fs::read(cache.retry_after_path()).unwrap(), marker);
+            assert_eq!(cache.read_last_error(), Some((429, "quota limited".into())));
+        }
+    }
+
+    #[tokio::test]
+    async fn an_active_backoff_keeps_an_unexpired_remote_cache_visible() {
+        let mut server = mockito::Server::new_async().await;
+        let eps = endpoints(&server);
+        let network = server
+            .mock("POST", mockito::Matcher::Any)
+            .expect(0)
+            .create_async()
+            .await;
+        let blob = keyring_blob(VALID, true);
+        let (_td, cache) = fixture();
+        let snap = cached_remote(&cache, &blob, false);
+        cache.write_last_error(429, "quota limited");
+
+        let outcome = run(&cache, remote(&blob, &eps), Duration::from_secs(60))
+            .await
+            .unwrap();
+
+        network.assert_async().await;
+        assert!(outcome.stale);
+        assert_eq!(outcome.snapshot, snap);
+        assert_eq!(outcome.last_error, Some((429, "quota limited".into())));
+    }
+
+    #[tokio::test]
+    async fn an_active_backoff_does_not_block_a_local_quota_after_a_window_reset() {
+        let mut server = mockito::Server::new_async().await;
+        let eps = endpoints(&server);
+        let status_path = format!("/{STATUS_RPC}");
+        server
+            .mock("POST", status_path.as_str())
+            .with_status(200)
+            .with_body(r#"{"userStatus":{"email":"test@example.test"}}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let quota_path = format!("/{QUOTA_RPC}");
+        let quota = server
+            .mock("POST", quota_path.as_str())
+            .with_status(200)
+            .with_body(QUOTA_JSON)
+            .expect(1)
+            .create_async()
+            .await;
+        let blob = keyring_blob(VALID, true);
+        let (_td, cache) = fixture();
+        cached_remote(&cache, &blob, true);
+        cache.write_last_error(429, "quota limited");
+
+        let outcome = run(
+            &cache,
+            RemoteOverride {
+                local_bases: Some(vec![server.url().into()]),
+                ..remote(&blob, &eps)
+            },
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+
+        quota.assert_async().await;
+        assert!(!outcome.stale);
+        assert_eq!(outcome.snapshot.source, AntigravitySource::Local);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_active_backoff_allows_agy_but_skips_its_cloud_plan_lookup() {
+        let mut server = mockito::Server::new_async().await;
+        let eps = endpoints(&server);
+        let network = server
+            .mock("POST", mockito::Matcher::Any)
+            .expect(0)
+            .create_async()
+            .await;
+        let blob = keyring_blob(VALID, true);
+        let (td, cache) = fixture();
+        cached_remote(&cache, &blob, true);
+        cache.write_last_error(429, "quota limited");
+        let runs = td.path().join("runs");
+        let agy = agy_reading(td.path(), &runs);
+
+        let outcome = run(
+            &cache,
+            RemoteOverride {
+                agy: super::super::agy::AgyCommand::At(agy),
+                ..remote(&blob, &eps)
+            },
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+
+        network.assert_async().await;
+        assert!(!outcome.stale);
+        assert_eq!(outcome.snapshot.source, AntigravitySource::Agy);
+        assert_eq!(outcome.snapshot.plan, DEFAULT_PLAN);
+        assert_eq!(std::fs::read_to_string(runs).unwrap().lines().count(), 1);
     }
 
     /// `agy` exposes the local RPC port but, unlike the desktop products, does
@@ -3676,7 +4258,9 @@ mod tests {
     }
 
     /// An `agy` stand-in: appends to `runs`, then writes `blob` into `file`
-    /// the way the real CLI rewrites the keyring entry.
+    /// the way the real CLI rewrites the keyring entry. Its print mode fails
+    /// without a trace, like an `agy` that predates `-p "/quota"`, so these
+    /// tests exercise the Cloud Code path and count only renewals.
     #[cfg(unix)]
     fn fake_agy(
         dir: &std::path::Path,
@@ -3684,19 +4268,16 @@ mod tests {
         file: &std::path::Path,
         blob: &str,
     ) -> std::path::PathBuf {
-        use std::os::unix::fs::PermissionsExt;
         let path = dir.join("agy");
-        std::fs::write(
+        super::super::agy::test_support::write_script(
             &path,
-            format!(
-                "#!/bin/sh\necho \"$@\" >> '{}'\nprintf '%s' '{}' > '{}'\n",
+            &format!(
+                "[ \"$1\" = -p ] && exit 1\necho \"$@\" >> '{}'\nprintf '%s' '{}' > '{}'",
                 runs.display(),
                 blob,
                 file.display()
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         path
     }
 
@@ -3780,6 +4361,307 @@ mod tests {
             .await
             .expect_err("nothing renews it");
         assert!(err.to_string().contains("no OAuth client"), "{err}");
+    }
+
+    /// What `agy -p "/quota" --output-format json` prints, cut down to the
+    /// fields read, on the fixture's clock.
+    #[cfg(unix)]
+    const AGY_QUOTA: &str = r#"{"status":"SUCCESS","num_turns":0,"command":{"name":"usage","data":{"groups":[
+{"name":"Gemini Models","buckets":[
+ {"id":"gemini-weekly","name":"Weekly Limit Remaining","window":"weekly","remaining_fraction":0.63,"reset_time":"2026-07-28T01:11:19Z"},
+ {"id":"gemini-5h","name":"Five Hour Limit Remaining","window":"5h","remaining_fraction":0.49,"reset_time":"2026-07-22T15:25:45Z"}]},
+{"name":"Claude and GPT models","buckets":[
+ {"id":"3p-weekly","name":"Weekly Limit Remaining","window":"weekly","remaining_fraction":1,"reset_time":"2026-07-29T12:00:00Z"},
+ {"id":"3p-5h","name":"Five Hour Limit Remaining","window":"5h","remaining_fraction":1,"reset_time":"2026-07-22T17:00:00Z"}]},
+{"name":"Gemini 4 Argon","buckets":[
+ {"id":"gemini-argon-wtu-weekly","name":"Gemini 4 Argon Weekly Limit","window":"weekly","remaining_fraction":0,"reset_time":"2026-07-28T01:10:47Z"}]}]}}}"#;
+
+    /// An `agy` that appends its arguments to `runs` and answers print mode
+    /// with [`AGY_QUOTA`]; any other command fails.
+    #[cfg(unix)]
+    fn agy_reading(dir: &std::path::Path, runs: &std::path::Path) -> std::path::PathBuf {
+        let path = dir.join("agy");
+        super::super::agy::test_support::write_script(
+            &path,
+            &format!(
+                "echo \"$@\" >> '{}'\n[ \"$1\" = -p ] || exit 1\ncat <<'EOF'\n{AGY_QUOTA}\nEOF",
+                runs.display()
+            ),
+        );
+        path
+    }
+
+    /// #450: `agy`'s own reading answers before the Cloud Code API is asked,
+    /// attributed to the saved session like any remote snapshot; the plan
+    /// still comes from `loadCodeAssist` while the token is good.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agys_own_reading_answers_before_the_cloud_code_api() {
+        let mut server = mockito::Server::new_async().await;
+        let eps = endpoints(&server);
+        let daily = server
+            .mock("POST", "/daily/quota")
+            .expect(0)
+            .create_async()
+            .await;
+        let prod = server
+            .mock("POST", "/prod/quota")
+            .expect(0)
+            .create_async()
+            .await;
+        let plan = server
+            .mock("POST", "/daily/plan")
+            .match_header("authorization", "Bearer KEYRING-AT")
+            .with_status(200)
+            .with_body(r#"{"currentTier":{"name":"google_ai_pro"}}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let blob = keyring_blob(VALID, true);
+        let (td, cache) = fixture();
+        let runs = td.path().join("runs");
+        let agy = agy_reading(td.path(), &runs);
+
+        let out = run(
+            &cache,
+            RemoteOverride {
+                agy: super::super::agy::AgyCommand::At(agy),
+                ..remote(&blob, &eps)
+            },
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("agy answered");
+
+        daily.assert_async().await;
+        prod.assert_async().await;
+        plan.assert_async().await;
+        let snap = out.snapshot;
+        assert_eq!(snap.source, AntigravitySource::Agy);
+        assert_eq!(snap.plan, "Pro");
+        assert_eq!(snap.session.as_ref().unwrap().utilization_pct, 51);
+        assert_eq!(snap.weekly.as_ref().unwrap().utilization_pct, 37);
+        assert_eq!(
+            snap.third_party_session.as_ref().unwrap().utilization_pct,
+            0
+        );
+        assert_eq!(snap.model_pools[0].window.utilization_pct, 100);
+        let fingerprint = credential::parse_keyring_blob(&blob).unwrap().fingerprint;
+        assert_eq!(snap.account, format!("acct:{fingerprint}"));
+        let cached = parse_cache_at(
+            &cache
+                .fresh_payload(Duration::from_secs(60))
+                .unwrap()
+                .unwrap(),
+            None,
+            now(),
+        )
+        .unwrap();
+        assert_eq!(cached.source, AntigravitySource::Agy);
+        assert_eq!(
+            std::fs::read_to_string(runs).unwrap().trim(),
+            "-p /quota --output-format json --log-file /dev/null"
+        );
+    }
+
+    /// An expired session costs `agy`'s reading nothing: no refresh, no
+    /// renewal run, and no plan lookup with a token that is no longer good.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agys_reading_needs_no_good_token() {
+        let mut server = mockito::Server::new_async().await;
+        let eps = endpoints(&server);
+        let plan = server
+            .mock("POST", "/daily/plan")
+            .expect(0)
+            .create_async()
+            .await;
+        let token = token_mock(&mut server).expect(0).create_async().await;
+        let blob = keyring_blob(EXPIRED, true);
+        let (td, cache) = fixture();
+        let runs = td.path().join("runs");
+        let agy = agy_reading(td.path(), &runs);
+
+        let out = run_without_oauth(
+            &cache,
+            RemoteOverride {
+                agy: super::super::agy::AgyCommand::At(agy),
+                ..remote(&blob, &eps)
+            },
+        )
+        .await
+        .expect("agy answered");
+
+        plan.assert_async().await;
+        token.assert_async().await;
+        assert_eq!(out.snapshot.source, AntigravitySource::Agy);
+        assert_eq!(out.snapshot.plan, "Antigravity");
+        assert_eq!(std::fs::read_to_string(runs).unwrap().lines().count(), 1);
+    }
+
+    /// When `agy` cannot answer, the Cloud Code API still does, and the
+    /// failed reading is not repeated on the next poll.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn when_agy_cannot_read_the_quota_the_cloud_code_api_answers() {
+        let mut server = mockito::Server::new_async().await;
+        let eps = endpoints(&server);
+        let quota = quota_mock(&mut server, "KEYRING-AT")
+            .expect(2)
+            .create_async()
+            .await;
+        let blob = keyring_blob(VALID, true);
+        let (td, cache) = fixture();
+        let runs = td.path().join("runs");
+        let agy = td.path().join("agy");
+        super::super::agy::test_support::write_script(
+            &agy,
+            &format!("echo \"$@\" >> '{}'\nexit 1", runs.display()),
+        );
+        let remote = || RemoteOverride {
+            agy: super::super::agy::AgyCommand::At(agy.clone()),
+            ..remote(&blob, &eps)
+        };
+
+        for _ in 0..2 {
+            let out = run(&cache, remote(), Duration::ZERO)
+                .await
+                .expect("the Cloud Code API answered");
+            assert_eq!(out.snapshot.source, AntigravitySource::Remote);
+            // As if the reading floor had passed, so the next poll fetches.
+            std::fs::remove_file(cache.payload_path()).unwrap();
+        }
+        quota.assert_async().await;
+        assert_eq!(std::fs::read_to_string(runs).unwrap().lines().count(), 1);
+    }
+
+    /// Move the payload past the reading floor without discarding it, as the
+    /// clock would: the next poll fetches, and the payload is still there to
+    /// fall back on.
+    #[cfg(unix)]
+    fn age_past_reading_floor(cache: &Cache) {
+        let aged = std::time::SystemTime::now() - super::super::agy::QUOTA_INTERVAL * 2;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(cache.payload_path())
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(aged))
+            .unwrap();
+    }
+
+    /// `agy` answered once, then cannot — a cold start past the timeout, and
+    /// the cooldown that follows. Its reading is kept, stale, rather than
+    /// replaced by the Cloud Code API's other tracker (#450): unpinned, the
+    /// entry read "0% used" for ten minutes at a time while `agy` read 90%.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn when_agy_stops_answering_its_last_reading_is_kept_over_the_cloud_code_api() {
+        let mut server = mockito::Server::new_async().await;
+        let eps = endpoints(&server);
+        let quota = quota_mock(&mut server, "KEYRING-AT")
+            .expect(0)
+            .create_async()
+            .await;
+        let _plan = server
+            .mock("POST", "/daily/plan")
+            .with_status(200)
+            .with_body(r#"{"currentTier":{"name":"google_ai_pro"}}"#)
+            .create_async()
+            .await;
+        let blob = keyring_blob(VALID, true);
+        let (td, cache) = fixture();
+        let runs = td.path().join("runs");
+        let agy = agy_reading(td.path(), &runs);
+        let remote = || RemoteOverride {
+            agy: super::super::agy::AgyCommand::At(agy.clone()),
+            ..remote(&blob, &eps)
+        };
+
+        let first = run(&cache, remote(), Duration::ZERO)
+            .await
+            .expect("agy answered");
+        assert_eq!(first.snapshot.source, AntigravitySource::Agy);
+        assert!(!first.stale);
+
+        // The floor passes, and `agy` stops answering.
+        age_past_reading_floor(&cache);
+        super::super::agy::test_support::write_script(
+            &agy,
+            &format!("echo \"$@\" >> '{}'\nexit 1", runs.display()),
+        );
+
+        for _ in 0..2 {
+            let out = run(&cache, remote(), Duration::ZERO)
+                .await
+                .expect("agy's reading is kept");
+            assert_eq!(out.snapshot.source, AntigravitySource::Agy);
+            assert_eq!(out.snapshot.weekly.as_ref().unwrap().utilization_pct, 37);
+            assert_eq!(out.snapshot.plan, "Pro");
+            assert!(out.stale, "a kept reading is not passed off as current");
+            age_past_reading_floor(&cache);
+        }
+        quota.assert_async().await;
+        // One reading, one failed attempt: the cooldown held the second poll's
+        // attempt off, and the kept reading answered it all the same.
+        assert_eq!(std::fs::read_to_string(runs).unwrap().lines().count(), 2);
+    }
+
+    /// Only a reading of `agy`'s own is kept. A Cloud Code figure is the one
+    /// to replace, so with that in the cache the Cloud Code API is asked again.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_cloud_code_figure_is_not_kept_in_agys_place() {
+        let mut server = mockito::Server::new_async().await;
+        let eps = endpoints(&server);
+        let quota = quota_mock(&mut server, "KEYRING-AT")
+            .expect(2)
+            .create_async()
+            .await;
+        let blob = keyring_blob(VALID, true);
+        let (td, cache) = fixture();
+        let agy = td.path().join("agy");
+        super::super::agy::test_support::write_script(&agy, "exit 1");
+        let remote = || RemoteOverride {
+            agy: super::super::agy::AgyCommand::At(agy.clone()),
+            ..remote(&blob, &eps)
+        };
+
+        for _ in 0..2 {
+            let out = run(&cache, remote(), Duration::ZERO)
+                .await
+                .expect("the Cloud Code API answered");
+            assert_eq!(out.snapshot.source, AntigravitySource::Remote);
+            assert!(!out.stale);
+            age_past_reading_floor(&cache);
+        }
+        quota.assert_async().await;
+    }
+
+    /// A reading starts a process, so it is taken at most every
+    /// [`super::super::agy::QUOTA_INTERVAL`], however short the TTL.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agys_reading_is_taken_at_most_every_quota_interval() {
+        let server = mockito::Server::new_async().await;
+        let eps = endpoints(&server);
+        let blob = keyring_blob(VALID, true);
+        let (td, cache) = fixture();
+        let runs = td.path().join("runs");
+        let agy = agy_reading(td.path(), &runs);
+        for _ in 0..2 {
+            let out = run(
+                &cache,
+                RemoteOverride {
+                    agy: super::super::agy::AgyCommand::At(agy.clone()),
+                    ..remote(&blob, &eps)
+                },
+                Duration::ZERO,
+            )
+            .await
+            .expect("a snapshot");
+            assert_eq!(out.snapshot.source, AntigravitySource::Agy);
+        }
+        assert_eq!(std::fs::read_to_string(runs).unwrap().lines().count(), 1);
     }
 
     /// A session saved without a refresh token cannot be renewed here.
@@ -3866,6 +4748,55 @@ mod tests {
 
         quota.assert_async().await;
         assert!(matches!(err, AppError::Http { status: 401, .. }), "{err}");
+    }
+
+    /// #500: a signed-out local server returning HTTP 403 must not fall back to
+    /// an existing cache payload and present full quota alongside an error.
+    #[tokio::test]
+    async fn a_403_auth_rejection_does_not_fall_back_to_a_warm_cache() {
+        let mut server = mockito::Server::new_async().await;
+        let eps = endpoints(&server);
+        let status_path = format!("/{STATUS_RPC}");
+        let _status = server
+            .mock("POST", status_path.as_str())
+            .with_status(403)
+            .with_body(r#"{"error":"forbidden"}"#)
+            .create_async()
+            .await;
+        let quota = quota_mock(&mut server, "KEYRING-AT")
+            .expect(0)
+            .create_async()
+            .await;
+        let blob = keyring_blob(VALID, true);
+        let (_td, cache) = fixture();
+
+        let mut warm_snap = parsed();
+        warm_snap.session = None;
+        if let Some(w) = warm_snap.weekly.as_mut() {
+            w.utilization_pct = 100;
+        }
+        if let Some(w) = warm_snap.third_party_weekly.as_mut() {
+            w.utilization_pct = 100;
+        }
+        let bytes = serde_json::to_vec(&snap_to_json(&warm_snap)).unwrap();
+        cache.write_payload(&bytes).unwrap();
+
+        let err = run(
+            &cache,
+            RemoteOverride {
+                credential: SavedCredential::Blob(&blob),
+                endpoints: Some(&eps),
+                local_bases: Some(vec![server.url().into()]),
+                ..Default::default()
+            },
+            Duration::ZERO,
+        )
+        .await
+        .expect_err("HTTP 403 must not fall back to warm cache");
+
+        quota.assert_async().await;
+        assert!(matches!(err, AppError::Http { status: 403, .. }), "{err}");
+        assert_eq!(cache.read_last_error().map(|(code, _)| code), Some(403));
     }
 
     /// #405: the reporter's exact setup. The IDE is open but its language
@@ -4041,6 +4972,64 @@ mod tests {
         );
     }
 
+    fn argon(pct: i32, reset: &str) -> ModelPoolWindow {
+        ModelPoolWindow {
+            name: "Gemini 4 Argon".into(),
+            window: UsageWindow {
+                utilization_pct: pct,
+                resets_at: Some(
+                    DateTime::parse_from_rfc3339(reset)
+                        .unwrap()
+                        .with_timezone(&Utc),
+                ),
+                window_duration: chrono::Duration::days(7),
+            },
+        }
+    }
+
+    #[test]
+    fn model_pools_round_trip_through_the_cache() {
+        let mut snap = parsed();
+        snap.model_pools.push(argon(60, "2026-07-28T17:00:00Z"));
+        let bytes = serde_json::to_vec(&snap_to_json(&snap)).unwrap();
+        assert_eq!(parse_cache_at(&bytes, None, now()).unwrap(), snap);
+
+        // A payload from before pools existed carries none.
+        let mut legacy = snap_to_json(&parsed());
+        legacy.as_object_mut().unwrap().remove("model_pools");
+        let legacy = serde_json::to_vec(&legacy).unwrap();
+        assert!(
+            parse_cache_at(&legacy, None, now())
+                .unwrap()
+                .model_pools
+                .is_empty()
+        );
+
+        // A pool entry we did not write whole refetches.
+        let mut torn = snap_to_json(&snap);
+        torn["model_pools"][0]["window"] = "monthly".into();
+        let torn = serde_json::to_vec(&torn).unwrap();
+        assert!(parse_cache_at(&torn, None, now()).is_err());
+
+        // A locally damaged cache cannot reintroduce control text into any
+        // renderer even though the rest of the entry remains usable.
+        let mut damaged = snap_to_json(&snap);
+        damaged["model_pools"][0]["name"] = "Argon\u{001b}[31m".into();
+        let damaged = serde_json::to_vec(&damaged).unwrap();
+        let restored = parse_cache_at(&damaged, None, now()).unwrap();
+        assert_eq!(restored.model_pools[0].name, "Argon[31m");
+    }
+
+    /// A pool past its reset is as obsolete as a shared window past its own.
+    #[test]
+    fn a_cached_model_pool_past_its_reset_refetches() {
+        let mut snap = parsed();
+        snap.model_pools.push(argon(60, "2026-07-22T11:00:00Z"));
+        let bytes = serde_json::to_vec(&snap_to_json(&snap)).unwrap();
+        let err = parse_cache_at(&bytes, None, now()).unwrap_err();
+        assert!(err.to_string().contains("Gemini 4 Argon weekly"), "{err}");
+    }
+
     #[test]
     fn source_round_trips_through_the_cache_and_defaults_to_local() {
         let mut snap = parsed();
@@ -4056,6 +5045,13 @@ mod tests {
         assert_eq!(
             parse_cache_at(&bytes, None, now()).unwrap().source,
             AntigravitySource::Statusline
+        );
+
+        snap.source = AntigravitySource::Agy;
+        let bytes = serde_json::to_vec(&snap_to_json(&snap)).unwrap();
+        assert_eq!(
+            parse_cache_at(&bytes, None, now()).unwrap().source,
+            AntigravitySource::Agy
         );
 
         // A payload from before the field existed is a local one.

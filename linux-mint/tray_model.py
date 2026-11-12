@@ -2,6 +2,7 @@
 
 import os
 import json
+import math
 from datetime import datetime, timezone
 
 
@@ -55,6 +56,47 @@ def summary_metric(entry):
     if not quota:
         return None
     return max(quota, key=lambda item: item.get("percent") or 0)
+
+
+def plain_name(value, limit=40):
+    """Provider text for a one-line sink: printable characters only, bounded."""
+    text = "".join(ch if ch.isprintable() else " " for ch in str(value))
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+def summary_lines(data, language=None):
+    """One line per provider for the tray menu and the icon tooltip."""
+    lines = []
+    for entry in dashboard_entries(data):
+        metric = summary_metric(entry)
+        if metric is None:
+            continue
+        name = plain_name(entry.get("display_name") or entry.get("name")
+                          or tr("Provider", "Provedor", language))
+        suffix = tr(" · stale", " · antigo", language) if entry.get("stale") else ""
+        lines.append(f"{name}: {metric_display(metric)}{suffix}")
+    return lines
+
+
+def icon_label(data):
+    """The leading provider's percentage for the status icon, or "" without one."""
+    metric = next(filter(None, map(summary_metric, dashboard_entries(data))), None)
+    # A value-headline metric is shown as its value, not as a percentage.
+    if metric is None or metric.get("headline") == "value":
+        return ""
+    percent = metric.get("percent")
+    if isinstance(percent, (int, float)) and not isinstance(percent, bool) and math.isfinite(percent):
+        return f"{percent:.0f}%"
+    return ""
+
+
+def icon_tooltip(data, language=None):
+    """Tooltip for the status icon: the same lines as the menu, else the static hint."""
+    lines = summary_lines(data, language)[:4]
+    if not lines:
+        return tr("AI Usage Bar — open dashboard", "AI Usage Bar — abrir painel", language)
+    return "\n".join(lines)
 
 
 def metric_usage_label(metric, language=None):

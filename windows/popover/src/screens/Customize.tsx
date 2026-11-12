@@ -1,16 +1,8 @@
-import MdiChevronRight from "~icons/mdi/chevron-right";
 import MdiCogOutline from "~icons/mdi/cog-outline";
 import { ScreenCrossLinkRow } from "@/components/Chrome";
-import { DragHandle } from "@/components/DragHandle";
-import { ProviderIcon } from "@/components/ProviderIcon";
-import { TruncatedText } from "@/components/TruncatedText";
-import { SortableItem, VerticalDnd } from "@/components/dnd";
-import { Switch } from "@/components/ui/switch";
-import type { Card, Layout } from "@/lib/types";
+import { ProviderList } from "@/components/ProviderList";
+import type { Card, Layout, Payload } from "@/lib/types";
 import { m } from "@/paraglide/messages.js";
-import { useI18n } from "@/lib/i18n";
-import { cn } from "@/lib/utils";
-import { metricCount, orderedCards, providerIconId } from "../model.js";
 
 interface CustomizeProps {
   cards: Card[];
@@ -19,88 +11,30 @@ interface CustomizeProps {
   onOpenSettings: () => void;
   onReorder: (ids: string[]) => void;
   onToggle: (id: string, on: boolean) => void;
-  embedded?: boolean;
+  /** The host catalog: the one provider list the screen is built from. */
+  payload: Payload;
 }
 
-/** CustomizeProviderListView (L1): one grouped card of provider rows, then the Settings cross-link. */
-export function Customize({ cards, layout, onOpen, onOpenSettings, onReorder, onToggle, embedded = false }: CustomizeProps) {
-  const ordered = orderedCards(cards, layout);
-  const ids = ordered.map((card) => card.id);
+/** Customize (L1): the single provider list, then the Settings cross-link. */
+export function Customize({ cards, layout, onOpen, onOpenSettings, onReorder, onToggle, payload }: CustomizeProps) {
   return (
     <div className="flex flex-col gap-[var(--section-gap)]">
-      <VerticalDnd
-        items={ids}
+      <ProviderList
+        heading
+        cards={cards}
+        error={payload.providersError}
+        layout={layout}
+        onOpen={onOpen}
         onReorder={onReorder}
-        overlay={(id) => {
-          const card = ordered.find((item) => item.id === id);
-          if (!card) return null;
-          return (
-            <div className="lifted-surface">
-              <ProviderListRow card={card} enabled />
-            </div>
-          );
-        }}
-      >
-        <div className="card-surface">
-          {ordered.map((card) => {
-            const enabled = !(layout.hidden && layout.hidden[card.id]);
-            return (
-              <SortableItem key={card.id} id={card.id}>
-                {({ attributes, listeners }) => (
-                  <ProviderListRow
-                    card={card}
-                    enabled={enabled}
-                    handle={{ attributes, listeners }}
-                    onOpen={() => onOpen(card.id)}
-                    onToggle={(on) => onToggle(card.id, on)}
-                  />
-                )}
-              </SortableItem>
-            );
-          })}
-        </div>
-      </VerticalDnd>
-      {embedded ? null : <ScreenCrossLinkRow
+        onToggle={onToggle}
+        providers={payload.providers}
+      />
+      <ScreenCrossLinkRow
         icon={<MdiCogOutline />}
         subtitle={m.startup_appearance_and_more()}
         title={m.settings()}
         onClick={onOpenSettings}
-      />}
-    </div>
-  );
-}
-
-interface ProviderListRowProps {
-  card: Card;
-  enabled: boolean;
-  handle?: Parameters<typeof DragHandle>[0];
-  onOpen?: () => void;
-  onToggle?: (on: boolean) => void;
-}
-
-/** ProviderListRow: grip, mark, name + "N metrics", switch, chevron. Disabled rows fade to 55%. */
-function ProviderListRow({ card, enabled, handle, onOpen, onToggle }: ProviderListRowProps) {
-  const { language } = useI18n();
-  const count = metricCount(card);
-  return (
-    <div
-      data-card-id={card.id}
-      className={cn("flex items-center gap-[var(--row-gap)] px-[var(--card-pad)] py-[var(--pad-control)]", !enabled && "opacity-55")}
-    >
-      <DragHandle attributes={handle?.attributes} listeners={handle?.listeners} />
-      <button type="button" className="plain-btn hover-fill flex min-w-0 flex-1 items-center gap-[var(--row-gap)]" onClick={onOpen}>
-        <ProviderIcon className="text-label-2" size="var(--row-icon-box)" slug={providerIconId(card.id)} title={card.title} />
-        <span className="flex min-w-0 flex-col">
-          <TruncatedText className="text-[length:var(--sz-header)] font-semibold">{card.title}</TruncatedText>
-          <span className="text-[length:var(--sz-badge)] text-label-2">
-            {count} {count === 1 ? m.metric_singular({}, { locale: language }) : m.metric_plural({}, { locale: language })}
-          </span>
-        </span>
-      </button>
-      <Switch checked={enabled} aria-label={`${m.show()} ${card.title}`} onCheckedChange={(on) => onToggle?.(on === true)} />
-      <button type="button" aria-label={`${m.open()} ${card.title}`} className="plain-btn hover-icon grid size-[var(--row-icon-box)] place-items-center" onClick={onOpen}>
-        <MdiChevronRight className="size-[var(--icon-row)] text-label-3" />
-      </button>
+      />
     </div>
   );
 }

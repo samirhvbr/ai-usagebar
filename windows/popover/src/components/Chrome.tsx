@@ -15,6 +15,7 @@ import MdiUpdate from "~icons/mdi/update";
 import MdiRestore from "~icons/mdi/restore";
 import MdiTune from "~icons/mdi/tune-variant";
 import { Hint } from "@/components/Hint";
+import { IconButton } from "@/components/IconButton";
 import { TruncatedText } from "@/components/TruncatedText";
 import {
   DropdownMenu,
@@ -30,44 +31,46 @@ import { nextUpdateLabel, sendCommand } from "../model.js";
 
 interface TopBarProps {
   onBack: () => void;
+  onDetect?: () => void;
   onReset?: () => void;
   resetArmed?: boolean;
   resetLabel?: string;
   title: string;
 }
 
-/** PopoverTopBar: compact bar, centered headline, Back on the left, Reset on the right. */
-export function TopBar({ onBack, onReset, resetArmed, resetLabel, title }: TopBarProps) {
+/**
+ * PopoverTopBar: compact bar, centered headline, Back on the left, Reset — and Detect, on the
+ * Customize screen — on the right. The outer columns reserve the wider side (two icon buttons
+ * plus their gap), so the title stays centered on every screen.
+ */
+export function TopBar({ onBack, onDetect, onReset, resetArmed, resetLabel, title }: TopBarProps) {
+  const resetHint = resetArmed ? m.click_again_to_confirm() : resetLabel;
   return (
-    <div className="bar-glass grid shrink-0 grid-cols-[var(--chrome-btn)_1fr_var(--chrome-btn)] items-center p-[var(--panel-pad)]">
-      <Hint content={m.back()}>
-        <button type="button" aria-label={m.back()} className="circle-btn" onClick={onBack}>
-          <MdiChevronLeft className="size-[var(--icon-card)]" />
-        </button>
-      </Hint>
+    <div className="bar-glass grid shrink-0 grid-cols-[calc(2*var(--icon-btn)_+_var(--gap-controls))_1fr_calc(2*var(--icon-btn)_+_var(--gap-controls))] items-center p-[var(--panel-pad)]">
+      <IconButton label={m.back()} onClick={onBack}>
+        <MdiChevronLeft />
+      </IconButton>
       <h1 className="m-0 min-w-0 text-center">
         <TruncatedText className="block w-full text-[length:var(--sz-header)] font-semibold">{title}</TruncatedText>
       </h1>
-      {onReset ? (
-        <Hint align="end" content={resetArmed ? m.click_again_to_confirm() : resetLabel}>
-          <button
-            type="button"
-            aria-label={resetArmed ? m.click_again_to_confirm() : resetLabel}
-            className="circle-btn"
-            data-armed={resetArmed ? "" : undefined}
-            onClick={onReset}
-          >
-            <MdiRestore className="size-[var(--icon-menu)]" />
-          </button>
-        </Hint>
-      ) : (
-        <span />
-      )}
+      <div className="flex items-center justify-end gap-[var(--gap-controls)]">
+        {onReset && resetHint ? (
+          <IconButton align="end" label={resetHint} data-armed={resetArmed ? "" : undefined} onClick={onReset}>
+            <MdiRestore />
+          </IconButton>
+        ) : null}
+        {onDetect ? (
+          <IconButton align="end" label={m.detect_providers()} onClick={onDetect}>
+            <MdiMagnifyScan />
+          </IconButton>
+        ) : null}
+      </div>
     </div>
   );
 }
 
 interface FooterProps {
+  notice?: { failed: boolean; text: string } | null;
   nowMs: number;
   optionsOpen: boolean;
   payload: Payload;
@@ -83,8 +86,11 @@ interface FooterProps {
 /**
  * PopoverFooter: app identity + next-update countdown on the left, the Options ▾ capsule on the
  * right. A blue dot after the version says a newer build is waiting (the banner may be snoozed).
+ * `notice` is the copy-image result: the footer's own small text, the meter's red when it
+ * failed, on the same line as the Options capsule.
  */
 export function Footer({
+  notice,
   nowMs,
   optionsOpen,
   payload,
@@ -117,6 +123,18 @@ export function Footer({
         {native ? null : <span className="tabular-nums">{nextLabel}</span>}
       </div>
       <span className="min-w-[var(--gap-controls)] flex-1" />
+      {notice ? (
+        <span
+          role="status"
+          className={
+            notice.failed
+              ? "min-w-0 truncate text-[length:var(--sz-badge)] leading-[var(--leading-note)] text-meter-red"
+              : "min-w-0 truncate text-[length:var(--sz-badge)] leading-[var(--leading-note)] text-label-2"
+          }
+        >
+          {notice.text}
+        </span>
+      ) : null}
       <DropdownMenu modal={false} open={optionsOpen} onOpenChange={onOptionsOpenChange}>
         <DropdownMenuTrigger asChild>
           <button type="button" className="capsule-btn">

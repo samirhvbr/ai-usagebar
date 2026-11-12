@@ -1,6 +1,7 @@
 import QtQuick
 import Quickshell
 import qs.Commons
+import qs.Commons as Commons
 import qs.Ui
 import "Model.js" as Model
 
@@ -18,6 +19,13 @@ BarWidget {
     : false
   readonly property bool colorCodeUsage: panelItem ? panelItem.colorCodeUsage === true : false
   readonly property bool alarming: panelItem ? panelItem.alarming === true : false
+  readonly property var urgentPriority: panelItem ? panelItem.urgentPriority : null
+  readonly property color priorityAlertColor: panelItem ? panelItem.urgent : button.foreground
+  // The priority chip lives in the chip row, which a vertical bar hides. Its
+  // own flag carries the same guard, so a hidden chip is never registered as a
+  // click target (#293).
+  readonly property bool priorityChipShown: !(root.bar && root.bar.vertical)
+    && !!(panelItem && (panelItem.showPriorityShortcut || urgentPriority))
 
   // Quickshell window that hosts this bar slot (not the usage panel popup).
   readonly property var barWindow: button.QsWindow ? button.QsWindow.window : null
@@ -36,9 +44,32 @@ BarWidget {
     return items
   }
 
+  // The bar api that holds the priority chip's click target. The slot can
+  // hand this widget a new api (a "bar-entry:" placeholder first, the
+  // plugin's own once the registry loads), and the api that registered a
+  // target keeps owning it: the new one then refuses it without a word. So,
+  // like WidgetButton's registeredBar, the chip leaves the api it joined
+  // before it joins another. Provider chips are rebuilt with each report and
+  // never outlive their api.
+  property var priorityTargetHost: null
+
+  function syncPriorityTarget(host) {
+    if (priorityTargetHost) priorityTargetHost.unregisterClickTarget(priorityHit)
+    priorityTargetHost = null
+    // Registered after the button, which covers the whole slot: the bar
+    // scans targets last first.
+    if (host && root.priorityChipShown) {
+      host.registerClickTarget(priorityHit)
+      priorityTargetHost = host
+    }
+  }
+
   function syncChipTargets() {
     var host = root.bar
-    if (!host || typeof host.registerClickTarget !== "function") return
+    if (!host || typeof host.registerClickTarget !== "function") {
+      syncPriorityTarget(null)
+      return
+    }
     // Anything of ours that is not the button is a chip, current or rebuilt.
     var registered = host.clickTargets || []
     for (var i = 0; i < registered.length; i++)
@@ -46,6 +77,7 @@ BarWidget {
     var chips = chipItems()
     // A lone chip, a vertical bar or an empty report keeps the button as the
     // only target, and its press toggles the panel the way it always did.
+    syncPriorityTarget(host)
     if (chips.length <= 1) return
     for (var j = 0; j < chips.length; j++) host.registerClickTarget(chips[j])
   }
@@ -71,11 +103,11 @@ BarWidget {
   }
 
   function nextEntry() {
-    if (panelItem) panelItem.selectEntry(panelItem.entryIndex + 1)
+    if (panelItem) panelItem.selectAdjacentBarEntry(1)
   }
 
   function launchDashboard() {
-    if (root.bar) root.bar.run("omarchy-launch-floating-terminal-with-presentation ai-usagebar-tui")
+    if (root.bar) root.bar.run("omarchy-launch-floating-terminal-with-presentation " + Util.shellQuote(root.panelItem ? root.panelItem.tuiBinary : "ai-usagebar-tui"))
     root.close()
   }
 
@@ -258,6 +290,8 @@ BarWidget {
     Qt.callLater(root.syncChipTargets)
   }
   onSettingsChanged: injectPanel()
+  onPriorityChipShownChanged: Qt.callLater(root.syncChipTargets)
+  Component.onDestruction: syncPriorityTarget(null)
 
   Loader {
     id: panelLoader
@@ -297,7 +331,7 @@ BarWidget {
 
     onWheelMoved: function(delta) {
       if (delta !== 0 && root.panelItem)
-        root.panelItem.selectEntry(root.panelItem.entryIndex + (delta < 0 ? 1 : -1))
+        root.panelItem.selectAdjacentBarEntry(delta < 0 ? 1 : -1)
     }
 
     Row {
@@ -411,14 +445,44 @@ BarWidget {
           }
         }
       }
+
+      // Priority indicator after the usage chips: usage reads first.
+      Item {
+        id: priorityHit
+        visible: root.priorityChipShown
+        width: visible ? priorityLabel.implicitWidth : 0
+        height: button.height
+        // Same buttons as a provider chip: right launches the dashboard,
+        // middle switches provider, left toggles the priorities view.
+        function triggerPress(buttonCode) {
+          root.armClickLock()
+          if (buttonCode === Qt.RightButton) root.launchDashboard()
+          else if (buttonCode === Qt.MiddleButton) root.nextEntry()
+          else if (root.panelItem) root.panelItem.togglePriorities()
+        }
+        Text {
+          id: priorityLabel
+          textFormat: Text.PlainText
+          text: !root.panelItem ? ""
+            : root.urgentPriority ? "  󰀦 " + root.urgentPriority.name + "  "
+            : root.panelItem.barRecommendation ? "  󰉻 " + root.panelItem.barRecommendation.name + "  "
+            : "  " + root.panelItem.tr("priority.title") + "  "
+          color: root.urgentPriority ? root.priorityAlertColor : button.foreground
+          font.bold: !!root.urgentPriority
+          font.family: button.fontFamily
+          font.pixelSize: button.fontSize
+          anchors.verticalCenter: parent.verticalCenter
+        }
+      }
     }
 
     Text {
       visible: root.bar && root.bar.vertical
       anchors.centerIn: parent
       textFormat: Text.PlainText
-      text: root.alarming ? "󰅙" : "󰚩"
-      color: button.active && button.useActiveColor ? button.activeColor : button.foreground
+      text: root.urgentPriority ? "󰀦" : root.alarming ? "󰅙" : "󰚩"
+      color: root.urgentPriority ? root.priorityAlertColor
+        : button.active && button.useActiveColor ? button.activeColor : button.foreground
       font.family: button.fontFamily
       font.pixelSize: button.fontSize
       rotation: button.textRotation
@@ -471,8 +535,8 @@ BarWidget {
       id: tipBubble
       implicitWidth: Math.max(tipLabel.implicitWidth + Style.spacing.controlPaddingX * 2, Style.space(40))
       implicitHeight: Math.max(tipLabel.implicitHeight + Style.spacing.controlPaddingY * 2, Style.space(24))
-      color: Color.tooltip.background
-      borderSpec: Border.surfaceSpec("tooltip", "border", Color.tooltip.border, 1)
+      color: Commons.Color.tooltip.background
+      borderSpec: Border.surfaceSpec("tooltip", "border", Commons.Color.tooltip.border, 1)
       radius: Style.cornerRadius
 
       Text {
@@ -480,7 +544,7 @@ BarWidget {
         anchors.centerIn: parent
         textFormat: Text.RichText
         text: root.tipHtml
-        color: Color.tooltip.text
+        color: Commons.Color.tooltip.text
         font.family: button.fontFamily
         font.pixelSize: Style.font.body
         horizontalAlignment: Text.AlignLeft

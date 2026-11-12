@@ -9,14 +9,15 @@ export interface RowPrefs {
 export type TimeFormat = "12" | "24" | "auto";
 export type Language = "en" | "pt-BR" | "ko" | "es";
 export type PopoverStyle = "classic" | "native";
-export type MenuBarLook = "chart" | "logos" | "quattro";
+export type MenuBarLook = "icon" | "chart" | "logos" | "quattro";
 
 export interface Layout {
+  /** The account tab each provider's card shows (provider id → card id); the first card when absent. */
+  accountTab: Record<string, string>;
   alwaysShowPace: boolean;
   usageGoal: boolean;
   cardOrder: string[];
   collapsed: Record<string, boolean>;
-  hidden: Record<string, boolean>;
   hideExtras: boolean;
   hintDismissed: boolean;
   language: Language;
@@ -43,8 +44,15 @@ export interface MetricRow {
   grouped?: boolean;
   key?: string;
   kind: "metric";
+  /** One model's own limit (Antigravity's "Gemini 4 Argon") rather than a
+   * window the whole provider shares; the report's `model_pool`. */
+  modelPool?: boolean;
   label: string;
   leftPercent: number;
+  /** What a refilling window (Synthetic's weekly credits) gets back at
+   * `resetAt`, such as "2%"; the report's `regen`. Its countdown reads
+   * "Regenerates 2% in …" instead of "Resets in …". */
+  regen?: string;
   reset: string;
   resetAt: string;
   severity: string;
@@ -108,7 +116,10 @@ export interface ResetCreditsRow extends ResetCredits {
 export type Row = BlockRow | MetricRow | ResetCreditsRow | TextRow;
 
 export interface ErrorAction {
+  /** A host command, or one the popover runs itself: "add-key" (with `id`) or "customize". */
   cmd: string;
+  /** The provider the key dialog opens for ("add-key" only). */
+  id?: string;
   label: string;
 }
 
@@ -139,6 +150,10 @@ export interface Card {
   errorDetail: string;
   errorHint: string;
   errorTitle: string;
+  /** When the payload on screen was fetched (ms), or 0. */
+  fetchedAt: number;
+  /** Mark slug: the entry's `brand` when it declares one, else its vendor. */
+  icon: string;
   id: string;
   plan: string;
   resetCredits: ResetCredits | null;
@@ -178,7 +193,9 @@ export interface BlockSection {
 export type Section = BlockSection | MetricSection | TextSection;
 
 export interface Entry {
+  brand: string;
   displayName: string;
+  fetchedAt: number;
   error: string;
   id: string;
   plan: string;
@@ -252,6 +269,82 @@ export interface Accent {
   light: string;
 }
 
+/** One built-in provider from the host catalog, enabled or not. */
+export interface ProviderInfo {
+  /** "device" | "terminal" | "app" | "settings" | "": what Sign in does on this host. */
+  action: "" | "app" | "device" | "settings" | "terminal";
+  /** Account kinds this row can add (macOS): Claude Code, Claude Desktop, Codex. */
+  addAccounts: Array<"code" | "codex" | "desktop">;
+  configured: boolean;
+  enabled: boolean;
+  env: string;
+  id: string;
+  /** The credential's label for an API-key provider ("" for the others). */
+  keyLabel?: string;
+  /** The credential's note; "" when the host has none. */
+  keyNote?: string;
+  name: string;
+  signIn: string;
+  /** A device-code provider's account, for the sign-in sheet ("ChatGPT"); "" otherwise. */
+  signInAccount?: string;
+  /** Who hands out a device-code provider's code ("OpenAI"); "" otherwise. */
+  signInIssuer?: string;
+}
+
+/** One row of the single provider list, as built by `providerListRows`. */
+export interface ProviderListRow {
+  /** The provider id for a catalog row, or the card id for a custom row. */
+  id: string;
+  /** The catalog's name (owned by the host), or the card title for a custom row. */
+  name: string;
+  /** The mark slug: the provider's icon, or the card's for a custom row. */
+  icon: string;
+  /** On in config.toml; a custom row is on by definition. */
+  enabled: boolean;
+  /** The switch draws (a catalog row); a custom row toggles in config.toml. */
+  switchable: boolean;
+  /** `providerState` of the catalog row; "" for a custom row. */
+  state: string;
+  /** The catalog's sign-in hint; the alert icon's tooltip while `state` is "needs". */
+  signIn: string;
+  action: "" | "app" | "device" | "settings" | "terminal";
+  /** A device-code provider's account and code issuer, for the sign-in sheet; "" otherwise. */
+  signInAccount: string;
+  signInIssuer: string;
+  /** The credential's label and note for a key-only provider ("API key"); "" otherwise. */
+  keyLabel: string;
+  keyNote: string;
+  addAccounts: Array<"code" | "codex" | "desktop">;
+  /** The provider's cards in the dashboard's order; a custom row carries its one. */
+  cards: Array<{ id: string; metrics: number; title: string }>;
+  /** The provider's total metric count across its accounts. */
+  metrics: number;
+}
+
+/** The host's verdict for one key send, matched to it by `seq`. */
+/** The host's device-code sign-in (`sign_in` in the payload); see `device_login.rs`. */
+export interface SignInFact {
+  /** The provider slug the flow runs for. */
+  id: string;
+  /** The one-time code to type on the provider's page; "" until there is one. */
+  code: string;
+  error: string;
+  /** Wall-clock ms when the code stops working; 0 while unknown. */
+  expiresAt: number;
+  /** "device-off" | "cli-missing" | "custom-path" | "denied" | "". */
+  reason: string;
+  seq: number;
+  state: "expired" | "failed" | "ok" | "starting" | "unavailable" | "waiting";
+}
+
+export interface KeyCheck {
+  /** The provider slug the check ran for. */
+  id: string;
+  error: string;
+  seq: number;
+  state: "checking" | "failed" | "ok";
+}
+
 export interface Payload {
   /** Switchable logins keyed by vendor slug ("anthropic", "openai", "claude-desktop"); empty off macOS. */
   accounts: Record<string, AccountSwitchInfo>;
@@ -259,6 +352,9 @@ export interface Payload {
   entries: Entry[];
   generatedAt: number;
   hostError: string;
+  /** The host's last key-check verdict; null before the first send. */
+  keyCheck: KeyCheck | null;
+  signIn: SignInFact | null;
   /** macOS menu-bar look the host draws. */
   menuBarLook: MenuBarLook;
   /** Whether the Quattro look draws the short name beside the logo. */
@@ -269,7 +365,11 @@ export interface Payload {
   os: string;
   nextRefreshAt: number;
   primary: string;
-  /** Host refresh interval; one of 1, 5 or 10. */
+  /** Every built-in provider, for Settings → Providers. */
+  providers: ProviderInfo[];
+  /** Why the last enable/disable failed, or "". */
+  providersError: string;
+  /** Host refresh interval; one of 1, 5, 10, 15, 30 or 60. */
   refreshMinutes: number;
   shortcut: string;
   shortcutError: string;

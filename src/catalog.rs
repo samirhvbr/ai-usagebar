@@ -44,11 +44,13 @@ pub struct Probes<'a> {
     /// user signed pi into any provider, so existence alone cannot mean
     /// "signed in" the way the provider-owned files above can.
     pub commandcode_signed_in: &'a dyn Fn(&[PathBuf]) -> bool,
-    /// Whether one of OpenCode Go's auth files holds a live key. Existence
-    /// alone cannot mean "signed in" either: the CLI's `auth.json` holds every
-    /// provider the user has connected, and only the `opencode` entry with a
-    /// key-bearing type is the account this endpoint accepts.
+    /// Whether an OpenCode Go store holds a usable key or access token.
+    /// Existence alone cannot mean "signed in": legacy JSON holds multiple
+    /// providers, and the v2 database can contain inactive or expired logins.
+    /// The shared reader selects the `opencode` entry or active database row.
     pub opencode_go_signed_in: &'a dyn Fn(&[PathBuf]) -> bool,
+    /// Whether one of Cline's auth files holds a live credential.
+    pub cline_signed_in: &'a dyn Fn(&[PathBuf]) -> bool,
 }
 
 /// One provider's row in the catalog.
@@ -94,6 +96,11 @@ pub fn statuses(cfg: &Config) -> Vec<VendorStatus> {
             paths
                 .iter()
                 .any(|path| crate::opencode_go::creds::read_key_from(path).is_some())
+        },
+        cline_signed_in: &|paths| {
+            paths
+                .iter()
+                .any(|path| crate::cline::creds::read_from(path).is_some())
         },
     };
     statuses_with(cfg, &probes)
@@ -186,10 +193,7 @@ fn credential_present(cfg: &Config, id: VendorId, probes: &Probes) -> bool {
                 Some(paths) if !paths.is_empty() => paths.to_vec(),
                 _ => crate::cline::creds::default_paths().unwrap_or_default(),
             };
-            paths
-                .iter()
-                .any(|path| crate::cline::creds::read_from(path).is_some())
-                || cfg.cline.api_key.as_deref().is_some_and(|k| !k.is_empty())
+            (probes.cline_signed_in)(&paths)
         }
         VendorId::OpenCodeGo => {
             match crate::opencode_go::creds::effective_paths(cfg.opencode_go.auth_paths.as_deref())
@@ -234,7 +238,16 @@ fn credential_present(cfg: &Config, id: VendorId, probes: &Probes) -> bool {
         VendorId::ModelStudio => {
             any_exists(probes, [crate::modelstudio::config_path(&cfg.modelstudio)])
         }
-        VendorId::Devin => any_exists(probes, [crate::devin::credentials_path(&cfg.devin)]),
+        VendorId::Devin => {
+            any_exists(probes, [crate::devin::credentials_path(&cfg.devin)])
+                || cfg
+                    .devin
+                    .accounts
+                    .iter()
+                    .any(|a| (probes.exists)(&a.credentials_path))
+        }
+        VendorId::Droid => any_exists(probes, [crate::droid::keyring_path()]),
+        VendorId::MuseCode => any_exists(probes, [crate::muse::creds::path(&cfg.muse)]),
         // Nothing to check: handled by `needs_credential`, never reached.
         VendorId::Antigravity => true,
         // Key-only providers: the environment and inline checks above are the
@@ -246,13 +259,16 @@ fn credential_present(cfg: &Config, id: VendorId, probes: &Probes) -> bool {
         | VendorId::Deepinfra
         | VendorId::Kilo
         | VendorId::Novita
+        | VendorId::Synthetic
+        | VendorId::DeepRelay
         | VendorId::Moonshot
         | VendorId::Grok
         | VendorId::Minimax
         | VendorId::Shvia
         | VendorId::Ollama
         | VendorId::OrcaRouter
-        | VendorId::Lyceum => false,
+        | VendorId::Lyceum
+        | VendorId::Mistral => false,
     }
 }
 
@@ -266,8 +282,10 @@ fn anthropic_credentials_path(cfg: &Config) -> crate::error::Result<PathBuf> {
 fn kimi_credentials_path(cfg: &Config) -> crate::error::Result<PathBuf> {
     match &cfg.kimi.credentials_path {
         Some(path) => Ok(path.clone()),
+        // The kimi-code home (`~/.kimi-code`), not the user's: the CLI keeps
+        // its login under its own directory.
         None => Ok(crate::kimi::oauth::credentials_path_in(
-            &crate::cache::home_dir()?,
+            &crate::kimi::oauth::default_home()?,
         )),
     }
 }
@@ -303,6 +321,13 @@ fn keychain_has_claude_for(config_dir: &Path) -> bool {
 #[cfg(not(target_os = "macos"))]
 fn keychain_has_claude_for(_config_dir: &Path) -> bool {
     false
+}
+
+/// `vendors --json`: the catalog as one JSON document.
+pub fn collect_json() -> Result<String, String> {
+    let cfg = Config::load().map_err(|error| error.user_message())?;
+    serde_json::to_string(&serde_json::json!({"vendors": statuses(&cfg)}))
+        .map_err(|error| error.to_string())
 }
 
 /// `vendors --json`: the catalog as one JSON document.
@@ -368,6 +393,7 @@ mod tests {
             keychain_has_claude_for: &|_| false,
             commandcode_signed_in,
             opencode_go_signed_in,
+            cline_signed_in: &|_| false,
         }
     }
 
@@ -422,6 +448,27 @@ mod tests {
         assert!(!row(&rows, "zai").configured);
     }
 
+    /// Cline's section carries the same `api_key_env` field, but the shared
+    /// resolver answered its fixed default, so a key held under another name
+    /// configured the fetch while this row kept asking for `CLINE_API_KEY`.
+    #[test]
+    fn a_cline_api_key_env_override_is_the_variable_both_reported_and_read() {
+        let mut cfg = Config::default();
+        cfg.cline.api_key_env = "WORK_CLINE_KEY".to_string();
+        let set = |name: &str| name == "WORK_CLINE_KEY";
+        let rows = statuses_with(&cfg, &probes(&set, &|_| false, &|_| false));
+        let cline = row(&rows, "cline");
+        assert_eq!(
+            cline.env, "WORK_CLINE_KEY",
+            "the row names the effective variable"
+        );
+        assert!(cline.configured, "and is satisfied by it, not the CLI");
+
+        let stale = |name: &str| name == "CLINE_API_KEY";
+        let rows = statuses_with(&cfg, &probes(&stale, &|_| false, &|_| false));
+        assert!(!row(&rows, "cline").configured);
+    }
+
     #[test]
     fn an_inline_key_configures_without_the_environment() {
         let mut cfg = Config::default();
@@ -446,6 +493,7 @@ mod tests {
             api_key_env: None,
             api_key: Some("sk-named".into()),
             management_api_key_env: None,
+            monthly_limit: None,
         });
         let rows = statuses_with(&cfg, &bare());
         assert!(row(&rows, "openrouter").configured);
@@ -460,6 +508,7 @@ mod tests {
             api_key_env: Some("DEEPSEEK_WORK_API_KEY".into()),
             api_key: None,
             management_api_key_env: None,
+            monthly_limit: None,
         });
         let set = |name: &str| name == "DEEPSEEK_WORK_API_KEY";
         let rows = statuses_with(&cfg, &probes(&set, &|_| false, &|_| false));
@@ -493,6 +542,7 @@ mod tests {
             keychain_has_claude_for: &|_| false,
             commandcode_signed_in: &|_| false,
             opencode_go_signed_in: &|_| false,
+            cline_signed_in: &|_| false,
         };
         assert!(row(&statuses_with(&cfg, &with_keychain), "anthropic").configured);
         assert!(!row(&statuses_with(&cfg, &bare()), "anthropic").configured);
@@ -506,6 +556,16 @@ mod tests {
         let exists = |path: &Path| path == custom;
         let rows = statuses_with(&cfg, &probes(&|_| false, &exists, &|_| false));
         assert!(row(&rows, "anthropic").configured);
+    }
+
+    #[test]
+    fn the_kimi_code_cli_login_counts_under_its_own_home() {
+        // `kimi login` writes `~/.kimi-code/credentials/kimi-code.json`; the
+        // row read `~/credentials/…`, so a signed-in CLI still asked for a
+        // sign-in. Only the path's tail is pinned: the probe touches no disk.
+        let exists = |path: &Path| path.ends_with(".kimi-code/credentials/kimi-code.json");
+        let rows = statuses_with(&Config::default(), &probes(&|_| false, &exists, &|_| false));
+        assert!(row(&rows, "kimi").configured);
     }
 
     #[test]
@@ -540,6 +600,7 @@ mod tests {
             keychain_has_claude_for: &|dir| dir == Path::new("/accounts/work"),
             commandcode_signed_in: &|_| false,
             opencode_go_signed_in: &|_| false,
+            cline_signed_in: &|_| false,
         };
         assert!(row(&statuses_with(&cfg, &with_named_keychain), "anthropic").configured);
         assert!(!row(&statuses_with(&cfg, &bare()), "anthropic").configured);
@@ -611,6 +672,19 @@ mod tests {
         assert!(row(&rows, "openai").configured);
     }
 
+    #[test]
+    fn a_devin_named_account_counts_as_configured() {
+        let mut cfg = Config::default();
+        let custom = PathBuf::from("/accounts/work/devin-credentials.toml");
+        cfg.devin.accounts.push(crate::config::DevinAccount {
+            label: "work".into(),
+            credentials_path: custom.clone(),
+        });
+        let exists = |path: &Path| path == custom;
+        let rows = statuses_with(&cfg, &probes(&|_| false, &exists, &|_| false));
+        assert!(row(&rows, "devin").configured);
+    }
+
     /// A provider is only ever fetched when config has it on, and `enabled` is
     /// the one fact `usage --json` cannot report for the rows it omits.
     #[test]
@@ -658,6 +732,37 @@ mod tests {
             &probes(&|_| false, &|_| false, &|paths| paths == [custom.clone()]),
         );
         assert!(row(&rows, "commandcode").configured);
+    }
+
+    /// Cline's credential file path is checked via the injected probe so
+    /// catalog status never hits the disk or $HOME during tests.
+    #[test]
+    fn cline_cli_auth_file_counts_as_configured() {
+        let mut cfg = Config::default();
+        let custom = PathBuf::from("/opt/cline/auth.json");
+        cfg.cline.auth_paths = Some(vec![custom.clone()]);
+
+        let signed_in = Probes {
+            env_set: &|_| false,
+            exists: &|_| false,
+            keychain_has_claude: &|| false,
+            keychain_has_claude_for: &|_| false,
+            commandcode_signed_in: &|_| false,
+            opencode_go_signed_in: &|_| false,
+            cline_signed_in: &|paths| paths == [custom.clone()],
+        };
+        assert!(row(&statuses_with(&cfg, &signed_in), "cline").configured);
+        assert!(!row(&statuses_with(&cfg, &bare()), "cline").configured);
+    }
+
+    /// Mistral is key-only: only an env var or inline key counts as
+    /// configured, never a credential store it did not own.
+    #[test]
+    fn mistral_is_configured_only_by_an_explicit_key() {
+        let mut cfg = Config::default();
+        assert!(!row(&statuses_with(&cfg, &bare()), "mistral").configured);
+        cfg.mistral.api_key = Some("mst-test".into());
+        assert!(row(&statuses_with(&cfg, &bare()), "mistral").configured);
     }
 
     /// Auth metadata has to be usable, not merely present: a key provider that

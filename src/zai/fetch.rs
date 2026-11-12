@@ -230,6 +230,59 @@ mod tests {
         assert!(out.is_err(), "expected an error, got {out:?}");
     }
 
+    /// The end-to-end regression (review F1): a 200 whose `msg` quotes the
+    /// key the fetch was sent with used to persist the key in `.last_error`
+    /// and hand the key-carrying error back to the report. The seam
+    /// `build_outcome`/`api_key_and_cache` use — a `Cache::at` attached to
+    /// the key via `redacting`, plus the real fetch under the same single
+    /// error wrap — must leave the key in neither place.
+    #[tokio::test]
+    async fn in_band_failure_quoting_the_key_redacts_the_diagnostic_and_the_error() {
+        let key = "test-key-value";
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("GET", "/api/monitor/usage/quota/limit")
+            .with_status(200)
+            .with_body(format!(
+                r#"{{"code":401,"msg":"bad key {key}","data":null,"success":false}}"#
+            ))
+            .create_async()
+            .await;
+
+        let (_td, cache) = cache_fixture();
+        let cache = cache.redacting(key);
+
+        let client = reqwest::Client::new();
+        let endpoints = Endpoints {
+            quota: format!("{}/api/monitor/usage/quota/limit", server.url()),
+        };
+        let err = crate::outcome::fetch_api_keyed(
+            async {
+                fetch_snapshot(&client, key, &cache, &endpoints, Duration::ZERO, None)
+                    .await
+                    .map(crate::vendor::VendorOutcome::from)
+            },
+            key,
+        )
+        .await
+        .unwrap_err();
+
+        // The cache's first point of writing never held the key.
+        let persisted = std::fs::read_to_string(cache.last_error_path()).unwrap();
+        assert!(
+            !persisted.contains(key),
+            "the key reached .last_error: {persisted}"
+        );
+        assert!(persisted.contains("[key]"), "{persisted}");
+        // Neither does the error the report shows.
+        let rendered = err.user_message();
+        assert!(
+            !rendered.contains(key),
+            "the key reached the report error: {rendered}"
+        );
+        assert!(rendered.contains("[key]"), "{rendered}");
+    }
+
     #[tokio::test]
     async fn corrupt_fresh_cache_refetches_instead_of_showing_unknown_plan() {
         let mut server = mockito::Server::new_async().await;

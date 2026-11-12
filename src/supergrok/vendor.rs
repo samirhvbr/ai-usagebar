@@ -20,8 +20,6 @@ use super::fetch::FetchOutcome;
 
 pub const DEFAULT_FORMAT: &str = "{sgk_pct}% · {sgk_reset}";
 
-const DEFAULT_ICON: &str = "󰚩";
-
 pub fn build_placeholders(
     snap: &SuperGrokSnapshot,
     now: DateTime<Utc>,
@@ -31,7 +29,7 @@ pub fn build_placeholders(
     let prepaid = snap.prepaid_balance.map(usd).unwrap_or_else(|| "—".into());
 
     placeholders(vec![
-        ("icon", DEFAULT_ICON.to_string()),
+        ("icon", VendorId::Supergrok.bar_icon().to_string()),
         ("vendor_short", VendorId::Supergrok.short_name().to_string()),
         // Cross-vendor compatibility aliases for the single current pool.
         ("plan", snap.plan.clone()),
@@ -45,6 +43,11 @@ pub fn build_placeholders(
         ("sgk_reset", reset),
         ("sgk_period", snap.period.label().to_string()),
         ("sgk_prepaid", prepaid),
+        (
+            "sgk_on_demand",
+            snap.additional_usage_text()
+                .unwrap_or_else(|| "—".to_string()),
+        ),
         (
             "sgk_resets_available",
             snap.reset_credits.available.to_string(),
@@ -145,7 +148,7 @@ fn push_product_row(
     let label = crate::display::pad_end(&product.label, label_width);
     let pct = format!("{:>4}%", product.percent);
     lines.push(TooltipLine::Body(format!(
-        " <span foreground='{dim}'>  󰚩  {}  </span><span foreground='{dim}' font_weight='bold'>{pct}</span>",
+        " <span foreground='{dim}'>  󰇷  {}  </span><span foreground='{dim}' font_weight='bold'>{pct}</span>",
         escape(&label)
     )));
 }
@@ -187,6 +190,17 @@ fn render_tooltip(
         for product in &snap.products {
             push_product_row(&mut lines, theme, product, label_width);
         }
+    }
+
+    // Spend past the included pool. The official CLI's `/usage` reads the
+    // same on-demand cents; a zero pair is the proto default and stays hidden,
+    // the way a $0.00 prepaid balance does.
+    if let Some(extra) = snap.additional_usage_text() {
+        lines.push(TooltipLine::Body("".into()));
+        lines.push(TooltipLine::Body(format!(
+            " <span foreground='{dim}'>  󰄑  Additional usage  {}</span>",
+            escape(&extra)
+        )));
     }
 
     // Same rule as the panel: a $0.00 prepaid line is noise, not information
@@ -272,6 +286,8 @@ mod tests {
             prepaid_balance: Some(0.0),
             reset_credits: Default::default(),
             products: Vec::new(),
+            on_demand_used_cents: None,
+            on_demand_cap_cents: None,
         }
     }
 
@@ -373,6 +389,19 @@ mod tests {
         assert!(!out.tooltip.contains("<b>Build"), "{}", out.tooltip);
     }
 
+    #[test]
+    fn tooltip_product_row_uses_supergrok_glyph() {
+        let mut snap = sample_snap();
+        snap.products = vec![crate::usage::SuperGrokProduct {
+            label: "Grok".into(),
+            percent: 7,
+        }];
+        let o = sample_outcome(snap.clone());
+        let out = render(&o, &snap, &Theme::default(), &opts(), now());
+        assert!(out.tooltip.contains("󰇷"), "{}", out.tooltip);
+        assert!(!out.tooltip.contains("󰚩"), "{}", out.tooltip);
+    }
+
     /// The prepaid line appears only when there is credit to show — a $0.00
     /// row reads as "no money" when the billing document merely reports that
     /// nothing was purchased on top of the subscription. The `{sgk_prepaid}`
@@ -457,10 +486,50 @@ mod tests {
     fn placeholders_include_generic_aliases() {
         let snap = sample_snap();
         let ph = build_placeholders(&snap, now());
+        assert_eq!(ph.get("icon").map(String::as_str), Some("󰇷"));
         assert_eq!(ph.get("vendor_short").map(String::as_str), Some("sgk"));
         assert_eq!(ph.get("weekly_pct").map(String::as_str), Some("34"));
         assert_eq!(ph.get("session_pct").map(String::as_str), Some("34"));
         assert_eq!(ph.get("sgk_period").map(String::as_str), Some("Weekly"));
         assert_eq!(ph.get("sgk_prepaid").map(String::as_str), Some("$0.00"));
+        assert_eq!(ph.get("sgk_on_demand").map(String::as_str), Some("—"));
+    }
+
+    /// Additional usage is the on-demand pair from the same billing document.
+    /// Zero or absent stays off the tooltip; a cap is shown as used / cap.
+    #[test]
+    fn tooltip_lists_additional_usage_only_when_present() {
+        let snap = sample_snap();
+        let quiet = render(
+            &sample_outcome(snap.clone()),
+            &snap,
+            &Theme::default(),
+            &opts(),
+            now(),
+        );
+        assert!(
+            !quiet.tooltip.contains("Additional usage"),
+            "{}",
+            quiet.tooltip
+        );
+
+        let mut snap = snap;
+        snap.on_demand_used_cents = Some(150);
+        snap.on_demand_cap_cents = Some(2000);
+        let out = render(
+            &sample_outcome(snap.clone()),
+            &snap,
+            &Theme::default(),
+            &opts(),
+            now(),
+        );
+        assert!(out.tooltip.contains("Additional usage"), "{}", out.tooltip);
+        assert!(out.tooltip.contains("$1.50 / $20.00"), "{}", out.tooltip);
+        assert_eq!(
+            build_placeholders(&snap, now())
+                .get("sgk_on_demand")
+                .map(String::as_str),
+            Some("$1.50 / $20.00")
+        );
     }
 }

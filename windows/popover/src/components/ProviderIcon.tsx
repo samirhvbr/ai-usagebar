@@ -8,11 +8,18 @@ import CursorMark from "~icons/aiub/cursor";
 import DeepseekMark from "~icons/aiub/deepseek";
 import GrokMark from "~icons/aiub/grok";
 import GrokbotMark from "~icons/aiub/grokbot";
+import DevinMark from "~icons/aiub/devin";
+import KiloMark from "~icons/aiub/kilo";
+import KiroMark from "~icons/aiub/kiro";
+import MuseCodeMark from "~icons/aiub/muse-code";
+import NousMark from "~icons/aiub/nous";
+import NovitaMark from "~icons/aiub/novita";
+import OllamaMark from "~icons/aiub/ollama";
 import KimiMark from "~icons/aiub/kimi";
 import MinimaxMark from "~icons/aiub/minimax";
 import MoonshotMark from "~icons/aiub/moonshot";
 import OpenaiMark from "~icons/aiub/openai";
-import OpencodeGoMark from "~icons/aiub/opencode_go";
+import OpencodeGoMark from "~icons/aiub/opencode-go";
 import OpenrouterMark from "~icons/aiub/openrouter";
 import ZaiMark from "~icons/aiub/zai";
 
@@ -29,11 +36,18 @@ const MARKS: Record<string, Mark> = {
   deepseek: DeepseekMark,
   grok: GrokMark,
   grokbot: GrokbotMark,
+  devin: DevinMark,
+  kilo: KiloMark,
+  kiro: KiroMark,
+  "muse-code": MuseCodeMark,
+  nous: NousMark,
+  novita: NovitaMark,
+  ollama: OllamaMark,
   kimi: KimiMark,
   minimax: MinimaxMark,
   moonshot: MoonshotMark,
   openai: OpenaiMark,
-  opencode_go: OpencodeGoMark,
+  "opencode-go": OpencodeGoMark,
   openrouter: OpenrouterMark,
   // SuperGrok is xAI's Grok plan: same mark (the menu bar's `tray/marks.rs` agrees).
   supergrok: GrokMark,

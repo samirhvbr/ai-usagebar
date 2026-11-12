@@ -3,6 +3,9 @@
 //! Antigravity splits its quota into two independent pools (Gemini, and
 //! Claude/GPT-OSS), each with a 5-hour and a weekly window. The two pools do
 //! **not** share a budget: exhausting Gemini leaves Claude & GPT OSS untouched.
+//! Some plans add per-model pools of their own (Pro's weekly "Gemini 4 Argon"
+//! limit); those rows follow the shared ones under the same headings and are
+//! named by the response, but take no part in the bar's fixed placeholders.
 //! Their reset times only coincide while both are unused — an untouched bucket's
 //! reset slides with the clock and anchors on first use — so every window keeps
 //! its own countdown and the grouping below is presentational only.
@@ -17,11 +20,26 @@ use crate::pacing::{self, PaceSeverity};
 use crate::pango::{color_span, escape, severity_color};
 use crate::theme::Theme;
 use crate::tooltip::{Line as TooltipLine, push_window, render_bordered};
-use crate::usage::{AntigravitySnapshot, UsageWindow};
+use crate::usage::{AntigravitySnapshot, ModelPoolWindow, UsageWindow};
 use crate::vendor::{RenderOpts, VendorId, VendorOutcome};
 use crate::waybar::{Class, WaybarOutput};
 
 pub const DEFAULT_FORMAT: &str = "{icon} {session_pct}% · {weekly_pct}%";
+pub const WEEKLY_ONLY_FORMAT: &str = "{icon} {weekly_pct}%";
+pub const SESSION_ONLY_FORMAT: &str = "{icon} {session_pct}%";
+pub const NO_WINDOWS_FORMAT: &str = "{icon}";
+
+/// Select the default format string based on which shared windows are present.
+/// When only weekly quota is reported (such as from CLI discovery), omit the
+/// session percentage slot instead of rendering a bare "%".
+pub fn default_format(snap: &AntigravitySnapshot) -> &'static str {
+    match (snap.session.is_some(), snap.weekly.is_some()) {
+        (true, true) => DEFAULT_FORMAT,
+        (false, true) => WEEKLY_ONLY_FORMAT,
+        (true, false) => SESSION_ONLY_FORMAT,
+        (false, false) => NO_WINDOWS_FORMAT,
+    }
+}
 
 /// Model-group names, as Antigravity's own Model Quota screen labels them.
 /// Both surfaces put these under a "Session"/"Weekly" heading, so the rows
@@ -38,6 +56,53 @@ fn windows(snap: &AntigravitySnapshot) -> [(&'static str, Option<&UsageWindow>);
         (GROUP_PRIMARY, snap.weekly.as_ref()),
         (GROUP_THIRD_PARTY, snap.third_party_weekly.as_ref()),
     ]
+}
+
+/// One row under a cadence heading.
+pub struct Row<'a> {
+    pub label: &'a str,
+    pub window: &'a UsageWindow,
+    /// A limit of one model (Pro's "Gemini 4 Argon"), not one of the shared
+    /// groups every model of the provider draws on.
+    pub model_pool: bool,
+}
+
+/// The rows under one cadence heading, in display order: Gemini, the
+/// per-model pools named after it (Pro's "Gemini 4 Argon"), Claude & GPT OSS,
+/// then any other pool.
+pub fn rows(snap: &AntigravitySnapshot, weekly: bool) -> Vec<Row<'_>> {
+    let (primary, third_party) = if weekly {
+        (snap.weekly.as_ref(), snap.third_party_weekly.as_ref())
+    } else {
+        (snap.session.as_ref(), snap.third_party_session.as_ref())
+    };
+    let (gemini_pools, other_pools): (Vec<&ModelPoolWindow>, Vec<_>) = snap
+        .model_pools
+        .iter()
+        .filter(|pool| pool.is_weekly() == weekly)
+        .partition(|pool| pool.name.starts_with(GROUP_PRIMARY));
+    fn pool_rows(pools: Vec<&ModelPoolWindow>) -> impl Iterator<Item = Row<'_>> {
+        pools.into_iter().map(|pool| Row {
+            label: pool.name.as_str(),
+            window: &pool.window,
+            model_pool: true,
+        })
+    }
+    primary
+        .map(|window| Row {
+            label: GROUP_PRIMARY,
+            window,
+            model_pool: false,
+        })
+        .into_iter()
+        .chain(pool_rows(gemini_pools))
+        .chain(third_party.map(|window| Row {
+            label: GROUP_THIRD_PARTY,
+            window,
+            model_pool: false,
+        }))
+        .chain(pool_rows(other_pools))
+        .collect()
 }
 
 fn elapsed_pct(w: &UsageWindow, now: DateTime<Utc>, tolerance: u32) -> i32 {
@@ -84,7 +149,7 @@ pub fn build_placeholders(
         optional(snap.third_party_weekly.as_ref(), GROUP_THIRD_PARTY);
 
     placeholders(vec![
-        ("icon", "󰧑".to_string()),
+        ("icon", VendorId::Antigravity.bar_icon().to_string()),
         (
             "vendor_short",
             VendorId::Antigravity.short_name().to_string(),
@@ -111,12 +176,14 @@ pub fn build_placeholders(
     ])
 }
 
-/// Worst of **all four** windows. Grading on the Gemini pool alone would show a
-/// calm panel while the Claude & GPT OSS pool is exhausted.
+/// Worst of **every** window, per-model pools included. Grading on the Gemini
+/// pool alone would show a calm panel while the Claude & GPT OSS pool, or a
+/// model's own limit, is exhausted.
 pub fn severity(snap: &AntigravitySnapshot) -> PaceSeverity {
     let worst = windows(snap)
         .iter()
         .filter_map(|(_, w)| w.map(|w| w.utilization_pct))
+        .chain(snap.model_pools.iter().map(|p| p.window.utilization_pct))
         .max()
         .unwrap_or(0);
     if worst >= 90 {
@@ -142,7 +209,7 @@ pub fn render(
     let format = opts
         .format
         .clone()
-        .unwrap_or_else(|| DEFAULT_FORMAT.to_string());
+        .unwrap_or_else(|| default_format(snap).to_string());
     let mut values = build_placeholders(snap, now, opts.pace_tolerance);
     // Both sinks fed by this map (bar text and --tooltip-format) are Pango
     // markup. One pool name carries an `&` ("Claude & GPT OSS") and the plan
@@ -204,15 +271,15 @@ fn render_tooltip(
     lines.push(TooltipLine::Sep);
     lines.push(TooltipLine::Body("".into()));
 
-    let all = windows(snap);
     let pace = |w: &UsageWindow| {
         opts.tooltip_pace_pts
             .then(|| elapsed_pct(w, now, opts.pace_tolerance))
     };
 
-    // Two groups, each holding the same pair of pools. A Sep between them marks
-    // the pools as independent budgets (same device Z.AI uses before its MCP
-    // block) without implying they share a reset.
+    // Two groups, each holding the same pair of pools and then any per-model
+    // pool of that cadence. A Sep between them marks the pools as independent
+    // budgets (same device Z.AI uses before its MCP block) without implying
+    // they share a reset.
     for (group_idx, (heading, icon)) in [("Session", "󰔟"), ("Weekly", "󰃰")].iter().enumerate()
     {
         if group_idx > 0 {
@@ -222,18 +289,17 @@ fn render_tooltip(
         lines.push(TooltipLine::Body(format!(
             " <span font_weight='bold' foreground='{fg}'>  {icon}  {heading}</span>"
         )));
-        for (slot, (label, window)) in all.iter().enumerate().skip(group_idx * 2).take(2) {
-            let Some(w) = window else { continue };
-            if slot % 2 == 1 {
+        for (index, row) in rows(snap, group_idx == 1).into_iter().enumerate() {
+            if index > 0 {
                 lines.push(TooltipLine::Body("".into()));
             }
             push_window(
                 &mut lines,
-                &format!("  󰆧  {}", escape(label)),
-                w,
+                &format!("  󰆧  {}", escape(row.label)),
+                row.window,
                 theme,
                 now,
-                pace(w),
+                pace(row.window),
             );
         }
     }
@@ -300,6 +366,7 @@ mod tests {
             weekly: Some(window(8, "2026-07-28T17:39:58Z", true)),
             third_party_session: Some(window(75, "2026-07-22T16:30:00Z", false)),
             third_party_weekly: Some(window(0, "2026-07-29T12:47:00Z", true)),
+            model_pools: Vec::new(),
         }
     }
 
@@ -339,6 +406,12 @@ mod tests {
         assert_eq!(v["scoped_reset"], "4h 30m");
         assert_ne!(v["session_reset"], v["weekly_reset"]);
         assert_ne!(v["scoped_reset"], v["extra_reset"]);
+    }
+
+    #[test]
+    fn icon_placeholder_matches_bar_icon() {
+        let v = build_placeholders(&snapshot(), now(), 5);
+        assert_eq!(v["icon"], VendorId::Antigravity.bar_icon());
     }
 
     #[test]
@@ -443,6 +516,61 @@ mod tests {
         assert_eq!(out.matches("Resets in").count(), 4, "{out}");
     }
 
+    /// A pool named after Gemini follows the shared Gemini row; any other pool
+    /// comes after the shared rows.
+    #[test]
+    fn rows_put_gemini_pools_after_gemini_and_others_last() {
+        let mut snap = snapshot();
+        for name in ["Future Pool", "Gemini 4 Argon"] {
+            snap.model_pools.push(crate::usage::ModelPoolWindow {
+                name: name.into(),
+                window: window(10, "2026-07-28T17:00:00Z", true),
+            });
+        }
+        let weekly = rows(&snap, true);
+        let labels: Vec<&str> = weekly.iter().map(|row| row.label).collect();
+        assert_eq!(
+            labels,
+            [
+                GROUP_PRIMARY,
+                "Gemini 4 Argon",
+                GROUP_THIRD_PARTY,
+                "Future Pool"
+            ]
+        );
+        // Only the per-model pools are marked as such (#453).
+        let pools: Vec<bool> = weekly.iter().map(|row| row.model_pool).collect();
+        assert_eq!(pools, [false, true, false, true]);
+        let labels: Vec<&str> = rows(&snap, false)
+            .into_iter()
+            .map(|row| row.label)
+            .collect();
+        assert_eq!(labels, [GROUP_PRIMARY, GROUP_THIRD_PARTY]);
+    }
+
+    /// A per-model pool gets its own row, named by the response, under the
+    /// heading of its cadence; it raises the panel like any other window, and
+    /// the bar's fixed placeholders stay with the shared pools.
+    #[test]
+    fn a_model_pool_gets_its_own_row_and_counts_toward_severity() {
+        let mut snap = snapshot();
+        snap.model_pools.push(crate::usage::ModelPoolWindow {
+            name: "Gemini 4 Argon".into(),
+            window: window(96, "2026-07-28T17:00:00Z", true),
+        });
+        let tip = render_tooltip(&outcome(None), &snap, &Theme::default(), &opts(), now());
+        let weekly_at = tip.find("Weekly").unwrap();
+        let argon_at = tip.find("Gemini 4 Argon").expect(&tip);
+        let third_party_at = weekly_at + tip[weekly_at..].find("Claude &amp; GPT OSS").unwrap();
+        // Right after the shared Gemini row, before the third-party pool.
+        assert!(weekly_at < argon_at && argon_at < third_party_at, "{tip}");
+        assert_eq!(tip.matches("Resets in").count(), 5, "{tip}");
+        assert_eq!(severity(&snap), PaceSeverity::Critical);
+        let v = build_placeholders(&snap, now(), 5);
+        assert_eq!(v["weekly_pct"], "8");
+        assert_eq!(v["extra_pct"], "0");
+    }
+
     #[test]
     fn tooltip_carries_the_shared_footer_and_error_block() {
         assert!(tooltip(&opts(), None).contains("Updated"));
@@ -486,5 +614,25 @@ mod tests {
         for glyph in ['↑', '→', '↓'] {
             assert!(!tip.contains(glyph), "{tip}");
         }
+    }
+
+    /// #500: when the product reports no session window, the default format
+    /// omits the session percentage slot instead of rendering a bare "%".
+    #[test]
+    fn default_format_omits_absent_session_window() {
+        let mut snap = snapshot();
+        assert_eq!(default_format(&snap), DEFAULT_FORMAT);
+
+        snap.session = None;
+        assert_eq!(default_format(&snap), WEEKLY_ONLY_FORMAT);
+        let out = render(&outcome(None), &snap, &Theme::default(), &opts(), now());
+        assert!(!out.text.contains(" %"), "bare % in text: {}", out.text);
+        assert!(out.text.contains("8%"), "missing weekly pct: {}", out.text);
+
+        snap.weekly = None;
+        assert_eq!(default_format(&snap), NO_WINDOWS_FORMAT);
+
+        snap.session = Some(window(43, "2026-07-22T14:00:00Z", false));
+        assert_eq!(default_format(&snap), SESSION_ONLY_FORMAT);
     }
 }

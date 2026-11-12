@@ -66,9 +66,12 @@ pub struct Cents(pub i64);
 /// pay-as-you-go credit balance.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AnthropicSnapshot {
-    /// "Claude Pro", "Claude Max 5x", "Claude Max 20x", etc.
+    /// "Pro", "Max", "Ultra", etc. — renderers add the "Claude " prefix.
     pub plan: String,
-    pub session: UsageWindow,
+    /// The five-hour window. `None` when the account has no five-hour limit
+    /// at all — a verified Ultra account: there is no window to show, which
+    /// is not the same thing as an idle one at 0%.
+    pub session: Option<UsageWindow>,
     pub weekly: UsageWindow,
     /// Some vendors of Claude (Pro, some Max tiers) don't have a separate
     /// Sonnet bucket — in which case this is None.
@@ -78,12 +81,53 @@ pub struct AnthropicSnapshot {
     /// from the API (`scope.model.display_name`), so new models show up
     /// without a code change. Empty when the account has none.
     pub scoped: Vec<ScopedWindow>,
-    /// `None` when `extra_usage.is_enabled` is false or the block is absent.
+    /// `None` when the block is absent, the user disabled extra usage, or the
+    /// response has no spend worth reporting. Provider-disabled exhausted
+    /// usage stays visible with an explicit status.
     pub extra: Option<ExtraUsage>,
     /// Banked limit resets from the `cedar_ember` block — the same idea as
     /// Codex's rate-limit reset credits and SuperGrok's remaining resets.
     /// Empty when the account has no grant or the endpoint withheld the block.
     pub reset_credits: ResetCredits,
+    /// Claude Code's cloud session credits, from the `iguana_necktie` block:
+    /// the dollar limit its cloud sessions draw from, what is left, when it
+    /// expires, and whether the grant is locked. `None` unless the response
+    /// reports a usable limit.
+    pub cloud_credits: Option<CloudCredits>,
+    /// The prepaid usage-credit balance, from `spend.balance`. `None` unless
+    /// the response reports a balance we can express — a balance the
+    /// response does not report is never shown, never as $0.
+    pub usage_credits: Option<UsageCredits>,
+}
+
+/// Cloud session credits (the usage response's `iguana_necktie` block).
+/// Both amounts are whole cents in USD — the wire is dollars, converted at
+/// the parse boundary so the snapshot, which derives `Eq`, stays integer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloudCredits {
+    pub limit: Cents,
+    pub remaining: Cents,
+    /// `resets_at` as RFC 3339. `None` when the wire omitted it or it does
+    /// not parse.
+    pub expires_at: Option<DateTime<Utc>>,
+    /// `locked_reason` was a non-empty string: the grant exists but cannot
+    /// currently be drawn on.
+    pub locked: bool,
+}
+
+/// The prepaid usage-credit balance (the usage response's `spend.balance`).
+/// The filled-in shape of `balance` has never been observed on the wire, so
+/// the parse interprets it after the fact and only then lifts it here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsageCredits {
+    /// Balance in minor units of `currency`, at the scale of
+    /// `decimal_places`.
+    pub balance: Cents,
+    pub decimal_places: u32,
+    pub currency: Option<String>,
+    /// Whether the balance auto-reloads, when the response says so —
+    /// `None` means "not reported", not "off".
+    pub auto_reload: Option<bool>,
 }
 
 /// A usage window scoped to a specific model, labeled by the API
@@ -112,6 +156,17 @@ pub struct ExtraUsage {
     /// JPY/KRW = 0). `None` means the wire did not report the scale. We keep
     /// that absence instead of guessing from an incomplete currency table.
     pub decimal_places: Option<u32>,
+    /// Why extra usage cannot currently continue. Enabled usage has `Active`.
+    pub status: ExtraUsageStatus,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum ExtraUsageStatus {
+    #[default]
+    Active,
+    OutOfCredits,
+    MonthlyLimitReached,
+    Unavailable,
 }
 
 impl ExtraUsage {
@@ -133,6 +188,15 @@ impl ExtraUsage {
 
     pub fn fmt_limit(&self) -> Option<String> {
         self.limit.map(|l| self.fmt_amount(l))
+    }
+
+    pub fn status_note(&self) -> Option<&'static str> {
+        match self.status {
+            ExtraUsageStatus::Active => None,
+            ExtraUsageStatus::OutOfCredits => Some("out of credits"),
+            ExtraUsageStatus::MonthlyLimitReached => Some("monthly limit reached"),
+            ExtraUsageStatus::Unavailable => Some("currently unavailable"),
+        }
     }
 
     fn fmt_amount(&self, amount: Cents) -> String {
@@ -435,6 +499,7 @@ pub enum VendorSnapshot {
     Kimi(KimiSnapshot),
     Kilo(KiloSnapshot),
     Novita(NovitaSnapshot),
+    Synthetic(SyntheticSnapshot),
     Moonshot(MoonshotSnapshot),
     Grok(GrokSnapshot),
     SuperGrok(SuperGrokSnapshot),
@@ -453,6 +518,10 @@ pub enum VendorSnapshot {
     ModelStudio(ModelStudioSnapshot),
     Lyceum(LyceumSnapshot),
     Devin(DevinSnapshot),
+    Droid(DroidSnapshot),
+    DeepRelay(DeepRelaySnapshot),
+    Mistral(MistralSnapshot),
+    MuseCode(MuseSnapshot),
     /// A `[[custom]]` provider. Which one is not in the snapshot: the caller
     /// that fetched it holds the `CustomProviderConfig`, and the cache
     /// directory is keyed by its `id`.
@@ -467,14 +536,16 @@ impl VendorSnapshot {
     /// once for the report's `reset_credits` field and once for the
     /// expiry notifications — and adding a third provider to only one of them
     /// is a silent half-feature: the sidebar lists a grant the notifier never
-    /// warns about. `None` is the honest answer for every other vendor; it is
-    /// not the same as an empty [`ResetCredits`], which means "this provider
-    /// banks resets and you currently hold none".
+    /// warns about. `None` is the honest answer for every other vendor, and
+    /// for Claude and SuperGrok while they hold none. Codex's usage response
+    /// states its count, so an empty [`ResetCredits`] there means "this
+    /// account banks resets and currently holds none" and is shown as such;
+    /// `None` for Codex means the response omitted the block.
     pub fn reset_credits(&self) -> Option<&ResetCredits> {
         match self {
-            Self::Anthropic(snapshot) => Some(&snapshot.reset_credits),
-            Self::Openai(snapshot) => Some(&snapshot.reset_credits),
-            Self::SuperGrok(snapshot) => Some(&snapshot.reset_credits),
+            Self::Anthropic(snapshot) => Some(&snapshot.reset_credits).filter(|c| !c.is_empty()),
+            Self::Openai(snapshot) => snapshot.reset_credits.as_ref(),
+            Self::SuperGrok(snapshot) => Some(&snapshot.reset_credits).filter(|c| !c.is_empty()),
             _ => None,
         }
     }
@@ -503,9 +574,30 @@ pub struct AntigravitySnapshot {
     pub third_party_session: Option<UsageWindow>,
     /// Claude/GPT group, weekly window.
     pub third_party_weekly: Option<UsageWindow>,
+    /// Pools kept apart from the two shared groups, such as the weekly
+    /// "Gemini 4 Argon" limit on Pro plans, in the order the response listed
+    /// them. Empty for a product or plan that reports none.
+    pub model_pools: Vec<ModelPoolWindow>,
 }
 
 impl Eq for AntigravitySnapshot {}
+
+/// One window of an Antigravity per-model pool, named by the response's group
+/// display name. Its cadence is `window.window_duration`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelPoolWindow {
+    pub name: String,
+    pub window: UsageWindow,
+}
+
+impl Eq for ModelPoolWindow {}
+
+impl ModelPoolWindow {
+    /// Pools report the shared windows' two cadences, 5-hour and weekly.
+    pub fn is_weekly(&self) -> bool {
+        self.window.window_duration > chrono::Duration::hours(5)
+    }
+}
 
 /// Which path produced an [`AntigravitySnapshot`]. The local language server
 /// is the primary source; the remote API is the fallback for when no product
@@ -517,6 +609,9 @@ pub enum AntigravitySource {
     Remote,
     /// The running `agy` CLI's official status-line payload.
     Statusline,
+    /// `agy`'s own reading, through `agy -p "/quota"`: the figures its Models
+    /// & Quota page shows, so the panel has nothing to qualify.
+    Agy,
 }
 
 impl AntigravitySource {
@@ -525,6 +620,7 @@ impl AntigravitySource {
             AntigravitySource::Local => "local",
             AntigravitySource::Remote => "remote",
             AntigravitySource::Statusline => "statusline",
+            AntigravitySource::Agy => "agy",
         }
     }
 
@@ -535,6 +631,7 @@ impl AntigravitySource {
             "local" => Some(AntigravitySource::Local),
             "remote" => Some(AntigravitySource::Remote),
             "statusline" => Some(AntigravitySource::Statusline),
+            "agy" => Some(AntigravitySource::Agy),
             _ => None,
         }
     }
@@ -568,6 +665,8 @@ pub struct MinimaxSnapshot {
 pub struct AnthropicApiSnapshot {
     pub spent: f64,
     pub limit: Option<f64>,
+    /// Last UTC calendar day fully covered by the daily cost buckets.
+    pub covered_through: Option<chrono::NaiveDate>,
 }
 
 impl Eq for AnthropicApiSnapshot {}
@@ -579,6 +678,23 @@ impl AnthropicApiSnapshot {
         self.limit
             .filter(|l| l.is_finite() && *l > 0.0)
             .map(|l| ((self.spent / l) * 100.0).round().clamp(0.0, 9999.0) as i32)
+    }
+
+    pub fn coverage_label(&self) -> String {
+        match self.covered_through_day() {
+            Some(day) => format!("Month to date (through {day})"),
+            None => "Completed daily buckets this month".into(),
+        }
+    }
+
+    /// The last fully covered UTC day as the card prints it, `Oct 17`.
+    pub fn covered_through_day(&self) -> Option<String> {
+        let date = self.covered_through?;
+        const MONTHS: [&str; 12] = [
+            "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+        ];
+        let month = MONTHS[chrono::Datelike::month0(&date) as usize];
+        Some(format!("{month} {}", chrono::Datelike::day(&date)))
     }
 }
 
@@ -607,6 +723,40 @@ pub struct NovitaSnapshot {
 }
 
 impl Eq for NovitaSnapshot {}
+
+/// Synthetic's sole limit from `/v2/quotas`: the regenerating weekly credit
+/// budget (`planWeeklyLimit`, percentage-only) or its credit-denominated
+/// variant (`weeklyTokenLimit`). The legacy five-hour `subscription` counter
+/// stopped being tracked when the weekly window became the only metric.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SyntheticSnapshot {
+    /// Configured plan tier label (go/standard/big) — the quotas API has no
+    /// tier identifier, so this is display-only config.
+    pub plan: Option<String>,
+    pub weekly: UsageWindow,
+    /// Credit spend figures when the plan reports a credit budget.
+    pub credits: Option<WeeklyCredits>,
+    /// Percentage points restored at the next regeneration tick.
+    pub next_regen_percent: Option<f64>,
+    /// The used share with the API's decimal precision preserved (the
+    /// integer `weekly.utilization_pct` is what meters and severity colors
+    /// use); frontends that print a figure read this so "70.5" does not
+    /// collapse to "70".
+    pub utilization_precise: f64,
+}
+
+impl Eq for SyntheticSnapshot {}
+
+/// Credit figures for Synthetic's weekly token budget.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WeeklyCredits {
+    pub used: f64,
+    pub max: f64,
+    /// Credits restored at the next regeneration tick.
+    pub next_regen: f64,
+}
+
+impl Eq for WeeklyCredits {}
 
 /// Lyceum's platform credit balance is denominated in USD, not a percentage quota.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -672,6 +822,35 @@ pub struct SuperGrokSnapshot {
     /// `GrokChat`, `GrokImagine`, …). Empty when the billing document omits
     /// `productUsage`.
     pub products: Vec<SuperGrokProduct>,
+    /// On-demand spend beyond the included pool, in USD cents. From the Grok
+    /// CLI billing document's `onDemandUsed`. `None` when the field is absent.
+    pub on_demand_used_cents: Option<i64>,
+    /// On-demand spending cap for that same pool, in USD cents
+    /// (`onDemandCap`). `None` when the field is absent.
+    pub on_demand_cap_cents: Option<i64>,
+}
+
+impl SuperGrokSnapshot {
+    /// Additional usage beyond the included pool, as dollars.
+    ///
+    /// A cap renders as `$used / $cap`. Spend with no cap renders as the
+    /// amount alone. Both absent or zero is the proto default — nothing was
+    /// configured — so the line stays hidden.
+    pub fn additional_usage_text(&self) -> Option<String> {
+        let used = self.on_demand_used_cents.unwrap_or(0);
+        let cap = self.on_demand_cap_cents;
+        if used == 0 && cap.unwrap_or(0) == 0 {
+            return None;
+        }
+        let used_s = crate::format::usd(used as f64 / 100.0);
+        match cap {
+            Some(cap) if cap > 0 => Some(format!(
+                "{used_s} / {}",
+                crate::format::usd(cap as f64 / 100.0)
+            )),
+            _ => Some(used_s),
+        }
+    }
 }
 
 /// One SuperGrok product's share of the current included-credit window.
@@ -781,7 +960,10 @@ pub struct OpenAiSnapshot {
     pub unavailable_models: Vec<OpenAiUnavailableModel>,
     /// Optional credit balance + approximate message-count ranges.
     pub credits: Option<OpenAiCredits>,
-    pub reset_credits: ResetCredits,
+    /// `None` when the usage response omits the block (a Codex build that
+    /// predates banked resets); `Some` with `available == 0` when it states
+    /// that the account holds none, which the report shows as such.
+    pub reset_credits: Option<ResetCredits>,
     /// Source of the snapshot — Codex OAuth vs admin-key fallback. Drives
     /// the placeholder set and the "OpenAI does not expose this for Plus"
     /// tooltip when the OAuth path isn't available.
@@ -876,11 +1058,14 @@ pub enum OpenAiSource {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenAiCredits {
-    /// Credit balance, formatted dollars ("$0.00", "$5.00", etc.) — kept as
-    /// a string because OpenAI returns it that way.
+    /// Credit balance as a bare count of Codex credits ("62500", "12.5"),
+    /// not dollars. A value the vendor sends that is not a number is kept as
+    /// it came, so this stays a string.
     pub balance: String,
     pub has_credits: bool,
     pub unlimited: bool,
+    /// OpenAI's estimate of how many messages the balance buys. Only the
+    /// `{oai_local_msgs}`/`{oai_cloud_msgs}` placeholders carry them now.
     pub approx_local_messages: Option<(i64, i64)>,
     pub approx_cloud_messages: Option<(i64, i64)>,
 }
@@ -997,6 +1182,177 @@ pub struct OllamaModelUsage {
     pub request_count: u64,
 }
 
+/// One DeepRelay plan meter: weighted tokens used against the allowance.
+///
+/// DeepRelay multiplies served tokens by each model's usage factor before they
+/// are metered, so every figure here is already in allowance units and is
+/// comparable with its own limit and with the other three meters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeepRelayMeter {
+    pub used: i64,
+    pub limit: i64,
+}
+
+impl DeepRelayMeter {
+    /// Used share of the allowance. `None` only for a zero ceiling, which is
+    /// "uncapped", not "0% used".
+    pub fn pct(&self) -> Option<i32> {
+        if self.limit <= 0 {
+            return None;
+        }
+        let pct = (self.used as f64 / self.limit as f64 * 100.0).round();
+        Some(pct.clamp(0.0, 100.0) as i32)
+    }
+
+    /// `"812.4M / 2.5B"` — the raw figure next to its ceiling.
+    pub fn used_of_limit(&self) -> String {
+        format!(
+            "{} / {}",
+            crate::format::tokens(self.used),
+            crate::format::tokens(self.limit)
+        )
+    }
+}
+
+/// One row of [`DeepRelaySnapshot::models`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeepRelayModelUsage {
+    pub model: String,
+    pub weighted_input_tokens: i64,
+    pub weighted_output_tokens: i64,
+}
+
+impl DeepRelayModelUsage {
+    pub fn weighted_total(&self) -> i64 {
+        self.weighted_input_tokens
+            .saturating_add(self.weighted_output_tokens)
+    }
+}
+
+/// DeepRelay — a monthly plan with four weighted-token meters, a dollar usage
+/// ceiling, and an optional pay-as-you-go wallet.
+///
+/// The monthly meters reset at the end of the billing period. The weekly caps
+/// **roll** (seven days, no reset instant), so a `None` reset there is the
+/// vendor's answer, not missing data.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeepRelaySnapshot {
+    /// `plan.name`, or "Pay as you go" when the organization has no plan.
+    pub plan: String,
+    pub plan_price_cents: Option<i64>,
+    /// `"month"`, `"3 months"`, … — already pluralized from `interval_count`.
+    pub plan_interval: Option<String>,
+    pub subscribed: bool,
+    pub cancel_at_period_end: bool,
+    pub monthly_input: Option<DeepRelayMeter>,
+    pub monthly_output: Option<DeepRelayMeter>,
+    pub weekly_input: Option<DeepRelayMeter>,
+    pub weekly_output: Option<DeepRelayMeter>,
+    /// Plan spend against the per-period usage ceiling, in dollars.
+    pub backstop_used_usd: Option<f64>,
+    pub backstop_limit_usd: Option<f64>,
+    /// `(used, included)` web searches this period.
+    pub searches: Option<(u64, u64)>,
+    /// Calls billed to the wallet in the last 24 h while subscribed.
+    pub payg_calls_24h: Option<u64>,
+    /// Wallet balance in dollars. Absent unless the balance request was made
+    /// and answered.
+    pub balance_usd: Option<f64>,
+    pub period_start: Option<chrono::DateTime<chrono::Utc>>,
+    pub period_end: Option<chrono::DateTime<chrono::Utc>>,
+    pub models: Vec<DeepRelayModelUsage>,
+}
+
+impl DeepRelaySnapshot {
+    /// The monthly meter closest to its ceiling — the one that will cap the
+    /// account. Drives the bar headline, its severity class and the TUI
+    /// overview cell.
+    pub fn monthly_worst(&self) -> Option<&DeepRelayMeter> {
+        worst(&self.monthly_input, &self.monthly_output)
+    }
+
+    /// The rolling-weekly meter closest to its ceiling.
+    pub fn weekly_worst(&self) -> Option<&DeepRelayMeter> {
+        worst(&self.weekly_input, &self.weekly_output)
+    }
+
+    /// Monthly allowance as the shared window shape, for `--format` pacing.
+    ///
+    /// Both period ends come from the server, so the length is exact rather
+    /// than a guessed "30 days" — but the report still exposes no `window_secs`
+    /// for these rows (they go through `push_metric`), because a frontend reads
+    /// that field as a rolling window. Pacing here is local to a placeholder.
+    pub fn monthly_window(&self) -> Option<UsageWindow> {
+        let meter = self.monthly_worst()?;
+        Some(UsageWindow {
+            utilization_pct: meter.pct()?,
+            resets_at: self.period_end,
+            window_duration: match (self.period_start, self.period_end) {
+                (Some(start), Some(end)) if end > start => end - start,
+                _ => chrono::Duration::zero(),
+            },
+        })
+    }
+
+    /// Rolling weekly caps as the shared window shape. The window rolls, so it
+    /// carries no reset instant; pacing stays neutral rather than guessing.
+    pub fn weekly_window(&self) -> Option<UsageWindow> {
+        let meter = self.weekly_worst()?;
+        Some(UsageWindow {
+            utilization_pct: meter.pct()?,
+            resets_at: None,
+            window_duration: chrono::Duration::days(7),
+        })
+    }
+}
+
+// The dollar figures are finite by construction (they are integer cents and
+// micro-cents divided by a constant), so the snapshot is total in the sense
+// `Eq` asks for — the same reasoning as `OpenRouterSnapshot`.
+impl Eq for DeepRelaySnapshot {}
+
+fn worst<'a>(
+    left: &'a Option<DeepRelayMeter>,
+    right: &'a Option<DeepRelayMeter>,
+) -> Option<&'a DeepRelayMeter> {
+    [left.as_ref(), right.as_ref()]
+        .into_iter()
+        .flatten()
+        .max_by_key(|meter| meter.pct().unwrap_or(0))
+}
+
+/// Mistral — the two monthly budgets the plan shares across Studio and Vibe
+/// Code. Both reset on the calendar-month boundary the billing response
+/// reports; the exact cycle length is not stated, so `window_duration` is zero
+/// and the renderers do not pace against a guessed month.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MistralSnapshot {
+    /// `plan_name` from `/v1/billing/subscription`; `None` when that optional
+    /// read failed.
+    pub plan: Option<String>,
+    /// Studio / API usage allowance. `None` when the plan does not expose the
+    /// API budget — the official `mistral-vibe` client only requires
+    /// `vibe_budget`, and some accounts report no `api_budget` at all.
+    pub api: Option<UsageWindow>,
+    /// Vibe Code usage allowance.
+    pub vibe: UsageWindow,
+    /// Monthly API allowance in `currency`; `None` when [`Self::api`] is.
+    pub api_budget: Option<f64>,
+    /// Monthly Vibe Code allowance in `currency`.
+    pub vibe_budget: f64,
+    /// ISO 4217 code the two allowances are denominated in.
+    pub currency: String,
+    /// Pay-as-you-go covers API usage past the included allowance.
+    pub api_payg: bool,
+    /// Pay-as-you-go covers Vibe Code usage past the included allowance.
+    pub vibe_payg: bool,
+}
+
+// The allowances are validated finite and non-negative at the parse boundary,
+// so the snapshot is total in the sense `Eq` asks for — the same reasoning as
+// `DeepRelaySnapshot` and `OpenRouterSnapshot`.
+impl Eq for MistralSnapshot {}
+
 /// OpenRouter — credit balance + lifetime/daily/weekly/monthly usage from
 /// `/api/v1/credits` and `/api/v1/key`.
 #[derive(Debug, Clone, PartialEq)]
@@ -1103,6 +1459,14 @@ pub struct ModelStudioSnapshot {
     pub monthly: Option<UsageWindow>,
 }
 
+/// Muse Code subscription windows. Missing observations stay absent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MuseSnapshot {
+    pub plan: String,
+    pub session: Option<UsageWindow>,
+    pub weekly: Option<UsageWindow>,
+}
+
 /// Devin CLI quota snapshot. The CLI reports remaining percentages, while
 /// renderers and report consumers use consumed percentages consistently.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1115,12 +1479,37 @@ pub struct DevinSnapshot {
     pub overage_balance_micros: Option<i64>,
 }
 
+/// Factory `droid` CLI subscription quota. The limits endpoint reports a
+/// `usedPercent` per window in two buckets — Standard and Droid Core — each
+/// with a 5-hour, a weekly and a monthly window. A window the account has not
+/// started still reports a percentage with `windowEnd: null`, so it is present
+/// with no reset; an absent window stays absent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DroidSnapshot {
+    /// Standard quota, 5-hour window.
+    pub session: Option<UsageWindow>,
+    /// Standard quota, weekly (7d) window.
+    pub weekly: Option<UsageWindow>,
+    /// Standard quota, monthly (30d) window.
+    pub monthly: Option<UsageWindow>,
+    /// Droid Core quota, 5-hour window.
+    pub core_session: Option<UsageWindow>,
+    /// Droid Core quota, weekly window.
+    pub core_weekly: Option<UsageWindow>,
+    /// Droid Core quota, monthly window.
+    pub core_monthly: Option<UsageWindow>,
+    /// `extraUsageBalanceCents`, verbatim; renderers convert cents to dollars.
+    pub extra_balance_cents: Option<i64>,
+}
+
 /// Worst-of severity class for the Waybar bar text color. Mirrors
 /// claudebar:606-620 — "extra usage only matters when a rate limit hits 100%".
 pub fn anthropic_severity(snap: &AnthropicSnapshot) -> crate::pacing::PaceSeverity {
-    let mut max = snap.session.utilization_pct;
-    if snap.weekly.utilization_pct > max {
-        max = snap.weekly.utilization_pct;
+    let mut max = snap.weekly.utilization_pct;
+    if let Some(s) = &snap.session
+        && s.utilization_pct > max
+    {
+        max = s.utilization_pct;
     }
     if let Some(s) = &snap.sonnet
         && s.utilization_pct > max
@@ -1133,7 +1522,10 @@ pub fn anthropic_severity(snap: &AnthropicSnapshot) -> crate::pacing::PaceSeveri
         }
     }
     // Extra usage only promotes severity if a rate-limit window is at 100%.
-    let any_at_cap = snap.session.utilization_pct >= 100
+    let any_at_cap = snap
+        .session
+        .as_ref()
+        .is_some_and(|s| s.utilization_pct >= 100)
         || snap.weekly.utilization_pct >= 100
         || snap
             .sonnet
@@ -1166,7 +1558,7 @@ mod tests {
     fn snap(s: i32, w_: i32, sonnet: Option<i32>, extra: Option<(i64, i64)>) -> AnthropicSnapshot {
         AnthropicSnapshot {
             plan: "Max 5x".into(),
-            session: w(s),
+            session: Some(w(s)),
             weekly: w(w_),
             sonnet: sonnet.map(w),
             scoped: vec![],
@@ -1175,8 +1567,11 @@ mod tests {
                 spent: Cents(spent),
                 currency: None,
                 decimal_places: Some(2),
+                status: ExtraUsageStatus::Active,
             }),
             reset_credits: Default::default(),
+            cloud_credits: None,
+            usage_credits: None,
         }
     }
 
@@ -1202,6 +1597,7 @@ mod tests {
             spent: Cents(14157),
             currency: Some("BRL".into()),
             decimal_places: Some(2),
+            status: ExtraUsageStatus::Active,
         };
         assert_eq!(e.fmt_spent(), "R$141.57");
         assert_eq!(e.fmt_limit(), None);
@@ -1211,6 +1607,7 @@ mod tests {
             spent: Cents(250),
             currency: None,
             decimal_places: Some(2),
+            status: ExtraUsageStatus::Active,
         };
         assert_eq!(capped.fmt_spent(), "$2.50");
         assert_eq!(capped.fmt_limit().as_deref(), Some("$50.00"));
@@ -1224,6 +1621,7 @@ mod tests {
                 spent: Cents(100),
                 currency: None,
                 decimal_places: Some(2),
+                status: ExtraUsageStatus::Active,
             }
             .percent(),
             0
@@ -1239,6 +1637,7 @@ mod tests {
                 spent: Cents(3333),
                 currency: None,
                 decimal_places: Some(2),
+                status: ExtraUsageStatus::Active,
             }
             .percent(),
             33
@@ -1262,6 +1661,19 @@ mod tests {
     fn severity_promotes_extra_when_session_at_100() {
         let s = snap(100, 50, None, Some((10000, 9500)));
         assert_eq!(anthropic_severity(&s), PaceSeverity::Critical); // 100 → critical
+    }
+
+    /// A verified Ultra account has no five-hour window: the worst of the
+    /// windows it does have decides.
+    #[test]
+    fn severity_without_a_session_window_uses_the_others() {
+        let mut s = snap(0, 60, Some(10), None);
+        s.session = None;
+        assert_eq!(anthropic_severity(&s), PaceSeverity::Mid); // weekly 60
+
+        let mut s = with_scoped(snap(0, 20, None, None), 84);
+        s.session = None;
+        assert_eq!(anthropic_severity(&s), PaceSeverity::High); // Fable 84
     }
 
     #[test]

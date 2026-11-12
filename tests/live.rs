@@ -79,11 +79,13 @@ use ai_usagebar::antigravity;
 use ai_usagebar::cache::Cache;
 use ai_usagebar::cursor;
 use ai_usagebar::deepinfra;
+use ai_usagebar::deeprelay;
 use ai_usagebar::devin;
 use ai_usagebar::error::AppError;
 use ai_usagebar::kimi;
 use ai_usagebar::kiro;
 use ai_usagebar::minimax;
+use ai_usagebar::mistral;
 use ai_usagebar::ollama;
 use ai_usagebar::openai;
 use ai_usagebar::openrouter;
@@ -142,7 +144,9 @@ async fn anthropic_live() {
     .expect("anthropic fetch should succeed against the real API");
 
     assert!(!out.snapshot.plan.is_empty(), "anthropic plan label empty");
-    assert_pct("anthropic.session", out.snapshot.session.utilization_pct);
+    if let Some(s) = out.snapshot.session.as_ref() {
+        assert_pct("anthropic.session", s.utilization_pct);
+    }
     assert_pct("anthropic.weekly", out.snapshot.weekly.utilization_pct);
     if let Some(s) = out.snapshot.sonnet.as_ref() {
         assert_pct("anthropic.sonnet", s.utilization_pct);
@@ -155,9 +159,9 @@ async fn anthropic_live() {
         assert!(e.spent.0 >= 0, "anthropic extra.spent < 0");
     }
     println!(
-        "✅ anthropic — plan={}, session={}%, weekly={}%, sonnet={:?}, extra={:?}",
+        "✅ anthropic — plan={}, session={:?}, weekly={}%, sonnet={:?}, extra={:?}",
         out.snapshot.plan,
-        out.snapshot.session.utilization_pct,
+        out.snapshot.session.as_ref().map(|s| s.utilization_pct),
         out.snapshot.weekly.utilization_pct,
         out.snapshot.sonnet.as_ref().map(|s| s.utilization_pct),
         out.snapshot
@@ -335,6 +339,146 @@ async fn deepinfra_live() {
         out.snapshot.monthly_spend,
         out.snapshot.monthly_limit,
         out.snapshot.period,
+    );
+}
+
+/// Mistral's monthly API and Vibe Code budgets. Skips when `MISTRAL_API_KEY`
+/// is unset, so the opt-in smoke run stays usable on a machine without an
+/// account.
+#[tokio::test]
+#[ignore = "live API; run with --ignored"]
+async fn mistral_live() {
+    let Ok(api_key) = std::env::var("MISTRAL_API_KEY") else {
+        eprintln!("mistral_live: MISTRAL_API_KEY is unset — skipping");
+        return;
+    };
+    if api_key.trim().is_empty() {
+        eprintln!("mistral_live: MISTRAL_API_KEY is empty — skipping");
+        return;
+    }
+    let cache = xdg_cache_for("mistral");
+    let client = reqwest::Client::builder()
+        .timeout(ai_usagebar::vendor::HTTP_CLIENT_TIMEOUT)
+        .redirect(ai_usagebar::vendor::same_origin_redirect_policy())
+        .build()
+        .unwrap();
+    let out = mistral::fetch::fetch_snapshot(
+        &client,
+        &api_key,
+        &cache,
+        &mistral::fetch::Endpoints::default(),
+        Duration::ZERO,
+    )
+    .await
+    .expect("mistral fetch should succeed against the real API");
+
+    if let Some(api) = &out.snapshot.api {
+        assert_pct("mistral API budget", api.utilization_pct);
+    }
+    assert_pct("mistral Vibe budget", out.snapshot.vibe.utilization_pct);
+    if let Some(api_budget) = out.snapshot.api_budget {
+        assert!(api_budget >= 0.0, "mistral API allowance is negative");
+    }
+    assert!(
+        out.snapshot.vibe_budget >= 0.0,
+        "mistral Vibe allowance is negative"
+    );
+    assert_eq!(
+        out.snapshot.currency.len(),
+        3,
+        "mistral currency is not a 3-letter code"
+    );
+    println!(
+        "mistral — plan={:?}, API={:?}% of {} {}, Vibe={}% of {} {}, payg={}/{}",
+        out.snapshot.plan,
+        out.snapshot.api.as_ref().map(|w| w.utilization_pct),
+        ai_usagebar::format::money(
+            out.snapshot.api_budget.unwrap_or_default(),
+            &out.snapshot.currency
+        ),
+        out.snapshot.currency,
+        out.snapshot.vibe.utilization_pct,
+        ai_usagebar::format::money(out.snapshot.vibe_budget, &out.snapshot.currency),
+        out.snapshot.currency,
+        out.snapshot.api_payg,
+        out.snapshot.vibe_payg,
+    );
+}
+
+/// DeepRelay's plan meters. Skips when `DEEPRELAY_API_KEY` is unset, so the
+/// opt-in smoke run stays usable on a machine without an account.
+#[tokio::test]
+#[ignore = "live API; run with --ignored"]
+async fn deeprelay_live() {
+    let Ok(api_key) = std::env::var("DEEPRELAY_API_KEY") else {
+        eprintln!("deeprelay_live: DEEPRELAY_API_KEY is unset — skipping");
+        return;
+    };
+    if api_key.trim().is_empty() {
+        eprintln!("deeprelay_live: DEEPRELAY_API_KEY is empty — skipping");
+        return;
+    }
+    let cache = xdg_cache_for("deeprelay");
+    let client = reqwest::Client::builder()
+        .timeout(ai_usagebar::vendor::HTTP_CLIENT_TIMEOUT)
+        .redirect(ai_usagebar::vendor::same_origin_redirect_policy())
+        .build()
+        .unwrap();
+    let out = deeprelay::fetch::fetch_snapshot(
+        &client,
+        &api_key,
+        &cache,
+        &deeprelay::fetch::Endpoints::default(),
+        Duration::ZERO,
+    )
+    .await
+    .expect("deeprelay fetch should succeed against the real API");
+
+    assert!(
+        !out.snapshot.plan.is_empty(),
+        "deeprelay plan label is empty"
+    );
+    for (label, meter) in [
+        ("monthly input", out.snapshot.monthly_input),
+        ("monthly output", out.snapshot.monthly_output),
+        ("weekly input", out.snapshot.weekly_input),
+        ("weekly output", out.snapshot.weekly_output),
+    ] {
+        if let Some(meter) = meter {
+            assert!(meter.used >= 0, "{label}: used tokens are negative");
+            assert!(meter.limit > 0, "{label}: allowance is not positive");
+            assert_pct(label, meter.pct().expect("a positive allowance has a pct"));
+        }
+    }
+    if let (Some(used), Some(limit)) = (
+        out.snapshot.backstop_used_usd,
+        out.snapshot.backstop_limit_usd,
+    ) {
+        assert!(used >= 0.0, "deeprelay ceiling spend is negative");
+        assert!(limit > 0.0, "deeprelay ceiling is not positive");
+    }
+    println!(
+        "deeprelay — plan={}, monthly in={}%, out={}%, weekly in={}%, out={}%, ceiling={:?}/{:?}, balance={:?}",
+        out.snapshot.plan,
+        out.snapshot
+            .monthly_input
+            .and_then(|m| m.pct())
+            .unwrap_or(-1),
+        out.snapshot
+            .monthly_output
+            .and_then(|m| m.pct())
+            .unwrap_or(-1),
+        out.snapshot
+            .weekly_input
+            .and_then(|m| m.pct())
+            .unwrap_or(-1),
+        out.snapshot
+            .weekly_output
+            .and_then(|m| m.pct())
+            .unwrap_or(-1),
+        out.snapshot.backstop_used_usd,
+        out.snapshot.backstop_limit_usd,
+        out.snapshot.balance_usd,
     );
 }
 
@@ -825,13 +969,24 @@ async fn antigravity_remote_live() {
             assert_pct(label, window.utilization_pct);
         }
     }
+    for pool in &snap.model_pools {
+        assert!(
+            !pool.name.trim().is_empty(),
+            "antigravity model-pool label empty"
+        );
+        assert_pct("antigravity.model_pool", pool.window.utilization_pct);
+    }
     println!(
-        "✅ antigravity (app closed) — plan={}, session={:?}, weekly={:?}, third-party session={:?}, third-party weekly={:?}",
+        "✅ antigravity (app closed) — plan={}, session={:?}, weekly={:?}, third-party session={:?}, third-party weekly={:?}, model pools={:?}",
         snap.plan,
         snap.session.as_ref().map(|w| w.utilization_pct),
         snap.weekly.as_ref().map(|w| w.utilization_pct),
         snap.third_party_session.as_ref().map(|w| w.utilization_pct),
         snap.third_party_weekly.as_ref().map(|w| w.utilization_pct),
+        snap.model_pools
+            .iter()
+            .map(|pool| (&pool.name, pool.window.utilization_pct))
+            .collect::<Vec<_>>(),
     );
 }
 
@@ -872,6 +1027,43 @@ async fn ollama_live() {
         snap.weekly.as_ref().map(|w| w.utilization_pct),
         snap.session_models.len(),
         snap.weekly_models.len(),
+    );
+}
+
+#[tokio::test]
+#[ignore = "live API; run explicitly with an existing `droid` CLI login on Linux"]
+async fn droid_live() {
+    let config = ai_usagebar::config::DroidConfig {
+        enabled: true,
+        ..Default::default()
+    };
+    let Ok(keyring_path) = ai_usagebar::droid::keyring_path() else {
+        eprintln!("droid_live: no home directory — skipping");
+        return;
+    };
+    if !keyring_path.is_file() {
+        eprintln!("droid_live: no ~/.factory/auth.v2.keyring — skipping");
+        return;
+    }
+    let cache = xdg_cache_for("droid");
+    let out = ai_usagebar::droid::fetch::fetch_snapshot(&config, &cache, Duration::ZERO)
+        .await
+        .expect("Droid limits fetch should succeed using the existing CLI login");
+    for (name, window) in [
+        ("droid.session", out.snapshot.session.as_ref()),
+        ("droid.weekly", out.snapshot.weekly.as_ref()),
+        ("droid.monthly", out.snapshot.monthly.as_ref()),
+    ] {
+        if let Some(window) = window {
+            assert!((0..=100).contains(&window.utilization_pct), "{name}");
+        }
+    }
+    eprintln!(
+        "✅ droid — session={:?}, weekly={:?}, monthly={:?}, extra_balance_cents={:?}",
+        out.snapshot.session.as_ref().map(|w| w.utilization_pct),
+        out.snapshot.weekly.as_ref().map(|w| w.utilization_pct),
+        out.snapshot.monthly.as_ref().map(|w| w.utilization_pct),
+        out.snapshot.extra_balance_cents,
     );
 }
 

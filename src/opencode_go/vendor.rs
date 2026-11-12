@@ -82,6 +82,7 @@ fn build_placeholders_with_plan_and_tolerance(
     let weekly_pace = window_pacing(usage.weekly.as_ref(), WEEKLY_WINDOW, pace_tolerance, now);
 
     placeholders([
+        ("icon", VendorId::OpenCodeGo.bar_icon().to_string()),
         (
             "vendor_short",
             VendorId::OpenCodeGo.short_name().to_string(),
@@ -403,6 +404,7 @@ mod tests {
     fn exposes_exact_opencode_go_and_generic_placeholders() {
         let values = build_placeholders(&sample_usage(), at("2026-08-16T18:00:00Z"));
 
+        assert_eq!(values["icon"], "ocg");
         assert_eq!(values["vendor_short"], "ocg");
         assert_eq!(values["session_pct"], "12.3");
         assert_eq!(values["weekly_pct"], "45.6");

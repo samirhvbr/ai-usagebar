@@ -42,6 +42,7 @@ pub fn lock_dir_for(target: &Path) -> PathBuf {
 #[derive(Debug)]
 pub struct OauthLock {
     dir: PathBuf,
+    owner: String,
     heartbeat: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -50,10 +51,18 @@ impl Drop for OauthLock {
         if let Some(handle) = self.heartbeat.take() {
             handle.abort();
         }
-        // `remove_dir_all`, not `remove_dir`: an aborted heartbeat can leave
-        // its sentinel behind, and a lock directory we fail to remove would
-        // block the CLI for `STALE` on every one of its own refreshes.
-        let _ = std::fs::remove_dir_all(&self.dir);
+        // Only release what is still ours. A holder delayed past `STALE` can
+        // resume after another process stole the lock and rebuilt the
+        // directory; deleting unconditionally would destroy the replacement
+        // (#495). A missing or foreign owner marker means "not ours" — the
+        // cost of leaving a lock behind is one stale-interval steal by the
+        // next acquirer, never data loss.
+        if owns(&self.dir, &self.owner) {
+            // `remove_dir_all`, not `remove_dir`: an aborted heartbeat can leave
+            // its sentinel behind, and a lock directory we fail to remove would
+            // block the CLI for `STALE` on every one of its own refreshes.
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
     }
 }
 
@@ -100,27 +109,69 @@ pub async fn acquire_with(
 }
 
 fn hold(dir: PathBuf) -> OauthLock {
+    // Identity for the ownership check (#495): unique per acquisition, so a
+    // holder that resumes after its lock was stolen can tell the replacement
+    // is not its own. Process id + nanos + a process-local counter keeps it
+    // collision-free without a new dependency.
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let owner = format!(
+        "{}-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+        COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    // Best-effort marker: if the write fails, this holder simply never
+    // deletes on release (missing marker = not ours), never a foreign one.
+    let _ = std::fs::write(dir.join(OWNER_FILE), owner.as_bytes());
+
     let beat_dir = dir.clone();
+    let beat_owner = owner.clone();
     let heartbeat = tokio::runtime::Handle::try_current().ok().map(|_| {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(HEARTBEAT).await;
-                touch(&beat_dir);
+                if !touch(&beat_dir, &beat_owner) {
+                    // The lock was stolen while we slept: stop touching a
+                    // directory that belongs to someone else (#495).
+                    break;
+                }
             }
         })
     });
-    OauthLock { dir, heartbeat }
+    OauthLock {
+        dir,
+        owner,
+        heartbeat,
+    }
+}
+
+/// The acquisition-time identity marker inside a held lock directory.
+const OWNER_FILE: &str = ".ai-usagebar-owner";
+
+/// Whether `dir` is still held under `owner`'s identity.
+fn owns(dir: &Path, owner: &str) -> bool {
+    std::fs::read(dir.join(OWNER_FILE)).is_ok_and(|bytes| bytes == owner.as_bytes())
 }
 
 /// Bump the lock directory's mtime, which is what proper-lockfile reads to
 /// decide whether a lock was abandoned. Adding and removing an entry is how a
 /// POSIX directory's mtime moves — there is no `utimes` in `std`, and pulling a
 /// crate in for one syscall is not worth a dependency.
-fn touch(dir: &Path) {
+///
+/// Returns false when the directory no longer belongs to `owner`, so the
+/// heartbeat stops touching a stolen lock (#495).
+fn touch(dir: &Path, owner: &str) -> bool {
+    if !owns(dir, owner) {
+        return false;
+    }
     let sentinel = dir.join(".ai-usagebar-heartbeat");
     if std::fs::write(&sentinel, b"").is_ok() {
         let _ = std::fs::remove_file(&sentinel);
     }
+    true
 }
 
 fn is_stale(dir: &Path, stale: Duration) -> bool {
@@ -222,12 +273,52 @@ mod tests {
         let td = TempDir::new().unwrap();
         let dir = td.path().join("kimi-code.lock");
         std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join(OWNER_FILE), b"owner").unwrap();
         let before = std::fs::metadata(&dir).unwrap().modified().unwrap();
         // Filesystem mtime granularity can be coarse; assert the touch is not
         // *older*, and that the sentinel never outlives the call.
-        touch(&dir);
+        assert!(touch(&dir, "owner"));
         let after = std::fs::metadata(&dir).unwrap().modified().unwrap();
         assert!(after >= before);
         assert!(!dir.join(".ai-usagebar-heartbeat").exists());
+        // A foreign owner's directory is never touched (#495).
+        assert!(!touch(&dir, "someone-else"));
+    }
+
+    /// Regression for #495: a holder delayed past `STALE` resumes after
+    /// another process stole the lock; dropping it must preserve the
+    /// replacement, and its heartbeat must stop touching the foreign
+    /// directory. Reproduction contributed with the issue.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_previous_holder_preserves_replacement_lock() {
+        let td = TempDir::new().unwrap();
+        let target = target(&td);
+        let dir = lock_dir_for(&target);
+        let poll = Duration::from_millis(1);
+        let first = acquire_with(&target, Duration::from_secs(1), STALE, poll)
+            .await
+            .unwrap();
+
+        std::fs::File::open(&dir)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(SystemTime::now() - STALE - Duration::from_secs(1)),
+            )
+            .unwrap();
+
+        let replacement = acquire_with(&target, Duration::from_secs(1), STALE, poll)
+            .await
+            .unwrap();
+        assert!(dir.is_dir());
+
+        // Give the original holder a full heartbeat interval to notice the
+        // replacement before releasing it. This does not restore ownership.
+        tokio::time::sleep(Duration::from_millis(2_600)).await;
+        drop(first);
+
+        assert!(dir.is_dir(), "old holder removed replacement holder's lock");
+        drop(replacement);
     }
 }

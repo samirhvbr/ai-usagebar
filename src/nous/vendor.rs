@@ -32,7 +32,16 @@ pub fn build_placeholders(
     let purchased = format_credit(snapshot.purchased_credits_remaining);
     let total_usable = format_credit(snapshot.total_usable_credits);
     let rollover = format_credit(snapshot.rollover_credits);
+    let balance = snapshot
+        .total_usable_credits
+        .or(snapshot.purchased_credits_remaining)
+        .or(snapshot.credits_remaining);
+    let balance_usd = balance
+        .filter(|v| v.is_finite())
+        .map(crate::format::usd)
+        .unwrap_or_else(|| NEUTRAL_UNAVAILABLE.into());
     let mut values = HashMap::new();
+    values.insert("icon", VendorId::NousResearch.bar_icon().into());
     values.insert("vendor", DISPLAY_NAME.into());
     values.insert("vendor_short", VENDOR_SHORT.into());
     values.insert("plan", plan.clone());
@@ -49,6 +58,8 @@ pub fn build_placeholders(
     values.insert("nous_top_up_credits_remaining", purchased);
     values.insert("nous_total_usable_credits", total_usable);
     values.insert("nous_rollover_credits", rollover);
+    values.insert("nous_balance", balance_usd.clone());
+    values.insert("balance", balance_usd);
     values
 }
 
@@ -67,28 +78,28 @@ pub fn render_tooltip(snapshot: &AccountSnapshot, now: DateTime<Utc>) -> String 
     if let Some(remaining) = snapshot.credits_remaining {
         lines.push(format!(
             "Subscription credits remaining: {}",
-            format_credit(Some(remaining))
+            crate::format::usd(remaining)
         ));
     }
     if let Some(purchased) = snapshot.purchased_credits_remaining {
         lines.push(format!(
             "Top-up credits remaining: {}",
-            format_credit(Some(purchased))
+            crate::format::usd(purchased)
         ));
     }
     if let Some(total_usable) = snapshot.total_usable_credits {
         lines.push(format!(
             "Total usable credits: {}",
-            format_credit(Some(total_usable))
+            crate::format::usd(total_usable)
         ));
     }
     if let Some(monthly) = snapshot.monthly_credits {
-        lines.push(format!("Monthly credits: {}", format_credit(Some(monthly))));
+        lines.push(format!("Monthly credits: {}", crate::format::usd(monthly)));
     }
     if let Some(rollover) = snapshot.rollover_credits {
         lines.push(format!(
             "Rollover credits: {}",
-            format_credit(Some(rollover))
+            crate::format::usd(rollover)
         ));
     }
     lines.push(format!("Renews: {}", values["nous_renewal"]));
@@ -198,6 +209,7 @@ mod tests {
         let values = build_placeholders(&snap, now);
         assert_eq!(DISPLAY_NAME, "Nous Research");
         assert_eq!(VENDOR_SHORT, "nrs");
+        assert_eq!(values["icon"], "nrs");
         assert_eq!(values["vendor"], "Nous Research");
         assert_eq!(values["vendor_short"], "nrs");
         assert_eq!(values["plan"], "Pro");
@@ -211,15 +223,19 @@ mod tests {
         assert_eq!(values["nous_top_up_credits_remaining"], "125.5");
         assert_eq!(values["nous_total_usable_credits"], "885.5");
         assert_eq!(values["nous_rollover_credits"], "40");
+        assert_eq!(values["nous_balance"], "$885.50");
+        assert_eq!(values["balance"], "$885.50");
     }
 
     #[test]
     fn tooltip_separates_subscription_top_up_and_total_credits() {
         let snap = snapshot();
         let tooltip = render_tooltip(&snap, Utc.with_ymd_and_hms(2026, 8, 16, 12, 0, 0).unwrap());
-        assert!(tooltip.contains("Subscription credits remaining: 760"));
-        assert!(tooltip.contains("Top-up credits remaining: 125.5"));
-        assert!(tooltip.contains("Total usable credits: 885.5"));
+        assert!(tooltip.contains("Subscription credits remaining: $760.00"));
+        assert!(tooltip.contains("Top-up credits remaining: $125.50"));
+        assert!(tooltip.contains("Total usable credits: $885.50"));
+        assert!(tooltip.contains("Monthly credits: $1000.00"));
+        assert!(tooltip.contains("Rollover credits: $40.00"));
         assert!(tooltip.contains("Usage: 24%"));
     }
 

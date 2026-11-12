@@ -156,6 +156,14 @@ export function colorForDelta(delta, colors) {
     return colors.low;
 }
 
+// The pace arrow on the same bands as colorForDelta: ↓ under pace (low),
+// → around it (mid), ↑ ahead of it (high and critical).
+export function paceGlyph(delta) {
+    if (delta > 0)
+        return '↑';
+    return delta >= POINT_MID_MIN ? '→' : '↓';
+}
+
 export function colorForPct(pct, colors) {
     if (pct >= 90)
         return colors.critical;

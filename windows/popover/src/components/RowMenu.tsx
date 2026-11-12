@@ -1,4 +1,5 @@
 import { useEffect, useState, type ReactNode } from "react";
+import MdiContentCopy from "~icons/mdi/content-copy";
 import MdiEyeOff from "~icons/mdi/eye-off-outline";
 import MdiPin from "~icons/mdi/pin-outline";
 import MdiPinOff from "~icons/mdi/pin-off-outline";
@@ -14,7 +15,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { m } from "@/paraglide/messages.js";
 
-export type RowAction = "always" | "customize" | "demand" | "hide" | "star";
+export type RowAction = "always" | "copy-image" | "customize" | "demand" | "hide" | "star";
 
 interface RowMenuProps {
   children: ReactNode;
@@ -84,6 +85,10 @@ export function RowMenu({ children, inAlways, providerTitle, starred, onAction, 
         <DropdownMenuItem onSelect={() => onAction("customize")}>
           <MdiTune />
           <span className="flex-1">{m.customize()} {providerTitle}</span>
+        </DropdownMenuItem>
+        <DropdownMenuItem onSelect={() => onAction("copy-image")}>
+          <MdiContentCopy />
+          <span className="flex-1">{m.copy_as_image()}</span>
         </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>

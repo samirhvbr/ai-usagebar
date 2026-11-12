@@ -6,7 +6,7 @@ import tempfile
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
-from tray_model import connection_help, dashboard_entries, installed_binary, is_not_connected, meter_color, metric_display, metric_pace, metric_usage_label, report_sections, summary_metric, tr
+from tray_model import connection_help, dashboard_entries, icon_label, icon_tooltip, installed_binary, is_not_connected, meter_color, metric_display, metric_pace, metric_usage_label, report_sections, summary_lines, summary_metric, tr
 
 
 NOW = datetime(2026, 9, 25, 12, 0, tzinfo=timezone.utc)
@@ -182,6 +182,45 @@ class TrayModelTest(unittest.TestCase):
         # A grouped row still stands in when the entry has nothing else.
         self.assertEqual(summary_metric({"metrics": metrics[2:]})["percent"], 90)
         self.assertIsNone(summary_metric({"metrics": []}))
+
+    def test_icon_tooltip_and_label_follow_the_leading_provider(self):
+        data = {
+            "entries": [
+                {"id": "openai", "name": "Codex", "metrics": [{"label": "Weekly", "percent": 12.4}]},
+                {"id": "anthropic", "name": "Claude", "display_name": "Claude Code", "stale": True,
+                 "metrics": [{"label": "Session", "percent": 41}]},
+            ],
+            "primary": "anthropic",
+        }
+        self.assertEqual(summary_lines(data, "en_US"), ["Claude Code: 41% · stale", "Codex: 12.4%"])
+        self.assertEqual(icon_tooltip(data, "en_US"), "Claude Code: 41% · stale\nCodex: 12.4%")
+        self.assertEqual(icon_label(data), "41%")
+
+    def test_icon_label_is_blank_without_a_percentage_and_tooltip_falls_back(self):
+        balance = {"entries": [{"name": "DeepSeek", "metrics": [
+            {"label": "Balance", "value": "$4.20", "headline": "value"}]}]}
+        self.assertEqual(icon_label(balance), "")
+        paid = {"entries": [{"name": "OpenRouter", "metrics": [
+            {"label": "Credits", "percent": 42, "value": "$8.40", "headline": "value"}]}]}
+        self.assertEqual(icon_label(paid), "")
+        self.assertEqual(summary_lines(paid, "en_US"), ["OpenRouter: $8.40"])
+        self.assertEqual(summary_lines(balance, "en_US"), ["DeepSeek: $4.20"])
+        self.assertEqual(icon_label({}), "")
+        self.assertEqual(icon_tooltip({}, "en_US"), "AI Usage Bar — open dashboard")
+        self.assertEqual(icon_tooltip({"entries": []}, "pt_BR"), "AI Usage Bar — abrir painel")
+
+    def test_icon_text_is_one_bounded_printable_line_and_ignores_non_finite_usage(self):
+        hostile = {"entries": [{"name": "A\x1b[31m\nB\x07" + "x" * 80,
+                                "metrics": [{"label": "Weekly", "percent": float("nan")}]}]}
+        (line,) = summary_lines(hostile, "en_US")
+        self.assertNotIn("\n", line)
+        self.assertTrue(line.isprintable())
+        name = line.rsplit(": ", 1)[0]
+        self.assertEqual(len(name), 40)
+        self.assertTrue(name.startswith("A [31m B xxx") and name.endswith("…"), name)
+        self.assertEqual(icon_label(hostile), "")
+        self.assertEqual(icon_label({"entries": [{"name": "A", "metrics": [
+            {"label": "Weekly", "percent": float("inf")}]}]}), "")
 
     def test_expired_antigravity_session_explains_remote_refresh_setup(self):
         entry = {"status": "error", "error": "Credentials error: Antigravity's saved Google session expired and ai-usagebar has no OAuth client to refresh it"}

@@ -60,6 +60,7 @@ Node contract tests (optional, needs Node 18+):
 node gnome-extension\marker-logic.test.mjs
 node gnome-extension\layout.test.mjs
 node gnome-extension\report-model.test.mjs
+node gnome-extension\prefs.test.mjs
 node kde-plasmoid\plasmoid-logic.test.mjs
 node windows\popover\popover.test.mjs
 node omarchy\model.test.mjs
@@ -146,3 +147,11 @@ Invoke-RestMethod `
   -Uri "https://ollama.com/api/usage" `
   -Headers @{ Authorization = "Bearer $env:OLLAMA_API_KEY" }
 ```
+
+### Credentials on WSL UNC paths
+
+Windows can sometimes read a WSL UNC file while the mount does not support the
+exclusive lock required to coordinate credential refresh. Such errors now report
+the original I/O failure and lock path immediately. Actual contention still waits
+for the normal deadline. This diagnostic does not add UNC locking support or bypass
+the credential lock; do not fix it by keeping independently rotating copies of a login.

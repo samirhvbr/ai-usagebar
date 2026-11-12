@@ -94,7 +94,13 @@ let POINT_CRITICAL_MIN = 10
 // USD balance. `{devin_daily_pct}` / `{devin_daily_reset}` /
 // `{devin_daily_elapsed}` (54-56) carry Devin's daily quota pool (empty when
 // not selected); Devin's weekly pool uses the shared `{weekly_*}` placeholders.
-// A final literal
+// `{cline_5h_pct}` / `{cline_5h_reset}` (57-58), `{cline_7d_pct}` /
+// `{cline_7d_reset}` (59-60), and `{cline_30d_pct}` / `{cline_30d_reset}` (61-62)
+// carry Cline's 5-hour, 7-day, and 30-day quota pools (empty when not selected).
+// `{mst_monthly_pct}` / `{mst_monthly_reset}` (63-64) carry Model Studio's
+// monthly Token Plan pool (empty when not selected or not reported).
+// `{synthetic_pct}` / `{synthetic_reset}` (65-66) carry Synthetic's
+// subscription request quota (empty when not selected). A final literal
 // sentinel absorbs the widget's stale suffix, preserving these fields.
 let FORMAT = "{plan};;{session_pct};;{session_reset};;{weekly_pct};;{weekly_reset};;" +
              "{sonnet_pct};;{sonnet_reset};;{extra_pct};;{extra_spent};;{extra_limit};;" +
@@ -113,7 +119,9 @@ let FORMAT = "{plan};;{session_pct};;{session_reset};;{weekly_pct};;{weekly_rese
              "{oll_monthly_pct};;{oll_monthly_reset};;{lyceum_balance};;{dif_balance};;" +
              "{devin_daily_pct};;{devin_daily_reset};;{devin_daily_elapsed};;" +
              "{cline_5h_pct};;{cline_5h_reset};;{cline_7d_pct};;{cline_7d_reset};;" +
-             "{cline_30d_pct};;{cline_30d_reset}"
+             "{cline_30d_pct};;{cline_30d_reset};;" +
+             "{mst_monthly_pct};;{mst_monthly_reset};;" +
+             "{synthetic_pct};;{synthetic_reset}"
 
 let FORMAT_WITH_SENTINEL = FORMAT + ";;__aiub_end__"
 
@@ -592,6 +600,17 @@ func parse(_ text: String, vendor: String) -> Snapshot? {
             sonnet = w
             sonnetLabel = "Video 5h"
         }
+    } else if vendor == "cline" {
+        if isReported(t(62)), let w = quotaWindow(61, 62, -1) {
+            sonnet = w
+            sonnetLabel = "Monthly"
+        }
+    } else if vendor == "modelstudio" {
+        if (quotaWindow(1, 2, 13) != nil || quotaWindow(3, 4, 14) != nil),
+           let w = quotaWindow(63, 64, -1) {
+            sonnet = w
+            sonnetLabel = "Monthly"
+        }
     }
     let spent = t(8)
     let limit = t(9)
@@ -730,6 +749,56 @@ func parse(_ text: String, vendor: String) -> Snapshot? {
         weeklyTag = "7d"
         sessionLabel = "Daily"
         weeklyLabel = "Weekly"
+    case "cline":
+        sessionWindow = quotaWindow(57, 58, -1) ?? sessionWindow
+        weeklyWindow = quotaWindow(59, 60, -1) ?? quotaWindow(3, 4, 14)
+        sessionTag = "5h"
+        weeklyTag = "7d"
+        sessionLabel = "5 hours"
+        weeklyLabel = "Weekly"
+    case "modelstudio":
+        if sessionWindow == nil, quotaWindow(3, 4, 14) == nil,
+           let monthly = quotaWindow(63, 64, -1) {
+            sessionWindow = monthly
+            weeklyWindow = nil
+            sessionTag = "mo"
+            weeklyTag = "7d"
+            sessionLabel = "Monthly"
+            weeklyLabel = ""
+        } else {
+            weeklyWindow = quotaWindow(3, 4, 14)
+            sessionTag = "5h"
+            weeklyTag = "7d"
+            sessionLabel = "Session"
+            weeklyLabel = "Weekly"
+        }
+    case "synthetic":
+        sessionWindow = quotaWindow(65, 66, -1) ?? sessionWindow
+        weeklyWindow = nil
+        sessionTag = "sub"
+        weeklyTag = "7d"
+        sessionLabel = "Subscription"
+        weeklyLabel = ""
+    case "deeprelay":
+        // The generic slots carry the plan's primary (monthly) window and the
+        // rolling 7-day caps. Relabelled so a monthly figure is never called
+        // a 5-hour session; the rolling cap has no reset, so it draws without
+        // one.
+        weeklyWindow = quotaWindow(3, 4, -1)
+        sessionTag = "mo"
+        weeklyTag = "wk"
+        sessionLabel = "Monthly"
+        weeklyLabel = "Weekly"
+    case "mistral":
+        // Both figures are monthly budgets; the generic slots carry the API
+        // budget first and the Vibe Code budget second. Neither has a fixed
+        // cycle length, so no elapsed marker.
+        sessionWindow = quotaWindow(1, 2, -1)
+        weeklyWindow = quotaWindow(3, 4, -1)
+        sessionTag = "api"
+        weeklyTag = "vibe"
+        sessionLabel = "API budget"
+        weeklyLabel = "Vibe budget"
     default:
         weeklyWindow = quotaWindow(3, 4, 14)
         sessionTag = "5h"
@@ -1176,16 +1245,25 @@ func copilotAccountLabels() -> [String] {
     return accountLabels(inTOML: text, vendor: "copilot")
 }
 
+/// Explicit `[[devin.accounts]]` labels; Rust resolves each credentials file.
+func devinAccountLabels() -> [String] {
+    guard let text = try? String(contentsOfFile: configPathTOML(), encoding: .utf8) else {
+        return []
+    }
+    return accountLabels(inTOML: text, vendor: "devin")
+}
+
 /// Preferences include enabled providers even before they have credentials.
 func preferenceVendorIds(catalog: [VendorCatalogEntry], claude: [String],
                          apiKeyAccounts: [String: [String]], codex: [String],
-                         copilot: [String] = []) -> [String] {
+                         copilot: [String] = [], devin: [String] = []) -> [String] {
     catalog.filter { $0.enabled }.flatMap { vendor -> [String] in
         let labels: [String]
         switch vendor.id {
         case "anthropic": labels = claude
         case "openai": labels = codex
         case "copilot": labels = copilot
+        case "devin": labels = devin
         default: labels = apiKeyAccounts[vendor.id] ?? []
         }
         return [vendor.id] + labels.map { vendor.id + "@" + $0 }
@@ -1277,6 +1355,7 @@ func vendorEntries(active: String,
                    catalog: [VendorCatalogEntry] = vendorCatalog,
                    codexLabels: () -> [String] = codexAccountLabels,
                    copilotLabels: () -> [String] = copilotAccountLabels,
+                   devinLabels: () -> [String] = devinAccountLabels,
                    apiKeyLabels: (String) -> [String] = apiKeyAccountLabels) -> [MenuEntry] {
     var out: [MenuEntry] = []
     for v in catalog where v.enabled {
@@ -1317,6 +1396,17 @@ func vendorEntries(active: String,
             }
             out.append(contentsOf: labels.map {
                 MenuEntry(id: "copilot@" + $0, name: "\(v.name) · \($0)")
+            })
+        } else if v.id == "devin" {
+            let labels = devinLabels()
+            let showDefault = showDefaultAccount(
+                configValue: configValueTOML("devin", "show_default_account"),
+                hasAccounts: !labels.isEmpty)
+            if showDefault && (v.id == active || v.configured) {
+                out.append(MenuEntry(id: v.id, name: v.name))
+            }
+            out.append(contentsOf: labels.map {
+                MenuEntry(id: "devin@" + $0, name: "\(v.name) · \($0)")
             })
         } else if API_KEY_ACCOUNT_VENDORS.contains(v.id) {
             let labels = apiKeyLabels(v.id)
@@ -1510,7 +1600,7 @@ func runInTerminal(_ script: String) {
     let tmp = NSTemporaryDirectory() + "ai-usagebar-\(UUID().uuidString).sh"
     try? script.write(toFile: tmp, atomically: true, encoding: .utf8)
     try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: tmp)
-    let osa = "tell application \"Terminal\" to do script \"bash '\(tmp)'; rm -f '\(tmp)'\"\n" +
+    let osa = "tell application \"Terminal\" to do script \"/bin/bash '\(tmp)'; rm -f '\(tmp)'\"\n" +
         "tell application \"Terminal\" to activate"
     let p = Process()
     p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
@@ -1792,7 +1882,8 @@ struct SettingsView: View {
         preferenceVendorIds(catalog: vendorCatalog, claude: claudeAccountLabels(),
                             apiKeyAccounts: apiKeyAccountLabelsByVendor(),
                             codex: codexAccountLabels(),
-                            copilot: copilotAccountLabels())
+                            copilot: copilotAccountLabels(),
+                            devin: devinAccountLabels())
     }
 
     var body: some View {

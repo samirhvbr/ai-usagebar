@@ -59,9 +59,13 @@ assert.equal(elapsedPercent('2026-09-25T18:00:00Z', 18000, now), 0);
 // nothing is stripped.
 assert.equal(metricDetail('Resets in 1h 07m · 77% elapsed · 7pts ahead', '2026-09-25T00:00:00Z'), '77% elapsed · 7pts ahead');
 assert.equal(metricDetail('Resets in 4h 52m', '2026-09-25T00:00:00Z'), '');
+assert.equal(metricDetail('Regenerates 2% in 3h 04m · 50% elapsed · 20pts ahead', '2026-09-25T00:00:00Z'), '50% elapsed · 20pts ahead');
+assert.equal(metricDetail('Regenerates 2% in 3h', '2026-09-25T00:00:00Z'), '');
+assert.equal(metricDetail('Regenerates 20 credits in 3h', '2026-09-25T00:00:00Z'), '');
 assert.equal(metricDetail('Auto + Composer', '2026-09-25T00:00:00Z'), 'Auto + Composer');
 assert.equal(metricDetail('$4.10 of $20.00 · reset Oct 1', '2026-09-25T00:00:00Z'), '$4.10 of $20.00');
 assert.equal(metricDetail('Resets in 3d', ''), 'Resets in 3d');
+assert.equal(metricDetail('Regenerates 2% in 3h', ''), 'Regenerates 2% in 3h');
 
 // Shapes below are what `ai-usagebar usage --json` prints (v1.23), trimmed to
 // the fields the menu reads.
@@ -235,6 +239,19 @@ assert.equal(parseReport(JSON.stringify({entries: many}), now).entries.length, 7
 assert.deepEqual(projectEntry({id: 'anthropic', sections: [
     {type: 'block', label: 'Banked resets', body: ['1 available', 'Expires in 2d']},
 ]}, now).rows, [{type: 'block', label: 'Banked resets', body: ['1 available', 'Expires in 2d']}]);
+
+const synthetic = projectEntry({
+    id: 'synthetic',
+    display_name: 'Synthetic',
+    plan: 'Standard',
+    sections: [
+        {type: 'metric', label: 'Weekly credits', percent: 30, value: '30%',
+            detail: 'Regenerates 2% in 3h 04m', regen: '2%', reset_at: '2026-09-24T21:04:00Z'},
+    ],
+}, now);
+assert.equal(synthetic.rows[0].regen, '2%');
+assert.equal(synthetic.rows[0].detail, '');
+assert.equal(synthetic.rows[0].reset, '3h 4m');
 
 // Overview previews preserve order, exact labels and values, including zero.
 const preview = entry => summarize(entry.rows);

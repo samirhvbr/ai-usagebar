@@ -28,6 +28,9 @@ Each provider header has a settings button that opens its configuration guidance
 and `config.toml`, plus a refresh button that reloads the shared usage report.
 The tray refreshes automatically every five minutes; shorter polling can rate-limit
 the Claude and Codex quota endpoints. Manual refresh is available from the panel.
+The status icon's label shows the leading provider's usage percentage, and its
+tooltip lists the same provider lines as the tray menu (at most four, with
+provider names cut to 40 characters).
 Bars follow the report's severity when no pacing data is available. With a
 reset time and window duration, blue means usage is projected to leave at
 least 10% spare, yellow means the projection is close to the limit, and red

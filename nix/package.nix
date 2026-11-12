@@ -33,6 +33,14 @@ rustPlatform.buildRustPackage {
       ../config.example.toml
       ../README.md
       ../LICENSE
+      # A cross-platform regression test scans the legacy macOS launcher for
+      # bare command names. `include_str!` needs the source in the Nix sandbox
+      # even though Swift itself is not built on Linux.
+      ../macos/ai-usagebar-menubar.swift
+      # Native application glyph selected by the macOS menu-bar host.
+      ../macos/menu-bar-icon.svg
+      ../macos/menu-bar-icon.LICENSE
+      ../macos/LICENSE-APACHE-2.0
       # `src/tray/icon.rs` is not Windows-gated — it `include_bytes!`s the tray
       # glyphs on every target, so the build fails without them here. Only the
       # .rgba files: the popover's TypeScript is built by `build.rs` on Windows

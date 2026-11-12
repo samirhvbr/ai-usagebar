@@ -1,8 +1,9 @@
 //! Anthropic Admin API fetch — sums the current month's `cost_report` buckets
 //! into a month-to-date spend, under the shared cache + flock primitives.
 //!
-//! Auth is a Console **Admin key** (`sk-ant-admin01-…`, distinct from an
-//! inference key) in the `x-api-key` header. The monthly `limit` is NOT part of
+//! Auth is a Console key authorized for organization reports, sent in the
+//! `x-api-key` header. Key prefixes do not establish report permissions.
+//! The monthly `limit` is NOT part of
 //! the API response — it's supplied from config and carried in the snapshot so
 //! the renderer can show spend-vs-limit.
 
@@ -15,7 +16,7 @@ use crate::error::{AppError, Result};
 use crate::usage::{AnthropicApiSnapshot, finite_amount};
 use crate::vendor::{MAX_BODY_BYTES, read_body_capped};
 
-use super::types::{CostReport, page_dollars};
+use super::types::{CostReport, page_covered_through, page_dollars};
 
 pub const BASE_URL: &str = "https://api.anthropic.com";
 pub const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -105,6 +106,27 @@ pub async fn fetch_snapshot_at(
     limit: Option<f64>,
     now: DateTime<Utc>,
 ) -> Result<FetchOutcome> {
+    fetch_snapshot_from(
+        cache,
+        cache_ttl,
+        limit,
+        now,
+        admin_key,
+        fetch_live(client, endpoints, admin_key, now),
+    )
+    .await
+}
+
+// Inject only the live result; cache identity, locking and fallback stay on the
+// production path so policy regressions can also be tested without a socket.
+async fn fetch_snapshot_from(
+    cache: &Cache,
+    cache_ttl: Duration,
+    limit: Option<f64>,
+    now: DateTime<Utc>,
+    report_key: &str,
+    live: impl std::future::Future<Output = Result<(f64, Option<chrono::NaiveDate>)>>,
+) -> Result<FetchOutcome> {
     let limit = validate_limit(limit)?;
     cache.ensure_dir()?;
     let _lock = acquire_lock_async(&cache.lock_path(), LOCK_TIMEOUT).await?;
@@ -112,21 +134,43 @@ pub async fn fetch_snapshot_at(
     // The query always starts at the current month, so a payload written last
     // month is a *different* figure — not a stale version of this one.
     let month = month_start_rfc3339(now);
-    let target = target_key(admin_key);
+    let target = target_key(report_key);
 
     if let Some(bytes) = cache.fresh_payload(cache_ttl)?
         && let Ok(outcome) = reuse_cache(&bytes, cache, false, limit, &month, &target)
     {
         return Ok(outcome);
     }
+    // #496: the cached bytes can be unusable for this refresh — a UTC month
+    // rollover makes last month's spend a *different* figure, which
+    // `reuse_cache` rejects. An active shared backoff still applies: surface
+    // the countdown instead of contacting the server, or a refresh interval
+    // shorter than the backoff window would re-request and re-arm forever.
+    if let Some(remaining) = cache.backoff_remaining() {
+        return Err(AppError::Http {
+            status: 429,
+            body: format!(
+                "rate limited; next attempt in {}",
+                crate::cache::human_backoff(remaining)
+            ),
+        });
+    }
 
-    match fetch_live(client, endpoints, admin_key, now).await {
-        Ok(spent) => {
-            let snap = AnthropicApiSnapshot { spent, limit };
+    match live.await {
+        Ok((spent, covered_through)) => {
+            let snap = AnthropicApiSnapshot {
+                spent,
+                limit,
+                covered_through,
+            };
             let bytes = serde_json::to_vec(&serde_json::json!({
                 "month": month,
                 "target": target,
-                "snapshot": { "spent": snap.spent, "limit": snap.limit },
+                "snapshot": {
+                    "spent": snap.spent,
+                    "limit": snap.limit,
+                    "covered_through": snap.covered_through,
+                },
             }))?;
             cache.write_payload(&bytes)?;
             Ok(crate::outcome::Outcome::fresh(snap))
@@ -167,7 +211,7 @@ fn fallback_silent(
 /// On failure we show the last good figure with the error alongside it. With
 /// nothing usable cached there is nothing to show, so the **original** error is
 /// returned — a first-run 401/403 or schema error must reach the user with its
-/// Admin-key guidance intact, not as a generic "no usable cache".
+/// authentication status intact, not as a generic "no usable cache".
 /// Last month's spend is not this month's: a payload that will not parse for
 /// `month` fails the closure, and `outcome::fallback` then reports the outage
 /// rather than showing the wrong month as current.
@@ -204,11 +248,19 @@ fn cached_snapshot(
     month: &str,
     target: &str,
 ) -> Result<AnthropicApiSnapshot> {
-    let spent = parse_cached_spent(bytes, month, target)?;
-    Ok(AnthropicApiSnapshot { spent, limit })
+    let (spent, covered_through) = parse_cached_spend(bytes, month, target)?;
+    Ok(AnthropicApiSnapshot {
+        spent,
+        limit,
+        covered_through,
+    })
 }
 
-fn parse_cached_spent(bytes: &[u8], month: &str, target: &str) -> Result<f64> {
+fn parse_cached_spend(
+    bytes: &[u8],
+    month: &str,
+    target: &str,
+) -> Result<(f64, Option<chrono::NaiveDate>)> {
     let v: serde_json::Value = serde_json::from_slice(bytes)?;
     // Payloads written before the month was recorded cannot be attributed to
     // one, so they are refetched rather than shown as the current month.
@@ -222,7 +274,7 @@ fn parse_cached_spent(bytes: &[u8], month: &str, target: &str) -> Result<f64> {
     let cached_target = v.get("target").and_then(serde_json::Value::as_str);
     if cached_target != Some(target) {
         return Err(AppError::Schema(
-            "anthropic-api cache belongs to a different Admin key; refetching".into(),
+            "anthropic-api cache belongs to a different report key; refetching".into(),
         ));
     }
     let s = v
@@ -231,7 +283,19 @@ fn parse_cached_spent(bytes: &[u8], month: &str, target: &str) -> Result<f64> {
     let spent = s["spent"]
         .as_f64()
         .ok_or_else(|| AppError::Schema("anthropic-api cache missing 'spent'".into()))?;
-    crate::usage::finite_amount("anthropic-api cache", "spent", spent)
+    let spent = crate::usage::finite_amount("anthropic-api cache", "spent", spent)?;
+    let covered_through = s
+        .get("covered_through")
+        .and_then(serde_json::Value::as_str)
+        .map(|raw| {
+            chrono::NaiveDate::parse_from_str(raw, "%Y-%m-%d").map_err(|e| {
+                AppError::Schema(format!(
+                    "anthropic-api cache has invalid 'covered_through' {raw:?}: {e}"
+                ))
+            })
+        })
+        .transpose()?;
+    Ok((spent, covered_through))
 }
 
 async fn fetch_live(
@@ -239,11 +303,12 @@ async fn fetch_live(
     endpoints: &Endpoints,
     admin_key: &str,
     now: DateTime<Utc>,
-) -> Result<f64> {
+) -> Result<(f64, Option<chrono::NaiveDate>)> {
     let starting_at = month_start_rfc3339(now);
     let mut total = 0.0;
     let mut page: Option<String> = None;
     let mut seen_pages: Vec<String> = Vec::new();
+    let mut covered_through = None;
 
     for _ in 0..MAX_PAGES {
         let mut req = client
@@ -281,12 +346,13 @@ async fn fetch_live(
             "cost_report running total",
             total + page_dollars(&report)?,
         )?;
+        covered_through = covered_through.max(page_covered_through(&report)?);
 
         // A partial total is indistinguishable from a genuinely smaller spend
         // once cached, so every way pagination can go wrong is an error rather
         // than an early `break` with whatever was summed so far.
         match (report.has_more, report.next_page) {
-            (false, _) => return Ok(total),
+            (false, _) => return Ok((total, covered_through)),
             (true, None) => {
                 return Err(AppError::Schema(
                     "anthropic-api cost_report: has_more is true but next_page is missing; \
@@ -347,7 +413,8 @@ mod tests {
             .match_query(mockito::Matcher::Any)
             .with_status(200)
             .with_body(
-                r#"{"data":[{"results":[{"amount":"100.0","currency":"USD"},
+                r#"{"data":[{"ending_at":"2026-07-19T00:00:00Z",
+                    "results":[{"amount":"100.0","currency":"USD"},
                     {"amount":"34.0","currency":"USD"}]}],
                     "has_more":false,"next_page":null}"#,
             )
@@ -372,6 +439,10 @@ mod tests {
         // 134 cents = $1.34
         assert!((out.snapshot.spent - 1.34).abs() < 1e-9);
         assert_eq!(out.snapshot.limit, Some(1000.0));
+        assert_eq!(
+            out.snapshot.covered_through,
+            Some(chrono::NaiveDate::from_ymd_opt(2026, 7, 18).unwrap())
+        );
         assert!(!out.stale);
     }
 
@@ -527,8 +598,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_active_backoff_is_not_bypassed_by_a_month_rollover() {
+        // #496: June's cached spend is unusable in July (`reuse_cache`
+        // rejects it as a different figure), but a 429 backoff armed moments
+        // ago still applies — the refresh must surface the shared countdown
+        // without contacting the server. A refresh interval shorter than the
+        // backoff would otherwise re-request and re-arm forever.
+        let mut server = mockito::Server::new_async().await;
+        // Any live request answers 500 here; the assertion below demands the
+        // backoff 429 instead, so an accidental round-trip fails loudly.
+        server
+            .mock("GET", "/v1/organizations/cost_report")
+            .match_query(mockito::Matcher::Any)
+            .with_status(500)
+            .with_body("must not be contacted during backoff")
+            .create_async()
+            .await;
+
+        let (_td, cache) = cache_fixture();
+        cache
+            .write_payload(
+                serde_json::json!({
+                    "month": month_start_rfc3339(at(2026, 6, 30)),
+                    "target": target_key("k"),
+                    "snapshot": { "spent": 2.5, "limit": null },
+                })
+                .to_string()
+                .as_bytes(),
+            )
+            .unwrap();
+        // Armed against the real clock, like a genuine 429 would be; the
+        // payload above is seconds fresh, so the backoff branch serves it
+        // and the month check rejects it.
+        cache.note_rate_limit_at(std::time::SystemTime::now());
+
+        let client = reqwest::Client::new();
+        let endpoints = Endpoints {
+            cost_report: format!("{}/v1/organizations/cost_report", server.url()),
+        };
+        let err = fetch_snapshot_at(
+            &client,
+            "k",
+            &cache,
+            &endpoints,
+            Duration::from_secs(600),
+            None,
+            at(2026, 7, 1),
+        )
+        .await
+        .unwrap_err();
+        match &err {
+            AppError::Http { status, body } => {
+                assert_eq!(status, &429, "body: {body}");
+                assert!(body.contains("rate limited"), "body: {body}");
+            }
+            other => panic!("expected the shared backoff 429, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn first_run_auth_failure_preserves_the_original_error() {
-        // No cache: the actionable Admin-key message must reach the user
+        // No cache: the original authentication failure must reach the user
         // instead of a generic "no usable cache".
         let mut server = mockito::Server::new_async().await;
         server
@@ -770,5 +900,255 @@ mod tests {
             assert!(err.to_string().contains("monthly_limit"), "{err:?}");
         }
         assert!(!cache.dir().exists());
+    }
+
+    /// The end-to-end regression for the Admin key: a non-401/403 error whose
+    /// body quotes the key the fetch was sent with used to persist the key in
+    /// `.last_error` and hand the key-carrying error back to the report. The
+    /// seam `build_outcome` uses — a `Cache::at` attached to the key via
+    /// `redacting`, plus the real fetch under the same single error wrap —
+    /// must leave the key in neither place.
+    #[tokio::test]
+    async fn error_response_quoting_the_admin_key_redacts_the_diagnostic_and_the_error() {
+        let key = "test-key-value";
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("GET", "/v1/organizations/cost_report")
+            .match_query(mockito::Matcher::Any)
+            .with_status(500)
+            .with_body(format!(
+                r#"{{"error":{{"message":"invalid admin key {key}"}}}}"#
+            ))
+            .create_async()
+            .await;
+
+        let (_td, cache) = cache_fixture();
+        let cache = cache.redacting(key);
+
+        let client = reqwest::Client::new();
+        let endpoints = Endpoints {
+            cost_report: format!("{}/v1/organizations/cost_report", server.url()),
+        };
+        let err = crate::outcome::fetch_api_keyed(
+            async {
+                fetch_snapshot_at(
+                    &client,
+                    key,
+                    &cache,
+                    &endpoints,
+                    Duration::ZERO,
+                    None,
+                    at(2026, 7, 19),
+                )
+                .await
+                .map(crate::vendor::VendorOutcome::from)
+            },
+            key,
+        )
+        .await
+        .unwrap_err();
+
+        // The cache's first point of writing never held the key.
+        let persisted = std::fs::read_to_string(cache.last_error_path()).unwrap();
+        assert!(
+            !persisted.contains(key),
+            "the key reached .last_error: {persisted}"
+        );
+        assert!(persisted.contains("[key]"), "{persisted}");
+        assert!(
+            persisted.starts_with("500\n"),
+            "the code line must survive: {persisted}"
+        );
+        // Neither does the error the report shows.
+        let rendered = err.user_message();
+        assert!(
+            !rendered.contains(key),
+            "the key reached the report error: {rendered}"
+        );
+        assert!(rendered.contains("[key]"), "{rendered}");
+    }
+
+    fn seed_report(cache: &Cache, key: &str, now: DateTime<Utc>) {
+        cache
+            .write_payload(
+                serde_json::to_vec(&serde_json::json!({
+                    "month": month_start_rfc3339(now), "target": target_key(key),
+                    "snapshot": {"spent": 7.0, "limit": null}
+                }))
+                .unwrap()
+                .as_slice(),
+            )
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn auth_policy_preserves_matching_spend_through_denial_outage_and_recovery() {
+        for status in [401, 403] {
+            let (_td, cache) = cache_fixture();
+            let now = at(2026, 7, 19);
+            seed_report(&cache, "key", now);
+            let denied =
+                fetch_snapshot_from(&cache, Duration::ZERO, Some(50.0), now, "key", async {
+                    Err(AppError::Http {
+                        status,
+                        body: "private-account@example.test".into(),
+                    })
+                })
+                .await
+                .unwrap();
+            assert!(denied.stale);
+            assert_eq!(denied.snapshot.spent, 7.0);
+            assert_eq!(denied.snapshot.limit, Some(50.0));
+            assert_eq!(
+                denied.last_error,
+                Some((status, crate::error::AUTH_FAILURE_MESSAGE.into()))
+            );
+            // Warm-cache reads keep the failure marker without forcing a live request.
+            let cached =
+                fetch_snapshot_from(&cache, Duration::from_secs(3600), None, now, "key", async {
+                    panic!("warm cache unexpectedly fetched")
+                })
+                .await
+                .unwrap();
+            assert!(cached.stale);
+            assert_eq!(cached.snapshot.spent, 7.0);
+            assert_eq!(cached.last_error, denied.last_error);
+            // Both server and transport failures must retain that same reading.
+            for error in [
+                AppError::Transport("offline".into()),
+                AppError::Http {
+                    status: 503,
+                    body: "outage".into(),
+                },
+            ] {
+                let expected_diagnostic = match &error {
+                    AppError::Http { status, body } => Some((*status, body.clone())),
+                    _ => cache.read_last_error(),
+                };
+                let stale = fetch_snapshot_from(&cache, Duration::ZERO, None, now, "key", async {
+                    Err(error)
+                })
+                .await
+                .unwrap();
+                assert!(stale.stale);
+                assert_eq!(stale.snapshot.spent, 7.0);
+                assert_eq!(stale.last_error, expected_diagnostic);
+            }
+            let fresh = fetch_snapshot_from(&cache, Duration::ZERO, None, now, "key", async {
+                Ok((1.0, None))
+            })
+            .await
+            .unwrap();
+            assert!(!fresh.stale);
+            assert_eq!(fresh.snapshot.spent, 1.0);
+            assert!(fresh.last_error.is_none());
+            assert!(cache.read_last_error().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn transient_failure_without_prior_auth_failure_keeps_matching_spend() {
+        for error in [
+            AppError::Http {
+                status: 500,
+                body: "outage".into(),
+            },
+            AppError::Transport("offline".into()),
+        ] {
+            let (_td, cache) = cache_fixture();
+            let now = at(2026, 7, 19);
+            seed_report(&cache, "key", now);
+            let expected_diagnostic = match &error {
+                AppError::Http { status, body } => Some((*status, body.clone())),
+                _ => None,
+            };
+            let stale = fetch_snapshot_from(&cache, Duration::ZERO, None, now, "key", async {
+                Err(error)
+            })
+            .await
+            .unwrap();
+            assert!(stale.stale);
+            assert_eq!(stale.snapshot.spent, 7.0);
+            assert_eq!(stale.last_error, expected_diagnostic);
+        }
+    }
+
+    #[tokio::test]
+    async fn auth_failure_without_matching_cache_preserves_status_and_redacts_public_message() {
+        for status in [401, 403] {
+            for key in [None, Some("other-key")] {
+                let (_td, cache) = cache_fixture();
+                let now = at(2026, 7, 19);
+                if let Some(key) = key {
+                    seed_report(&cache, key, now);
+                }
+                let error = fetch_snapshot_from(&cache, Duration::ZERO, None, now, "key", async {
+                    Err(AppError::Http {
+                        status,
+                        body: "private-account@example.test".into(),
+                    })
+                })
+                .await
+                .unwrap_err();
+                assert!(
+                    matches!(&error, AppError::Http { status: actual, .. } if *actual == status)
+                );
+                assert_eq!(
+                    error.user_message(),
+                    format!("HTTP {status}: {}", crate::error::AUTH_FAILURE_MESSAGE)
+                );
+                assert_eq!(
+                    cache.read_last_error(),
+                    Some((status, crate::error::AUTH_FAILURE_MESSAGE.into()))
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn denial_marker_cannot_hide_another_keys_valid_cache() {
+        let (_td, cache) = cache_fixture();
+        let now = at(2026, 7, 19);
+        seed_report(&cache, "key-b", now);
+        // Simulate a failed revalidation with key A over B's cached payload.
+        let error = fetch_snapshot_from(&cache, Duration::ZERO, None, now, "key-a", async {
+            Err(AppError::Http {
+                status: 401,
+                body: "denied A".into(),
+            })
+        })
+        .await
+        .unwrap_err();
+        assert!(matches!(error, AppError::Http { status: 401, .. }));
+        let b = fetch_snapshot_from(
+            &cache,
+            Duration::from_secs(3600),
+            None,
+            now,
+            "key-b",
+            async { panic!("key A's marker forced B to refetch") },
+        )
+        .await
+        .unwrap();
+        assert_eq!(b.snapshot.spent, 7.0);
+        assert!(b.stale); // Shared diagnostic metadata remains vendor-scoped.
+    }
+
+    #[tokio::test]
+    async fn outage_never_reuses_another_key_or_another_month() {
+        let now = at(2026, 7, 19);
+        for (cached_key, cached_month) in [("other-key", now), ("key", at(2026, 6, 30))] {
+            let (_td, cache) = cache_fixture();
+            seed_report(&cache, cached_key, cached_month);
+            let error = fetch_snapshot_from(&cache, Duration::ZERO, None, now, "key", async {
+                Err(AppError::Http {
+                    status: 500,
+                    body: "outage".into(),
+                })
+            })
+            .await
+            .unwrap_err();
+            assert!(matches!(error, AppError::Http { status: 500, .. }));
+        }
     }
 }

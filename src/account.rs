@@ -1463,21 +1463,6 @@ fn register(label: &str) -> Result<Registered> {
 }
 
 fn register_at(config_path: &Path, label: &str, home: Option<&Path>) -> Result<Registered> {
-    let original = match std::fs::read_to_string(config_path) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(error) => return Err(AppError::io_at(config_path, error)),
-    };
-    let mut doc: toml_edit::DocumentMut = if original.trim().is_empty() {
-        toml_edit::DocumentMut::new()
-    } else {
-        original.parse().map_err(|error: toml_edit::TomlError| {
-            let summary =
-                crate::config::toml_error_summary(&original, error.span(), error.message());
-            AppError::Other(format!("config.toml is not valid TOML: {summary}"))
-        })?
-    };
-
     // Honor an existing explicit or accounts_dir-discovered account. In
     // particular, do not send a re-login to a different default directory.
     let (existing, anthropic_enabled) = if config_path.exists() {
@@ -1505,10 +1490,6 @@ fn register_at(config_path: &Path, label: &str, home: Option<&Path>) -> Result<R
         |home| crate::config::tildify(&credential_file, home),
     );
 
-    if !already_existed {
-        crate::config::add_anthropic_account_to_doc(&mut doc, label, &credential_display)?;
-    }
-
     let supports_scoped_login =
         credential_file.file_name().and_then(|name| name.to_str()) == Some(".credentials.json");
     if !already_existed || supports_scoped_login {
@@ -1519,8 +1500,14 @@ fn register_at(config_path: &Path, label: &str, home: Option<&Path>) -> Result<R
             restrict_account_dir(&account_dir)?;
         }
     }
+    // One locked read-modify-write, the same way the TUI's save and the
+    // tray's key check write the config: the entry is appended to the
+    // document as it stands under the lock, so a concurrent save is queued,
+    // not clobbered.
     if !already_existed {
-        crate::cache::atomic_write(config_path, doc.to_string().as_bytes())?;
+        crate::config::edit_config_document(config_path, |doc| {
+            crate::config::add_anthropic_account_to_doc(doc, label, &credential_display)
+        })?;
     }
 
     Ok(Registered {
@@ -1709,20 +1696,6 @@ fn codex_login_command(codex_home: &Path) -> std::process::Command {
 }
 
 fn register_codex_at(config_path: &Path, label: &str, home: &Path) -> Result<RegisteredCodex> {
-    let original = match std::fs::read_to_string(config_path) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(error) => return Err(AppError::io_at(config_path, error)),
-    };
-    let mut doc: toml_edit::DocumentMut = if original.trim().is_empty() {
-        toml_edit::DocumentMut::new()
-    } else {
-        original.parse().map_err(|error: toml_edit::TomlError| {
-            let summary =
-                crate::config::toml_error_summary(&original, error.span(), error.message());
-            AppError::Other(format!("config.toml is not valid TOML: {summary}"))
-        })?
-    };
     let existing = if config_path.exists() {
         Config::load_from(config_path)?
             .openai
@@ -1739,7 +1712,6 @@ fn register_codex_at(config_path: &Path, label: &str, home: &Path) -> Result<Reg
     );
     let display = crate::config::tildify(&auth_path, home);
     if !already_existed {
-        crate::config::add_openai_account_to_doc(&mut doc, label, &display)?;
         let dir = auth_path
             .parent()
             .ok_or_else(|| AppError::Other("codex_auth_path has no parent directory".into()))?;
@@ -1747,7 +1719,13 @@ fn register_codex_at(config_path: &Path, label: &str, home: &Path) -> Result<Reg
             std::fs::create_dir_all(dir).map_err(|error| AppError::io_at(dir, error))?;
             restrict_account_dir(dir)?;
         }
-        crate::cache::atomic_write(config_path, doc.to_string().as_bytes())?;
+        // One locked read-modify-write, the same way the TUI's save and the
+        // tray's key check write the config: the entry is appended to the
+        // document as it stands under the lock, so a concurrent save is
+        // queued, not clobbered.
+        crate::config::edit_config_document(config_path, |doc| {
+            crate::config::add_openai_account_to_doc(doc, label, &display)
+        })?;
     }
     Ok(RegisteredCodex {
         config_path: config_path.to_path_buf(),
@@ -1884,8 +1862,8 @@ mod tests {
             sessions: Default::default(),
             scheduled: None,
             tokens: claude_desktop::SavedTokens {
-                token_cache: "{}".into(),
-                token_cache_v2: "{}".into(),
+                token_cache: Some("{}".into()),
+                token_cache_v2: Some("{}".into()),
             },
             archive: std::path::PathBuf::from("/archives/rollback.tar"),
             archive_members: vec!["a".into()],

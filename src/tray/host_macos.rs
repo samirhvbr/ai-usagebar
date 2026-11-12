@@ -4,6 +4,7 @@ use std::borrow::Cow;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
+use std::ptr::NonNull;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
@@ -15,9 +16,10 @@ use objc2::{AnyThread, Message};
 use objc2_app_kit::{
     NSAppearance, NSAppearanceCustomization, NSAppearanceNameAqua, NSAppearanceNameDarkAqua,
     NSApplication, NSAutoresizingMaskOptions, NSBezierPath, NSButton, NSColor,
-    NSCompositingOperation, NSEvent, NSFont, NSFontAttributeName, NSFontWeightSemibold,
-    NSForegroundColorAttributeName, NSGlassEffectView, NSGlassEffectViewStyle, NSImage,
-    NSImageScaling, NSScreen, NSStringDrawing, NSView, NSVisualEffectBlendingMode,
+    NSCompositingOperation, NSEvent, NSEventMask, NSFont, NSFontAttributeName,
+    NSFontWeightSemibold, NSForegroundColorAttributeName, NSGlassEffectView,
+    NSGlassEffectViewStyle, NSImage, NSImageScaling, NSPasteboard, NSPasteboardTypePNG,
+    NSPasteboardTypeString, NSScreen, NSStringDrawing, NSView, NSVisualEffectBlendingMode,
     NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView, NSWindow,
     NSWindowOrderingMode,
 };
@@ -37,13 +39,14 @@ use tao::window::{Window, WindowBuilder};
 use tray_icon::menu::{ContextMenu, Menu, MenuEvent, MenuItem};
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use wry::http::{Request, Response, StatusCode, header::CONTENT_TYPE};
-use wry::{WebView, WebViewBuilder, WebViewBuilderExtDarwin};
+use wry::{NewWindowResponse, WebView, WebViewBuilder, WebViewBuilderExtDarwin};
 
 use super::browse;
 use super::hotkey::{self, HotkeyBinding};
 use super::icon::{Severity, tray_icon_rgba};
+use super::ipc_origin;
 use super::marks;
-use super::menu_bar::{self, LogoSegment, MenuBarLook, StatusItemContent, UsageReading};
+use super::menu_bar::{self, LogoSegment, MenuBarLook, StatusItemContent};
 use super::options_menu::{self, OptionsAction, OptionsLabels};
 use super::panel::{
     CLICK_LOCK_MS, CORNER_RADIUS, CocoaRect, FALLBACK_WORK_AREA_HEIGHT, PopoverPlacement,
@@ -54,8 +57,8 @@ use super::payload::{
     wrap_report,
 };
 use super::strip::{
-    BARS_PIXEL_SIDE, BARS_POINT_SIDE, HiddenRows, Stars, bar_fill, bars_layout, bars_rgba,
-    content_from_payload, parse_hidden_rows, parse_strip_ipc,
+    BARS_PIXEL_SIDE, BARS_POINT_SIDE, HiddenRows, Stars, UsageReading, bar_fill, bars_layout,
+    bars_rgba, content_from_payload, parse_hidden_rows, parse_strip_ipc, tooltip,
 };
 use super::style::PopoverStyle;
 use super::updates::Updates;
@@ -77,6 +80,8 @@ enum UserEvent {
     Ipc(String),
     Report(Value),
     FocusPopover,
+    /// A mouse press in another app while the popover is open.
+    ClickOutside,
     Hotkey,
     Facts,
     /// An update is ready: start the verified exe and quit, or, with `None`, just quit because
@@ -86,8 +91,12 @@ enum UserEvent {
 
 enum WorkerCmd {
     Refresh,
+    /// Re-read the provider catalog alone, without a report.
+    Providers,
     Detect,
-    CheckUpdate { manual: bool },
+    CheckUpdate {
+        manual: bool,
+    },
     InstallUpdate,
     SnoozeUpdate,
     SetUpdates(UpdateMode),
@@ -152,7 +161,8 @@ struct TrayState {
     payload: Value,
     js_ready: bool,
     popover_open: bool,
-    blur_guard_until: Option<Instant>,
+    /// The global mouse-down monitor, installed while the popover is open.
+    outside_clicks: Option<Retained<AnyObject>>,
     /// Cocoa (points, y-up) location of the last click / shortcut, used to
     /// keep the popover on that screen instead of tao's primary-display space.
     last_anchor: Option<(f64, f64)>,
@@ -280,7 +290,7 @@ fn run_loop() -> Result<(), String> {
         payload: empty,
         js_ready: false,
         popover_open: false,
-        blur_guard_until: None,
+        outside_clicks: None,
         last_anchor: None,
         popover_height: WINDOW_HEIGHT,
         theme,
@@ -321,15 +331,21 @@ fn run_loop() -> Result<(), String> {
             }
             Event::UserEvent(UserEvent::FocusPopover) => {
                 if state.popover_open {
-                    guard_blur(&mut state);
                     state.window.set_focus();
+                }
+            }
+            Event::UserEvent(UserEvent::ClickOutside) => {
+                if state.popover_open {
+                    hide_popover(&mut state);
                 }
             }
             Event::WindowEvent {
                 event: WindowEvent::Focused(false),
                 ..
             } => {
-                if !blur_guarded(&state) && state.popover_open {
+                if state.popover_open
+                    && super::blur::macos_verdict(mouse_button_down()) == super::blur::Verdict::Hide
+                {
                     hide_popover(&mut state);
                 }
             }
@@ -339,6 +355,8 @@ fn run_loop() -> Result<(), String> {
             } => hide_popover(&mut state),
             Event::LoopDestroyed => {
                 let _ = state.worker.send(WorkerCmd::Shutdown);
+                // A sign-in CLI would otherwise outlive the tray, polling.
+                super::device_login::stop_all();
             }
             _ => {}
         }
@@ -384,6 +402,11 @@ fn spawn_worker(
                     let wait = deadline.saturating_duration_since(Instant::now());
                     match rx.recv_timeout(wait) {
                         Ok(WorkerCmd::Refresh) | Err(mpsc::RecvTimeoutError::Timeout) => break,
+                        Ok(WorkerCmd::Providers) => {
+                            if super::providers::refresh_due(&facts) {
+                                let _ = proxy.send_event(UserEvent::Facts);
+                            }
+                        }
                         Ok(WorkerCmd::Detect) => {
                             run_detection(true);
                             break;
@@ -547,6 +570,7 @@ fn switch_with(tray: &std::path::Path, vendor: &str, label: &str) -> String {
 
 async fn push_report(proxy: &EventLoopProxy<UserEvent>, facts: &SharedFacts) {
     refresh_account_facts(facts);
+    super::providers::refresh_due(facts);
     let mut snapshot = facts_snapshot(facts);
     snapshot.startup_enabled = startup::is_enabled();
     let now = now_ms();
@@ -572,18 +596,8 @@ fn stamp_facts(state: &mut TrayState) {
     let Some(obj) = state.payload.as_object_mut() else {
         return;
     };
-    for key in [
-        "shortcut",
-        "shortcut_error",
-        "refresh_minutes",
-        "updates",
-        "update",
-        "update_checked_at",
-        "repository",
-        "version",
-        "accounts",
-    ] {
-        obj.insert(key.into(), stamped[key].clone());
+    for key in super::payload::STAMPED_FACTS {
+        obj.insert((*key).into(), stamped[*key].clone());
     }
 }
 
@@ -596,8 +610,8 @@ fn apply_facts(state: &mut TrayState) {
 
 fn apply_strip_icon(state: &mut TrayState) {
     let content = content_from_payload(&state.payload, &state.stars, &state.strip_order);
-    let tooltip = menu_bar::tooltip(&content, state.usage_reading);
-    let _ = state.tray.set_tooltip(Some(tooltip.as_str()));
+    let tooltip_text = tooltip(&content, state.usage_reading);
+    let _ = state.tray.set_tooltip(Some(tooltip_text.as_str()));
     state.tray.set_title(Some(""));
     let segments = menu_bar::logo_segments(
         &content,
@@ -654,6 +668,13 @@ fn static_icon() -> Result<Icon, tray_icon::BadIcon> {
 
 fn set_static_status_icon(state: &mut TrayState) {
     let _ = state.tray.set_icon_templated(None);
+    if let Some(image) = svg_image(include_bytes!("../../macos/menu-bar-icon.svg")) {
+        let side = f64::from(BARS_POINT_SIDE);
+        image.setSize(NSSize::new(side, side));
+        image.setTemplate(true);
+        set_status_button_image(Some(&image));
+        return;
+    }
     set_status_button_image(None);
     if let Ok(icon) = static_icon() {
         let _ = state.tray.set_icon_templated(Some(icon));
@@ -782,6 +803,36 @@ fn push_to_webview(state: &TrayState) {
     let _ = webview.evaluate_script(&script);
 }
 
+/// The `copy-image` answer: the page installs `__AIUB_IMAGE_COPIED__` on load, so with no
+/// webview there is nothing to evaluate it in. The script is built by
+/// `clipboard_image::copied_reply_script` with the request's id, so the page matches the
+/// reply to its own request instead of its position in a queue.
+fn reply_image_copied(state: &TrayState, id: Option<&str>, copied: bool) {
+    if let Some(webview) = state.webview.as_ref() {
+        let _ = webview.evaluate_script(&super::clipboard_image::copied_reply_script(id, copied));
+    }
+}
+
+/// Puts the validated PNG on the system pasteboard. The pattern is OpenUsage's
+/// `ShareCardRenderer.copyToPasteboard`: clear the general pasteboard, then set the PNG
+/// type. Returns whether `setData:` succeeded — the host only answers `true` when it does.
+fn copy_png_to_clipboard(bytes: &[u8]) -> bool {
+    let pasteboard = NSPasteboard::generalPasteboard();
+    pasteboard.clearContents();
+    let data = NSData::with_bytes(bytes);
+    // SAFETY: AppKit exports the PNG pasteboard type name for the lifetime of the process.
+    unsafe { pasteboard.setData_forType(Some(&data), NSPasteboardTypePNG) }
+}
+
+/// Puts plain text on the general pasteboard: the sign-in sheet's one-time code.
+fn copy_text_to_clipboard(text: &str) -> bool {
+    let pasteboard = NSPasteboard::generalPasteboard();
+    pasteboard.clearContents();
+    let string = NSString::from_str(text);
+    // SAFETY: AppKit exports the string pasteboard type name for the lifetime of the process.
+    unsafe { pasteboard.setString_forType(&string, NSPasteboardTypeString) }
+}
+
 fn popover_payload(state: &TrayState) -> String {
     let mut payload = state.payload.clone();
     payload["menu_bar_look"] = json!(state.menu_bar_look.picker_value());
@@ -849,6 +900,7 @@ fn handle_menu(state: &mut TrayState, event: &MenuEvent, control_flow: &mut Cont
             let _ = state.worker.send(WorkerCmd::Refresh);
         }
         OptionsAction::Detect => {
+            super::providers::request();
             let _ = state.worker.send(WorkerCmd::Detect);
         }
         OptionsAction::OpenTui => tui_launch::open(),
@@ -1033,11 +1085,64 @@ fn handle_ipc(state: &mut TrayState, body: &str, control_flow: &mut ControlFlow)
             }
         }
         "detect" => {
+            super::providers::request();
             let _ = state.worker.send(WorkerCmd::Detect);
+        }
+        "providers" => {
+            super::providers::request();
+            let _ = state.worker.send(WorkerCmd::Providers);
         }
         "refresh" => {
             let _ = state.worker.send(WorkerCmd::Refresh);
         }
+        "set-provider-enabled" => {
+            super::providers::set_enabled(&value, &state.facts);
+            apply_facts(state);
+            let _ = state.worker.send(WorkerCmd::Refresh);
+        }
+        "sign-in-provider" => super::providers::sign_in(&value),
+        "set-api-key" => {
+            let proxy = state.proxy.clone();
+            let worker = state.worker.clone();
+            match super::providers::request_key_check(&state.facts, &value, move || {
+                let _ = proxy.send_event(UserEvent::Facts);
+                let _ = worker.send(WorkerCmd::Refresh);
+            }) {
+                // `Ok(None)` is an ignored request: nothing to publish.
+                Ok(_) => apply_facts(state),
+                Err(fact) => {
+                    with_facts(&state.facts, |f| f.key_check = Some(fact));
+                    apply_facts(state);
+                }
+            }
+        }
+        "start-sign-in" => {
+            let push = state.proxy.clone();
+            let worker = state.worker.clone();
+            super::device_login::start(
+                &state.facts,
+                &value,
+                move || {
+                    let _ = push.send_event(UserEvent::Facts);
+                },
+                move || {
+                    let _ = worker.send(WorkerCmd::Refresh);
+                },
+            );
+            apply_facts(state);
+        }
+        "cancel-sign-in" => {
+            if super::device_login::cancel(&state.facts, &value) {
+                apply_facts(state);
+            }
+        }
+        "open-sign-in-page" => super::device_login::open_page(&state.facts, &value),
+        "copy-sign-in-code" => {
+            if let Some(code) = super::device_login::code_to_copy(&state.facts, &value) {
+                copy_text_to_clipboard(&code);
+            }
+        }
+        "add-account" => super::providers::add_account(&value),
         "open-tui" => tui_launch::open(),
         "close" => hide_popover(state),
         "quit" => *control_flow = ControlFlow::Exit,
@@ -1132,6 +1237,18 @@ fn handle_ipc(state: &mut TrayState, body: &str, control_flow: &mut ControlFlow)
         }
         "snooze-update" => {
             let _ = state.worker.send(WorkerCmd::SnoozeUpdate);
+        }
+        "copy-image" => {
+            let id = super::clipboard_image::copy_request_id(&value);
+            // No valid id: no `png_from_ipc`, no clipboard — the reply is `null, false`.
+            let copied = match id {
+                Some(_) => match super::clipboard_image::png_from_ipc(&value) {
+                    Ok(bytes) => copy_png_to_clipboard(&bytes),
+                    Err(_reason) => false,
+                },
+                None => false,
+            };
+            reply_image_copied(state, id, copied);
         }
         _ => {}
     }
@@ -1273,9 +1390,9 @@ fn show_popover(state: &mut TrayState) {
         state.last_anchor = Some(cocoa_mouse());
     }
     position_popover(state);
-    guard_blur(state);
     state.window.set_visible(true);
     state.popover_open = true;
+    watch_outside_clicks(state);
     if let Some(webview) = state.webview.as_ref() {
         let _ = webview.evaluate_script(&format!(
             "window.__AIUB_LOCKCLICKS__ && window.__AIUB_LOCKCLICKS__({CLICK_LOCK_MS})"
@@ -1292,21 +1409,10 @@ fn show_popover(state: &mut TrayState) {
     });
 }
 
-fn blur_guarded(state: &TrayState) -> bool {
-    state
-        .blur_guard_until
-        .is_some_and(|until| Instant::now() < until)
-}
-
-const BLUR_GUARD: Duration = Duration::from_millis(400);
-
-fn guard_blur(state: &mut TrayState) {
-    state.blur_guard_until = Some(Instant::now() + BLUR_GUARD);
-}
-
 fn hide_popover(state: &mut TrayState) {
     state.window.set_visible(false);
     state.popover_open = false;
+    stop_watching_outside_clicks(state);
     // Closing lands the next open on the dashboard, so a screen choice still
     // waiting for `ready` is dropped too.
     state.pending_menu_action = None;
@@ -1314,6 +1420,36 @@ fn hide_popover(state: &mut TrayState) {
         let _ =
             webview.evaluate_script("window.__AIUB_VISIBLE__ && window.__AIUB_VISIBLE__(false)");
     }
+}
+
+/// Close on a click in another app. A focus loss alone does not say whether the user clicked
+/// elsewhere or an app brought itself forward, and once the popover has lost focus macOS sends
+/// no second loss for the click that should close it. A global monitor only receives events
+/// meant for other processes, so a click on the popover, the status item or one of our menus
+/// never arrives here.
+fn watch_outside_clicks(state: &mut TrayState) {
+    if state.outside_clicks.is_some() {
+        return;
+    }
+    let proxy = state.proxy.clone();
+    let block = RcBlock::new(move |_event: NonNull<NSEvent>| {
+        let _ = proxy.send_event(UserEvent::ClickOutside);
+    });
+    let mask =
+        NSEventMask::LeftMouseDown | NSEventMask::RightMouseDown | NSEventMask::OtherMouseDown;
+    state.outside_clicks = NSEvent::addGlobalMonitorForEventsMatchingMask_handler(mask, &block);
+}
+
+fn stop_watching_outside_clicks(state: &mut TrayState) {
+    if let Some(monitor) = state.outside_clicks.take() {
+        // SAFETY: `monitor` is the object `addGlobalMonitorForEventsMatchingMask:handler:`
+        // returned, which is exactly what `removeMonitor:` takes.
+        unsafe { NSEvent::removeMonitor(&monitor) };
+    }
+}
+
+fn mouse_button_down() -> bool {
+    NSEvent::pressedMouseButtons() != 0
 }
 
 fn toggle_popover_from_keyboard(state: &mut TrayState) {
@@ -1381,8 +1517,27 @@ fn build_webview(window: &Window, proxy: EventLoopProxy<UserEvent>) -> Result<We
         // `http://aiub.localhost/` instead).
         .with_url("aiub://localhost/index.html")
         .with_ipc_handler(move |request| {
+            // The bridge now writes to `config.toml` (`set-api-key`), so only
+            // the popover's own frame may use it. wry stamps the message with
+            // the sending frame's absolute URL (`request.uri()`); any other
+            // origin is dropped before the parse, without a reply.
+            let uri = request.uri().to_string();
+            if !ipc_origin::is_popover_origin(&uri, ipc_origin::Os::Macos) {
+                return;
+            }
             let body = request.body().clone();
             let _ = proxy.send_event(UserEvent::Ipc(body));
+        })
+        // The WebView never leaves the popover's origin: other web URLs go to
+        // the default browser (the `open-url` command's path), the rest is
+        // denied.
+        .with_navigation_handler(|url| navigation_allowed(&url))
+        .with_new_window_req_handler(|url, _features| {
+            if navigation_allowed(&url) {
+                NewWindowResponse::Allow
+            } else {
+                NewWindowResponse::Deny
+            }
         })
         .with_transparent(true)
         .with_background_color((0, 0, 0, 0))
@@ -1390,6 +1545,21 @@ fn build_webview(window: &Window, proxy: EventLoopProxy<UserEvent>) -> Result<We
         .with_data_store_identifier(STORE)
         .build(window)
         .map_err(|error| error.to_string())
+}
+
+/// What the WebView may do with a navigation or a `window.open` to `url`:
+/// the popover's own origin loads in place; another web URL is handed to
+/// `browse::open` (the `open-url` command's path) and denied in place; anything
+/// else is denied.
+fn navigation_allowed(url: &str) -> bool {
+    match ipc_origin::navigation(url, ipc_origin::Os::Macos) {
+        ipc_origin::Navigation::Allow => true,
+        ipc_origin::Navigation::OpenExternal => {
+            browse::open(url);
+            false
+        }
+        ipc_origin::Navigation::Deny => false,
+    }
 }
 
 fn protocol_response(request: Request<Vec<u8>>) -> Response<Cow<'static, [u8]>> {

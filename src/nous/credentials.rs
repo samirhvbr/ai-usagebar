@@ -215,17 +215,41 @@ impl CredentialStore {
     }
 
     pub fn acquire_lock(&self) -> Result<CredentialLock> {
-        ensure_private_parent(self.parent(), &self.owner)?;
-        let path = self.lock_path();
-        reject_symlink(&path)?;
-        let file = open_private_lock_file(&path).map_err(|source| io_at(&path, source))?;
-        validate_file_metadata(&path, &file, &self.owner)?;
+        let (file, path) = self.open_lock_file()?;
         file.lock_exclusive()
             .map_err(|source| CredentialError::Lock {
                 path: path.clone(),
                 source,
             })?;
         Ok(CredentialLock { file, path })
+    }
+
+    /// Wait for another refresh without parking Tokio's reactor. The file
+    /// stays owned by this future, so cancelling the wait closes it without
+    /// leaving a blocking worker behind. The acquired guard still spans the
+    /// complete read, token exchange, and persisted rotation.
+    pub(crate) async fn acquire_lock_async(&self) -> Result<CredentialLock> {
+        let (file, path) = self.open_lock_file()?;
+        loop {
+            match file.try_lock_exclusive() {
+                Ok(()) => return Ok(CredentialLock { file, path }),
+                Err(source)
+                    if source.raw_os_error() == fs2::lock_contended_error().raw_os_error() =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+                Err(source) => return Err(CredentialError::Lock { path, source }),
+            }
+        }
+    }
+
+    fn open_lock_file(&self) -> Result<(File, PathBuf)> {
+        ensure_private_parent(self.parent(), &self.owner)?;
+        let path = self.lock_path();
+        reject_symlink(&path)?;
+        let file = open_private_lock_file(&path).map_err(|source| io_at(&path, source))?;
+        validate_file_metadata(&path, &file, &self.owner)?;
+        Ok((file, path))
     }
 
     pub fn read(&self) -> Result<Option<CredentialDocument>> {

@@ -17,8 +17,8 @@ use std::time::{Duration, SystemTime};
 
 use ai_usagebar::config::Config;
 use ai_usagebar::tui::app::{
-    ANTHROPIC_REFRESH_STAGGER, App, FooterAction, REFRESH_INTERVAL, TabId, TabState, refresh_one,
-    refresh_stagger, tabs_with_desktop,
+    ANTHROPIC_REFRESH_STAGGER, App, FooterAction, Freshness, REFRESH_INTERVAL, TabId, TabState,
+    refresh_one, refresh_stagger, tabs_with_desktop,
 };
 use ai_usagebar::tui::view::draw;
 use ai_usagebar::vendor::HTTP_CLIENT_TIMEOUT;
@@ -353,7 +353,7 @@ where
                     }
                     InputEvent::Mouse(m) => {
                         match handle_mouse(app, &m) {
-                            Some(MouseAction::Settings(action)) => {
+                            Some(MouseAction::Settings(action))
                                 if apply_settings_action(
                                     action,
                                     app,
@@ -361,10 +361,11 @@ where
                                     client,
                                     &tx,
                                     &mut last_config_stamp,
-                                ) {
-                                    return Ok(());
-                                }
+                                ) =>
+                            {
+                                return Ok(());
                             }
+                            Some(MouseAction::Settings(_)) => {}
                             Some(MouseAction::Footer(FooterAction::Refresh)) => {
                                 refresh_active(app, client, config, &tx);
                             }
@@ -543,7 +544,7 @@ fn spawn_one(
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
         }
-        let state = refresh_one(&client, &cfg, &tab).await;
+        let state = refresh_one(&client, &cfg, &tab, Freshness::Cached).await;
         let _ = tx.send((generation, tab, state));
     });
 }
@@ -1217,6 +1218,7 @@ mod tests {
         use ratatui::backend::TestBackend;
 
         let moon = vendor_index(VendorId::Moonshot);
+        let novita = vendor_index(VendorId::Novita);
         let mut app = settings_focused_on_provider(moon);
         app.settings.as_mut().unwrap().focus = SFocus::Primary;
         let mut terminal = Terminal::new(TestBackend::new(160, 70)).unwrap();
@@ -1236,34 +1238,28 @@ mod tests {
         terminal.draw(|f| draw_view(f, &mut app)).unwrap();
 
         // A provider row click lands outside the popup: it only closes it.
-        // The popup is centred and grows with the vendor list, so which
-        // provider rows it covers depends on how many vendors the build has
-        // (a fork adding one shifts it over Novita). Take the first provider
-        // row clear of the popup's choice rows, with a margin for its border.
-        let hit = app.hit.borrow();
-        let pick_rows: Vec<u16> = hit
-            .settings_rows
-            .iter()
-            .filter_map(|(row, rect)| matches!(row, SettingsRow::Pick(_)).then_some(rect.y))
-            .collect();
-        let (top, bottom) = (
-            *pick_rows.iter().min().expect("picker records choice rows"),
-            *pick_rows.iter().max().unwrap(),
-        );
-        let provider_row = hit
+        let provider_row = app
+            .hit
+            .borrow()
             .settings_rows
             .iter()
             .find_map(|(row, rect)| match row {
-                SettingsRow::Focus(SFocus::Vendor(_))
-                    if rect.y + 2 < top || rect.y > bottom + 2 =>
-                {
-                    Some(*rect)
-                }
+                SettingsRow::Focus(SFocus::Vendor(v)) if *v == novita => Some(*rect),
                 _ => None,
             })
-            .expect("a provider row outside the picker");
-        drop(hit);
-        let _ = handle_mouse(&mut app, &click_at(provider_row.x + 4, provider_row.y));
+            .unwrap();
+        // The popup grows with the provider catalog. Choose a point outside
+        // its actual choice rectangles rather than assuming this row's left
+        // edge is uncovered after a provider is added.
+        let outside_x = (provider_row.x..provider_row.right())
+            .find(|x| {
+                !app.hit.borrow().settings_rows.iter().any(|(row, rect)| {
+                    matches!(row, SettingsRow::Pick(_))
+                        && rect.contains(ratatui::layout::Position::new(*x, provider_row.y))
+                })
+            })
+            .expect("provider row has a point outside the picker");
+        let _ = handle_mouse(&mut app, &click_at(outside_x, provider_row.y));
         let state = app.settings.as_ref().unwrap();
         assert!(state.picker.is_none(), "outside click closes the picker");
         assert_eq!(state.primary, VendorId::Anthropic, "no selection happened");

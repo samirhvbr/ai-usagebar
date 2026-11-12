@@ -1,7 +1,62 @@
 # Format placeholders
 
-Use placeholders with `--format` and `--tooltip-format`. Unsupported or absent
-metrics expand to an empty string unless noted otherwise.
+Use placeholders with `--format` and `--tooltip-format`. A placeholder the
+active provider defines but has no value for (an absent window or metric)
+expands to an empty string unless noted otherwise. A placeholder the provider
+does not define at all is left as written, braces included.
+
+Muse Code (`--vendor muse-code`, short name `msc`) supplies `{muse_plan}`,
+`{muse_session_pct}`, `{muse_session_reset}`, `{muse_session_elapsed}`,
+`{muse_session_pace}`, `{muse_session_pace_indicator}`, `{muse_weekly_pct}`,
+`{muse_weekly_reset}`, `{muse_weekly_elapsed}`, `{muse_weekly_pace}`, and
+`{muse_weekly_pace_indicator}`, plus the generic `{icon}`, `{plan}`,
+`{vendor_short}`, `{session_pct}`, `{session_reset}`, `{session_elapsed}`,
+`{weekly_pct}`, `{weekly_reset}`, and `{weekly_elapsed}`.
+Percentages are used allowance; an omitted window expands to an empty string.
+
+Synthetic (`--vendor synthetic`, short name `syn`) supplies
+`{synthetic_pct}`, `{synthetic_reset}`, `{synthetic_requests}`, and
+`{synthetic_limit}`, plus the generic `{icon}`, `{plan}`, `{vendor_short}`,
+`{session_pct}`, `{session_reset}`, `{weekly_pct}`, and `{weekly_reset}`. The
+percentage is the regenerating weekly credit window (`planWeeklyLimit` on
+percentage-only plans, `weeklyTokenLimit` on credit-denominated plans); the
+reset counts down to the next regeneration tick. `{synthetic_requests}` and
+`{synthetic_limit}` carry the weekly credits used and budget when the plan
+reports them, and expand to an empty string on percentage-only plans.
+
+Mistral (`--vendor mistral`, short name `mis`) supplies
+`{mistral_api_pct}`, `{mistral_api_reset}`, `{mistral_api_elapsed}`,
+`{mistral_api_pace}`, `{mistral_api_pace_indicator}`, `{mistral_vibe_pct}`,
+`{mistral_vibe_reset}`, `{mistral_vibe_elapsed}`, `{mistral_vibe_pace}`,
+`{mistral_vibe_pace_indicator}`, `{mistral_api_budget}`,
+`{mistral_vibe_budget}`, and `{mistral_payg}`, plus the generic `{icon}`,
+`{plan}`, `{vendor_short}`, `{session_pct}`, `{session_reset}`,
+`{session_elapsed}`, `{weekly_pct}`, `{weekly_reset}`, and
+`{weekly_elapsed}`. The session aliases carry the API budget and the weekly
+aliases the Vibe Code budget; both reset on the plan's calendar-month boundary.
+The budget placeholders carry the monthly allowance in the plan's currency;
+`{mistral_payg}` is `on` when either budget is covered by pay-as-you-go. The API
+placeholders expand to an empty string on plans that do not report an
+`api_budget` window.
+
+DeepRelay (`--vendor deeprelay`, short name `drl`) supplies
+`{deeprelay_pct}`, `{deeprelay_reset}`, `{deeprelay_elapsed}`,
+`{deeprelay_pace}`, `{deeprelay_pace_indicator}`,
+`{deeprelay_monthly_input_pct}`, `{deeprelay_monthly_input}` (the raw
+`used / limit` in weighted tokens), `{deeprelay_monthly_output_pct}`,
+`{deeprelay_monthly_output}`, `{deeprelay_weekly_input_pct}`,
+`{deeprelay_weekly_input}`, `{deeprelay_weekly_output_pct}`,
+`{deeprelay_weekly_output}`, `{deeprelay_weekly_pace}`,
+`{deeprelay_weekly_pace_indicator}`, `{deeprelay_backstop_pct}`,
+`{deeprelay_backstop}` (`$used / $ceiling`), `{deeprelay_balance}`,
+`{deeprelay_payg}` (wallet-billed calls in the last 24 h), and
+`{deeprelay_searches}`, plus the generic `{icon}`, `{plan}`, `{vendor_short}`,
+`{session_pct}`, `{session_reset}`, `{session_elapsed}`, `{weekly_pct}`,
+`{weekly_reset}`, and `{weekly_elapsed}`. `{deeprelay_pct}` is the **monthly**
+meter closest to its ceiling, which is also the bar's headline; the generic
+`session_*` aliases carry that same monthly window because DeepRelay has no
+5-hour session, and `weekly_*` carries the rolling 7-day caps. The weekly caps
+slide rather than reset, so every weekly reset placeholder is empty by design.
 
 ## Cross-provider formats
 
@@ -22,13 +77,17 @@ metrics expand to an empty string unless noted otherwise.
 | OpenCode Go | `ocg` | Command Code | `cmc` |
 | Ollama Cloud | `oll` | SuperGrok | `sgk` |
 | Devin | `dvn` | Cline | `cln` |
+| Muse Code | `msc` | Synthetic | `syn` |
+| Droid | `drd` | DeepRelay | `drl` |
+| Mistral | `mis` | | |
 
 The same codes ride the `ai-usagebar usage --json` report as each entry's
 `short_name`, so a native frontend can draw a Waybar-style provider tag without
 restating the table. Every account of one provider shares that provider's code.
 
-Use `{session_pct}`, `{session_reset}`, `{weekly_pct}`, and `{weekly_reset}`
-when one format must work across providers. Providers without matching time
+Use `{session_pct}`, `{session_reset}`, `{weekly_pct}`, `{weekly_reset}`, and
+`{icon}` (the provider's bar mark or short name) when one format must work across
+providers. Providers without matching time
 windows return neutral values. Cursor maps Cursor Models to the session slot
 and Other Models to the weekly slot; both reset with the billing cycle. Kiro
 has one pool, so it maps `kiro_pct` to both percentage slots, and Nous Research
@@ -44,7 +103,10 @@ Model and plan names are Pango-escaped at the placeholder boundary, so a name
 like `Claude & GPT OSS` can never break the bar's markup (non-Pango consumers
 see the escaped form, e.g. `&amp;`).
 Provider-specific families such as `{oai_*}`, `{zai_*}`, `{or_*}`, and
-`{orc_*}` are empty for providers that do not define them.
+`{orc_*}` exist only for their own provider. Any other provider prints them
+literally (`{oai_weekly_pct}`), so a format shared across providers should use
+the generic `{session_*}` and `{weekly_*}` placeholders described under
+"Cross-provider formats".
 
 ## Shared and Claude placeholders
 
@@ -52,7 +114,7 @@ These are compatible with claudebar.
 
 | Placeholder | Example |
 |---|---|
-| `{plan}` | `Max 5x` |
+| `{plan}` | `Ultra` |
 | `{session_pct}`, `{session_reset}`, `{session_bar}`, `{session_elapsed}` | `62`, `1h 30m`, `█████████████░░░░░░░`, `58` |
 | `{session_pace}`, `{session_pace_indicator}`, `{session_pace_pct}`, `{session_pace_pts}`, `{session_pace_delta}`, `{session_pace_abs_delta}` | `↑`, `↑`, `12% ahead`, `4pts ahead`, `4`, `4` |
 | `{weekly_*}` | The same family for the seven-day window. |
@@ -63,6 +125,11 @@ These are compatible with claudebar.
 
 The scoped family describes the first model-specific weekly window. When that
 window is absent, it returns neutral empty, `0`, or `—` values as appropriate.
+
+A verified Ultra account has no five-hour limit, so it has no session window:
+every `{session_*}` placeholder above expands to an empty string, and without
+`--format` the bar shows `{weekly_pct}% · {weekly_reset}` instead. An
+unverified Ultra account still has a temporary five-hour limit and fills them.
 
 `{resets_available}` is the number of banked limit resets Claude is offering —
 the ones the app shows under "Resets", which you redeem by hand rather than
@@ -238,6 +305,12 @@ combined monthly pool — so the weekly placeholders (`kimi_weekly_*` and the
 `weekly_pct`/`weekly_reset` aliases) render empty there, and
 `{kimi_monthly_pct}` / `{kimi_monthly_reset}` carry the monthly pool
 instead. On legacy-shape accounts the monthly placeholders render empty.
+The default format follows the shape: newer-shape accounts get
+`5h {kimi_window_pct}% · mo {kimi_monthly_pct}%`. When Kimi reports no rolling
+five-hour window, the window placeholders (`kimi_window_*` and the
+`session_pct`/`session_reset` aliases) render empty, and the default format
+shows only the long window the account has (`7d {kimi_weekly_pct}%` or
+`mo {kimi_monthly_pct}%`).
 
 ## Grok Bot
 
@@ -246,7 +319,8 @@ instead. On legacy-shape accounts the monthly placeholders render empty.
 These cover the desktop app's weekly included-usage pool from
 `api2.cursor.sh/aiserver.v1.DashboardService/GetSandUsageStatus`
 (Linux and macOS). The default format is `{gbt_weekly_pct}%`. Generic
-aliases are `{plan}` and `{weekly_pct}` / `{weekly_reset}`.
+aliases are `{plan}` and `{weekly_pct}` / `{weekly_reset}`. There is no 5-hour
+session, so `{session_pct}` and its related placeholders remain empty.
 `{weekly_elapsed}` aliases `{gbt_weekly_elapsed}`, the elapsed percentage of
 the reported period. The period length comes from `currentPeriodStart` and
 `nextResetTimestampUtc`; it is never assumed to be seven days.
@@ -290,7 +364,7 @@ USD; the China service uses CNY.
 ## SuperGrok
 
 `{sgk_plan}`, `{sgk_pct}`, `{sgk_reset}`, `{sgk_period}`, `{sgk_prepaid}`,
-`{sgk_resets_available}`, `{sgk_resets}`
+`{sgk_on_demand}`, `{sgk_resets_available}`, `{sgk_resets}`
 
 - `{sgk_period}` is `Weekly`, `Monthly`, or `Current period`.
 - The default bar format is `{sgk_pct}% · {sgk_reset}`.
@@ -305,15 +379,21 @@ USD; the China service uses CNY.
 - The prepaid line is shown only when the billing document reports credit —
   a `prepaidBalance` of zero draws no row, while `{sgk_prepaid}` still
   publishes the raw figure.
+- `{sgk_on_demand}` is additional usage past the included pool (`onDemandUsed`
+  / `onDemandCap` from the same billing document), as `$used / $cap` when a
+  cap is set. It is `—` when both are absent or zero, and the tooltip, TUI,
+  and `usage --json` omit the row in that case.
 - `{plan}` is the subscription tier when Grok Build supplies one.
 - `{sgk_resets_available}` is the number of banked resets you can redeem by
   hand, and `{sgk_resets}` the compact count (`1 reset available`). These are
   unrelated to `{sgk_reset}`, which is the current period's automatic rollover.
 
 SuperGrok is the subscription path. It is separate from the Grok Management
-API prepaid balance. Billing comes from Grok Build's documented
-`cli-chat-proxy.grok.com` endpoint, with the CLI's `x.ai/billing` ACP extension
-as a fallback for builds where that endpoint is unavailable.
+API prepaid balance. Billing comes from the endpoint the official Grok CLI
+uses for `/usage` (`cli-chat-proxy.grok.com/v1/billing`), with the CLI's
+`x.ai/billing` ACP extension as a fallback for builds where that endpoint is
+unavailable. That route is not published on docs.x.ai. See
+[docs/grok.md](grok.md).
 
 The HTTPS path reads the `key` from the login's `auth.json` and uses it inside
 the outgoing `Authorization` headers of the billing request and, separately,
@@ -328,8 +408,11 @@ The default executable is `$GROK_HOME/bin/grok`, or `~/.grok/bin/grok` when
 
 ## Anthropic API
 
-`{aapi_headline}`, `{aapi_spent}`, `{aapi_limit}`, `{aapi_pct}` report
-month-to-date spend from the Admin API `cost_report`.
+`{aapi_headline}`, `{aapi_spent}`, `{aapi_limit}`, `{aapi_pct}`, and
+`{aapi_through}` report
+spend from completed daily buckets in the Admin API `cost_report`.
+`{aapi_through}` is the last fully covered UTC date in `YYYY-MM-DD` form (or
+empty when the report has no dated bucket).
 
 - With a positive finite `monthly_limit`, the headline looks like
   `$1.34 / $1000 · 0%`.
@@ -414,7 +497,7 @@ modified.
 `{nous_plan}`, `{nous_pct}`, `{nous_renewal}`, `{nous_credits_remaining}`,
 `{nous_monthly_credits}`, `{nous_purchased_credits_remaining}`,
 `{nous_top_up_credits_remaining}`, `{nous_total_usable_credits}`,
-`{nous_rollover_credits}`
+`{nous_rollover_credits}`, `{nous_balance}`, `{balance}`
 
 These describe the Portal account the OAuth login reads. `{nous_pct}` is the
 consumed share of the monthly subscription-credit pool, a whole number held to
@@ -425,7 +508,8 @@ current period (`—` when none is stated). The credit placeholders are plain
 numbers without a currency symbol: whole credits print without decimals,
 fractions keep up to six decimal places with trailing zeros trimmed, and a
 value the Portal does not report is `—`. `{nous_top_up_credits_remaining}`
-aliases `{nous_purchased_credits_remaining}`.
+aliases `{nous_purchased_credits_remaining}`. `{nous_balance}` and its alias
+`{balance}` report total usable credits formatted as USD (e.g. `$44.84`).
 
 The default format is `{nous_pct}% · {nous_renewal}`; with no `format`
 configured and no percentage available, the bar shows the renewal countdown
@@ -464,6 +548,19 @@ values consistently mean more quota used. `{weekly_pct}` and
 `{session_pct}` and its related placeholders remain empty. The optional
 `{devin_overage_balance}` display uses the tested account's six-decimal USD
 interpretation; its currency contract is not verified for all accounts.
+
+## Droid (Factory)
+
+`{droid_headline_pct}` is the busiest active Standard window — the figure the
+`droid` CLI's `/limits` leads with. `{droid_session_*}`, `{droid_weekly_*}` and
+`{droid_monthly_*}` describe the Standard 5-hour, weekly and monthly windows;
+`{droid_core_session_*}`, `{droid_core_weekly_*}` and `{droid_core_monthly_*}`
+the Droid Core bucket. Every family also has `_reset`, `_elapsed`, `_pace` and
+`_pace_indicator` forms. A window the account has not started keeps its
+percentage with an empty reset; an absent one expands to empty strings.
+`{droid_extra_balance}` is `extraUsageBalanceCents` in dollars.
+`{session_pct}`/`{session_reset}`/`{session_elapsed}` and the `weekly_*`
+aliases map to the Standard 5-hour and weekly windows.
 
 ## Ollama Cloud
 

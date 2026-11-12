@@ -18,7 +18,7 @@
 
     <key name="vendor" type="s">
       <default>'anthropic'</default>
-      <summary>Provider shown in the top bar. The click menu lists every enabled provider.</summary>
+      <summary>Providers shown in the top bar, comma-separated (one indicator each). The click menu lists every enabled provider.</summary>
     </key>
 
     <key name="binary-path" type="s">
@@ -90,6 +90,11 @@
     <key name="show-bars" type="b">
       <default>true</default>
       <summary>Draw the bars; when off, show only the percentages</summary>
+    </key>
+
+    <key name="show-pace" type="b">
+      <default>false</default>
+      <summary>With bars off, color each value by pace and follow it with a pace arrow</summary>
     </key>
 
     <key name="color-low" type="s">

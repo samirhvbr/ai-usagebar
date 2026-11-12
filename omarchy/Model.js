@@ -34,6 +34,14 @@ function finitePercent(value) {
   return Math.max(0, Math.min(100, Math.round(number)))
 }
 
+// A vendor-reported fraction (Synthetic's weekly budget, e.g. 29.52) kept at
+// full precision for printed figures; null when absent or not a number.
+function finitePercentPrecise(value) {
+  var number = Number(value)
+  if (!isFinite(number)) return null
+  return number
+}
+
 function normalizeSection(raw) {
   if (!raw || typeof raw !== "object") return null
   var type = String(raw.type || "")
@@ -59,7 +67,10 @@ function normalizeSection(raw) {
       severity: severity,
       reset_at: cleanText(raw.reset_at, 80),
       window_secs: windowSecs,
-      group: cleanText(raw.group, 80)
+      group: cleanText(raw.group, 80),
+      regen: cleanText(raw.regen, 40),
+      percent_precise: finitePercentPrecise(raw.percent_precise),
+      reading: cleanText(raw.reading, 16)
     }
   }
   if (type === "text") {
@@ -256,6 +267,19 @@ function normalizeShowAs(value) {
 }
 
 /**
+ * The reading a metric is drawn with. A metric can carry its own reading —
+ * refill-style budgets (Synthetic's weekly credits) report `"left"`, the
+ * fuel-gauge view, whatever the widget's global `showAs` — and every other
+ * metric follows the setting.
+ * @param {Object} row Metric row from the report.
+ * @param {*} showAs Raw reading setting.
+ * @returns {"left"|"used"} The effective reading.
+ */
+function metricShowAs(row, showAs) {
+  return row && cleanText(row.reading, 16) === "left" ? "left" : normalizeShowAs(showAs)
+}
+
+/**
  * Converts a used percentage to the number drawn for the chosen reading.
  * Which window the bar picks never depends on this; only the number drawn for it does.
  * @param {number|string} percent Used percentage from the report.
@@ -268,15 +292,26 @@ function shownPercent(percent, showAs) {
   return normalizeShowAs(showAs) === "left" ? Math.max(0, 100 - number) : number
 }
 
+// Prints a shown percentage with at most one decimal ("70.5%", "70%") so a
+// precise figure does not collapse to a whole number. Meters keep integers.
+function shownPctText(shown) {
+  if (shown === null) return ""
+  return String(Math.round(shown * 10) / 10)
+}
+
 /**
  * Formats a used percentage as drawn for the chosen reading.
  * @param {number|string} percent Used percentage from the report.
  * @param {*} showAs Raw reading setting.
+ * @param {number|null} [precise] Decimal-precise used percentage when the
+ *   vendor reports one; the printed figure keeps that decimal.
  * @returns {string} For example "18%", or an empty string when the input is not a number.
  */
-function percentText(percent, showAs) {
-  var shown = shownPercent(percent, showAs)
-  return shown === null ? "" : shown + "%"
+function percentText(percent, showAs, precise) {
+  var source = precise === null || precise === undefined ? percent : precise
+  var shown = shownPercent(source, showAs)
+  if (shown === null) return ""
+  return shownPctText(shown) + "%"
 }
 
 var UNSAFE_KEYS = ["__proto__", "constructor", "prototype"]
@@ -537,6 +572,8 @@ function brandFileFor(provider) {
       return "copilot.svg"
     case "devin":
       return "devin.svg"
+    case "droid":
+      return "droid.svg"
     case "zai":
       return "zhipu.svg"
     case "openrouter":
@@ -570,6 +607,15 @@ function brandFileFor(provider) {
       return "opencode.svg"
     case "ollama":
       return "ollama.svg"
+    case "muse-code":
+      return "muse-code.svg"
+    case "synthetic":
+      return "synthetic.svg"
+    case "orcarouter":
+      return "orcarouter.svg"
+    case "mistral":
+    case "custom:mistral":
+      return "mistral.svg"
     default:
       return ""
   }
@@ -950,7 +996,9 @@ function toggleCursorPool(flags, id) {
  */
 function antigravityPoolOf(section) {
   if (!section || section.type !== "metric") return ""
-  if (section.label === "Gemini") return "gemini"
+  // Per-model Gemini pools (currently "Gemini 4 Argon") belong to the same
+  // visibility control and headline as the shared Gemini windows.
+  if (section.label === "Gemini" || section.label.indexOf("Gemini ") === 0) return "gemini"
   if (section.label === "Claude & GPT OSS") return "third_party"
   return ""
 }
@@ -1235,14 +1283,21 @@ function toggleMetricChoice(hidden, entry, key) {
  */
 function metricValueView(row, showAs) {
   var value = row && row.value !== undefined && row.value !== null ? String(row.value).trim() : ""
-  var left = normalizeShowAs(showAs) === "left"
+  var reading = metricShowAs(row, showAs)
+  var left = reading === "left"
   var echoesPercent = /^\d+(\.\d+)?%$/.test(value)
   if (value !== "" && !(left && echoesPercent)) return { text: value, left: false, percent: null }
-  var shown = row ? shownPercent(row.percent, showAs) : null
+  // A vendor-reported fraction (percent_precise) keeps its decimal through
+  // the left reading; the rounded integer is the fallback of older reports.
+  var precise = row && row.percent_precise !== null && row.percent_precise !== undefined
+    ? row.percent_precise
+    : null
+  var shown = row ? shownPercent(precise !== null ? precise : row.percent, reading) : null
+  if (shown === null) return { text: "", left: false, percent: null }
   return {
-    text: shown === null ? "" : shown + "%",
-    left: left && shown !== null,
-    percent: shown
+    text: shownPctText(shown) + "%",
+    left: left,
+    percent: Math.round(shown * 10) / 10
   }
 }
 
@@ -1519,7 +1574,7 @@ function headline(entry, barWindow, showAs) {
     // put OpenRouter's dollar figure on the bar and hid its consumed percent.
     // An older report omits the field, and a metric is a percentage by default.
     var bestText = best.headline === "value" && best.value !== ""
-      ? best.value : percentText(best.percent, showAs)
+      ? best.value : percentText(best.percent, metricShowAs(best, showAs), best.percent_precise)
     return {
       text: bestText,
       percent: best.percent,
@@ -1566,7 +1621,7 @@ function isSameLocalDay(a, b) {
     && a.getDate() === b.getDate()
 }
 
-function formatReset(resetAt, nowMs) {
+function formatReset(resetAt, nowMs, regen) {
   if (!resetAt) return ""
   var resetMs = new Date(String(resetAt)).getTime()
   if (!isFinite(resetMs)) return ""
@@ -1582,7 +1637,10 @@ function formatReset(resetAt, nowMs) {
   var clock = pad2(at.getHours()) + ":" + pad2(at.getMinutes())
   if (!isSameLocalDay(at, new Date(Number(nowMs))))
     clock = MONTH_NAMES[at.getMonth()] + " " + at.getDate() + " " + clock
-  return "Resets in " + formatDuration(remaining) + " · " + clock
+  // A refilling window (Synthetic's weekly credits) regenerates by a stated
+  // amount instead of resetting wholesale, so the line names that amount.
+  var lead = regen ? "Regenerates " + regen + " in " : "Resets in "
+  return lead + formatDuration(remaining) + " · " + clock
 }
 
 function formatUpdated(fetchedAt, nowMs) {
@@ -1600,6 +1658,7 @@ function metricDetail(row) {
   // Older human-readable reset text remains useful to CLI consumers. Strip
   // just that fragment in the native panel, which renders a live countdown.
   detail = detail.replace(/^Resets in [^·]+\s*(?:·\s*)?/i, "")
+  detail = detail.replace(/^Regenerates [^·]+? in [^·]+\s*(?:·\s*)?/i, "")
   detail = detail.replace(/\s*·\s*reset\s+[^·]+$/i, "")
   return detail.trim()
 }
@@ -1791,4 +1850,57 @@ function parseSettingsApplyResult(raw) {
   } catch (error) {
     return false
   }
+}
+
+// Display-only entry choices. Keep exact ids so named accounts are independent.
+function barVisibleEntries(entries, hidden) {
+  var ids = Array.isArray(hidden) ? hidden : []
+  return (Array.isArray(entries) ? entries : []).filter(function(entry) {
+    return ids.indexOf(entry.id) < 0
+  })
+}
+
+function toggleBarEntry(hidden, id) {
+  var ids = Array.isArray(hidden) ? hidden : []
+  return ids.indexOf(id) >= 0
+    ? ids.filter(function(value) { return value !== id })
+    : ids.concat([id])
+}
+
+// Wheel and middle-click step through the entries the bar is showing.
+// `selectedId` is the panel selection. When that entry was hidden, the bar
+// is showing the first entry of `entries`, so the step starts there.
+function adjacentBarEntryId(entries, selectedId, delta) {
+  var list = Array.isArray(entries) ? entries : []
+  var step = Number(delta) || 0
+  if (list.length === 0 || step === 0) return ""
+  var current = -1
+  for (var i = 0; i < list.length; i++) {
+    if (list[i] && list[i].id === selectedId) {
+      current = i
+      break
+    }
+  }
+  if (current < 0) current = 0
+  var next = (current + step) % list.length
+  if (next < 0) next += list.length
+  var entry = list[next]
+  return entry && entry.id !== undefined && entry.id !== null && entry.id !== ""
+    ? String(entry.id) : ""
+}
+
+function providerDisplaySummary(rows) {
+  var on = 0
+  for (var i = 0; i < rows.length; i++) if (rows[i].checked) on++
+  return on + "/" + rows.length
+}
+
+// Splits a metric value for display: the figure is the emphasis, the unit and
+// any words around it ("47% left", "осталось 47%") are secondary. A value with
+// no percentage (a balance such as "$75.00") is all figure.
+function valueParts(text) {
+  var value = String(text === undefined || text === null ? "" : text)
+  var match = /^(.*?)(-?\d+(?:[.,]\d+)?)\s?%(.*)$/.exec(value)
+  if (!match) return { prefix: "", figure: value, unit: "", suffix: "" }
+  return { prefix: match[1], figure: match[2], unit: "%", suffix: match[3] }
 }

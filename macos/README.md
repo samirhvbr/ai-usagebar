@@ -39,6 +39,13 @@ Logos and Quattro values follow **Preferences → Show Usage As**, like the popo
 tabs and meters: what is left, by default, or what is used. With
 nothing starred it shows the app icon. Left-click opens the popover; right-click opens the Options menu.
 
+**App Icon** shows the same gauge as About, as a monochrome menu-bar symbol.
+It stays visible even with starred metrics and keeps those favorites for
+switching back to Chart or Logos. The glyph is Material Design Icons'
+`mdi/gauge` by Pictogrammers, under Apache 2.0; see
+[`menu-bar-icon.LICENSE`](menu-bar-icon.LICENSE).
+
+
 ```bash
 cargo build --release --bin ai-usagebar-tray
 ./target/release/ai-usagebar-tray
@@ -104,8 +111,11 @@ The selector dynamically discovers **all providers** that ship in the binary via
   with unlimited chat and completions reported cleanly), SuperGrok, Kiro,
   Nous Research, OpenCode Go (session, weekly, and monthly pools), Command Code
   (session, weekly, and monthly pools), Grok Bot (weekly included-usage
-  pool from the Grok Bot desktop app), and Devin (daily and weekly quotas
-  from the Devin CLI).
+  pool from the Grok Bot desktop app), Devin (daily and weekly quotas
+  from the Devin CLI), Cline (5h, 7d, and 30d rolling quotas
+  from the Cline CLI), Model Studio (session, weekly, and monthly Token Plan
+  pools), Synthetic (weekly regenerating credit budget), and Mistral (monthly
+  API and Vibe Code budgets).
 - **Included-usage pools:** Cursor (Cursor Models and Other Models, both reset
   on the billing cycle).
 - **Balance-only:** OpenRouter, DeepSeek, DeepInfra, Kimi, Kilo, Novita,

@@ -11,10 +11,12 @@
 // metricDetail) deliberately mirror omarchy/Model.js so the two native panels
 // word the same data the same way.
 //
-// Two QML V4 engine rules apply to this file, asserted by the test:
+// Three QML V4 engine rules apply to this file, asserted by the test:
 //   - no ES2019 optional catch binding (`catch {`), which V4 rejects outright;
 //   - no Unicode property escapes (\p{...}), which V4 evaluates to false
-//     *silently* rather than throwing.
+//     *silently* rather than throwing;
+//   - no object spread ({...obj}), which V4 rejects with "Unexpected token `...`".
+//     Copy properties explicitly instead.
 
 export const DEFAULT_BINARY = 'ai-usagebar';
 export const DEFAULT_TIMEOUT_SECS = 600;
@@ -63,6 +65,20 @@ export function buildArgv(binary, timeoutSecs) {
 
 export function buildCommand(binary, timeoutSecs) {
     return buildArgv(binary, timeoutSecs).map(shellQuote).join(' ');
+}
+
+// plasmashell's PATH is the session PATH, not the interactive shell's — so a
+// cargo / ~/.local/bin install is often invisible. When binaryPath is an
+// absolute path to `ai-usagebar`, launch the sibling `ai-usagebar-tui` from
+// the same directory instead of relying on PATH.
+export function tuiPathFromBinary(binary) {
+    const bin = String(binary ?? '').trim() || DEFAULT_BINARY;
+    if (bin.indexOf('/') === -1)
+        return 'ai-usagebar-tui';
+    if (bin.endsWith('ai-usagebar'))
+        return bin.slice(0, -'ai-usagebar'.length) + 'ai-usagebar-tui';
+    const slash = bin.lastIndexOf('/');
+    return bin.slice(0, slash + 1) + 'ai-usagebar-tui';
 }
 
 // Launching the TUI needs a terminal, and there is no portable way to probe
@@ -155,6 +171,7 @@ function normalizeSection(raw) {
             headline: raw.headline === 'value' ? 'value' : 'percent',
             resetAt: safeText(raw.reset_at, 64),
             severity: severityOf(percent, raw.severity),
+            regen: safeText(raw && raw.regen, 40),
         };
     }
     if (type === 'block') {
@@ -171,6 +188,31 @@ function normalizeSection(raw) {
     };
 }
 
+// SVG stems in windows/popover/src/icons/providers/ (the tray/popover catalog;
+// the plasmoid install symlinks or copies that directory, and src/tray/marks.rs
+// include_bytes!'s the same files). QML cannot list a directory, so this is a
+// hand-kept mirror — exported so the test suite can diff it against the real
+// catalog. A stem listed here with no SVG asks plasmashell for a file that is
+// not there; one missing from here silently drops that provider's mark.
+export const PROVIDER_ICON_SLUGS = new Set([
+    'anthropic', 'anthropic_api', 'antigravity', 'copilot', 'cursor', 'deepseek',
+    'devin', 'grok', 'grokbot', 'kilo', 'kimi', 'kiro', 'minimax', 'moonshot',
+    'muse-code', 'nous', 'novita', 'ollama', 'openai', 'opencode-go',
+    'openrouter', 'zai',
+]);
+
+// Map report brand/id to a shipped SVG stem. Matches tray marks.rs: strip
+// @account, lowercase, SuperGrok → grok. Unknown vendors get "" so QML hides
+// the Image rather than requesting a missing file.
+export function providerIconSlug(idOrBrand) {
+    const raw = String(idOrBrand ?? '').trim();
+    if (!raw)
+        return '';
+    const base = raw.split('@')[0].toLowerCase();
+    const slug = base === 'supergrok' ? 'grok' : base;
+    return PROVIDER_ICON_SLUGS.has(slug) ? slug : '';
+}
+
 function normalizeEntry(raw) {
     if (!raw || typeof raw !== 'object')
         return null;
@@ -179,8 +221,11 @@ function normalizeEntry(raw) {
         return null;
     const sections = Array.isArray(raw.sections)
         ? raw.sections.slice(0, 128).map(normalizeSection) : [];
+    const brand = safeText(raw.brand, 60).trim() || id.split('@')[0];
     return {
         id: id,
+        brand: brand,
+        iconSlug: providerIconSlug(brand || id),
         // display_name is the canonical label the Rust core owns. Falling back
         // to the raw id keeps a slug visible rather than an empty tab.
         label: safeText(raw.display_name, 60).trim() || safeText(raw.name, 60).trim() || id,
@@ -235,15 +280,66 @@ export function entryFor(report, vendorId) {
     return entries[0];
 }
 
-// The popup's tab strip. Every configured vendor is offered, including ones
-// currently failing — hiding an errored vendor is what made it impossible to
-// tell "not configured" from "configured and broken".
-export function vendorTabs(report, activeId) {
+// Entries the user opted into via the scroll/tab ring, in ring order. An empty
+// ring means "no filter" and keeps report order — that is what a fresh applet
+// sees before the settings page has been opened. A ring whose ids no longer
+// appear in the report (every vendor disabled in config.toml) falls back the
+// same way so the popup never goes blank.
+export function entriesForRing(report, ring) {
     const entries = (report && report.entries) || [];
+    const order = toRing(ring);
+    if (!order.length)
+        return entries.slice();
+    const byId = new Map();
+    for (const e of entries)
+        byId.set(e.id, e);
+    const chosen = [];
+    for (const id of order) {
+        const e = byId.get(id);
+        if (e)
+            chosen.push(e);
+    }
+    return chosen.length ? chosen : entries.slice();
+}
+
+// The ids the popup actually shows, in the order it shows them. Scroll walks
+// this rather than the raw ring, so a flick reaches exactly the tabs in front
+// of you — including the "no ring configured" case, where that is every vendor
+// the report returned.
+export function ringOrder(report, ring) {
+    return entriesForRing(report, ring).map(e => e.id);
+}
+
+// Reorder one id inside the ring. Returns a new array; out-of-range moves and
+// unknown ids are no-ops so the settings page can bind the arrows blindly.
+export function moveRing(ring, id, delta) {
+    const list = toRing(ring);
+    const wanted = String(id ?? '').trim();
+    const at = list.indexOf(wanted);
+    const step = Number(delta) || 0;
+    if (at === -1 || step === 0)
+        return list;
+    const to = at + step;
+    if (to < 0 || to >= list.length)
+        return list;
+    const next = list.slice();
+    next.splice(at, 1);
+    next.splice(to, 0, wanted);
+    return next;
+}
+
+// The popup's tab strip. Follows the user's ring for both membership and order
+// so unticked vendors stay out of the chips and the arrows in Configure set
+// the chip order. Failing vendors that ARE in the ring still show the ⚠ —
+// hiding them only when the user unticks them is what keeps "I don't use this"
+// distinct from "configured and broken".
+export function vendorTabs(report, activeId, ring) {
+    const entries = entriesForRing(report, ring);
     const active = entryFor(report, activeId);
     return entries.map(e => ({
         id: e.id,
         label: e.label,
+        iconSlug: e.iconSlug || providerIconSlug(e.brand || e.id),
         active: !!active && e.id === active.id,
         failing: e.status === 'error' || !!e.error,
     }));
@@ -337,6 +433,137 @@ export function detailRows(entry) {
     return entry.sections.filter(s => s.type !== 'spacer');
 }
 
+// Metric visibility is stored per applet as JSON because KConfigXT has no map
+// type. Treat malformed or stale values as empty preferences, never as a
+// reason to blank the panel.
+export function parseHiddenMetrics(value) {
+    let parsed;
+    try {
+        parsed = JSON.parse(String(value ?? '{}'));
+    } catch (e) {
+        return {};
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed))
+        return {};
+    const clean = {};
+    for (const id of Object.keys(parsed).slice(0, 64)) {
+        if (!Array.isArray(parsed[id]))
+            continue;
+        const providerId = safeText(id, 60);
+        // These names have special meaning on ordinary JavaScript objects.
+        // Provider identifiers never use them, and ignoring them keeps a
+        // hand-edited configuration from mutating the preferences object's
+        // prototype.
+        if (!providerId || ['__proto__', 'constructor', 'prototype'].includes(providerId))
+            continue;
+        const keys = [];
+        for (const rawKey of parsed[id].slice(0, 32)) {
+            const key = safeText(rawKey, 220).trim();
+            if (key && keys.indexOf(key) === -1)
+                keys.push(key);
+        }
+        if (keys.length)
+            clean[providerId] = keys;
+    }
+    return clean;
+}
+
+function isHeadingRow(section) {
+    return section && section.type === 'text' && section.label && !section.value;
+}
+
+export function metricKeys(entry) {
+    if (!entry)
+        return [];
+    const counts = {};
+    let heading = '';
+    return entry.sections.map((section, index) => {
+        if (isHeadingRow(section)) {
+            heading = section.label.trim();
+            return null;
+        }
+        if (section.type !== 'metric')
+            return null;
+        const group = section.group.trim() || heading;
+        const base = group ? `${group} / ${section.label}` : section.label;
+        counts[base] = (counts[base] || 0) + 1;
+        return {index: index, key: counts[base] === 1 ? base : `${base} #${counts[base]}`};
+    });
+}
+
+export function visibleEntry(entry, hiddenByProvider) {
+    if (!entry)
+        return null;
+    const hidden = (hiddenByProvider && hiddenByProvider[entry.id]) || [];
+    const keys = metricKeys(entry);
+    const metrics = keys.filter(Boolean);
+    const visibleCount = metrics.filter(item => hidden.indexOf(item.key) === -1).length;
+    // A stale preference cannot hide every metric. This matches the settings
+    // UI, which locks the final visible switch.
+    if (visibleCount === 0)
+        return entry;
+    const sections = [];
+    let block = null;
+    const closeBlock = () => {
+        if (block && block.metrics > 0 && block.kept === 0) {
+            const hasLeadingSpacer = block.start > 0 && sections[block.start - 1].type === 'spacer';
+            sections.splice(hasLeadingSpacer ? block.start - 1 : block.start, hasLeadingSpacer ? 2 : 1);
+        }
+        block = null;
+    };
+    entry.sections.forEach((section, index) => {
+        if (isHeadingRow(section)) {
+            closeBlock();
+            block = {start: sections.length, metrics: 0, kept: 0};
+        }
+        if (keys[index]) {
+            if (block)
+                block.metrics++;
+            if (hidden.indexOf(keys[index].key) !== -1) {
+                const next = entry.sections[index + 1];
+                const endsRun = !next || next.type === 'spacer' || isHeadingRow(next);
+                if (endsRun && sections.length && sections[sections.length - 1].type === 'spacer')
+                    sections.pop();
+                return;
+            }
+            if (block)
+                block.kept++;
+        }
+        sections.push(section);
+    });
+    closeBlock();
+    // QML V4 does not support object spread (...), so copy properties explicitly.
+    return {
+        id: entry.id,
+        brand: entry.brand,
+        iconSlug: entry.iconSlug,
+        label: entry.label,
+        plan: entry.plan,
+        status: entry.status,
+        stale: entry.stale,
+        error: entry.error,
+        fetchedAt: entry.fetchedAt,
+        sections: sections,
+    };
+}
+
+export function metricChoices(entry, hiddenByProvider) {
+    if (!entry)
+        return [];
+    const hidden = ((hiddenByProvider && hiddenByProvider[entry.id]) || []);
+    const keys = metricKeys(entry).filter(Boolean);
+    const visibleCount = keys.filter(item => hidden.indexOf(item.key) === -1).length;
+    return keys.map(item => {
+        const checked = hidden.indexOf(item.key) === -1;
+        return {
+            key: item.key,
+            label: entry.sections[item.index].label,
+            checked: checked,
+            canToggle: !checked || visibleCount > 1,
+        };
+    });
+}
+
 // The panel cells. Each carries its own severity so the compact representation
 // colours per cell rather than by the entry's worst value.
 export function panelCells(entry, options) {
@@ -423,6 +650,7 @@ export function cardFor(entry) {
     return {
         id: entry.id,
         label: entry.label,
+        iconSlug: entry.iconSlug || providerIconSlug(entry.brand || entry.id),
         plan: entry.plan,
         state: state,
         // An errored vendor outranks whatever its last good numbers said.
@@ -438,15 +666,16 @@ export function cardFor(entry) {
                 severity: s.severity,
                 resetAt: s.resetAt,
                 detail: metricDetail(s),
+                regen: s.regen,
             };
         }),
         blocks: entry.sections.filter(s => s.type === 'block'),
     };
 }
 
-export function cardModel(report) {
-    const entries = (report && report.entries) || [];
-    return entries.map(cardFor);
+export function cardModel(report, hiddenByProvider, ring) {
+    const entries = entriesForRing(report, ring);
+    return entries.map(entry => cardFor(visibleEntry(entry, hiddenByProvider)));
 }
 
 // "Session (5h)" -> "5h", "Weekly (7d)" -> "7d". The panel is width
@@ -468,6 +697,7 @@ export function metricDetail(row) {
     if (!row || !row.resetAt)
         return detail.trim();
     detail = detail.replace(/^Resets in [^·]+\s*(?:·\s*)?/i, '');
+    detail = detail.replace(/^Regenerates [^·]+? in [^·]+\s*(?:·\s*)?/i, '');
     detail = detail.replace(/\s*·\s*reset\s+[^·]+$/i, '');
     return detail.trim();
 }

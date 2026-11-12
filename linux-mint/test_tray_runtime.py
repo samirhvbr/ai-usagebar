@@ -9,7 +9,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 
 SOURCE = Path(__file__).with_name("ai-usagebar-tray")
@@ -131,6 +131,19 @@ class TrayRuntimeTest(unittest.TestCase):
             x11.x11_get_server_time.side_effect = TypeError("not an X11 window")
             tray.AIUsageTrayApp.show_window(app)
         self.assertEqual(window.presented, [tray.Gdk.CURRENT_TIME])
+
+    def test_report_updates_every_icon_flavour_with_tooltip_and_percentage(self):
+        data = {"entries": [{"id": "anthropic", "name": "Claude",
+                             "metrics": [{"label": "Weekly", "percent": 41}]}]}
+        app = MagicMock()
+        app.xapp_icon, app.status_icon, app.indicator = MagicMock(), MagicMock(), MagicMock()
+        with patch.dict(os.environ, {"LANG": "en_US.UTF-8", "LC_ALL": "", "LC_MESSAGES": ""}):
+            tray.AIUsageTrayApp.update_menu_summary(app, data)
+        app.build_menu.assert_called_once_with(data)
+        app.xapp_icon.set_tooltip_text.assert_called_once_with("Claude: 41%")
+        app.xapp_icon.set_label.assert_called_once_with("41%")
+        app.status_icon.set_tooltip_text.assert_called_once_with("Claude: 41%")
+        app.indicator.set_label.assert_called_once_with("41%", "100%")
 
 
 if __name__ == "__main__":

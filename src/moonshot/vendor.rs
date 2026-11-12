@@ -20,7 +20,7 @@ pub const DEFAULT_FORMAT: &str = "{km_balance}";
 
 pub fn build_placeholders(snap: &MoonshotSnapshot) -> HashMap<&'static str, String> {
     placeholders(vec![
-        ("icon", "󰚩".to_string()),
+        ("icon", VendorId::Moonshot.bar_icon().to_string()),
         ("vendor_short", VendorId::Moonshot.short_name().to_string()),
         // Cross-vendor aliases — Kimi has no rate-limit windows here.
         ("session_pct", "0".to_string()),
@@ -195,6 +195,10 @@ mod tests {
     #[test]
     fn default_render_shows_balance() {
         let snap = sample_snap();
+        assert_eq!(
+            build_placeholders(&snap)["icon"],
+            VendorId::Moonshot.bar_icon()
+        );
         let out = render(
             &sample_outcome(snap.clone()),
             &snap,

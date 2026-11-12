@@ -2,24 +2,43 @@
 /** @typedef {import('../runtime.js').LocalizedString} LocalizedString */
 /** @typedef {{}} _10_MinutesInputs */
 /** @typedef {{}} _12_HourInputs */
+/** @typedef {{}} _15_MinutesInputs */
+/** @typedef {{}} _1_HourInputs */
 /** @typedef {{}} _1_MinuteInputs */
 /** @typedef {{}} _24_HourInputs */
+/** @typedef {{}} _30_MinutesInputs */
 /** @typedef {{}} _5_HourInputs */
 /** @typedef {{}} _5_MinutesInputs */
 /** @typedef {{}} AboutInputs */
 /** @typedef {{}} About_Summary_Menu_BarInputs */
 /** @typedef {{}} About_Summary_TrayInputs */
+/** @typedef {{}} AccountsInputs */
 /** @typedef {{}} ActivityInputs */
+/** @typedef {{}} Add_AccountInputs */
+/** @typedef {{}} Add_Claude_Code_AccountInputs */
+/** @typedef {{}} Add_Claude_Desktop_AccountInputs */
+/** @typedef {{}} Add_Codex_AccountInputs */
+/** @typedef {{}} Add_One_To_Track_UsageInputs */
 /** @typedef {{}} Alert_ThresholdInputs */
 /** @typedef {{}} Alert_Threshold_HintInputs */
 /** @typedef {{}} AlertsInputs */
+/** @typedef {{}} All_ProvidersInputs */
+/** @typedef {{}} All_Providers_HintInputs */
 /** @typedef {{}} Always_ShowInputs */
 /** @typedef {{}} Always_Show_PacingInputs */
 /** @typedef {{}} Always_Show_Pacing_HintInputs */
 /** @typedef {{}} Always_VisibleInputs */
 /** @typedef {{}} Antigravity_Not_RunningInputs */
 /** @typedef {{}} Antigravity_Start_HintInputs */
+/** @typedef {{ provider: NonNullable<unknown> }} Api_Key_CheckingInputs */
+/** @typedef {{}} Api_Key_Checking_ShortInputs */
+/** @typedef {{ provider: NonNullable<unknown> }} Api_Key_Dialog_TitleInputs */
+/** @typedef {{ provider: NonNullable<unknown> }} Api_Key_No_AnswerInputs */
+/** @typedef {{ provider: NonNullable<unknown> }} Api_Key_RejectedInputs */
+/** @typedef {{}} Api_Key_SaveInputs */
+/** @typedef {{}} Api_Key_Stored_NoteInputs */
 /** @typedef {{}} Api_KeysInputs */
+/** @typedef {{}} App_IconInputs */
 /** @typedef {{}} AppearanceInputs */
 /** @typedef {{}} AutoInputs */
 /** @typedef {{}} AutomaticInputs */
@@ -48,6 +67,9 @@
 /** @typedef {{}} Click_To_Record_A_ShortcutInputs */
 /** @typedef {{}} CloseInputs */
 /** @typedef {{}} Connection_Retry_HintInputs */
+/** @typedef {{}} Copied_To_ClipboardInputs */
+/** @typedef {{}} Copy_As_ImageInputs */
+/** @typedef {{}} Copy_Image_FailedInputs */
 /** @typedef {{}} Couldn_T_Load_UsageInputs */
 /** @typedef {{}} Couldn_T_Read_Local_FilesInputs */
 /** @typedef {{}} Couldn_T_Read_Usage_DataInputs */
@@ -67,6 +89,7 @@
 /** @typedef {{}} Date_UnavailableInputs */
 /** @typedef {{ day: NonNullable<unknown>, time: NonNullable<unknown> }} Day_AtInputs */
 /** @typedef {{ days: NonNullable<unknown> }} Days_AgoInputs */
+/** @typedef {{}} Default_AccountInputs */
 /** @typedef {{}} Detect_ProvidersInputs */
 /** @typedef {{}} Development_BuildInputs */
 /** @typedef {{}} DismissInputs */
@@ -85,6 +108,7 @@
 /** @typedef {{}} Global_ShortcutInputs */
 /** @typedef {{}} Global_Shortcut_HintInputs */
 /** @typedef {{}} Goal_NowInputs */
+/** @typedef {{}} Hide_KeyInputs */
 /** @typedef {{}} Hide_RowInputs */
 /** @typedef {{}} HighestInputs */
 /** @typedef {{ hours: NonNullable<unknown> }} Hours_AgoInputs */
@@ -121,6 +145,7 @@
 /** @typedef {{}} Monthly_LowercaseInputs */
 /** @typedef {{}} MoreInputs */
 /** @typedef {{}} NativeInputs */
+/** @typedef {{}} Needs_Api_Key_HintInputs */
 /** @typedef {{}} New_UpdateInputs */
 /** @typedef {{}} New_Version_ReadyInputs */
 /** @typedef {{}} New_Version_UninstallableInputs */
@@ -128,6 +153,7 @@
 /** @typedef {{ duration: NonNullable<unknown> }} Next_Update_InInputs */
 /** @typedef {{}} No_AnswerInputs */
 /** @typedef {{}} No_Api_KeyInputs */
+/** @typedef {{}} No_Details_GivenInputs */
 /** @typedef {{}} No_Providers_DetectedInputs */
 /** @typedef {{}} No_Providers_EnabledInputs */
 /** @typedef {{}} No_Providers_Enabled_HintInputs */
@@ -135,6 +161,7 @@
 /** @typedef {{}} No_Usage_Or_Balance_Data_YetInputs */
 /** @typedef {{}} NoneInputs */
 /** @typedef {{}} Not_Checked_YetInputs */
+/** @typedef {{}} Not_Signed_InInputs */
 /** @typedef {{}} NotificationsInputs */
 /** @typedef {{}} Notify_MeInputs */
 /** @typedef {{}} NowInputs */
@@ -146,10 +173,7 @@
 /** @typedef {{}} Open_CustomizeInputs */
 /** @typedef {{ owner: NonNullable<unknown> }} Open_Source_ByInputs */
 /** @typedef {{}} Open_TuiInputs */
-/** @typedef {{}} Open_Tui_For_DetailsInputs */
-/** @typedef {{}} Open_Tui_Settings_To_Add_OneInputs */
 /** @typedef {{}} Open_Tui_Settings_To_Sign_InInputs */
-/** @typedef {{}} Open_Tui_Settings_To_Turn_One_OnInputs */
 /** @typedef {{}} OptionsInputs */
 /** @typedef {{ percent: NonNullable<unknown> }} Pace_By_ResetInputs */
 /** @typedef {{ duration: NonNullable<unknown> }} Pace_Shows_After_FirstInputs */
@@ -164,7 +188,14 @@
 /** @typedef {{}} Press_KeysInputs */
 /** @typedef {{}} Press_Keys_EllipsisInputs */
 /** @typedef {{}} ProviderInputs */
+/** @typedef {{}} Provider_Add_KeyInputs */
+/** @typedef {{}} Provider_EnableInputs */
 /** @typedef {{}} Provider_Is_UnavailableInputs */
+/** @typedef {{}} Provider_OffInputs */
+/** @typedef {{}} Provider_Off_ReadyInputs */
+/** @typedef {{}} Provider_Open_AppInputs */
+/** @typedef {{}} Provider_ReadyInputs */
+/** @typedef {{}} Provider_Sign_InInputs */
 /** @typedef {{}} ProvidersInputs */
 /** @typedef {{}} QuattroInputs */
 /** @typedef {{}} QuitInputs */
@@ -178,6 +209,8 @@
 /** @typedef {{}} Refresh_Interval_HintInputs */
 /** @typedef {{}} Refresh_NowInputs */
 /** @typedef {{}} Refresh_To_Detect_HintInputs */
+/** @typedef {{ amount: NonNullable<unknown>, exact: NonNullable<unknown> }} Regenerates_AtInputs */
+/** @typedef {{ amount: NonNullable<unknown>, duration: NonNullable<unknown> }} Regenerates_InInputs */
 /** @typedef {{}} Release_NotesInputs */
 /** @typedef {{}} Remind_Me_LaterInputs */
 /** @typedef {{}} ReorderInputs */
@@ -197,12 +230,35 @@
 /** @typedef {{}} Shortcut_Recording_HintInputs */
 /** @typedef {{}} ShowInputs */
 /** @typedef {{}} Show_Expiry_DatesInputs */
+/** @typedef {{}} Show_KeyInputs */
 /** @typedef {{}} Show_LessInputs */
 /** @typedef {{}} Show_MoreInputs */
 /** @typedef {{}} Show_On_DemandInputs */
 /** @typedef {{}} Show_Usage_AsInputs */
 /** @typedef {{}} Show_Usage_As_HintInputs */
+/** @typedef {{ issuer: NonNullable<unknown> }} Sign_In_AskingInputs */
+/** @typedef {{ provider: NonNullable<unknown> }} Sign_In_Cli_MissingInputs */
+/** @typedef {{}} Sign_In_Code_ExpiredInputs */
+/** @typedef {{}} Sign_In_CopiedInputs */
+/** @typedef {{}} Sign_In_CopyInputs */
+/** @typedef {{ provider: NonNullable<unknown> }} Sign_In_Custom_PathInputs */
+/** @typedef {{}} Sign_In_DeniedInputs */
+/** @typedef {{ account: NonNullable<unknown> }} Sign_In_Device_OffInputs */
+/** @typedef {{ provider: NonNullable<unknown> }} Sign_In_Dialog_TitleInputs */
+/** @typedef {{ provider: NonNullable<unknown> }} Sign_In_DoneInputs */
+/** @typedef {{}} Sign_In_Enter_CodeInputs */
 /** @typedef {{}} Sign_In_ExpiredInputs */
+/** @typedef {{ time: NonNullable<unknown> }} Sign_In_Expires_InInputs */
+/** @typedef {{}} Sign_In_FailedInputs */
+/** @typedef {{}} Sign_In_FetchingInputs */
+/** @typedef {{}} Sign_In_New_CodeInputs */
+/** @typedef {{}} Sign_In_No_AnswerInputs */
+/** @typedef {{}} Sign_In_Open_PageInputs */
+/** @typedef {{ account: NonNullable<unknown> }} Sign_In_To_Track_UsageInputs */
+/** @typedef {{}} Sign_In_Try_AgainInputs */
+/** @typedef {{}} Sign_In_Use_TerminalInputs */
+/** @typedef {{}} Sign_In_WaitingInputs */
+/** @typedef {{ account: NonNullable<unknown> }} Sign_In_With_AccountInputs */
 /** @typedef {{}} Source_CodeInputs */
 /** @typedef {{}} Source_On_GithubInputs */
 /** @typedef {{}} StaleInputs */
@@ -225,6 +281,7 @@
 /** @typedef {{}} Try_Refresh_In_A_BitInputs */
 /** @typedef {{}} Try_Refresh_In_A_MinuteInputs */
 /** @typedef {{}} Turn_On_A_Provider_In_CustomizeInputs */
+/** @typedef {{}} Turn_One_On_In_CustomizeInputs */
 /** @typedef {{}} UnstarInputs */
 /** @typedef {{}} Unstar_From_Menu_BarInputs */
 /** @typedef {{}} Up_To_2_Stars_Per_ProviderInputs */
@@ -273,12 +330,24 @@ export const _12_hour = /** @type {(inputs: _12_HourInputs) => LocalizedString} 
 	return /** @type {LocalizedString} */ (`12 horas`)
 };
 
+export const _15_minutes = /** @type {(inputs: _15_MinutesInputs) => LocalizedString} */ () => {
+	return /** @type {LocalizedString} */ (`15 minutos`)
+};
+
+export const _1_hour = /** @type {(inputs: _1_HourInputs) => LocalizedString} */ () => {
+	return /** @type {LocalizedString} */ (`1 hora`)
+};
+
 export const _1_minute = /** @type {(inputs: _1_MinuteInputs) => LocalizedString} */ () => {
 	return /** @type {LocalizedString} */ (`1 minuto`)
 };
 
 export const _24_hour = /** @type {(inputs: _24_HourInputs) => LocalizedString} */ () => {
 	return /** @type {LocalizedString} */ (`24 horas`)
+};
+
+export const _30_minutes = /** @type {(inputs: _30_MinutesInputs) => LocalizedString} */ () => {
+	return /** @type {LocalizedString} */ (`30 minutos`)
 };
 
 export const _5_hour = /** @type {(inputs: _5_HourInputs) => LocalizedString} */ () => {
@@ -301,8 +370,32 @@ export const about_summary_tray = /** @type {(inputs: About_Summary_TrayInputs) 
 	return /** @type {LocalizedString} */ (`Cuánto te queda de cada plan de IA — Claude, Codex, Cursor, Copilot y muchos más — directo en la bandeja del sistema, con horarios de reinicio y ritmo de uso para que un límite nunca te sorprenda a mitad de una tarea.`)
 };
 
+export const accounts = /** @type {(inputs: AccountsInputs) => LocalizedString} */ () => {
+	return /** @type {LocalizedString} */ (`Cuentas`)
+};
+
 export const activity = /** @type {(inputs: ActivityInputs) => LocalizedString} */ () => {
 	return /** @type {LocalizedString} */ (`Actividad`)
+};
+
+export const add_account = /** @type {(inputs: Add_AccountInputs) => LocalizedString} */ () => {
+	return /** @type {LocalizedString} */ (`Añadir cuenta`)
+};
+
+export const add_claude_code_account = /** @type {(inputs: Add_Claude_Code_AccountInputs) => LocalizedString} */ () => {
+	return /** @type {LocalizedString} */ (`Añadir cuenta de Claude Code`)
+};
+
+export const add_claude_desktop_account = /** @type {(inputs: Add_Claude_Desktop_AccountInputs) => LocalizedString} */ () => {
+	return /** @type {LocalizedString} */ (`Añadir cuenta de Claude Desktop`)
+};
+
+export const add_codex_account = /** @type {(inputs: Add_Codex_AccountInputs) => LocalizedString} */ () => {
+	return /** @type {LocalizedString} */ (`Añadir cuenta de Codex`)
+};
+
+export const add_one_to_track_usage = /** @type {(inputs: Add_One_To_Track_UsageInputs) => LocalizedString} */ () => {
+	return /** @type {LocalizedString} */ (`Añade una para empezar a seguir el uso.`)
 };
 
 export const alert_threshold = /** @type {(inputs: Alert_ThresholdInputs) => LocalizedString} */ () => {
@@ -315,6 +408,14 @@ export const alert_threshold_hint = /** @type {(inputs: Alert_Threshold_HintInpu
 
 export const alerts = /** @type {(inputs: AlertsInputs) => LocalizedString} */ () => {
 	return /** @type {LocalizedString} */ (`Alertas`)
+};
+
+export const all_providers = /** @type {(inputs: All_ProvidersInputs) => LocalizedString} */ () => {
+	return /** @type {LocalizedString} */ (`Todos los proveedores`)
+};
+
+export const all_providers_hint = /** @type {(inputs: All_Providers_HintInputs) => LocalizedString} */ () => {
+	return /** @type {LocalizedString} */ (`Activa un proveedor para consultarlo. Los cambios se guardan en config.toml.`)
 };
 
 export const always_show = /** @type {(inputs: Always_ShowInputs) => LocalizedString} */ () => {
@@ -341,8 +442,40 @@ export const antigravity_start_hint = /** @type {(inputs: Antigravity_Start_Hint
 	return /** @type {LocalizedString} */ (`Abre la app de Antigravity o una sesión de agy y vuelve a actualizar.`)
 };
 
+export const api_key_checking = /** @type {(inputs: Api_Key_CheckingInputs) => LocalizedString} */ (i) => {
+	return /** @type {LocalizedString} */ (`Verificando la clave con ${i?.provider}…`)
+};
+
+export const api_key_checking_short = /** @type {(inputs: Api_Key_Checking_ShortInputs) => LocalizedString} */ () => {
+	return /** @type {LocalizedString} */ (`Verificando…`)
+};
+
+export const api_key_dialog_title = /** @type {(inputs: Api_Key_Dialog_TitleInputs) => LocalizedString} */ (i) => {
+	return /** @type {LocalizedString} */ (`Clave de ${i?.provider}`)
+};
+
+export const api_key_no_answer = /** @type {(inputs: Api_Key_No_AnswerInputs) => LocalizedString} */ (i) => {
+	return /** @type {LocalizedString} */ (`${i?.provider} todavía no responde. Inténtalo de nuevo en un momento.`)
+};
+
+export const api_key_rejected = /** @type {(inputs: Api_Key_RejectedInputs) => LocalizedString} */ (i) => {
+	return /** @type {LocalizedString} */ (`${i?.provider} rechazó esta clave.`)
+};
+
+export const api_key_save = /** @type {(inputs: Api_Key_SaveInputs) => LocalizedString} */ () => {
+	return /** @type {LocalizedString} */ (`Guardar`)
+};
+
+export const api_key_stored_note = /** @type {(inputs: Api_Key_Stored_NoteInputs) => LocalizedString} */ () => {
+	return /** @type {LocalizedString} */ (`Guardada en config.toml, legible solo por ti.`)
+};
+
 export const api_keys = /** @type {(inputs: Api_KeysInputs) => LocalizedString} */ () => {
 	return /** @type {LocalizedString} */ (`Claves de API`)
+};
+
+export const app_icon = /** @type {(inputs: App_IconInputs) => LocalizedString} */ () => {
+	return /** @type {LocalizedString} */ (`Icono de la app`)
 };
 
 export const appearance = /** @type {(inputs: AppearanceInputs) => LocalizedString} */ () => {
@@ -457,6 +590,18 @@ export const connection_retry_hint = /** @type {(inputs: Connection_Retry_HintIn
 	return /** @type {LocalizedString} */ (`Revisa tu conexión y vuelve a actualizar.`)
 };
 
+export const copied_to_clipboard = /** @type {(inputs: Copied_To_ClipboardInputs) => LocalizedString} */ () => {
+	return /** @type {LocalizedString} */ (`Copiado al portapapeles`)
+};
+
+export const copy_as_image = /** @type {(inputs: Copy_As_ImageInputs) => LocalizedString} */ () => {
+	return /** @type {LocalizedString} */ (`Copiar como imagen`)
+};
+
+export const copy_image_failed = /** @type {(inputs: Copy_Image_FailedInputs) => LocalizedString} */ () => {
+	return /** @type {LocalizedString} */ (`No se pudo copiar la imagen`)
+};
+
 export const couldn_t_load_usage = /** @type {(inputs: Couldn_T_Load_UsageInputs) => LocalizedString} */ () => {
 	return /** @type {LocalizedString} */ (`No se pudo cargar el uso`)
 };
@@ -533,6 +678,10 @@ export const days_ago = /** @type {(inputs: Days_AgoInputs) => LocalizedString} 
 	return /** @type {LocalizedString} */ (`hace ${i?.days} d`)
 };
 
+export const default_account = /** @type {(inputs: Default_AccountInputs) => LocalizedString} */ () => {
+	return /** @type {LocalizedString} */ (`Predeterminada`)
+};
+
 export const detect_providers = /** @type {(inputs: Detect_ProvidersInputs) => LocalizedString} */ () => {
 	return /** @type {LocalizedString} */ (`Detectar proveedores`)
 };
@@ -603,6 +752,10 @@ export const global_shortcut_hint = /** @type {(inputs: Global_Shortcut_HintInpu
 
 export const goal_now = /** @type {(inputs: Goal_NowInputs) => LocalizedString} */ () => {
 	return /** @type {LocalizedString} */ (`Meta ahora`)
+};
+
+export const hide_key = /** @type {(inputs: Hide_KeyInputs) => LocalizedString} */ () => {
+	return /** @type {LocalizedString} */ (`Ocultar clave`)
 };
 
 export const hide_row = /** @type {(inputs: Hide_RowInputs) => LocalizedString} */ () => {
@@ -714,7 +867,7 @@ export const menu_bar_shows = /** @type {(inputs: Menu_Bar_ShowsInputs) => Local
 };
 
 export const menu_bar_shows_hint = /** @type {(inputs: Menu_Bar_Shows_HintInputs) => LocalizedString} */ () => {
-	return /** @type {LocalizedString} */ (`Gráfico y Logos muestran las métricas destacadas de todos los proveedores. Quattro muestra el mayor uso del proveedor seleccionado.`)
+	return /** @type {LocalizedString} */ (`Icono de la app muestra el medidor de la aplicación. Gráfico y Logos muestran las métricas destacadas de todos los proveedores. Quattro muestra el mayor uso del proveedor seleccionado.`)
 };
 
 export const metric_plural = /** @type {(inputs: Metric_PluralInputs) => LocalizedString} */ () => {
@@ -749,6 +902,10 @@ export const native = /** @type {(inputs: NativeInputs) => LocalizedString} */ (
 	return /** @type {LocalizedString} */ (`Nativo`)
 };
 
+export const needs_api_key_hint = /** @type {(inputs: Needs_Api_Key_HintInputs) => LocalizedString} */ () => {
+	return /** @type {LocalizedString} */ (`Necesita una clave de API: añádela con el botón de la llave.`)
+};
+
 export const new_update = /** @type {(inputs: New_UpdateInputs) => LocalizedString} */ () => {
 	return /** @type {LocalizedString} */ (`Una actualización`)
 };
@@ -777,6 +934,10 @@ export const no_api_key = /** @type {(inputs: No_Api_KeyInputs) => LocalizedStri
 	return /** @type {LocalizedString} */ (`Sin clave de API`)
 };
 
+export const no_details_given = /** @type {(inputs: No_Details_GivenInputs) => LocalizedString} */ () => {
+	return /** @type {LocalizedString} */ (`No se dieron detalles.`)
+};
+
 export const no_providers_detected = /** @type {(inputs: No_Providers_DetectedInputs) => LocalizedString} */ () => {
 	return /** @type {LocalizedString} */ (`No se detectaron proveedores`)
 };
@@ -803,6 +964,10 @@ export const none = /** @type {(inputs: NoneInputs) => LocalizedString} */ () =>
 
 export const not_checked_yet = /** @type {(inputs: Not_Checked_YetInputs) => LocalizedString} */ () => {
 	return /** @type {LocalizedString} */ (`Aún sin comprobar`)
+};
+
+export const not_signed_in = /** @type {(inputs: Not_Signed_InInputs) => LocalizedString} */ () => {
+	return /** @type {LocalizedString} */ (`Sin sesión iniciada`)
 };
 
 export const notifications = /** @type {(inputs: NotificationsInputs) => LocalizedString} */ () => {
@@ -849,20 +1014,8 @@ export const open_tui = /** @type {(inputs: Open_TuiInputs) => LocalizedString} 
 	return /** @type {LocalizedString} */ (`Abrir TUI`)
 };
 
-export const open_tui_for_details = /** @type {(inputs: Open_Tui_For_DetailsInputs) => LocalizedString} */ () => {
-	return /** @type {LocalizedString} */ (`Abre la TUI para ver los detalles.`)
-};
-
-export const open_tui_settings_to_add_one = /** @type {(inputs: Open_Tui_Settings_To_Add_OneInputs) => LocalizedString} */ () => {
-	return /** @type {LocalizedString} */ (`Abre TUI → Ajustes para agregar una.`)
-};
-
 export const open_tui_settings_to_sign_in = /** @type {(inputs: Open_Tui_Settings_To_Sign_InInputs) => LocalizedString} */ () => {
 	return /** @type {LocalizedString} */ (`Abre TUI → Ajustes para iniciar sesión.`)
-};
-
-export const open_tui_settings_to_turn_one_on = /** @type {(inputs: Open_Tui_Settings_To_Turn_One_OnInputs) => LocalizedString} */ () => {
-	return /** @type {LocalizedString} */ (`Abre TUI → Ajustes para activar uno.`)
 };
 
 export const options = /** @type {(inputs: OptionsInputs) => LocalizedString} */ () => {
@@ -921,8 +1074,36 @@ export const provider = /** @type {(inputs: ProviderInputs) => LocalizedString} 
 	return /** @type {LocalizedString} */ (`Proveedor`)
 };
 
+export const provider_add_key = /** @type {(inputs: Provider_Add_KeyInputs) => LocalizedString} */ () => {
+	return /** @type {LocalizedString} */ (`Añadir clave`)
+};
+
+export const provider_enable = /** @type {(inputs: Provider_EnableInputs) => LocalizedString} */ () => {
+	return /** @type {LocalizedString} */ (`Activar`)
+};
+
 export const provider_is_unavailable = /** @type {(inputs: Provider_Is_UnavailableInputs) => LocalizedString} */ () => {
 	return /** @type {LocalizedString} */ (`El proveedor no está disponible`)
+};
+
+export const provider_off = /** @type {(inputs: Provider_OffInputs) => LocalizedString} */ () => {
+	return /** @type {LocalizedString} */ (`Desactivado`)
+};
+
+export const provider_off_ready = /** @type {(inputs: Provider_Off_ReadyInputs) => LocalizedString} */ () => {
+	return /** @type {LocalizedString} */ (`Desactivado — credencial encontrada`)
+};
+
+export const provider_open_app = /** @type {(inputs: Provider_Open_AppInputs) => LocalizedString} */ () => {
+	return /** @type {LocalizedString} */ (`Abrir app`)
+};
+
+export const provider_ready = /** @type {(inputs: Provider_ReadyInputs) => LocalizedString} */ () => {
+	return /** @type {LocalizedString} */ (`Conectado`)
+};
+
+export const provider_sign_in = /** @type {(inputs: Provider_Sign_InInputs) => LocalizedString} */ () => {
+	return /** @type {LocalizedString} */ (`Iniciar sesión`)
 };
 
 export const providers = /** @type {(inputs: ProvidersInputs) => LocalizedString} */ () => {
@@ -975,6 +1156,14 @@ export const refresh_now = /** @type {(inputs: Refresh_NowInputs) => LocalizedSt
 
 export const refresh_to_detect_hint = /** @type {(inputs: Refresh_To_Detect_HintInputs) => LocalizedString} */ () => {
 	return /** @type {LocalizedString} */ (`Actualiza para revisar los proveedores instalados.`)
+};
+
+export const regenerates_at = /** @type {(inputs: Regenerates_AtInputs) => LocalizedString} */ (i) => {
+	return /** @type {LocalizedString} */ (`Regenera ${i?.amount} ${i?.exact}`)
+};
+
+export const regenerates_in = /** @type {(inputs: Regenerates_InInputs) => LocalizedString} */ (i) => {
+	return /** @type {LocalizedString} */ (`Regenera ${i?.amount} en ${i?.duration}`)
 };
 
 export const release_notes = /** @type {(inputs: Release_NotesInputs) => LocalizedString} */ () => {
@@ -1053,6 +1242,10 @@ export const show_expiry_dates = /** @type {(inputs: Show_Expiry_DatesInputs) =>
 	return /** @type {LocalizedString} */ (`mostrar fechas de vencimiento`)
 };
 
+export const show_key = /** @type {(inputs: Show_KeyInputs) => LocalizedString} */ () => {
+	return /** @type {LocalizedString} */ (`Mostrar clave`)
+};
+
 export const show_less = /** @type {(inputs: Show_LessInputs) => LocalizedString} */ () => {
 	return /** @type {LocalizedString} */ (`Mostrar menos`)
 };
@@ -1073,8 +1266,96 @@ export const show_usage_as_hint = /** @type {(inputs: Show_Usage_As_HintInputs) 
 	return /** @type {LocalizedString} */ (`Usado llena la barra con lo consumido. Restante la llena con lo que queda.`)
 };
 
+export const sign_in_asking = /** @type {(inputs: Sign_In_AskingInputs) => LocalizedString} */ (i) => {
+	return /** @type {LocalizedString} */ (`Pidiendo un código de inicio de sesión a ${i?.issuer}…`)
+};
+
+export const sign_in_cli_missing = /** @type {(inputs: Sign_In_Cli_MissingInputs) => LocalizedString} */ (i) => {
+	return /** @type {LocalizedString} */ (`La herramienta de línea de comandos de ${i?.provider} no está instalada aquí. Instálala o inicia sesión desde la terminal.`)
+};
+
+export const sign_in_code_expired = /** @type {(inputs: Sign_In_Code_ExpiredInputs) => LocalizedString} */ () => {
+	return /** @type {LocalizedString} */ (`El código caducó antes de ser aprobado.`)
+};
+
+export const sign_in_copied = /** @type {(inputs: Sign_In_CopiedInputs) => LocalizedString} */ () => {
+	return /** @type {LocalizedString} */ (`Copiado`)
+};
+
+export const sign_in_copy = /** @type {(inputs: Sign_In_CopyInputs) => LocalizedString} */ () => {
+	return /** @type {LocalizedString} */ (`Copiar`)
+};
+
+export const sign_in_custom_path = /** @type {(inputs: Sign_In_Custom_PathInputs) => LocalizedString} */ (i) => {
+	return /** @type {LocalizedString} */ (`config.toml apunta ${i?.provider} a un archivo de inicio de sesión propio; inicia sesión desde la terminal.`)
+};
+
+export const sign_in_denied = /** @type {(inputs: Sign_In_DeniedInputs) => LocalizedString} */ () => {
+	return /** @type {LocalizedString} */ (`El inicio de sesión se rechazó en el navegador.`)
+};
+
+export const sign_in_device_off = /** @type {(inputs: Sign_In_Device_OffInputs) => LocalizedString} */ (i) => {
+	return /** @type {LocalizedString} */ (`El inicio de sesión con dispositivo está desactivado en esta cuenta. Actívalo en la configuración de seguridad de ${i?.account} o inicia sesión desde la terminal.`)
+};
+
+export const sign_in_dialog_title = /** @type {(inputs: Sign_In_Dialog_TitleInputs) => LocalizedString} */ (i) => {
+	return /** @type {LocalizedString} */ (`Iniciar sesión en ${i?.provider}`)
+};
+
+export const sign_in_done = /** @type {(inputs: Sign_In_DoneInputs) => LocalizedString} */ (i) => {
+	return /** @type {LocalizedString} */ (`Sesión iniciada en ${i?.provider}`)
+};
+
+export const sign_in_enter_code = /** @type {(inputs: Sign_In_Enter_CodeInputs) => LocalizedString} */ () => {
+	return /** @type {LocalizedString} */ (`Abre la página e introduce este código:`)
+};
+
 export const sign_in_expired = /** @type {(inputs: Sign_In_ExpiredInputs) => LocalizedString} */ () => {
 	return /** @type {LocalizedString} */ (`La sesión expiró`)
+};
+
+export const sign_in_expires_in = /** @type {(inputs: Sign_In_Expires_InInputs) => LocalizedString} */ (i) => {
+	return /** @type {LocalizedString} */ (`Caduca en ${i?.time}`)
+};
+
+export const sign_in_failed = /** @type {(inputs: Sign_In_FailedInputs) => LocalizedString} */ () => {
+	return /** @type {LocalizedString} */ (`No se pudo iniciar sesión.`)
+};
+
+export const sign_in_fetching = /** @type {(inputs: Sign_In_FetchingInputs) => LocalizedString} */ () => {
+	return /** @type {LocalizedString} */ (`Obteniendo tu uso…`)
+};
+
+export const sign_in_new_code = /** @type {(inputs: Sign_In_New_CodeInputs) => LocalizedString} */ () => {
+	return /** @type {LocalizedString} */ (`Obtener un código nuevo`)
+};
+
+export const sign_in_no_answer = /** @type {(inputs: Sign_In_No_AnswerInputs) => LocalizedString} */ () => {
+	return /** @type {LocalizedString} */ (`La bandeja no ha respondido. Cierra esto y vuelve a intentarlo.`)
+};
+
+export const sign_in_open_page = /** @type {(inputs: Sign_In_Open_PageInputs) => LocalizedString} */ () => {
+	return /** @type {LocalizedString} */ (`Abrir página`)
+};
+
+export const sign_in_to_track_usage = /** @type {(inputs: Sign_In_To_Track_UsageInputs) => LocalizedString} */ (i) => {
+	return /** @type {LocalizedString} */ (`Inicia sesión con tu cuenta de ${i?.account} para ver el uso.`)
+};
+
+export const sign_in_try_again = /** @type {(inputs: Sign_In_Try_AgainInputs) => LocalizedString} */ () => {
+	return /** @type {LocalizedString} */ (`Reintentar`)
+};
+
+export const sign_in_use_terminal = /** @type {(inputs: Sign_In_Use_TerminalInputs) => LocalizedString} */ () => {
+	return /** @type {LocalizedString} */ (`Usar la terminal`)
+};
+
+export const sign_in_waiting = /** @type {(inputs: Sign_In_WaitingInputs) => LocalizedString} */ () => {
+	return /** @type {LocalizedString} */ (`Esperando tu aprobación en el navegador…`)
+};
+
+export const sign_in_with_account = /** @type {(inputs: Sign_In_With_AccountInputs) => LocalizedString} */ (i) => {
+	return /** @type {LocalizedString} */ (`Con tu cuenta de ${i?.account}`)
 };
 
 export const source_code = /** @type {(inputs: Source_CodeInputs) => LocalizedString} */ () => {
@@ -1163,6 +1444,10 @@ export const try_refresh_in_a_minute = /** @type {(inputs: Try_Refresh_In_A_Minu
 
 export const turn_on_a_provider_in_customize = /** @type {(inputs: Turn_On_A_Provider_In_CustomizeInputs) => LocalizedString} */ () => {
 	return /** @type {LocalizedString} */ (`Activa un proveedor en Personalizar.`)
+};
+
+export const turn_one_on_in_customize = /** @type {(inputs: Turn_One_On_In_CustomizeInputs) => LocalizedString} */ () => {
+	return /** @type {LocalizedString} */ (`Activa uno en Personalizar.`)
 };
 
 export const unstar = /** @type {(inputs: UnstarInputs) => LocalizedString} */ () => {

@@ -2,9 +2,11 @@ import QtQuick
 import QtQuick.Controls
 import Quickshell.Io
 import qs.Commons
+import qs.Commons as Commons
 import qs.Ui
 import "Model.js" as Model
 import "I18n.js" as I18n
+import "Priority.js" as Priority
 
 // Native Quattro settings form. Rust remains the sole config owner: this view
 // receives only non-secret key-presence metadata and sends changed keys over
@@ -12,9 +14,22 @@ import "I18n.js" as I18n
 Column {
   id: root
 
-  property color foreground: Color.foreground
-  property color urgent: Color.urgent
+  property color foreground: Commons.Color.foreground
+  property color urgent: Commons.Color.urgent
   property string fontFamily: Style.font.family
+  property int recentHours: 3
+  signal recentHoursRequested(int hours)
+  property bool showPriorities: false
+  property bool showPriorityShortcut: false
+  signal showPrioritiesRequested(bool enabled)
+  signal showPriorityShortcutRequested(bool enabled)
+  signal openPrioritiesRequested()
+  property bool priorityAlert: true
+  property int alertUnusedPercent: 50
+  property int alertHours: 24
+  signal priorityAlertRequested(bool enabled)
+  signal alertUnusedPercentRequested(int value)
+  signal alertHoursRequested(int value)
   property bool showValue: true
   property bool showProvider: false
   property bool showAll: false
@@ -24,9 +39,15 @@ Column {
   property string barWindow: "auto"
   property string showAs: "used"
   property bool brandIcons: true
+  property bool tabNames: false
+  signal tabNamesRequested(bool enabled)
+  // The executable for `settings show`/`settings apply` (Panel.reportBinary).
+  property string binaryPath: "ai-usagebar"
+  property var barProviderChoices: []
   property var metricEntries: []
   property string openMetricEntry: ""
   property string openSection: "display"
+  property bool fetchingOpen: false
   property int keyPendingCount: 0
   readonly property color dim: Qt.darker(foreground, 1.45)
 
@@ -63,6 +84,7 @@ Column {
   signal barWindowRequested(string value)
   signal showAsRequested(string value)
   signal brandIconsRequested(bool enabled)
+  signal barProviderToggleRequested(string entryId)
   signal metricToggleRequested(string entryId, string key)
   signal closeRequested()
 
@@ -249,7 +271,7 @@ Column {
   Process {
     id: stateProcess
     running: false
-    command: ["ai-usagebar", "settings", "show"]
+    command: [root.binaryPath, "settings", "show"]
 
     stdout: StdioCollector {
       waitForEnd: true
@@ -268,7 +290,7 @@ Column {
   Process {
     id: applyProcess
     running: false
-    command: ["ai-usagebar", "settings", "apply"]
+    command: [root.binaryPath, "settings", "apply"]
     stdinEnabled: true
 
     onStarted: {
@@ -346,6 +368,16 @@ Column {
       }
       Toggle {
         width: parent.width
+        label: root.tr("toggle.tab_names")
+        description: root.tr("toggle.tab_names_desc")
+        checked: root.tabNames || !root.brandIcons
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        enabled: root.brandIcons && !root.saving
+        onClicked: root.tabNamesRequested(!root.tabNames)
+      }
+      Toggle {
+        width: parent.width
         label: root.tr("toggle.show_provider")
         description: root.tr("toggle.show_provider_desc")
         checked: root.showProvider
@@ -373,6 +405,108 @@ Column {
         fontFamily: root.fontFamily
         enabled: !root.saving
         onClicked: root.showAllRequested(!root.showAll)
+      }
+    }
+  }
+
+  Column {
+    visible: !root.loading
+    width: parent.width
+    spacing: Style.space(8)
+    Disclosure {
+      text: root.tr("priority.section")
+      badge: root.tr("priority.hours", { hours: root.recentHours })
+      expanded: root.openSection === "priorities"
+      onToggled: root.toggleSection("priorities")
+    }
+    Column {
+      visible: root.openSection === "priorities"
+      width: parent.width
+      spacing: Style.space(8)
+      Toggle {
+        width: parent.width
+        label: root.tr("priority.enable")
+        description: root.tr("priority.enable_desc")
+        checked: root.showPriorities
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        enabled: !root.saving
+        onClicked: root.showPrioritiesRequested(!root.showPriorities)
+      }
+      Toggle {
+        width: parent.width
+        label: root.tr("priority.shortcut")
+        description: root.tr("priority.shortcut_desc")
+        checked: root.showPriorityShortcut
+        enabled: root.showPriorities && !root.saving
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        onClicked: root.showPriorityShortcutRequested(!root.showPriorityShortcut)
+      }
+      Dropdown {
+        width: parent.width
+        label: root.tr("priority.recent_label")
+        value: String(root.recentHours)
+        options: {
+          var hours = []
+          for (var h = 1; h <= 24; h++) hours.push({ value: String(h), label: root.tr("priority.hours", {hours: h}) })
+          return hours
+        }
+        enabled: root.showPriorities && !root.saving
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        onChanged: function(value) { root.recentHoursRequested(Priority.normalizeHours(value)) }
+      }
+      Text {
+        width: parent.width
+        text: root.tr("priority.recent_help")
+        textFormat: Text.PlainText
+        wrapMode: Text.WordWrap
+        color: root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+      }
+      Toggle {
+        width: parent.width
+        label: root.tr("priority.alert")
+        description: root.tr("priority.alert_desc", { unused: root.alertUnusedPercent, hours: root.alertHours })
+        checked: root.priorityAlert
+        enabled: root.showPriorities && !root.saving
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        onClicked: root.priorityAlertRequested(!root.priorityAlert)
+      }
+      Dropdown {
+        width: parent.width
+        label: root.tr("priority.alert_unused_label")
+        value: String(root.alertUnusedPercent)
+        options: Priority.choices([10, 20, 25, 30, 40, 50, 60, 70, 75, 80, 90], root.alertUnusedPercent,
+          function(v) { return root.tr("priority.percent", { value: v }) })
+        enabled: root.showPriorities && !root.saving
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        onChanged: function(value) { root.alertUnusedPercentRequested(Priority.normalizeAlertPercent(value)) }
+      }
+      Dropdown {
+        width: parent.width
+        label: root.tr("priority.alert_hours_label")
+        value: String(root.alertHours)
+        options: Priority.choices([6, 12, 24, 36, 48, 72, 96, 120], root.alertHours,
+          function(v) { return root.tr("priority.hours", { hours: v }) })
+        enabled: root.showPriorities && !root.saving
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        onChanged: function(value) { root.alertHoursRequested(Priority.normalizeAlertHours(value)) }
+      }
+      Button {
+        text: root.tr("priority.open")
+        enabled: root.showPriorities && !root.saving
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        fontSize: Style.font.bodySmall
+        bordered: true
+        focusable: true
+        onClicked: root.openPrioritiesRequested()
       }
     }
   }
@@ -665,13 +799,13 @@ Column {
   }
 
   Column {
-    visible: !root.loading && root.snapshot.vendors.length > 0
+    visible: !root.loading && (root.snapshot.vendors.length > 0 || root.barProviderChoices.length > 0)
     width: parent.width
     spacing: Style.space(8)
 
     Disclosure {
       text: root.tr("section.providers")
-      badge: root.vendorSummary()
+      badge: Model.providerDisplaySummary(root.barProviderChoices)
       expanded: root.openSection === "providers"
       onToggled: root.toggleSection("providers")
     }
@@ -680,9 +814,14 @@ Column {
       width: parent.width
       spacing: Style.space(8)
 
+      PanelSectionHeader {
+        text: root.tr("providers.bar_title")
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+      }
       Text {
         width: parent.width
-        text: root.tr("providers.help")
+        text: root.tr("providers.bar_help")
         textFormat: Text.PlainText
         color: root.dim
         font.family: root.fontFamily
@@ -690,25 +829,58 @@ Column {
         wrapMode: Text.WordWrap
       }
       Repeater {
-        model: root.snapshot.vendors
-
+        model: root.barProviderChoices
         Toggle {
           required property var modelData
           width: parent.width
-          label: root.safe(modelData.label)
-          description: {
-            var pending = root.vendorOverrides[modelData.id]
-            var effective = pending === true || pending === false ? pending : modelData.enabled
-            return effective ? root.tr("status.vendor_on") : root.tr("status.vendor_off")
-          }
-          checked: {
-            var pending = root.vendorOverrides[modelData.id]
-            return pending === true || pending === false ? pending : modelData.enabled
-          }
+          label: root.safe(modelData.name)
+          description: modelData.checked ? root.tr("providers.shown") : root.tr("providers.hidden")
+          checked: modelData.checked
           foreground: root.foreground
           fontFamily: root.fontFamily
-          enabled: !root.saving
-          onClicked: root.setVendorOverride(modelData.id, !checked)
+          onClicked: root.barProviderToggleRequested(modelData.id)
+        }
+      }
+      Disclosure {
+        text: root.tr("providers.fetch_title")
+        badge: root.vendorSummary()
+        expanded: root.fetchingOpen
+        onToggled: root.fetchingOpen = !root.fetchingOpen
+      }
+      Column {
+        width: parent.width
+        visible: root.fetchingOpen
+        spacing: Style.space(8)
+        Text {
+          width: parent.width
+          text: root.tr("providers.help")
+          textFormat: Text.PlainText
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          wrapMode: Text.WordWrap
+        }
+        Repeater {
+          model: root.snapshot.vendors
+
+          Toggle {
+            required property var modelData
+            width: parent.width
+            label: root.safe(modelData.label)
+            description: {
+              var pending = root.vendorOverrides[modelData.id]
+              var effective = pending === true || pending === false ? pending : modelData.enabled
+              return effective ? root.tr("status.vendor_on") : root.tr("status.vendor_off")
+            }
+            checked: {
+              var pending = root.vendorOverrides[modelData.id]
+              return pending === true || pending === false ? pending : modelData.enabled
+            }
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            enabled: !root.saving
+            onClicked: root.setVendorOverride(modelData.id, !checked)
+          }
         }
       }
     }

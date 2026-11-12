@@ -15,7 +15,7 @@ use serde_json::Value;
 use crate::config::{CustomMetricSpec, CustomProviderConfig, CustomTextSpec};
 use crate::display::sanitize_untrusted_line;
 use crate::error::{AppError, Result};
-use crate::format::clamp_pct;
+use crate::format::{clamp_pct, money};
 
 use super::types::{CustomMetric, CustomSnapshot, CustomText};
 
@@ -63,10 +63,13 @@ fn project_metric(body: &Value, id: &str, spec: &CustomMetricSpec) -> Result<Cus
                     "custom {id}: {limit_ptr} must be greater than zero"
                 )));
             }
-            (
-                clamp_pct(used / limit * 100.0),
-                format!("{} of {}", format_number(used), format_number(limit)),
-            )
+            let footnote = match spec.currency.as_deref() {
+                Some(currency) => {
+                    format!("{} of {}", money(used, currency), money(limit, currency))
+                }
+                None => format!("{} of {}", format_number(used), format_number(limit)),
+            };
+            (clamp_pct(used / limit * 100.0), footnote)
         }
         // `Config::validate` already rejects this shape; the arm is here so
         // a spec built in code cannot reach a bar with a percentage of nothing.
@@ -91,18 +94,24 @@ fn project_metric(body: &Value, id: &str, spec: &CustomMetricSpec) -> Result<Cus
 }
 
 fn project_text(body: &Value, id: &str, spec: &CustomTextSpec) -> Result<CustomText> {
-    let value = match lookup(body, id, &spec.value)? {
-        Value::String(s) => clean(s),
-        Value::Number(n) => format_json_number(n, id, &spec.value)?,
-        Value::Bool(b) => b.to_string(),
-        other => {
-            return Err(wrong_type(
-                id,
-                &spec.value,
-                "a string, number, or boolean",
-                other,
-            ));
+    let value = match spec.currency.as_deref() {
+        Some(currency) => {
+            let amount = read_number(body, id, &spec.value)?;
+            money(amount, currency)
         }
+        None => match lookup(body, id, &spec.value)? {
+            Value::String(s) => clean(s),
+            Value::Number(n) => format_json_number(n, id, &spec.value)?,
+            Value::Bool(b) => b.to_string(),
+            other => {
+                return Err(wrong_type(
+                    id,
+                    &spec.value,
+                    "a string, number, or boolean",
+                    other,
+                ));
+            }
+        },
     };
     Ok(CustomText {
         label: clean(&spec.label),
@@ -258,6 +267,14 @@ mod tests {
         }
     }
 
+    fn text(label: &str, value: &str) -> CustomTextSpec {
+        CustomTextSpec {
+            label: label.into(),
+            value: value.into(),
+            ..CustomTextSpec::default()
+        }
+    }
+
     fn spec(metrics: Vec<CustomMetricSpec>, texts: Vec<CustomTextSpec>) -> CustomProviderConfig {
         CustomProviderConfig {
             id: "mytool".into(),
@@ -336,6 +353,23 @@ mod tests {
     }
 
     #[test]
+    fn footnote_formats_as_money_when_currency_is_set() {
+        let mut metric_spec = metric("Spend", "/used", "/limit");
+        metric_spec.currency = Some("USD".into());
+        let provider_spec = spec(vec![metric_spec], vec![]);
+        let m = only_metric(&provider_spec, &json!({"used": 0.17, "limit": 25.0}));
+        assert_eq!(m.pct, 1);
+        assert_eq!(m.footnote, "$0.17 of $25.00");
+
+        let mut eur_metric = metric("Spend", "/used", "/limit");
+        eur_metric.currency = Some("EUR".into());
+        let provider_spec_eur = spec(vec![eur_metric], vec![]);
+        let m = only_metric(&provider_spec_eur, &json!({"used": 1.5, "limit": 10}));
+        assert_eq!(m.pct, 15);
+        assert_eq!(m.footnote, "€1.50 of €10.00");
+    }
+
+    #[test]
     fn resets_at_accepts_rfc3339_and_epoch_seconds_and_milliseconds() {
         let spec = spec(
             vec![CustomMetricSpec {
@@ -409,26 +443,11 @@ mod tests {
     #[test]
     fn text_values_render_strings_numbers_and_booleans() {
         let texts = vec![
-            CustomTextSpec {
-                label: "Tier".into(),
-                value: "/tier".into(),
-            },
-            CustomTextSpec {
-                label: "Seats".into(),
-                value: "/seats".into(),
-            },
-            CustomTextSpec {
-                label: "Spend".into(),
-                value: "/spend".into(),
-            },
-            CustomTextSpec {
-                label: "Active".into(),
-                value: "/active".into(),
-            },
-            CustomTextSpec {
-                label: "Account".into(),
-                value: "/account".into(),
-            },
+            text("Tier", "/tier"),
+            text("Seats", "/seats"),
+            text("Spend", "/spend"),
+            text("Active", "/active"),
+            text("Account", "/account"),
         ];
         let spec = spec(vec![], texts);
         let body = json!({
@@ -445,14 +464,46 @@ mod tests {
     }
 
     #[test]
-    fn a_null_or_missing_text_value_is_a_schema_error() {
-        let spec = spec(
-            vec![],
-            vec![CustomTextSpec {
-                label: "Tier".into(),
-                value: "/tier".into(),
-            }],
+    fn text_values_format_as_money_when_currency_is_set() {
+        let texts = vec![
+            CustomTextSpec {
+                label: "Spend".into(),
+                value: "/spend".into(),
+                currency: Some("USD".into()),
+            },
+            CustomTextSpec {
+                label: "Cost String".into(),
+                value: "/cost_str".into(),
+                currency: Some("EUR".into()),
+            },
+            text("Plain", "/plain"),
+        ];
+        let provider_spec = spec(vec![], texts);
+        let body = json!({
+            "spend": 12.5,
+            "cost_str": "3.45",
+            "plain": 12.5,
+        });
+        let snap = project(&body, &provider_spec).unwrap();
+        let values: Vec<&str> = snap.texts.iter().map(|t| t.value.as_str()).collect();
+        assert_eq!(values, ["$12.50", "€3.45", "12.5"]);
+
+        let bad_body = json!({
+            "spend": "not-a-number",
+            "cost_str": "3.45",
+            "plain": 12.5,
+        });
+        let err = project(&bad_body, &provider_spec).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("/spend is a string that does not hold a number"),
+            "{err}"
         );
+    }
+
+    #[test]
+    fn a_null_or_missing_text_value_is_a_schema_error() {
+        let spec = spec(vec![], vec![text("Tier", "/tier")]);
         let err = project(&json!({"tier": null}), &spec).unwrap_err();
         assert!(err.to_string().contains("/tier is null"), "{err}");
         let err = project(&json!({}), &spec).unwrap_err();
@@ -461,13 +512,7 @@ mod tests {
 
     #[test]
     fn text_values_are_sanitized_and_capped() {
-        let spec = spec(
-            vec![],
-            vec![CustomTextSpec {
-                label: "Tier".into(),
-                value: "/tier".into(),
-            }],
-        );
+        let spec = spec(vec![], vec![text("Tier", "/tier")]);
         let snap = project(&json!({"tier": "\u{1b}[31mred\u{7}\nline"}), &spec).unwrap();
         assert_eq!(snap.texts[0].value, "[31mred line");
 
@@ -518,10 +563,7 @@ mod tests {
                 resets_at: Some("/reset".into()),
                 ..metric("Requests", "/used", "/limit")
             }],
-            vec![CustomTextSpec {
-                label: "Tier".into(),
-                value: "/tier".into(),
-            }],
+            vec![text("Tier", "/tier")],
         );
         let body = json!({"used": 1, "limit": 4, "reset": 1_767_225_600, "tier": "Pro"});
         let snap = project(&body, &spec).unwrap();

@@ -30,7 +30,7 @@ pub fn open(raw: &str) {
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = std::process::Command::new("open").arg(url).spawn();
+        let _ = std::process::Command::new("/usr/bin/open").arg(url).spawn();
     }
 }
 

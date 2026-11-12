@@ -91,7 +91,7 @@ pub struct Window {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CreditsBlock {
-    #[serde(default, deserialize_with = "de_opt_money_string")]
+    #[serde(default, deserialize_with = "de_opt_credit_balance")]
     pub balance: Option<String>,
     pub has_credits: bool,
     pub unlimited: bool,
@@ -217,12 +217,14 @@ where
     }
 }
 
-/// Accept either a string ("$0.00") or a finite number (0.0) — codexbar
-/// treats both. A string that is only a number ("0", observed 2026-09-09 on a
-/// Pro account with no extra-usage credits) is formatted like the number, so
-/// a balance always reads as dollars. Null and an omitted field mean that no
-/// balance was supplied.
-fn de_opt_money_string<'de, D>(d: D) -> Result<Option<String>, D::Error>
+/// Accept either a string or a finite number — codexbar treats both. The
+/// value is a count of Codex credits, not money, so it is kept as a bare
+/// number: whole counts without decimals ("62500"), fractional ones rounded
+/// to two places with the trailing zeros dropped ("12.5"). A string that is
+/// not a number ("$2.50", observed before this fix, when the count was
+/// rendered as dollars) passes through as sent. Null and an omitted field
+/// mean that no balance was supplied.
+fn de_opt_credit_balance<'de, D>(d: D) -> Result<Option<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -230,11 +232,11 @@ where
     match v {
         serde_json::Value::Null => Ok(None),
         serde_json::Value::String(s) => Ok(Some(match s.trim().parse::<f64>() {
-            Ok(value) if value.is_finite() => crate::format::usd(value),
+            Ok(value) if value.is_finite() => credit_count(value),
             _ => s,
         })),
         serde_json::Value::Number(n) => match n.as_f64() {
-            Some(value) if value.is_finite() => Ok(Some(crate::format::usd(value))),
+            Some(value) if value.is_finite() => Ok(Some(credit_count(value))),
             _ => Err(serde::de::Error::custom(
                 "credit balance is not a finite number",
             )),
@@ -243,6 +245,22 @@ where
             "expected credit balance string, number, or null; got {other:?}"
         ))),
     }
+}
+
+/// Render a credit count the way the user reads it. Credits are a count, not
+/// money, so there is no currency symbol and no forced two decimals: whole
+/// values stay bare ("62500", "-3"), fractional ones are rounded to two
+/// places with trailing zeros dropped ("12.5", "0.25", 1.239 -> "1.24"). A
+/// sub-half-cent negative rounds to zero, and the zero is not negative.
+fn credit_count(v: f64) -> String {
+    let mut s = format!("{v:.2}");
+    while s.ends_with('0') {
+        s.pop();
+    }
+    if s.ends_with('.') {
+        s.pop();
+    }
+    if s == "-0" { "0".to_string() } else { s }
 }
 
 /// OpenAI sends `null` for an empty collection rather than `[]`/`{}` (observed
@@ -282,21 +300,18 @@ impl UsageResponse {
             approx_local_messages: range_from_vec(c.approx_local_messages),
             approx_cloud_messages: range_from_vec(c.approx_cloud_messages),
         });
-        let reset_credits = self
-            .rate_limit_reset_credits
-            .map(|credits| ResetCredits {
-                available: credits.available_count,
-                credits: credits
-                    .credits
-                    .into_iter()
-                    .filter(|credit| credit.status == "available")
-                    .map(|credit| BankedReset {
-                        title: checked_reset_title(credit.title),
-                        expires_at: credit.expires_at,
-                    })
-                    .collect(),
-            })
-            .unwrap_or_default();
+        let reset_credits = self.rate_limit_reset_credits.map(|credits| ResetCredits {
+            available: credits.available_count,
+            credits: credits
+                .credits
+                .into_iter()
+                .filter(|credit| credit.status == "available")
+                .map(|credit| BankedReset {
+                    title: checked_reset_title(credit.title),
+                    expires_at: credit.expires_at,
+                })
+                .collect(),
+        });
 
         let additional_limits = self
             .additional_rate_limits
@@ -600,9 +615,9 @@ mod tests {
         let body = r#"{"plan_type":"plus","rate_limit_reset_credits":{"available_count":2}}"#;
         let s: UsageResponse = serde_json::from_str(body).unwrap();
         let s = s.into_snapshot(None).unwrap();
-        assert_eq!(s.reset_credits.available, 2);
-        assert!(s.reset_credits.credits.is_empty());
-        assert!(!s.reset_credits.is_empty());
+        assert_eq!(s.reset_credits.as_ref().unwrap().available, 2);
+        assert!(s.reset_credits.as_ref().unwrap().credits.is_empty());
+        assert!(!s.reset_credits.as_ref().unwrap().is_empty());
     }
 
     /// A redeemed credit still appears in the detail list. Its expiry is not a
@@ -621,37 +636,67 @@ mod tests {
         }"#;
         let s: UsageResponse = serde_json::from_str(body).unwrap();
         let s = s.into_snapshot(None).unwrap();
-        assert_eq!(s.reset_credits.available, 1);
-        assert_eq!(s.reset_credits.credits.len(), 2);
+        assert_eq!(s.reset_credits.as_ref().unwrap().available, 1);
+        assert_eq!(s.reset_credits.as_ref().unwrap().credits.len(), 2);
         assert_eq!(
-            s.reset_credits.credits[0].title.as_deref(),
+            s.reset_credits.as_ref().unwrap().credits[0]
+                .title
+                .as_deref(),
             Some("Full reset (Weekly + 5 hr)")
         );
         assert_eq!(
-            s.reset_credits.next_expiry(),
+            s.reset_credits.as_ref().unwrap().next_expiry(),
             Some("2026-07-17T00:00:00Z".parse::<DateTime<Utc>>().unwrap())
         );
     }
 
-    /// Every other vendor's absent block means "none". This one is load-bearing
-    /// in the same way: a response from an account with no banked resets, or
-    /// from a Codex build that predates them, reports none rather than failing.
+    /// A response from a Codex build that predates banked resets omits the
+    /// block. That reports nothing rather than failing, and stays distinct
+    /// from a stated zero (below).
     #[test]
     fn an_absent_reset_block_is_no_credits_rather_than_an_error() {
         let s: UsageResponse = serde_json::from_str(r#"{"plan_type":"plus"}"#).unwrap();
-        assert!(s.into_snapshot(None).unwrap().reset_credits.is_empty());
+        assert!(s.into_snapshot(None).unwrap().reset_credits.is_none());
+    }
+
+    /// An account with no banked resets states `available_count: 0`. That is
+    /// an answer, not missing data, so it survives as an empty block that the
+    /// report renders as "None available".
+    #[test]
+    fn a_stated_zero_reset_block_stays_distinct_from_an_absent_one() {
+        let s: UsageResponse = serde_json::from_str(
+            r#"{"plan_type":"pro","rate_limit_reset_credits":{"available_count":0,"credits":[]}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            s.into_snapshot(None).unwrap().reset_credits,
+            Some(ResetCredits::default())
+        );
+    }
+
+    /// Credits are a count, not money: no currency symbol, no forced decimals.
+    /// Whole counts stay bare, fractional ones keep at most two places with the
+    /// trailing zeros dropped, and the sign survives.
+    #[test]
+    fn credit_balance_reads_as_a_count_not_dollars() {
+        let balance_of = |raw: &str| {
+            let body = format!(
+                r#"{{"credits":{{"balance":{raw},"has_credits":false,"unlimited":false}}}}"#
+            );
+            let r: UsageResponse = serde_json::from_str(&body).unwrap();
+            r.into_snapshot(None).unwrap().credits.unwrap().balance
+        };
+        assert_eq!(balance_of(r#""62500""#), "62500");
+        assert_eq!(balance_of("62500"), "62500");
+        assert_eq!(balance_of(r#""62500.0""#), "62500");
+        assert_eq!(balance_of("12.5"), "12.5");
+        assert_eq!(balance_of(r#""0.25""#), "0.25");
+        assert_eq!(balance_of("1.239"), "1.24");
+        assert_eq!(balance_of("-3"), "-3");
     }
 
     #[test]
-    fn balance_as_number_formats_to_dollars() {
-        let body = r#"{"credits":{"balance":1.5,"has_credits":true,"unlimited":false}}"#;
-        let r: UsageResponse = serde_json::from_str(body).unwrap();
-        let s = r.into_snapshot(None).unwrap();
-        assert_eq!(s.credits.unwrap().balance, "$1.50");
-    }
-
-    #[test]
-    fn balance_as_numeric_string_formats_to_dollars_too() {
+    fn balance_as_numeric_string_is_a_bare_count_too() {
         let balance = |raw: &str| {
             let body = format!(
                 r#"{{"credits":{{"balance":"{raw}","has_credits":false,"unlimited":false}}}}"#
@@ -659,11 +704,11 @@ mod tests {
             let r: UsageResponse = serde_json::from_str(&body).unwrap();
             r.into_snapshot(None).unwrap().credits.unwrap().balance
         };
-        for (raw, want) in [("0", "$0.00"), (" 2.5 ", "$2.50"), ("-1", "-$1.00")] {
+        for (raw, want) in [("0", "0"), (" 2.5 ", "2.5"), ("-1", "-1")] {
             assert_eq!(balance(raw), want, "balance {raw:?}");
         }
-        // Anything the vendor already formatted, or that is not a finite number, passes through
-        // untouched, so a cached "$2.50" reads back the same.
+        // Anything that is not a finite number passes through untouched, so a
+        // cached "$2.50" (what an older build wrote) reads back the same.
         for raw in ["$2.50", "NaN", "inf", "1,000.50", "n/a"] {
             assert_eq!(balance(raw), raw, "balance {raw:?}");
         }
@@ -1042,7 +1087,7 @@ mod tests {
         assert_eq!(snap.weekly.as_ref().unwrap().utilization_pct, 64);
         assert!(snap.additional_limits.is_empty());
         assert!(snap.unavailable_models.is_empty());
-        assert_eq!(snap.reset_credits.available, 3);
-        assert!(snap.reset_credits.credits.is_empty());
+        assert_eq!(snap.reset_credits.as_ref().unwrap().available, 3);
+        assert!(snap.reset_credits.as_ref().unwrap().credits.is_empty());
     }
 }

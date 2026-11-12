@@ -957,7 +957,9 @@ mod tests {
             TEST_CLIENT_VERSION,
             &cache,
             &Endpoints { base: server.url() },
-            Duration::ZERO,
+            // A positive TTL, like production: a zero TTL is the wire-only
+            // read, and a wire read never serves the cached answer.
+            Duration::from_secs(60),
         )
         .await
         .unwrap();
@@ -1084,7 +1086,9 @@ mod tests {
             TEST_CLIENT_VERSION,
             &cache,
             &endpoints,
-            Duration::ZERO,
+            // A positive TTL, like production: a zero TTL is the wire-only
+            // read, and a wire read never serves the cached answer.
+            Duration::from_secs(60),
         )
         .await
         .unwrap();

@@ -21,8 +21,8 @@
 //! a double one, and nothing in this module may change a caller's return
 //! value or exit code.
 //!
-//! No burn-rate extrapolation anywhere: reset times in bodies are only the
-//! vendor-reported absolute instants.
+//! No burn-rate extrapolation anywhere: reset or refill times in bodies are
+//! only the vendor-reported absolute instants.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -63,6 +63,16 @@ const LOCK_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 const SPAWN_KILL_AFTER: Duration = Duration::from_secs(5);
 
+/// Timeout a critical toast asks `notify-send` for, in milliseconds.
+///
+/// Omarchy's notification plugin treats critical urgency as immortal and
+/// ignores the sender's timeout, so a 100% toast stays until it is dismissed.
+/// [omacom/omarchy#12964](https://github.com/omacom/omarchy/pull/12964)
+/// honours a positive timeout instead, capped at 30s, while a critical toast
+/// sent without one still stays — hence asking for the cap.
+#[cfg(target_os = "linux")]
+const CRITICAL_TIMEOUT_MS: &str = "30000";
+
 /// Urgency band for one notification. `notify-send`'s `-u` maps directly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Urgency {
@@ -99,9 +109,12 @@ pub struct MetricRow {
     /// is the window half of the dedupe key.
     pub window: String,
     pub percent: u16,
-    /// Vendor-reported absolute reset instant. `None` when the vendor does
-    /// not state one — then the body carries no ETA, by rule.
+    /// Vendor-reported absolute reset or refill instant. `None` when the
+    /// vendor does not state one — then the body carries no ETA, by rule.
     pub reset_at: Option<DateTime<Utc>>,
+    /// Amount restored at the reported instant for a partially refilling
+    /// window, rather than a full reset (for example, `"2%"`).
+    pub regen: Option<String>,
 }
 
 /// One banked reset credit with a known expiry (Codex/SuperGrok
@@ -134,7 +147,9 @@ pub struct RefreshInput {
 /// - Fire when `percent >= threshold` and the key is not marked notified.
 ///   Band: `>= 100` is [`Urgency::Critical`], otherwise [`Urgency::Normal`].
 /// - A key re-arms when usage drops below `threshold - 7`, or when the
-///   window's `reset_at` moves to a later instant (a new window). The same
+///   window's `reset_at` moves to a later instant (a new window). A
+///   refilling window (one with `regen`) re-arms only on the drop: each
+///   refill tick moves its instant without opening a new window. The same
 ///   crossing therefore never fires twice.
 /// - A credit expiring within 48h (and not yet expired) fires once per
 ///   expiry instant, at [`Urgency::Normal`].
@@ -144,6 +159,7 @@ pub fn decide(
     state: &mut NotifyState,
     now: DateTime<Utc>,
 ) -> Vec<Notification> {
+    migrate_anthropic_api_spend_key(input, state);
     let mut fired = Vec::new();
     let threshold = threshold as i32;
     let rearm_below = threshold - HYSTERESIS_PCT;
@@ -153,6 +169,9 @@ pub fn decide(
         if pct >= threshold {
             let armed = match state.entries.get(&key) {
                 None => true,
+                // A refill tick returns part of the same budget instead of
+                // opening a new window: only the hysteresis band re-arms it.
+                Some(_) if row.regen.is_some() => false,
                 Some(record) => reset_moved_later(row.reset_at, record.reset_at_snapshot),
             };
             if armed {
@@ -198,6 +217,47 @@ pub fn decide(
     fired
 }
 
+/// Version 1.41.0 used the last covered day as Anthropic API's spend-window
+/// identity. Collapse those daily keys into the stable row before deciding so
+/// an upgrade neither repeats a notification nor leaves unbounded stale state.
+fn migrate_anthropic_api_spend_key(input: &RefreshInput, state: &mut NotifyState) {
+    if input.entry_id != "anthropic_api" && !input.entry_id.starts_with("anthropic_api@") {
+        return;
+    }
+    let prefix = format!("{}::", input.entry_id);
+    let stable = format!("{prefix}Spend (mo)");
+    let legacy: Vec<String> = state
+        .entries
+        .keys()
+        .filter(|key| {
+            let Some(label) = key.strip_prefix(&prefix) else {
+                return false;
+            };
+            label == "Completed daily buckets this month"
+                || (label.starts_with("Month to date (through ") && label.ends_with(')'))
+        })
+        .cloned()
+        .collect();
+    if legacy.is_empty() {
+        return;
+    }
+    // An already-stable record is authoritative. Otherwise keep the newest
+    // daily record, since it represents the most recent delivered crossing.
+    let mut chosen = state.entries.get(&stable).cloned();
+    if chosen.is_none() {
+        chosen = legacy
+            .iter()
+            .filter_map(|key| state.entries.get(key).cloned())
+            .max_by_key(|record| record.notified_at);
+    }
+    for key in legacy {
+        state.entries.remove(&key);
+    }
+    if let Some(record) = chosen {
+        state.entries.insert(stable, record);
+    }
+}
+
 /// `true` when `current` is a later reset than `snapshot` — a `None → Some`
 /// change counts (the vendor started reporting a reset), `Some → None` and
 /// backwards moves do not, and so do not moves within
@@ -224,9 +284,14 @@ fn threshold_notification(
     let title = sanitize_untrusted_line(&format!("{} — {} at {}%", who, row.window, row.percent));
     let mut body = format!("{}% of the {} used", row.percent, row.window);
     if let Some(reset_at) = row.reset_at {
+        let remaining = countdown::format(Some(reset_at), now);
+        let action = match &row.regen {
+            Some(amount) if remaining == "now" => format!("regenerates {amount}"),
+            Some(amount) => format!("regenerates {amount} in"),
+            None => "resets".into(),
+        };
         body.push_str(&format!(
-            " · resets {} ({})",
-            countdown::format(Some(reset_at), now),
+            " · {action} {remaining} ({})",
             format::local_time_hm(reset_at)
         ));
     }
@@ -248,9 +313,13 @@ fn credit_notification(
     now: DateTime<Utc>,
 ) -> Notification {
     let label = credit.title.as_deref().unwrap_or("Reset credit");
+    let who = match &input.account {
+        Some(account) => format!("{} · {}", input.vendor, account),
+        None => input.vendor.clone(),
+    };
     let title = sanitize_untrusted_line(&format!(
         "{} — reset credit expires {}",
-        input.vendor,
+        who,
         format::local_date_hm(credit.expires_at)
     ));
     let body = sanitize_untrusted_line(&format!(
@@ -377,20 +446,35 @@ impl NotifySendSink {
             program: program.into(),
         }
     }
+
+    /// `notify-send` arguments for one notification, program name aside.
+    ///
+    /// The title and body come last: `notify-send` reads the trailing
+    /// positionals as those two, so every switch has to precede them.
+    fn argv(&self, notification: &Notification) -> Vec<String> {
+        let mut args = vec![
+            "-a".to_string(),
+            "ai-usagebar".to_string(),
+            "-c".to_string(),
+            "quota".to_string(),
+            "-u".to_string(),
+            notification.urgency.as_arg().to_string(),
+        ];
+        if notification.urgency == Urgency::Critical {
+            args.push("-t".to_string());
+            args.push(CRITICAL_TIMEOUT_MS.to_string());
+        }
+        args.push(notification.title.clone());
+        args.push(notification.body.clone());
+        args
+    }
 }
 
 #[cfg(target_os = "linux")]
 impl NotifySink for NotifySendSink {
     fn deliver(&mut self, notification: &Notification) {
         let spawned = std::process::Command::new(&self.program)
-            .arg("-a")
-            .arg("ai-usagebar")
-            .arg("-c")
-            .arg("quota")
-            .arg("-u")
-            .arg(notification.urgency.as_arg())
-            .arg(&notification.title)
-            .arg(&notification.body)
+            .args(self.argv(notification))
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -611,6 +695,7 @@ fn metric_rows(
                     window,
                     percent: pct,
                     reset_at: projected.reset_at,
+                    regen: projected.regen,
                 });
             }
             Section::Spacer => {}
@@ -635,6 +720,7 @@ mod tests {
             window: window.to_string(),
             percent,
             reset_at,
+            regen: None,
         }
     }
 
@@ -821,6 +907,36 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_refill_tick_is_not_a_new_window() {
+        // Synthetic's weekly budget refills about 2% every 202 minutes. Each
+        // tick moves the reported instant past the tolerance without opening
+        // a new window, so a budget held at its cap must not notify per tick.
+        let mut state = NotifyState::default();
+        let now = at(23, 12, 0);
+        let tick = chrono::Duration::minutes(202);
+        let refilling = |percent: u16, reset_at: DateTime<Utc>| {
+            let mut metric = row("Weekly credits", percent, Some(reset_at));
+            metric.regen = Some("2%".into());
+            input(vec![metric])
+        };
+        let next = at(23, 15, 22);
+
+        let exhausted = refilling(100, next);
+        assert_eq!(decide(&exhausted, 97, &mut state, now).len(), 1);
+        // The tick restored 2% and moved the instant 202 minutes later.
+        let refilled = refilling(98, next + tick);
+        assert_eq!(decide(&refilled, 97, &mut state, now).len(), 0);
+        let hovering = refilling(97, next + tick * 2);
+        assert_eq!(decide(&hovering, 97, &mut state, now).len(), 0);
+
+        // Below the band it re-arms like any other window.
+        let dropped = refilling(89, next + tick * 6);
+        assert_eq!(decide(&dropped, 97, &mut state, now).len(), 0);
+        let crossed = refilling(97, next + tick * 7);
+        assert_eq!(decide(&crossed, 97, &mut state, now).len(), 1);
+    }
+
     // — Decision: copy ——————————————————————————————
 
     #[test]
@@ -897,7 +1013,9 @@ mod tests {
         assert_eq!(fired.len(), 1);
         assert_eq!(fired[0].urgency, Urgency::Normal);
         assert!(
-            fired[0].title.starts_with("Claude — reset credit expires "),
+            fired[0]
+                .title
+                .starts_with("Claude · gmail — reset credit expires "),
             "{}",
             fired[0].title
         );
@@ -945,6 +1063,68 @@ mod tests {
             ..input(Vec::new())
         };
         assert_eq!(decide(&later, 97, &mut state, now).len(), 1);
+    }
+
+    #[test]
+    fn credit_expiry_alerts_identify_each_named_account() {
+        use crate::tui::app::{ReadyTab, TabId, TabState};
+        use crate::usage::{
+            OpenAiSnapshot, OpenAiSource, ResetCredit, ResetCredits, VendorSnapshot,
+        };
+
+        let now = at(23, 12, 0);
+        let expiry = now + chrono::Duration::hours(3);
+        let ready = TabState::Ready(Box::new(ReadyTab {
+            snapshot: VendorSnapshot::Openai(OpenAiSnapshot {
+                plan: "ChatGPT Pro".into(),
+                session: None,
+                weekly: None,
+                code_review: None,
+                additional_limits: Vec::new(),
+                unavailable_models: Vec::new(),
+                credits: None,
+                reset_credits: Some(ResetCredits {
+                    available: 1,
+                    credits: vec![ResetCredit {
+                        title: Some("Full reset".into()),
+                        expires_at: Some(expiry),
+                    }],
+                }),
+                source: OpenAiSource::CodexOauth,
+            }),
+            stale: false,
+            last_error: None,
+            fetched_at: Some(now),
+            display: Default::default(),
+        }));
+        let mut state = NotifyState::default();
+        for account in [Some("personal"), Some("work"), None] {
+            let tab = account.map_or_else(
+                || TabId::vendor(crate::vendor::VendorId::Openai),
+                |label| TabId::account_for(crate::vendor::VendorId::Openai, label),
+            );
+            let input = RefreshInput::from_tab(&tab, &ready, now).unwrap();
+            let fired = decide(&input, 97, &mut state, now);
+            assert_eq!(fired.len(), 1);
+            let who = account.map_or(input.vendor.clone(), |label| {
+                format!("{} · {label}", input.vendor)
+            });
+            assert_eq!(
+                fired[0].title,
+                format!(
+                    "{who} — reset credit expires {}",
+                    format::local_date_hm(expiry)
+                )
+            );
+            assert!(fired[0].body.starts_with("Full reset — redeem within 3h"));
+            assert_eq!(fired[0].urgency, Urgency::Normal);
+            assert!(
+                fired[0]
+                    .key
+                    .starts_with(&format!("{}::credit::", input.entry_id))
+            );
+            assert!(decide(&input, 97, &mut state, now).is_empty());
+        }
     }
 
     // — State persistence ———————————————————————————
@@ -1002,6 +1182,93 @@ mod tests {
         let mut state = NotifyState::read_from(&path);
         assert_eq!(decide(&high, 97, &mut state, now).len(), 1);
         drop(dir);
+    }
+
+    #[test]
+    fn anthropic_api_daily_notification_keys_migrate_without_refiring() {
+        let (dir, path) = state_path();
+        let old = at(17, 9, 0);
+        let newest = at(18, 9, 0);
+        let mut state = NotifyState::default();
+        for (label, notified_at) in [
+            ("Month to date (through Sep 17)", old),
+            ("Month to date (through Sep 18)", newest),
+            ("Completed daily buckets this month", old),
+        ] {
+            state.entries.insert(
+                format!("anthropic_api::{label}"),
+                KeyRecord {
+                    notified_at,
+                    reset_at_snapshot: None,
+                },
+            );
+        }
+        state.write_to(&path).unwrap();
+        let input = RefreshInput {
+            entry_id: "anthropic_api".into(),
+            vendor: "Anthropic API".into(),
+            account: None,
+            rows: vec![row("Spend (mo)", 98, None)],
+            credits: Vec::new(),
+        };
+        let mut sink = RecorderSink::default();
+        run_at(
+            &input,
+            97,
+            &path,
+            Duration::from_secs(2),
+            &mut sink,
+            at(19, 9, 0),
+        );
+
+        assert!(
+            sink.delivered.is_empty(),
+            "the existing crossing remains notified"
+        );
+        let migrated = NotifyState::read_from(&path);
+        assert_eq!(migrated.entries.len(), 1);
+        assert_eq!(
+            migrated.entries["anthropic_api::Spend (mo)"].notified_at,
+            newest
+        );
+        assert!(
+            migrated
+                .entries
+                .keys()
+                .all(|key| !key.contains("Month to date") && !key.contains("Completed daily"))
+        );
+        drop(dir);
+    }
+
+    #[test]
+    fn an_existing_stable_anthropic_api_notification_record_wins_migration() {
+        let stable_at = at(16, 9, 0);
+        let mut state = NotifyState::default();
+        for (label, notified_at) in [
+            ("Spend (mo)", stable_at),
+            ("Month to date (through Sep 18)", at(18, 9, 0)),
+        ] {
+            state.entries.insert(
+                format!("anthropic_api@work::{label}"),
+                KeyRecord {
+                    notified_at,
+                    reset_at_snapshot: None,
+                },
+            );
+        }
+        let input = RefreshInput {
+            entry_id: "anthropic_api@work".into(),
+            vendor: "Anthropic API".into(),
+            account: Some("work".into()),
+            rows: Vec::new(),
+            credits: Vec::new(),
+        };
+        assert!(decide(&input, 97, &mut state, at(19, 9, 0)).is_empty());
+        assert_eq!(state.entries.len(), 1);
+        assert_eq!(
+            state.entries["anthropic_api@work::Spend (mo)"].notified_at,
+            stable_at
+        );
     }
 
     // — Orchestration ————————————————————————————————
@@ -1080,6 +1347,42 @@ mod tests {
         assert!(sink.delivered.is_empty());
     }
 
+    /// A 100% toast asks for the 30s Omarchy honours once it stops treating
+    /// critical urgency as immortal; a normal one leaves the timeout to the
+    /// daemon, which is where Omarchy's own 8s default lives.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_critical_toast_asks_for_a_timeout_and_a_normal_one_does_not() {
+        let sink = NotifySendSink::new();
+        let toast = |urgency| Notification {
+            title: "Claude — Session (5h) at 100%".to_string(),
+            body: "resets in 2h".to_string(),
+            urgency,
+            key: "anthropic::Session (5h)".to_string(),
+        };
+        let critical_toast = toast(Urgency::Critical);
+
+        let critical = sink.argv(&critical_toast);
+        assert!(
+            critical
+                .windows(2)
+                .any(|pair| pair[0] == "-t" && pair[1] == "30000"),
+            "a critical toast asks for the cap: {critical:?}"
+        );
+
+        let normal = sink.argv(&toast(Urgency::Normal));
+        assert!(
+            !normal.iter().any(|arg| arg == "-t"),
+            "a normal toast leaves the timeout to the daemon: {normal:?}"
+        );
+
+        // `notify-send` reads the trailing positionals as title and body, so
+        // the switch this test is about must not land after them.
+        let tail = &critical[critical.len() - 2..];
+        assert_eq!(tail[0], critical_toast.title);
+        assert_eq!(tail[1], critical_toast.body);
+    }
+
     /// The guard test for the whole feature: a notifier that cannot even be
     /// spawned must not make the check error, panic, or skip the state
     /// bookkeeping. `run_at` has no failure channel at all — this pins that.
@@ -1138,11 +1441,11 @@ mod tests {
         let state = TabState::Ready(Box::new(ReadyTab {
             snapshot: VendorSnapshot::Anthropic(AnthropicSnapshot {
                 plan: "Claude Max 20x".into(),
-                session: UsageWindow {
+                session: Some(UsageWindow {
                     utilization_pct: 98,
                     resets_at: Some(reset),
                     window_duration: chrono::Duration::hours(5),
-                },
+                }),
                 weekly: UsageWindow {
                     utilization_pct: 42,
                     resets_at: None,
@@ -1161,6 +1464,8 @@ mod tests {
                         expires_at: Some(at(25, 0, 0)),
                     }],
                 },
+                cloud_credits: None,
+                usage_credits: None,
             }),
             stale: false,
             last_error: None,
@@ -1199,13 +1504,13 @@ mod tests {
                 additional_limits: Vec::new(),
                 unavailable_models: Vec::new(),
                 credits: None,
-                reset_credits: ResetCredits {
+                reset_credits: Some(ResetCredits {
                     available: 2,
                     credits: vec![ResetCredit {
                         title: Some("Full reset".into()),
                         expires_at: Some(at(25, 0, 0)),
                     }],
-                },
+                }),
                 source: crate::usage::OpenAiSource::CodexOauth,
             }),
             stale: false,
@@ -1230,6 +1535,85 @@ mod tests {
     }
 
     #[test]
+    fn synthetic_notifications_describe_the_partial_refill() {
+        use crate::tui::app::{ReadyTab, TabId, TabState};
+        use crate::usage::{SyntheticSnapshot, UsageWindow, VendorSnapshot, WeeklyCredits};
+
+        let now = at(23, 12, 0);
+        let reset = at(23, 15, 0);
+        let tab = TabId::vendor(crate::vendor::VendorId::Synthetic);
+        for (credits, next_regen_percent, amount) in [
+            (None, Some(2.0), "2%"),
+            (
+                Some(WeeklyCredits {
+                    used: 30.0,
+                    max: 30.0,
+                    next_regen: 0.6,
+                }),
+                None,
+                "0.60 credits",
+            ),
+        ] {
+            for percent in [97, 100] {
+                let state = TabState::Ready(Box::new(ReadyTab {
+                    snapshot: VendorSnapshot::Synthetic(SyntheticSnapshot {
+                        plan: None,
+                        weekly: UsageWindow {
+                            utilization_pct: percent,
+                            resets_at: Some(reset),
+                            window_duration: chrono::Duration::zero(),
+                        },
+                        credits: credits.clone(),
+                        next_regen_percent,
+                        utilization_precise: f64::from(percent),
+                    }),
+                    stale: false,
+                    last_error: None,
+                    fetched_at: Some(now),
+                    display: Default::default(),
+                }));
+                let input = RefreshInput::from_tab(&tab, &state, now).unwrap();
+                let mut notify_state = NotifyState::default();
+                let fired = decide(&input, 97, &mut notify_state, now);
+
+                assert_eq!(fired.len(), 1);
+                assert_eq!(fired[0].key, "synthetic::Weekly credits");
+                assert_eq!(
+                    fired[0].body,
+                    format!(
+                        "{percent}% of the Weekly credits used · regenerates {amount} in 3h 00m ({})",
+                        format::local_time_hm(reset)
+                    )
+                );
+                assert_eq!(
+                    fired[0].urgency,
+                    if percent == 100 {
+                        Urgency::Critical
+                    } else {
+                        Urgency::Normal
+                    }
+                );
+                assert!(decide(&input, 97, &mut notify_state, now).is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn a_refill_due_now_has_no_future_countdown() {
+        let now = at(23, 12, 0);
+        let mut refill = row("Weekly credits", 100, Some(now));
+        refill.regen = Some("2%".into());
+        let fired = decide(&input(vec![refill]), 97, &mut NotifyState::default(), now);
+        assert_eq!(
+            fired[0].body,
+            format!(
+                "100% of the Weekly credits used · regenerates 2% now ({})",
+                format::local_time_hm(now)
+            )
+        );
+    }
+
+    #[test]
     fn from_tab_skips_grouped_slices_and_unavailable_credits() {
         use crate::tui::app::{ReadyTab, TabId, TabState};
         use crate::usage::{
@@ -1245,6 +1629,8 @@ mod tests {
                 period: SuperGrokPeriod::Weekly,
                 reset_at: Some(at(26, 0, 0)),
                 prepaid_balance: None,
+                on_demand_used_cents: None,
+                on_demand_cap_cents: None,
                 // available == 0: the report would not surface these either.
                 reset_credits: ResetCredits {
                     available: 0,
@@ -1300,6 +1686,7 @@ mod tests {
                 weekly: window(weekly, at(26, 1, 34), 168),
                 third_party_session: window(third_party_session, at(24, 2, 19), 5),
                 third_party_weekly: window(third_party_weekly, at(30, 19, 19), 168),
+                model_pools: Vec::new(),
             }),
             stale: false,
             last_error: None,
@@ -1418,6 +1805,37 @@ mod tests {
         }
     }
 
+    /// A window's identity must not depend on the day of the fetch either. An
+    /// Anthropic API spend row named after its covered day got a new key every
+    /// morning, so one crossing of the threshold notified again each day (#470).
+    #[test]
+    fn a_spend_over_the_threshold_notifies_once_as_the_covered_day_moves() {
+        use crate::tui::app::{ReadyTab, TabId, TabState};
+        use crate::usage::{AnthropicApiSnapshot, VendorSnapshot};
+
+        let tab = TabId::vendor(crate::vendor::VendorId::AnthropicApi);
+        let mut notify_state = NotifyState::default();
+        let fired: Vec<usize> = (17..=19)
+            .map(|day| {
+                let state = TabState::Ready(Box::new(ReadyTab {
+                    snapshot: VendorSnapshot::AnthropicApi(AnthropicApiSnapshot {
+                        spent: 98.0,
+                        limit: Some(100.0),
+                        covered_through: chrono::NaiveDate::from_ymd_opt(2026, 9, day),
+                    }),
+                    stale: false,
+                    last_error: None,
+                    fetched_at: None,
+                    display: Default::default(),
+                }));
+                let now = at(day + 1, 9, 0);
+                let input = RefreshInput::from_tab(&tab, &state, now).expect("ready tab projects");
+                decide(&input, 97, &mut notify_state, now).len()
+            })
+            .collect();
+        assert_eq!(fired, [1, 0, 0]);
+    }
+
     /// Heading context applies to unique labels too, survives spacers, and
     /// ends at a non-heading row. Unscoped metrics keep their bare names.
     #[test]
@@ -1431,9 +1849,13 @@ mod tests {
             reset_at: None,
             window: None,
             group: None,
+            model_pool: false,
             headline: MetricHeadline::Percent,
             used_cents: None,
             limit_cents: None,
+            regen: None,
+            percent_precise: None,
+            reading: None,
         };
         let metric = |label: &str, pct| {
             projection(Section::Metric {

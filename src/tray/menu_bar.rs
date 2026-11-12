@@ -6,7 +6,9 @@
 
 use serde_json::Value;
 
-use super::strip::{HiddenRows, StripContent, StripMetric, quota_group};
+use super::strip::{
+    HiddenRows, StripContent, StripMetric, UsageReading, metric_text, quota_group, safe_text,
+};
 
 /// Artwork needed for the current status-item content.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,6 +24,8 @@ pub(super) enum StatusItemContent {
 /// The menu-bar look chosen in Settings → Menu Bar → Menu Bar Shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum MenuBarLook {
+    /// The application gauge, regardless of starred metrics.
+    AppIcon,
     /// The usage bars (default).
     Chart,
     /// Each starred provider's logo followed by its highest quota usage.
@@ -37,6 +41,7 @@ impl MenuBarLook {
     /// is what 1.32.0 called the Quattro look and is still read as it.
     pub(super) fn from_style(style: Option<&str>) -> Self {
         match style {
+            Some("icon") => Self::AppIcon,
             Some("provider") => Self::Logos,
             Some("quattro" | "name") => Self::Quattro,
             _ => Self::Chart,
@@ -46,6 +51,7 @@ impl MenuBarLook {
     /// The `[tray] menu_bar_style` value persisted for this look.
     pub(super) fn style(self) -> &'static str {
         match self {
+            Self::AppIcon => "icon",
             Self::Chart => "bars",
             Self::Logos => "provider",
             Self::Quattro => "quattro",
@@ -55,6 +61,7 @@ impl MenuBarLook {
     /// The value the popover's picker uses for this look.
     pub(super) fn picker_value(self) -> &'static str {
         match self {
+            Self::AppIcon => "icon",
             Self::Chart => "chart",
             Self::Logos => "logos",
             Self::Quattro => "quattro",
@@ -64,6 +71,7 @@ impl MenuBarLook {
     /// Parse the popover's picker value; `name` is the 1.32.0 spelling.
     pub(super) fn from_picker_value(value: &str) -> Option<Self> {
         match value {
+            "icon" => Some(Self::AppIcon),
             "chart" => Some(Self::Chart),
             "logos" => Some(Self::Logos),
             "quattro" | "name" => Some(Self::Quattro),
@@ -74,41 +82,12 @@ impl MenuBarLook {
 
 /// Select status-item artwork, falling back to the app icon when content is empty.
 pub(super) fn status_item_content(look: MenuBarLook, has_content: bool) -> StatusItemContent {
-    if !has_content {
+    if look == MenuBarLook::AppIcon || !has_content {
         StatusItemContent::AppIcon
     } else if look == MenuBarLook::Chart {
         StatusItemContent::Chart
     } else {
         StatusItemContent::Logos
-    }
-}
-
-/// How the popover reads a quota (Preferences → Show Usage As). The menu
-/// bar's percentages follow it, so the chip says `82%` left when the tab
-/// that selects it does, not the `18%` used behind it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum UsageReading {
-    Used,
-    Left,
-}
-
-impl UsageReading {
-    /// Read the `strip` IPC's `show_as`. Anything else keeps used, the
-    /// reading the menu bar had before the popover reports one.
-    pub(super) fn from_strip_ipc(value: &Value) -> Self {
-        match value.get("show_as").and_then(Value::as_str) {
-            Some("left") => Self::Left,
-            _ => Self::Used,
-        }
-    }
-}
-
-/// A metric's text in `reading`: its remaining share in Left when it has a
-/// percent, its report value otherwise.
-fn metric_text(metric: &StripMetric, reading: UsageReading) -> &str {
-    match (reading, metric.left_value.as_deref()) {
-        (UsageReading::Left, Some(left)) => left,
-        _ => metric.value.trim(),
     }
 }
 
@@ -189,6 +168,9 @@ pub(super) fn logo_segments(
     reading: UsageReading,
     hidden: &HiddenRows,
 ) -> Vec<LogoSegment> {
+    if look == MenuBarLook::AppIcon {
+        return Vec::new();
+    }
     if look == MenuBarLook::Quattro {
         return name_segment(content, report, selected, show_short_name, reading, hidden)
             .into_iter()
@@ -305,31 +287,6 @@ fn segment(
     })
 }
 
-/// Build tooltip lines for the starred groups in `reading`, or the app name
-/// when none have values.
-pub(super) fn tooltip(content: &StripContent, reading: UsageReading) -> String {
-    let lines: Vec<String> = content
-        .groups
-        .iter()
-        .filter_map(|(_, name, metrics)| {
-            let values: Vec<&str> = metrics
-                .iter()
-                .map(|metric| metric_text(metric, reading))
-                .filter(|value| !value.is_empty())
-                .collect();
-            if values.is_empty() {
-                return None;
-            }
-            Some(format!("{} · {}", safe_text(name), values.join(" ")))
-        })
-        .collect();
-    if lines.is_empty() {
-        "AI Usage".into()
-    } else {
-        lines.join("\n")
-    }
-}
-
 fn short_name_for(report: &Value, id: &str) -> Option<String> {
     report
         .get("entries")?
@@ -343,17 +300,9 @@ fn short_name_for(report: &Value, id: &str) -> Option<String> {
         .map(safe_text)
 }
 
-fn safe_text(value: &str) -> String {
-    value
-        .chars()
-        .filter(|c| !c.is_control())
-        .collect::<String>()
-        .trim()
-        .to_owned()
-}
-
 #[cfg(test)]
 mod tests {
+    use super::super::strip::tooltip;
     use super::*;
     use serde_json::json;
 
@@ -431,7 +380,12 @@ mod tests {
 
     #[test]
     fn empty_modes_fall_back_to_static_app_icon() {
-        for look in [MenuBarLook::Chart, MenuBarLook::Logos, MenuBarLook::Quattro] {
+        for look in [
+            MenuBarLook::AppIcon,
+            MenuBarLook::Chart,
+            MenuBarLook::Logos,
+            MenuBarLook::Quattro,
+        ] {
             assert_eq!(
                 status_item_content(look, false),
                 StatusItemContent::AppIcon,
@@ -455,13 +409,57 @@ mod tests {
 
     #[test]
     fn menu_bar_look_round_trips_through_config_and_picker() {
-        for look in [MenuBarLook::Chart, MenuBarLook::Logos, MenuBarLook::Quattro] {
+        for look in [
+            MenuBarLook::AppIcon,
+            MenuBarLook::Chart,
+            MenuBarLook::Logos,
+            MenuBarLook::Quattro,
+        ] {
             assert_eq!(MenuBarLook::from_style(Some(look.style())), look);
             assert_eq!(
                 MenuBarLook::from_picker_value(look.picker_value()),
                 Some(look)
             );
         }
+    }
+
+    // Mutation captured: falling back to Logos when starred metrics exist
+    // hides the explicitly selected application icon.
+    #[test]
+    fn app_icon_stays_selected_with_starred_metrics() {
+        let report = json!({"entries": [{
+            "id": "anthropic", "status": "ready", "short_name": "cld",
+            "sections": [{"type": "metric", "label": "Weekly", "percent": 42}]
+        }]});
+        let stars =
+            super::super::strip::Stars::from([("anthropic".into(), vec!["metric:Weekly".into()])]);
+        let content = super::super::strip::content_from_payload(&report, &stars, &[]);
+        assert_eq!(
+            status_item_content(MenuBarLook::AppIcon, !content.bars.is_empty()),
+            StatusItemContent::AppIcon
+        );
+        assert!(
+            logo_segments(
+                &content,
+                &report,
+                MenuBarLook::AppIcon,
+                None,
+                false,
+                UsageReading::Used,
+                &HiddenRows::new(),
+            )
+            .is_empty()
+        );
+        let restored = logo_segments(
+            &content,
+            &report,
+            MenuBarLook::Logos,
+            None,
+            false,
+            UsageReading::Used,
+            &HiddenRows::new(),
+        );
+        assert_eq!(restored[0].values, ["42%"]);
     }
 
     /// An unset, unknown or future `menu_bar_style` keeps the chart default.
@@ -923,6 +921,7 @@ mod tests {
             left_value: None,
             value_headline: false,
             grouped: false,
+            model_pool: false,
         }
     }
 
@@ -993,6 +992,58 @@ mod tests {
 
         assert_eq!(value("anthropic"), vec![String::from("0%")]);
         assert_eq!(value("supergrok"), vec![String::from("7%")]);
+    }
+
+    /// #453: an exhausted per-model pool (Antigravity's Gemini 4 Argon) is one
+    /// model's limit: Flash, Pro, Claude and GPT-OSS still have room, so the
+    /// chip reads the busiest window the provider shares. The pool stands in
+    /// only when nothing shared is left to show.
+    #[test]
+    fn logos_rank_a_model_pool_below_the_shared_windows() {
+        let antigravity = |sections: Value| json!({"primary":null, "entries":[{"id":"antigravity", "status":"ready", "sections": sections}]});
+        let heading = |label: &str| json!({"type":"text", "label": label, "value":""});
+        let metric = |label: &str, percent: u32| json!({"type":"metric", "label": label, "percent": percent, "value": format!("{percent}%")});
+        let pool = |label: &str, percent: u32| {
+            json!({"type":"metric", "label": label, "percent": percent,
+                   "value": format!("{percent}%"), "model_pool": true})
+        };
+        let chip = |report: &Value, hidden: &HiddenRows| {
+            logo_segments(
+                &starred(&["antigravity"]),
+                report,
+                MenuBarLook::Logos,
+                None,
+                false,
+                UsageReading::Used,
+                hidden,
+            )[0]
+            .values
+            .clone()
+        };
+        let report = antigravity(json!([
+            heading("Session"),
+            metric("Gemini", 55),
+            metric("Claude & GPT OSS", 0),
+            heading("Weekly"),
+            metric("Gemini", 39),
+            pool("Gemini 4 Argon", 100),
+            metric("Claude & GPT OSS", 0),
+        ]));
+        assert_eq!(chip(&report, &HiddenRows::new()), vec![String::from("55%")]);
+
+        // With every shared window hidden, the pool is what is left to show.
+        let hidden = HiddenRows::from([(
+            String::from("antigravity"),
+            [
+                "metric:Gemini (Session)",
+                "metric:Claude & GPT OSS (Session)",
+                "metric:Gemini (Weekly)",
+                "metric:Claude & GPT OSS (Weekly)",
+            ]
+            .map(String::from)
+            .to_vec(),
+        )]);
+        assert_eq!(chip(&report, &hidden), vec![String::from("100%")]);
     }
 
     /// A value headline that carries a percent (a prepaid balance meter, a

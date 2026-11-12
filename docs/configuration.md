@@ -5,6 +5,12 @@ Claude, Codex, Z.AI, and OpenRouter are enabled by default; other providers are
 opt-in. The commented example shows the defaults and provider-specific
 settings.
 
+Muse Code subscription quotas use the official CLI's existing file-based
+OAuth login. Enable `[muse-code] enabled = true`, optionally with a
+`credentials_path`. It remains opt-in during detection. See
+[Muse Code setup](muse-code.md) for paths, the five-minute request bound,
+and Meta's idle-window missing-data limitation.
+
 Both binaries accept `--config <PATH>` to use an alternate file instead of the
 default location (`%APPDATA%\ai-usagebar\config\config.toml` on Windows). The file
 must already exist; loads and the Settings overlay then read and write that
@@ -15,6 +21,12 @@ ai-usagebar --vendor kimi --config ./config.test.toml --watch 5
 ai-usagebar-tui --config ./config.test.toml
 ```
 
+The macOS and Windows tray's **Add key** dialog checks a new API key with
+the provider. If the check fails or cannot clear the provider's cache first,
+it restores the previous key and enabled state, in both standard and inline
+TOML provider tables. Other settings and comments are preserved, as are edits
+you make while the check is running.
+
 ```toml
 [ui]
 # Which vendor the widget shows when --vendor is omitted, AND which tab
@@ -24,7 +36,8 @@ ai-usagebar-tui --config ./config.test.toml
 #                         # | zai | openrouter | deepseek | deepinfra | kimi | kilo | novita
 #                         # | moonshot | grok | supergrok | grokbot | antigravity | cursor
 #                         # | minimax | kiro | nous | opencode-go | commandcode
-#                         # | orcarouter | modelstudio | lyceum | devin
+#                         # | orcarouter | modelstudio | lyceum | devin | cline | muse-code | droid
+#                         # | synthetic | mistral
 # Which vendors the Overview lists, in this order. The TUI tab bar leads with
 # the same list; enabled vendors left off it follow in the canonical order.
 # Omit for every enabled vendor. A repeated slug keeps its first occurrence;
@@ -61,9 +74,9 @@ enabled = true
 # credentials_path = "/home/you/.claude/.credentials.json"
 
 [anthropic_api]
-enabled = true             # disabled by default; requires an organization Admin key
+enabled = true             # disabled by default; requires organization report access
 api_key_env = "ANTHROPIC_ADMIN_KEY"
-# api_key = "sk-ant-admin01-..."  # not an inference key; chmod 600 if inline
+# api_key = "..."         # authorized report credential; chmod 600 if inline
 # monthly_limit = 1000     # optional positive, finite USD display limit
 
 [openai]
@@ -169,6 +182,19 @@ enabled = true
 api_key_env = "OLLAMA_API_KEY"
 # api_key = "..."          # used if OLLAMA_API_KEY is unset; chmod 600 the file!
 
+[deeprelay]
+enabled = true             # disabled by default; enable once you add an API key
+# The key needs the `billing:read` scope; the dashboard's default key has it.
+api_key_env = "DEEPRELAY_API_KEY"
+# api_key = "deeprelay_live_..."   # used if DEEPRELAY_API_KEY is unset; chmod 600!
+
+[mistral]
+enabled = true             # disabled by default; enable once you add a key
+# Reads the monthly API and Vibe Code budgets. The key must be supplied
+# explicitly: ai-usagebar never discovers credentials on its own.
+api_key_env = "MISTRAL_API_KEY"
+# api_key = "mst-..."      # used if MISTRAL_API_KEY is unset; chmod 600!
+
 [moonshot]
 enabled = true             # disabled by default; enable once you add an API key
 api_key_env = "MOONSHOT_API_KEY"
@@ -189,12 +215,14 @@ api_key_env = "XAI_MANAGEMENT_KEY"
 
 [supergrok]
 enabled = true             # disabled by default; enable once you've run `grok login`
-# Included usage from Grok Build billing (overall % plus productUsage slices).
-# Distinct from `[grok]`, which is Management API prepaid dollars.
-# No API key of its own: billing and banked resets use the `key` already in
-# its auth.json (read-only, sent in an Authorization header, never copied or
-# rewritten). Billing is Grok Build's documented HTTPS endpoint, or its ACP
-# process as fallback; remaining resets are a separate grok.com RPC.
+# Included usage from the official Grok CLI's `/usage` billing call (overall
+# % plus product slices, and additional usage when the document reports it).
+# Distinct from `[grok]`, which is Management API prepaid dollars — that API
+# does not report the SuperGrok weekly pool. See docs/grok.md.
+# No API key of its own: billing uses the `key` already in auth.json
+# (read-only, sent in an Authorization header, never copied or rewritten).
+# Billing is the CLI's HTTPS endpoint, or its ACP process as fallback;
+# remaining resets are a separate grok.com RPC that can fail on its own.
 # Defaults to $GROK_HOME/bin/grok or ~/.grok/bin/grok. Override only when the
 # trusted official binary was installed elsewhere.
 # grok_binary = "/opt/grok/bin/grok"
@@ -219,7 +247,10 @@ enabled = false            # opt in after signing in with Antigravity
 # Antigravity is read locally first: the running desktop product or `agy`
 # language server supplies quota over its loopback RPC. When that source is
 # unavailable — including `agy` sessions whose CSRF token is not published —
-# ai-usagebar uses the saved Google session and the Cloud Code API instead.
+# ai-usagebar asks `agy -p "/quota"` when `agy` is installed (at most every two
+# minutes), and otherwise uses the saved Google session and the Cloud Code API.
+# By default `agy` is discovered on `PATH` and in `~/.local/bin`. Set
+# `agy_binary = "~/.local/bin/agy"` to pin the exact executable.
 # The session is read-only from either the OS keyring or the CLI file:
 # ~/.gemini/antigravity-cli/antigravity-oauth-token
 # oauth_client_id = "<public installed-app client id>"
@@ -240,7 +271,9 @@ enabled = true             # disabled by default; enable once you've signed in t
 # No API key: reads the session token the Cursor IDE already wrote to its own
 # state.vscdb after you signed in there. No desktop IDE (headless machine)?
 # Sign in to the cursor-agent CLI once instead — its own auth.json is the
-# fallback when the IDE database is absent.
+# fallback when the IDE database is absent. It is also retried when Cursor
+# rejects a 3.27.12+ opaque IDE token with HTTP 401; ordinary IDE JWTs remain
+# authoritative.
 # db_path = "/home/you/.config/Cursor/User/globalStorage/state.vscdb"
 # agent_auth_path = "/home/you/.config/cursor/auth.json"
 
@@ -252,12 +285,14 @@ enabled = true             # disabled by default; enable once you've run `kiro-c
 
 [opencode-go]
 enabled = true             # disabled by default; enable once signed in or configured
-# Reads the API key the official OpenCode CLI already wrote to its own
-# auth.json (default $XDG_DATA_HOME/opencode or ~/.local/share/opencode),
-# read-only, so a signed-in CLI shows up on its own. An explicit key still
-# wins: OPENCODE_GO_API_KEY (or `api_key`) is resolved before the file.
+# Reads auth.json, then OpenCode 2's opencode.db, under
+# $XDG_DATA_HOME/opencode or ~/.local/share/opencode (read-only).
+# The database must have an active opencode key or unexpired OAuth access token.
+# OpenCode owns token refresh; renew an expired session in the CLI.
+# An explicit key wins over both stores. If v1 and v2 coexist, auth.json
+# keeps priority; use auth_paths with only opencode.db to select the v2 login.
 # api_key = "..."                          # or export OPENCODE_GO_API_KEY
-# auth_paths = ["/custom/opencode/auth.json"]  # non-standard install
+# auth_paths = ["/custom/opencode/opencode.db"]  # replaces the search list
 
 [modelstudio]
 enabled = false            # disabled by default; enable after `bl auth login --console`
@@ -275,7 +310,34 @@ enabled = false            # disabled by default; enable after signing in with D
 # (the CLI's documented paths; macOS is untested here).
 # An explicit credentials_path needs no home directory to resolve.
 # credentials_path = "/home/you/.local/share/devin/credentials.toml"
+# show_default_account = true
+#
+# [[devin.accounts]]
+# label = "work"
+# credentials_path = "~/.zapdevin/devin/credentials.toml"
+[droid]
+enabled = false            # disabled by default; enable after signing in with `droid` on Linux
+# Factory Droid subscription quota. Reuses the login the official `droid` CLI
+cli_renewal = true         # near expiry, let the `droid` CLI renew its own login
+# cli_path = "/home/you/.local/bin/droid"   # default: `droid` on PATH
 ```
+
+The CLI's access token lasts about a day and the CLI renews it only when it
+runs. With `cli_renewal` on, a login within 10 minutes of expiry makes
+ai-usagebar run `droid doctor --checks auth --timeout 10000` — the CLI's own
+auth check, which renews and saves the session through Factory's sign-in
+service without calling a model. It runs with stdin closed, its output
+discarded, provider secrets removed from its environment, a 30-second limit,
+and at most once every 15 minutes. If it is off or the CLI cannot renew
+(signed out, offline, `droid` not on the bar's `PATH`), the bar keeps the last
+reading and says to run `droid` once.
+
+Droid remains opt-in when its CLI login is present. First-run detection and
+`detect --all` do not enable it; set `enabled = true` explicitly to activate
+the provider. It reports the Standard quota's 5-hour, weekly and monthly
+windows plus the Droid Core bucket and the extra-usage balance. A window the
+account has not started reads "Not started", and a Droid Core bucket that was
+never used collapses to one "not used yet" row.
 
 Devin remains opt-in when its CLI login is present. First-run detection and
 `detect --all` do not enable it; set `enabled = true` explicitly to activate
@@ -289,6 +351,22 @@ shown as fully used. Its optional
 the tested account; that currency interpretation is not a verified universal
 contract. The existing CLI token is read only for the status request and cache
 identity. ai-usagebar does not sign in, refresh, or rewrite Devin credentials.
+
+For more than one Devin CLI login, add `[[devin.accounts]]` — a label and that
+login's own `credentials.toml`:
+
+```toml
+[[devin.accounts]]
+label = "work"
+credentials_path = "~/.devin-work/devin/credentials.toml"
+```
+
+Create the second login with `XDG_DATA_HOME=~/.devin-work devin auth login` (or
+a shell function / alias wrapping `XDG_DATA_HOME`) and point `credentials_path`
+at the file it writes. Select it with `--account work`; each account keeps its own
+isolated cache under `~/.cache/ai-usagebar/devin/<label>`. The singular
+`credentials_path` remains the default account and appears alongside named
+accounts unless `show_default_account = false`.
 
 For more than one OpenRouter key, see the
 [OpenRouter account guide](openrouter-accounts.md). The existing singular
@@ -304,7 +382,13 @@ default at 97%: after a **fresh** fetch (never a cached or failed one), any
 window at or above the threshold raises one notification — normal urgency
 between the threshold and 99%, critical at 100% (exhausted). Linux delivers
 via `notify-send` (`-a ai-usagebar -c quota`); macOS delivers through
-Notification Center. The macOS popover also exposes the enable switch and
+Notification Center. A critical (100%) toast also asks for a 30-second
+timeout, so it can expire where the daemon honours one: Omarchy's notification
+plugin keeps critical toasts until they are dismissed and ignores the sender's
+timeout, and
+[omacom/omarchy#12964](https://github.com/omacom/omarchy/pull/12964) is what
+makes it honour a requested one, capped at 30s. The macOS popover also exposes
+the enable switch and
 threshold in Preferences. Windows delivery is planned for a later release.
 
 One crossing is one notification. A key re-arms only when usage drops 7
@@ -315,8 +399,15 @@ sub-second drift between fetches and a rolling window slides it forward with
 the refresh interval — and the dedupe state lives in
 `~/.cache/ai-usagebar/notifications.json` behind the same file locking as the
 vendor caches. Banked reset credits (Codex, SuperGrok) also notify once, 48
-hours before each credit expires. Bodies carry only vendor-reported absolute
-resets — never a burn-rate estimate.
+hours before each credit expires. Bodies carry only vendor-reported reset or
+refill times — never a burn-rate estimate. For a partially refilling window
+such as Synthetic's weekly budget, the alert names the regeneration amount
+(for example, `regenerates 2% in 3h 00m`) rather than promising a full reset.
+Each refill tick moves that instant later without opening a new window, so
+such a window re-arms only on the 7-point drop.
+
+Credit-expiry alerts include the configured account label for named accounts,
+so the reminder identifies which account needs to redeem the credit.
 
 Delivery is best-effort: a missing or failing notifier, an unwritable state
 file, or lock contention is a silent skip that never affects the bar, the
@@ -392,6 +483,23 @@ under the meter and moves the percentage and the detail line to its hover text;
 `"percent"` keeps the popover's used/left toggle. Waybar and GNOME build their
 bar text from the per-vendor formats, so `headline` does not reach them.
 
+### Mistral
+
+Mistral reads the monthly API and Vibe Code budgets from the billing routes the
+official open-source `mistral-vibe` CLI uses. The documented Admin API is
+Enterprise-only. The key must come from `MISTRAL_API_KEY` or an inline
+`[mistral] api_key`; ai-usagebar never reads another app's credential store.
+The key needs the `see_org_inference_usage` permission: a key without it can
+still be valid but the budget read answers 403, which ai-usagebar reports as a
+permission problem rather than a rejected credential.
+
+The subscription read only names the plan and is best-effort; the budget read
+is required. `vibe_budget` is always present; `api_budget` is optional because
+some plans do not report a separate API allowance, and the panel then shows the
+Vibe budget alone. Allowances are denominated in the response's `currency`
+(USD or EUR on current accounts). Both budgets reset on the calendar-month
+boundary the response reports, so no fixed window length is assumed.
+
 ### GitHub Copilot
 
 GitHub Copilot uses the OAuth login managed by the official GitHub CLI. Run
@@ -400,6 +508,8 @@ in the Omarchy settings form and save; this enables `[copilot]` and sets it as
 the primary provider. The normal fetch path runs only the fixed structured
 command `gh auth token`. ai-usagebar never parses GitHub CLI configuration or
 credential stores and never writes the OAuth token to its config or cache.
+The helper runs asynchronously with a five-second deadline, so a slow or
+wedged OS credential store cannot freeze the TUI.
 
 `GITHUB_COPILOT_TOKEN` is an optional explicit environment override. It takes
 precedence over `gh auth token`, which can be useful for a managed runtime that
@@ -460,3 +570,5 @@ detection continues to respect disabled providers. The command preserves other
 settings, comments, and credentials, and supports `--config PATH` to edit an
 existing alternate configuration. It does not sign in or select a primary
 provider. Successful writes return `{"ok":true}`; failures exit nonzero.
+
+See [Anthropic API setup and report permissions](anthropic-api.md) for supported key types and 401/403 troubleshooting.
