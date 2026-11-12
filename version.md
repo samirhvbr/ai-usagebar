@@ -1,7 +1,7 @@
 # Version — samirhvbr fork of ai-usagebar
 
-**Current version:** `0.4.0`
-**Upstream:** [akitaonrails/ai-usagebar](https://github.com/akitaonrails/ai-usagebar) @ `a983efd` (`v1.50.0`) — 71 commits of ours past it
+**Current version:** `0.4.1`
+**Upstream:** [akitaonrails/ai-usagebar](https://github.com/akitaonrails/ai-usagebar) @ `a983efd` (`v1.50.0`) — 73 commits of ours past it
 
 The **first semver in this file is ours**, and that is not cosmetic: everything
 that reads a version here takes the first one it finds. Pointing that at the
@@ -29,6 +29,21 @@ Where this fork's CI runs: [`docs/ci.md`](docs/ci.md).
 
 Newest first. Each `##` heading is literally the commit subject. The upstream's
 own changelog, where it has one, is left alone: it is their record, not ours.
+
+## 0.4.1 - include Kimi monthly quota in the legacy macOS menu
+
+Applies upstream contribution [#619](https://github.com/akitaonrails/ai-usagebar/pull/619)
+(`7348cbb`, based on `a983efd`) without changing the shared quota fetch path.
+The Swift format now carries Kimi's monthly pool into its existing third
+quota row and Overview's maximum-window headline. Older weekly-only output
+keeps its existing rows; a missing monthly pool never becomes a fabricated 0%.
+
+The full Swift test harness and production native build pass on macOS arm64.
+Synthetic parser regressions fail on the unchanged base and pass here;
+light/dark Ring and Block fixture renders are attached to the upstream PR.
+Full Rust and platform CI is tracked on that PR. No credentials or local
+account data are included in the contribution. The installed Swift binary
+was rebuilt and the LaunchAgent reloaded with the existing CLI and settings.
 
 ## 0.4.0 - fetch upstream tags locally for fork changelog validation
 
