@@ -39,3 +39,17 @@ initiative** — it says what is needed and asks.
 counterpart in [akitaonrails/ai-usagebar](https://github.com/akitaonrails/ai-usagebar), so it never conflicts on a
 sync — which is why the fleet's rule arrives in a file of our own instead of in
 the upstream's `CLAUDE.md` or `README.md`.
+
+## Upstream release tags for changelog validation
+
+The Linux and macOS CI jobs run the upstream immutable-changelog check against
+the latest release tags. This fork's remote retains only early `v*` tags, so a
+full checkout of `origin` alone does not provide the current upstream tags.
+The two jobs fetch `refs/tags/v*` directly from `akitaonrails/ai-usagebar`
+before running the check, gated to this fork's repository name.
+
+That fetch writes only local refs in the disposable CI checkout. It does not
+force replacement of existing tags, push tags to the fork, modify the release
+workflow, or change released changelog sections. Publishing the upstream's
+`v*` tags on this fork would trigger its Release workflow and is not part of
+upstream synchronization.

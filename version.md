@@ -1,7 +1,7 @@
 # Version — samirhvbr fork of ai-usagebar
 
 **Current version:** `0.4.0`
-**Upstream:** [akitaonrails/ai-usagebar](https://github.com/akitaonrails/ai-usagebar) @ `a983efd` (`v1.50.0`) — 70 commits of ours past it
+**Upstream:** [akitaonrails/ai-usagebar](https://github.com/akitaonrails/ai-usagebar) @ `a983efd` (`v1.50.0`) — 71 commits of ours past it
 
 The **first semver in this file is ours**, and that is not cosmetic: everything
 that reads a version here takes the first one it finds. Pointing that at the
@@ -29,6 +29,14 @@ Where this fork's CI runs: [`docs/ci.md`](docs/ci.md).
 
 Newest first. Each `##` heading is literally the commit subject. The upstream's
 own changelog, where it has one, is left alone: it is their record, not ours.
+
+## 0.4.0 - fetch upstream tags locally for fork changelog validation
+
+The first CI run of the sync found only the fork's early remote tags and
+compared old release sections instead of the current upstream releases.
+Linux and macOS now fetch the official `v*` tags into their disposable
+checkouts before the unchanged changelog gate. This never pushes tags or
+starts the fork's Release workflow; upstream released history stays intact.
 
 ## 0.4.0 - adopt upstream v1.50.0, preserving ShvIA and GNOME account panels
 

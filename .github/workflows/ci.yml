@@ -28,6 +28,12 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
 
+      # This fork does not publish the upstream's release tags: doing so
+      # would trigger its own Release workflow. Read them into this checkout.
+      - name: Fetch upstream release tags for the fork's changelog check
+        if: github.repository == 'samirhvbr/ai-usagebar'
+        run: git fetch --no-tags https://github.com/akitaonrails/ai-usagebar.git 'refs/tags/v*:refs/tags/v*'
+
       - name: Published changelog sections and versions are intact
         shell: bash
         run: |
@@ -143,6 +149,10 @@ jobs:
         with:
           fetch-depth: 0
           fetch-tags: true
+
+      - name: Fetch upstream release tags for the fork's changelog check
+        if: github.repository == 'samirhvbr/ai-usagebar'
+        run: git fetch --no-tags https://github.com/akitaonrails/ai-usagebar.git 'refs/tags/v*:refs/tags/v*'
 
       # Same gate as Linux, under BSD sed: maintainers run it locally on macOS
       # before tagging, and a GNU-only expression would otherwise pass CI.
