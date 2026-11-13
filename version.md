@@ -1,7 +1,7 @@
 # Version — samirhvbr fork of ai-usagebar
 
-**Current version:** `0.4.1`
-**Upstream:** [akitaonrails/ai-usagebar](https://github.com/akitaonrails/ai-usagebar) @ `a983efd` (`v1.50.0`) — 73 commits of ours past it
+**Current version:** `0.5.0`
+**Upstream:** [akitaonrails/ai-usagebar](https://github.com/akitaonrails/ai-usagebar) @ `7418f4c` (`v1.51.0`) — 74 commits of ours past it
 
 The **first semver in this file is ours**, and that is not cosmetic: everything
 that reads a version here takes the first one it finds. Pointing that at the
@@ -29,6 +29,47 @@ Where this fork's CI runs: [`docs/ci.md`](docs/ci.md).
 
 Newest first. Each `##` heading is literally the commit subject. The upstream's
 own changelog, where it has one, is left alone: it is their record, not ours.
+
+## 0.5.0 - adopt upstream v1.51.0, preserving ShvIA and fork panels
+
+Merges the official `v1.51.0` release, exactly
+`7418f4c29245dd29660d40e0d1f03071183861a5`, into fork main
+`91b004361d5b44aef7dd66c81fc171bd8f22e4fe`. The upstream point moves from
+`a983efd99c514b7b13018900b21a0ead5c841f18` (`v1.50.0`), importing 31 commits.
+This brings Kiro Google/GitHub social sessions, Omarchy pace markers, scoped
+Claude Keychain account detection, Anthropic API named accounts in the native
+menu, and the released Mistral and Kimi fixes.
+
+Resolution and preservation notes:
+
+- The only conflict was `CHANGELOG.md`: the fork's Kimi entry was already
+  released upstream through #619 (`3d0ce41`, original patch `7348cbb`). The
+  official release changelog is retained byte for byte, with no duplicate
+  `[Unreleased]` entry. Upstream version fields and packaging metadata also
+  match the release exactly; only this file carries fork version `0.5.0`.
+- Shared Rust files merged without manual source changes. ShvIA remains
+  opt-in, with its configuration, provider registration, fetch/report/TUI
+  integration and credential-permission handling preserved. Its provider
+  directory is byte-identical to the previous fork main.
+- The entire GNOME extension is byte-identical to the previous fork main:
+  saved aggregate panel entries, named-account selection, "Status das APIs",
+  dark styling and the single background API-refresh owner are retained.
+  The official release did not change that tree.
+- Native macOS source, tests and README now match the release exactly. The
+  fork's prior Kimi monthly patch is already included there, alongside the
+  new Anthropic API named-account mirror; it is not reapplied separately.
+- The fork-only CI tag fetch and `docs/ci.md` are unchanged. They fetch
+  upstream tags only into disposable checkouts for changelog validation;
+  synchronization does not push upstream tags or change runner settings.
+
+Preparation checks passed: rustfmt, cargo-machete, immutable changelog/version
+checks, `git diff --check`, GNOME/KDE/popover/Omarchy Node contracts, 18 Linux
+Mint model tests and four macOS packaging tests. Rust builds, Clippy, the
+Swift suite and platform integration checks are left to the separate build
+and CI lanes; this preparation did not run heavyweight local builds. Live
+GNOME, KDE, Omarchy and GTK behavior has not been exercised on this macOS
+host. Runtime installation and the settings-preserving reload are verified
+separately from this source merge.
 
 ## 0.4.1 - include Kimi monthly quota in the legacy macOS menu
 
