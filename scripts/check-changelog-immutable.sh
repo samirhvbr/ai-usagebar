@@ -19,7 +19,25 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 
 fail=0
-tags=$(git tag --list 'v*' --sort=-v:refname | head -"${CHANGELOG_TAGS_TO_CHECK:-8}")
+# A fork can opt into checking only releases already integrated at this ref.
+# Leave the default global tag comparison unchanged for upstream release work.
+if [ "${CHANGELOG_TAG_REF+x}" = x ]; then
+  if [ -z "$CHANGELOG_TAG_REF" ] || ! tag_commit=$(git rev-parse --verify --quiet --end-of-options "${CHANGELOG_TAG_REF}^{commit}"); then
+    echo "error: CHANGELOG_TAG_REF must name a valid, nonempty commit reference"
+    exit 1
+  fi
+  if ! release_tags=$(git tag --merged "$tag_commit" --list 'v*' --sort=-v:refname); then
+    echo "error: could not list release tags for CHANGELOG_TAG_REF"
+    exit 1
+  fi
+  if [ -z "$release_tags" ]; then
+    echo "error: no v* tags are reachable from CHANGELOG_TAG_REF"
+    exit 1
+  fi
+else
+  release_tags=$(git tag --list 'v*' --sort=-v:refname)
+fi
+tags=$(printf '%s\n' "$release_tags" | head -"${CHANGELOG_TAGS_TO_CHECK:-8}")
 [ -z "$tags" ] && { echo "no v* tags found — nothing to compare"; exit 0; }
 
 # Tags cut but abandoned before their release ever shipped: v1.20.0 was caught
@@ -63,7 +81,7 @@ for tag in $tags; do
   fi
 done
 
-newest=$(git tag --list 'v*' --sort=-v:refname | head -1)
+newest=$(printf '%s\n' "$release_tags" | head -1)
 if [ -n "$newest" ]; then
   want=${newest#v}
   check_version() {

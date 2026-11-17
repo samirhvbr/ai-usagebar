@@ -42,9 +42,10 @@ the upstream's `CLAUDE.md` or `README.md`.
 
 ## Upstream release tags for changelog validation
 
-The Linux and macOS CI jobs run the upstream immutable-changelog check against
-the latest release tags. This fork's remote retains only early `v*` tags, so a
-full checkout of `origin` alone does not provide the current upstream tags.
+The Linux and macOS CI jobs run the immutable-changelog check against the
+latest upstream releases integrated into the fork. This fork's remote retains
+only early `v*` tags, so a full checkout of `origin` alone does not provide the
+current upstream tags.
 The two jobs fetch `refs/tags/v*` directly from `akitaonrails/ai-usagebar`
 before running the check, gated to this fork's repository name.
 
@@ -53,3 +54,28 @@ force replacement of existing tags, push tags to the fork, modify the release
 workflow, or change released changelog sections. Publishing the upstream's
 `v*` tags on this fork would trigger its Release workflow and is not part of
 upstream synchronization.
+
+On `samirhvbr/ai-usagebar` only, both jobs set `CHANGELOG_TAG_REF=HEAD` when
+running the check. The checker uses `git tag --merged` to select release tags
+reachable from that commit for both the published-section comparisons and the
+newest-version rollback check. Fetching a newer upstream release that the fork
+has not integrated therefore does not require an unrelated upstream update or
+a package-version bump. Released sections already imported into the fork must
+still match their tags, and none of the checked version files may fall below
+the newest reachable release.
+
+Without `CHANGELOG_TAG_REF`, the check retains its upstream behavior and
+compares against all release tags. An explicitly empty or invalid reference,
+a reference to a non-commit object, or a valid commit without reachable `v*`
+tags fails the scoped check rather than skipping validation. Reproduce the
+fork's check locally with a full-history checkout and upstream release tags:
+
+```sh
+CHANGELOG_TAG_REF=HEAD make changelog-check
+python3 -m unittest discover -s scripts -p 'test_check_changelog_immutable.py'
+```
+
+The tests create temporary Git repositories with isolated home directories and
+Git configuration. Linux and macOS run them to cover unmerged newer releases,
+published-section changes, version rollback, and invalid tag boundaries under
+both GNU and BSD command-line tools.

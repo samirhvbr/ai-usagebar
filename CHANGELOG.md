@@ -8,6 +8,14 @@
   worker and publishes only display readings, with freshness and no-data
   states, while preserving the existing CLI configuration and logins.
 
+### Fixed
+
+- **Fork CI: validate imported releases without requiring future upstream
+  updates.** Changelog and version checks can explicitly select release tags
+  reachable from the checked commit. Unmerged upstream tags no longer force
+  unrelated package-version bumps in this fork; imported released sections
+  and version rollback remain protected.
+
 ## [1.51.0] — 2026-11-12
 
 ### Added

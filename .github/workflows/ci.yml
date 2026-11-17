@@ -34,6 +34,9 @@ jobs:
         if: github.repository == 'samirhvbr/ai-usagebar'
         run: git fetch --no-tags https://github.com/akitaonrails/ai-usagebar.git 'refs/tags/v*:refs/tags/v*'
 
+      - name: Test changelog validation boundaries
+        run: python3 -m unittest discover -s scripts -p 'test_check_changelog_immutable.py'
+
       - name: Published changelog sections and versions are intact
         shell: bash
         run: |
@@ -44,6 +47,9 @@ jobs:
           if [ -z "$(git tag --list 'v*')" ]; then
             echo "::error::Changelog validation requires v* release tags."
             exit 1
+          fi
+          if [ "$GITHUB_REPOSITORY" = "samirhvbr/ai-usagebar" ]; then
+            export CHANGELOG_TAG_REF=HEAD
           fi
           make changelog-check
 
@@ -154,10 +160,17 @@ jobs:
         if: github.repository == 'samirhvbr/ai-usagebar'
         run: git fetch --no-tags https://github.com/akitaonrails/ai-usagebar.git 'refs/tags/v*:refs/tags/v*'
 
+      - name: Test changelog validation boundaries (BSD sed)
+        run: python3 -m unittest discover -s scripts -p 'test_check_changelog_immutable.py'
+
       # Same gate as Linux, under BSD sed: maintainers run it locally on macOS
       # before tagging, and a GNU-only expression would otherwise pass CI.
       - name: Published changelog sections and versions are intact (BSD sed)
-        run: make changelog-check
+        run: |
+          if [ "$GITHUB_REPOSITORY" = "samirhvbr/ai-usagebar" ]; then
+            export CHANGELOG_TAG_REF=HEAD
+          fi
+          make changelog-check
 
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:

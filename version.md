@@ -1,7 +1,7 @@
 # Version — samirhvbr fork of ai-usagebar
 
-**Current version:** `0.6.0`
-**Upstream:** [akitaonrails/ai-usagebar](https://github.com/akitaonrails/ai-usagebar) @ `7418f4c` (`v1.51.0`) — 75 commits of ours past it
+**Current version:** `0.6.1`
+**Upstream:** [akitaonrails/ai-usagebar](https://github.com/akitaonrails/ai-usagebar) @ `7418f4c` (`v1.51.0`) — 76 commits of ours past it
 
 The **first semver in this file is ours**, and that is not cosmetic: everything
 that reads a version here takes the first one it finds. Pointing that at the
@@ -29,6 +29,17 @@ Where this fork's CI runs: [`docs/ci.md`](docs/ci.md).
 
 Newest first. Each `##` heading is literally the commit subject. The upstream's
 own changelog, where it has one, is left alone: it is their record, not ours.
+
+## 0.6.1 - scope fork changelog validation to integrated releases
+
+The widget PR's first CI run fetched upstream `v1.52.2`, which is not an
+ancestor of this fork's intentional `v1.51.0` baseline. The global tag
+comparison then rejected unchanged package versions before tests ran.
+Fork CI now opts into `CHANGELOG_TAG_REF=HEAD`: both immutable-section and
+version-rollback checks use releases reachable from that commit. Invalid or
+empty boundaries fail; upstream's default all-tag behavior is unchanged.
+Nine hermetic Git-fixture tests preserve the failure cases on Linux/macOS.
+Widget code and upstream version fields are unchanged by this CI correction.
 
 ## 0.6.0 - prototype a native macOS usage widget with shared menu readings
 
