@@ -132,10 +132,30 @@ def compile_command(sdk: str, arch: str, output: Path, *, extension: bool) -> li
         "-D", "WIDGET_EXTENSION" if extension else "WIDGET_HOST",
     ]
     if extension:
-        command.append("-application-extension")
+        # Match Xcode's app-extension entry point; the API-safety flag alone
+        # still starts at Swift main and skips the NSExtension bootstrap.
+        command += ["-application-extension", "-Xlinker", "-e", "-Xlinker", "_NSExtensionMain"]
     command += [str(source) for source in sources]
     command += ["-o", str(output)]
     return command
+
+
+def verify_extension_entry_point(binary: Path) -> None:
+    """Check the linked Mach-O enters the app-extension bootstrap, not Swift main."""
+    commands = subprocess.check_output(["/usr/bin/otool", "-l", str(binary)], text=True)
+    symbols = subprocess.check_output(["/usr/bin/otool", "-Iv", str(binary)], text=True)
+    text_addresses = re.findall(r"\bsegname __TEXT\n\s+vmaddr (0x[0-9a-fA-F]+)", commands)
+    entry_offsets = re.findall(r"\bcmd LC_MAIN\n\s+cmdsize \d+\n\s+entryoff (\d+)", commands)
+    if len(text_addresses) != 1 or len(entry_offsets) != 1:
+        raise ValueError("expected one Mach-O architecture with __TEXT and LC_MAIN")
+    entry_address = int(text_addresses[0], 16) + int(entry_offsets[0])
+    bootstrap_addresses = {
+        int(address, 16) for address in re.findall(
+            r"^0x([0-9a-fA-F]+)\s+\d+\s+_NSExtensionMain\s*$", symbols, re.MULTILINE,
+        )
+    }
+    if entry_address not in bootstrap_addresses:
+        raise ValueError("WidgetKit extension LC_MAIN must enter _NSExtensionMain")
 
 
 def sign_bundle(bundle: Path, identity: str, team_id: str, entitlement_path: Path) -> None:
@@ -180,6 +200,7 @@ def build(args: argparse.Namespace) -> Path:
         extension = temporary / EXTENSION_EXECUTABLE
         print("Building the WidgetKit extension at background priority...", flush=True)
         subprocess.run(compile_command(sdk, args.arch, extension, extension=True), check=True)
+        verify_extension_entry_point(extension)
         staged = temporary / output.name
         package_bundle(host, extension, staged, version, args.team_id)
         for is_extension in (True, False):

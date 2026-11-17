@@ -10,6 +10,10 @@
 
 ### Fixed
 
+- **Fork macOS widget bootstrap.** Manual extension builds now enter through
+  `_NSExtensionMain`, matching Xcode's app-extension product. The extension
+  retains its Swift `@main` registration instead of crashing before gallery
+  descriptor discovery. The build verifies the Mach-O entry point.
 - **Fork CI: validate imported releases without requiring future upstream
   updates.** Changelog and version checks can explicitly select release tags
   reachable from the checked commit. Unmerged upstream tags no longer force

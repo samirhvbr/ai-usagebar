@@ -85,9 +85,44 @@ class WidgetBundleTest(unittest.TestCase):
         self.assertNotIn("-application-extension", host)
         self.assertIn("WIDGET_EXTENSION", widget)
         self.assertIn("-application-extension", widget)
+        self.assertNotIn("_NSExtensionMain", host)
+        self.assertIn(["-Xlinker", "-e", "-Xlinker", "_NSExtensionMain"],
+                      [widget[index:index + 4] for index in range(len(widget) - 3)])
         self.assertIn("arm64-apple-macosx14.0", widget)
         self.assertFalse(any("Tests.swift" in argument for argument in host + widget))
         self.assertFalse(any("WidgetPublisher.swift" in argument for argument in widget))
+
+    def test_extension_entry_point_matches_the_bootstrap_stub(self):
+        commands = """Load command 0
+      cmd LC_SEGMENT_64
+  cmdsize 312
+  segname __TEXT
+   vmaddr 0x0000000100000000
+Load command 13
+       cmd LC_MAIN
+   cmdsize 24
+  entryoff 6664
+ stacksize 0
+"""
+        symbols = """Indirect symbols for (__TEXT,__auth_stubs) 3 entries
+address            index name
+0x00000001000019f8 LOCAL ABSOLUTE
+0x0000000100001a08     3 _NSExtensionMain
+0x0000000100001a18    31 _objc_opt_self
+"""
+        with patch.object(builder.subprocess, "check_output", side_effect=[commands, symbols]):
+            builder.verify_extension_entry_point(self.extension)
+        for bad_commands, bad_symbols in (
+            (commands.replace("entryoff 6664", "entryoff 82576"), symbols),
+            (commands, symbols.replace("_NSExtensionMain", "_main")),
+            (commands.replace("LC_MAIN", "LC_UNIXTHREAD"), symbols),
+            (commands + commands, symbols),
+        ):
+            with self.subTest(commands=bad_commands, symbols=bad_symbols):
+                with patch.object(builder.subprocess, "check_output",
+                                  side_effect=[bad_commands, bad_symbols]):
+                    with self.assertRaises(ValueError):
+                        builder.verify_extension_entry_point(self.extension)
 
     def test_mismatched_signing_team_is_rejected_before_release(self):
         metadata = type("Metadata", (), {"stderr": "TeamIdentifier=OTHERTEAM1\n"})()

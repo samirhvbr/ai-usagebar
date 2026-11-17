@@ -1,7 +1,7 @@
 # Version — samirhvbr fork of ai-usagebar
 
-**Current version:** `0.6.1`
-**Upstream:** [akitaonrails/ai-usagebar](https://github.com/akitaonrails/ai-usagebar) @ `7418f4c` (`v1.51.0`) — 76 commits of ours past it
+**Current version:** `0.6.2`
+**Upstream:** [akitaonrails/ai-usagebar](https://github.com/akitaonrails/ai-usagebar) @ `7418f4c` (`v1.51.0`) — 77 commits of ours past it
 
 The **first semver in this file is ours**, and that is not cosmetic: everything
 that reads a version here takes the first one it finds. Pointing that at the
@@ -29,6 +29,15 @@ Where this fork's CI runs: [`docs/ci.md`](docs/ci.md).
 
 Newest first. Each `##` heading is literally the commit subject. The upstream's
 own changelog, where it has one, is left alone: it is their record, not ours.
+
+## 0.6.2 - use the macOS app extension bootstrap for WidgetKit
+
+Native gallery acceptance exposed a launch failure before WidgetKit could
+request descriptors. The manual Swift build entered the generated Swift
+`main` directly, while Xcode's app-extension product enters the
+`_NSExtensionMain` bootstrap. Extension builds now select that entry point
+explicitly and verify the resulting Mach-O. The Widget `@main` registration,
+host, preferences, App Group, and provider collector remain unchanged.
 
 ## 0.6.1 - scope fork changelog validation to integrated releases
 

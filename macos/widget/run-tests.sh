@@ -20,6 +20,14 @@ swiftc -module-cache-path "$STAGE/cache" -O -parse-as-library \
 swiftc -module-cache-path "$STAGE/cache" -O -parse-as-library \
   -target "$(uname -m)-apple-macosx14.0" \
   -application-extension -D WIDGET_EXTENSION \
+  -Xlinker -e -Xlinker _NSExtensionMain \
   "$WIDGET_DIR/WidgetSnapshot.swift" "$WIDGET_DIR/UsageWidgetView.swift" \
   "$WIDGET_DIR/UsageWidget.swift" -o "$STAGE/widget-extension"
-echo "WidgetKit extension compilation passed"
+python3 - "$WIDGET_DIR" "$STAGE/widget-extension" <<'PY'
+from pathlib import Path
+import sys
+sys.path.insert(0, sys.argv[1])
+import build
+build.verify_extension_entry_point(Path(sys.argv[2]))
+PY
+echo "WidgetKit extension compilation and bootstrap entry point passed"

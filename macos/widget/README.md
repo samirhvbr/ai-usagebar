@@ -65,6 +65,15 @@ architecture. `--host-binary` can reuse a host already built with
 `-D WIDGET_HOST`, `WidgetSnapshot.swift`, and `WidgetPublisher.swift`.
 An ordinary standalone host does not publish widget snapshots.
 
+The extension links with `-Xlinker -e -Xlinker _NSExtensionMain`, matching
+Xcode's app-extension target. `-application-extension` restricts API usage but
+does not select this bootstrap entry point. The build verifies the resulting
+Mach-O `LC_MAIN` address against the `_NSExtensionMain` import before signing.
+Entering the generated Swift `main` directly can crash during extension
+bootstrap, leaving a registered plug-in absent from the widget gallery. Keep
+the widget's Swift `@main` declaration; it still defines the configuration
+that the extension bootstrap loads.
+
 The final artifact contains:
 
 ```text
@@ -153,8 +162,9 @@ the containing app instead.
 ./macos/widget/run-tests.sh
 ```
 
-The aggregate runner checks the model, publisher, packaging, and extension
-compilation without a certificate; the macOS CI job runs it too. Packaging
+The aggregate runner checks the model, publisher, packaging, extension
+compilation, and linked bootstrap entry point without a certificate; the macOS
+CI job runs it too. Packaging
 tests use synthetic binaries and temporary directories; they never invoke a
 signing key or read real settings. The production extension uses
 the `com.apple.widgetkit-extension` extension point from Apple's Xcode
