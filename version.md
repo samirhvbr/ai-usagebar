@@ -1,7 +1,7 @@
 # Version — samirhvbr fork of ai-usagebar
 
-**Current version:** `0.5.0`
-**Upstream:** [akitaonrails/ai-usagebar](https://github.com/akitaonrails/ai-usagebar) @ `7418f4c` (`v1.51.0`) — 74 commits of ours past it
+**Current version:** `0.6.0`
+**Upstream:** [akitaonrails/ai-usagebar](https://github.com/akitaonrails/ai-usagebar) @ `7418f4c` (`v1.51.0`) — 75 commits of ours past it
 
 The **first semver in this file is ours**, and that is not cosmetic: everything
 that reads a version here takes the first one it finds. Pointing that at the
@@ -29,6 +29,26 @@ Where this fork's CI runs: [`docs/ci.md`](docs/ci.md).
 
 Newest first. Each `##` heading is literally the commit subject. The upstream's
 own changelog, where it has one, is left alone: it is their record, not ours.
+
+## 0.6.0 - prototype a native macOS usage widget with shared menu readings
+
+Adds an optional, signed macOS application bundle containing the existing
+Swift menu and a medium WidgetKit extension for Claude `me`/`b3`, Codex,
+Kimi, and ShvIA. The standalone build remains available. The host preserves
+the `ai-usagebar-menubar` preferences domain and uses the installed CLI and
+its existing configuration and login stores.
+
+The widget reads a versioned, atomic display snapshot from an App Group.
+It does not execute the CLI, read credentials, or contact providers. The
+host combines menu and widget requests in its existing single refresh
+worker, deduplicates each provider/account, and reuses the menu's headline
+and reset projection. Missing, disabled, unlimited, cached, and expired
+readings remain distinguishable; example data is restricted to previews.
+
+Build, signing, snapshot, and notebook acceptance instructions are in
+[`macos/widget/README.md`](macos/widget/README.md). This prototype is a
+local signed build, not a notarized release. WidgetKit controls refresh
+scheduling; check times describe local observations, not API fetch times.
 
 ## 0.5.0 - adopt upstream v1.51.0, preserving ShvIA and fork panels
 

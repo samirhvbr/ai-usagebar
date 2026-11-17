@@ -157,6 +157,11 @@ Start at login from the popover **Settings → Launch at Login**. That writes
 
 The legacy Swift dropdown:
 
+An optional [native WidgetKit prototype](widget/README.md) packages this
+dropdown as a containing app and adds a medium desktop widget for Claude
+`me`/`b3`, Codex, Kimi, and ShvIA. It shares the menu's existing refresh
+worker and preserves its preference domain and CLI configuration.
+
 ```bash
 cd macos
 ./build.sh

@@ -1,5 +1,13 @@
 ## [Unreleased]
 
+### Added
+
+- **Fork: native macOS medium widget prototype.** An optional signed bundle
+  hosts the existing Swift menu and a sandboxed WidgetKit extension for
+  Claude `me`/`b3`, Codex, Kimi, and ShvIA. It shares the menu's collection
+  worker and publishes only display readings, with freshness and no-data
+  states, while preserving the existing CLI configuration and logins.
+
 ## [1.51.0] — 2026-11-12
 
 ### Added

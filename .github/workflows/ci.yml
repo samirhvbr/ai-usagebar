@@ -183,6 +183,9 @@ jobs:
       - name: Run the menu bar test harness
         run: ./macos/run-tests.sh
 
+      - name: Test the native widget prototype
+        run: ./macos/widget/run-tests.sh
+
       - name: Package the tray app bundle
         run: python3 -m unittest discover -s macos -p 'test_package_app.py'
 

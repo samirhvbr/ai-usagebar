@@ -1295,6 +1295,28 @@ func testVendorCatalogContract() {
     assertEqual(entryDisplayName("supergrok", catalog: catalog), "SuperGrok", "supergrok display name from catalog")
 }
 
+func testMenuReadingProjection() {
+    print("shared menu reading transport")
+    let values = [0: "Test plan", 1: "42", 2: "2h", 3: "12", 4: "4d"]
+    let text = FORMAT.components(separatedBy: ";;").enumerated().map {
+        values[$0.offset] ?? $0.element
+    }.joined(separator: ";;") + ";;__aiub_end__ ⏸"
+    let data = try! JSONSerialization.data(withJSONObject: [
+        "text": text, "tooltip": "not a widget export", "class": "low",
+    ])
+    let date = Date(timeIntervalSince1970: 1_700_000_000)
+    let entry = MenuEntry(id: "anthropic-desktop@me", name: "Claude · me")
+    let reading = menuReading(entry: entry, output: String(data: data, encoding: .utf8)!, checkedAt: date)
+    assertEqual(reading.snapshot?.session?.pct, 42, "shared transport preserves session")
+    assertEqual(reading.snapshot?.weekly?.pct, 12, "shared transport preserves weekly")
+    assertEqual(reading.stale, true, "backend pause suffix stays stale")
+    assertEqual(reading.checkedAt, date, "check time is injected, not wall-clock state")
+    assertEqual(reading.entry.id, entry.id, "Desktop account identity is preserved")
+    let invalid = menuReading(entry: entry, output: "not JSON", checkedAt: date)
+    assertNil(invalid.snapshot, "invalid output has no synthesized quota")
+    assertEqual(invalid.stale, false, "invalid output does not fabricate a cache reading")
+}
+
 func testVendorCatalogLifecycle() {
     print("vendor catalog lifecycle (generation guard and overview refresh)")
     let app = AppDelegate()
@@ -1606,6 +1628,7 @@ struct TestRunner {
         testSystemIntegrations()
         testSubprocessEnvironment()
         testVendorCatalogContract()
+        testMenuReadingProjection()
         testVendorCatalogLifecycle()
         if failures > 0 {
             print("\n\(failures) test(s) FAILED")

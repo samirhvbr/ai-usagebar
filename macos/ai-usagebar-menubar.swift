@@ -523,6 +523,64 @@ struct Snapshot {
     var cursorTotalPct: Int? = nil
 }
 
+/// One observation from the existing CLI transport. A check time records when
+/// this process observed the output, not when the provider fetched its cache.
+struct MenuReading {
+    let entry: MenuEntry
+    let output: String
+    let snapshot: Snapshot?
+    let checkedAt: Date
+    let stale: Bool
+}
+
+func menuReading(entry: MenuEntry, output: String, checkedAt: Date = Date()) -> MenuReading {
+    let object = output.data(using: .utf8).flatMap {
+        try? JSONSerialization.jsonObject(with: $0) as? [String: Any]
+    }
+    let text = object?["text"] as? String
+    return MenuReading(entry: entry, output: output,
+                       snapshot: text.flatMap { parse($0, vendor: baseVendorId(entry.id)) },
+                       checkedAt: checkedAt, stale: text?.contains("⏸") ?? false)
+}
+
+/// Shared serial transport for the overview and the optional native widget.
+/// Both surfaces share the same in-flight refresh, watchdog and cache locks.
+func readMenuEntry(bin: String, entry: MenuEntry) -> MenuReading {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: bin)
+    process.arguments = vendorArgs(for: entry.id) + ["--format", FORMAT_WITH_SENTINEL]
+    process.environment = subprocessEnvironment()
+    let pipe = Pipe()
+    process.standardOutput = pipe
+    process.standardError = FileHandle.nullDevice
+    let watchdog = DispatchWorkItem { if process.isRunning { process.terminate() } }
+    DispatchQueue.global(qos: .utility)
+        .asyncAfter(deadline: .now() + REFRESH_TIMEOUT, execute: watchdog)
+    var output = ""
+    do {
+        try process.run()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        output = String(data: data, encoding: .utf8) ?? ""
+    } catch { output = "" }
+    watchdog.cancel()
+    return menuReading(entry: entry, output: output)
+}
+
+func collectMenuReadings(bin: String, entries: [MenuEntry],
+                         shouldContinue: () -> Bool = { true },
+                         onReading: (MenuReading) -> Void = { _ in },
+                         readEntry: (String, MenuEntry) -> MenuReading = readMenuEntry) -> [MenuReading] {
+    var readings: [MenuReading] = []
+    for entry in entries {
+        guard shouldContinue() else { break }
+        let reading = readEntry(bin, entry)
+        readings.append(reading)
+        onReading(reading)
+    }
+    return readings
+}
+
 func stripMarkup(_ s: String) -> String {
     // Decode exactly one layer after removing tags. Rust escapes API-controlled
     // labels for Pango; the native surface consumes plain text and must not
@@ -2195,9 +2253,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard generation == vendorCatalogGeneration else { return false }
         vendorCatalog = catalog
         rebuildVendorSubmenu()
+        #if WIDGET_HOST
+        refresh()
+        #else
         if VENDOR == "overview" {
             refresh()
         }
+        #endif
         return true
     }
 
@@ -2702,6 +2764,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // label a late result with whatever is selected by then.
         let vendor = VENDOR
 
+        #if WIDGET_HOST
+        refreshWidgetHost(bin: bin, generation: generation, vendor: vendor)
+        #else
         if vendor == "overview" {
             refreshOverview(bin: bin, generation: generation)
             return
@@ -2750,11 +2815,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
             }
         }
+        #endif
     }
 
     /// Applies `body` only when `generation` is still the current attempt, then
     /// releases the in-flight slot and runs any request that arrived meanwhile.
-    private func finishRefresh(_ generation: Int, _ body: (AppDelegate) -> Void) {
+    func finishRefresh(_ generation: Int, _ body: (AppDelegate) -> Void) {
         let current = generation == refreshGeneration
         if current {
             refreshInFlight = false
@@ -2778,33 +2844,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                                 usageAccounts: lastAccountStatus?.usageAccounts),
                                             requested: configuredOverviewVendorIds())
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            var results: [(name: String, id: String, snap: Snapshot?)] = []
-            for v in entries {
-                let p = Process()
-                p.executableURL = URL(fileURLWithPath: bin)
-                p.arguments = vendorArgs(for: v.id) + ["--format", FORMAT_WITH_SENTINEL]
-                p.environment = subprocessEnvironment()
-                let pipe = Pipe()
-                p.standardOutput = pipe
-                p.standardError = FileHandle.nullDevice
-                let watchdog = DispatchWorkItem { if p.isRunning { p.terminate() } }
-                DispatchQueue.global(qos: .utility)
-                    .asyncAfter(deadline: .now() + REFRESH_TIMEOUT, execute: watchdog)
-                var out = ""
-                do {
-                    try p.run()
-                    let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                    p.waitUntilExit()
-                    out = String(data: data, encoding: .utf8) ?? ""
-                } catch { out = "" }
-                watchdog.cancel()
-                var snap: Snapshot?
-                if let data = out.data(using: .utf8),
-                   let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                   let text = obj["text"] as? String {
-                    snap = parse(text, vendor: baseVendorId(v.id))
-                }
-                results.append((name: v.name, id: v.id, snap: snap))
+            let results = collectMenuReadings(bin: bin, entries: entries).map {
+                (name: $0.entry.name, id: $0.entry.id, snap: $0.snapshot)
             }
             DispatchQueue.main.async {
                 self?.finishRefresh(generation) { me in
